@@ -1,4 +1,5 @@
 #include "datagram_mgr.h"
+#include "frame_io.h"
 #include <algorithm>
 #include <vector>
 
@@ -363,13 +364,7 @@ std::optional<DatagramMgr::RoutedDatagram> DatagramMgr::route_datagram(std::span
         std::optional<RelayAttach> attach;
         try
         {
-            const auto payload_size = WireMessage::decode_length(datagram.first<WireMessage::header_length>());
-            if (payload_size != datagram.size() - WireMessage::header_length)
-            {
-                return std::nullopt;
-            }
-            attach = RelayAttach::from_msg(
-                CtrlMessage::deserialize(datagram.subspan(WireMessage::header_length, payload_size)));
+            attach = RelayAttach::from_msg(decode_ctrl_datagram(datagram));
         }
         catch (...)
         {

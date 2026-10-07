@@ -7,6 +7,9 @@ route 模块，以及 Dashboard 的拓扑消费规则；接入 RelayAgent 本地
 证书生成、信任链、SAN 与 TLS 排错见 [证书制作与部署](证书制作与部署.md)；Debian 打包、安装、升级和
 卸载见 [RelayWeave 打包与安装](RelayWeave打包与安装.md)。
 
+本文描述当前已实现的行为。中心指挥 Node 建立共享明文 TCP/UDP 数据通道，再按 Agent 选择路径转发的
+后续工作见 [Node 共享数据通道与按路径转发实施计划](Node共享数据通道与按路径转发实施计划.md)。
+
 ## 1. 总体设计
 
 ### 1.1 模块关系
@@ -178,7 +181,7 @@ master 负责集群消息路由且不保存全局服务目录，同时也可以�
 
 ### 3.2 RelayNode 监听端口
 
-每个 RelayNode 都配置四个控制或数据端口；master 额外监听一个集群端口：
+每个 RelayNode 配置普通 Agent 控制/数据端口和两个 Node 共享数据端口；master 额外监听集群控制端口：
 
 | 配置 | 传输 | 用途 |
 |---|---|---|
@@ -186,9 +189,11 @@ master 负责集群消息路由且不保存全局服务目录，同时也可以�
 | `tcp.port` | TCP | 明文流式 Relay 数据 |
 | `tls.port` | TCP + mTLS | 加密流式 Relay 数据 |
 | `udp.port` | UDP | UDP Relay 数据 |
-| `cluster.port` | TCP + mTLS | master 监听 slave；slave 用它连接 master |
+| `cluster.control_port` | TCP + mTLS | master 监听 slave；slave 用它连接 master |
+| `cluster.tcp_port` | TCP 明文 | Node 间共享、双向、分帧的数据连接 |
+| `cluster.udp_port` | UDP 明文 | Node 间固定 socket 的共享数据报通道 |
 
-`cluster.port` 必须与本节点其他 TCP 监听端口不同。slave 不监听集群端口。防火墙应允许客户端访问每个可能承载服务的节点，而不只是 master，因为服务发现后客户端会直接连接目标节点的控制端口和数据端口。
+三个 cluster 端口均必填，不再接受旧 `cluster.port`。master 的 `cluster.control_port` 与本节点其他 TCP 监听端口不同；slave 不监听集群控制端口。所有 Node 的 `cluster.tcp_port/udp_port` 必须一致，分别沿用 `tcp.address/udp.address` bind，对端地址来自 `topology.members`。TCP 与 UDP 可以使用相同数字端口。防火墙应允许客户端访问每个可能承载服务的节点，而不只是 master，因为服务发现后客户端会直接连接目标节点的控制端口和数据端口。
 
 ### 3.3 核心不变量
 
@@ -239,7 +244,9 @@ master 负责集群消息路由且不保存全局服务目录，同时也可以�
     "role": "master",
     "node_id": "master-1",
     "address": "0.0.0.0",
-    "port": 18447
+    "control_port": 18447,
+    "tcp_port": 18448,
+    "udp_port": 18448
   },
   "control": {
     "address": "0.0.0.0",
@@ -301,14 +308,16 @@ master 负责集群消息路由且不保存全局服务目录，同时也可以�
 
 ### 4.3 RelayNode slave 配置
 
-slave 的控制和数据端口按本节点实际端口填写。它的 `cluster.address` 和 `cluster.port` 指向 master：
+slave 的控制和数据端口按本节点实际端口填写。它的 `cluster.address` 和 `cluster.control_port` 指向 master：
 
 ```json
 "cluster": {
   "role": "slave",
   "node_id": "slave-1",
   "address": "203.0.113.10",
-  "port": 18447
+  "control_port": 18447,
+    "tcp_port": 18448,
+    "udp_port": 18448
 }
 ```
 
@@ -478,13 +487,14 @@ flowchart TD
 
 ### 5.1 RelayNode 编排与执行域
 
-RelayNode 使用三个互相独立的单线程 `asio::io_context`：
+RelayNode 使用四个互相独立的单线程 `asio::io_context`：
 
 | 执行域 | 所有者 | 目的 |
 |---|---|---|
 | `control_io` | control acceptor、`ControlSession`、`ControlRouter`、`RegistryMgr`、`ClusterMgr`、`Topology`、服务发现 | 控制状态按顺序修改，会话、服务表和探测状态由本执行域串行访问 |
 | `transfer_tcp_io` | 两个 `StreamPipeline` 的 acceptor、Relay 索引和流式数据复制 | 把高吞吐流式数据与控制消息隔离 |
 | `transfer_udp_io` | `DatagramMgr`、UDP socket、UDP 路由 | UDP 报文处理与 TCP/TLS、控制面独立调度 |
+| `cluster_data_io` | node 的 `LnkChannel` 监听/读写/保活、会话表和逐跳分派 | Node 通道与会话数据面同域运行，与业务服务限速隔离 |
 
 跨执行域操作使用 `asio::post`。例如 RelayNode 的 ControlRouter 收到 `relay.open/reject/cancel` 后，把操作
 投递给相应 StreamPipeline 或 DatagramMgr；注册 UDP 服务后，也把对应统计与控制会话投递给
@@ -517,6 +527,34 @@ flowchart LR
 ```
 
 单线程执行域保证同一域内 handler 不并发执行，但不能允许同一个 socket 上出现重叠的异步读或异步写。每种 stream 的读循环和写队列仍各自保持单一所有者。
+
+NodeLink 指相邻 Node 的物理通道，NodeFlow 指跨完整路径的逻辑流，FlowFrame 是其载荷帧；原有 ControlSession 保持控制连接会话含义。
+NodeLinkMgr 与 Pipeline/DatagramMgr 同层，由 RelayNode 直接持有，其建连和路径协调状态留在 control_io。master 通过平级 link.prepare/prepared/connect/ready/error/close/closed/status
+指挥端点；单次建立期限 10 秒，TCP 固定 Node ID 顺序发起，只解析一次、connect 一次；UDP 双方各发送一次
+link.attach，并互相响应 link.attached。只有双方 ready 才完成 ensure。成功按 Node 对及 transport 复用，
+并发申请合并，失败由外层处理，不反向尝试、不重发接入、不自动重连。
+数据接入绑定 master epoch、唯一 NodeLink ID 和控制通道下发凭据。NodeFlow 的 DATA 使用原始二进制
+payload，共享连接按 flow_id 分派。每 5 秒保活、20 秒无匹配响应失效。Node 数据不应用服务限速或统计。
+`LnkChannel` 位于 node/lnk_channel，直接拥有物理通道和逻辑流分派状态；
+protocol/message 定义固定 32 字节 Node 帧头，DATA/FIN/RESET 与保活不经过 JSON/CBOR。
+TCP 首帧接入沿用 CBOR 并校验 data_version；UDP 使用 8 字节 NodeLink ID + 同一二进制帧头，接入帧体才承载 CBOR。原有回调注册与独立 Forwarder 已移除，数据域共用一个监控计时器。
+NodeLinkMgr 的一个控制协程等待有界通知队列并直接处理 Link/Flow 状态；通知任务由管理器启动、停止和等待，业务帧不经过该队列。
+第二阶段由 control_io 中的 NodeLinkMgr 统一协调，直接持有 cluster_data_io 中的 LnkChannel：
+master 使用 async_open_flow 提交显式路径，先 ensure 相邻边，再通过 flow.prepare/commit
+安装全路径 NodeFlow；所有 committed 后返回 epoch + flow_id。中间 Node 按逻辑流和方向校验入边并逐跳分派。
+路径必须无环且包含 2..8 个 Node；prepare/commit/close 确认使用 8 位掩码，此限制不约束集群总节点数。
+TCP 使用 DATA/FIN/RESET；FIN 仅结束一个方向，RESET 只释放该逻辑流；UDP 只转发 DATA 并由控制面关闭。
+prepare/commit 共用 10 秒建立期限，各端仅对未提交表项检查准备超时；已提交 Flow 不做周期续租。
+控制连接断开或心跳超时清理本节点全部 Flow 和端点授权；epoch/路径成员失效、NodeLink 断链或显式 close 清理相关 Flow。
+集群控制发送队列溢出沿用原处理：报告本地错误，不主动断开全部控制连接；因此不保证远端旧 Flow 立即回收。
+close 等待全路径确认，最多 10 秒；关闭与拥塞不会关闭共享 NodeLink，重连须重新申请 Flow。
+首末 Node 的内部收发接口已支持分叉、回程和失败验证，不依赖 Agent/服务对象。
+Agent 路径提交、首末 socket 桥接和真实业务背压仍待第三、第四阶段实现，现有业务连接仍直达服务所在 Node。
+物理通道、逻辑流协调/分派和首末业务保持独立；信用、调度、池化和换路在这些边界内后续扩展，
+现有 Pipeline/DatagramMgr 不承担中间节点状态。
+数据格式在本地 NodeFlow 注入或每跳网络解码时校验一次；内部转发直接编码，不重复校验/查出边。
+数据域使用不可变类型化身份与协议字段，热路径不查 JSON；测试专用 Diagnostic/直接发帧接口已删除。
+详细接口及后续步骤见 [共享数据通道与按路径转发计划](Node共享数据通道与按路径转发实施计划.md)。
 
 ### 5.2 ControlSession 与 RegistryMgr
 
@@ -945,22 +983,30 @@ TCP、TLS 或 UDP 不改变上述公式。
 
 两个搜索接口共用按“节点、已用节点数”分层的算法，同成本按完整节点序列排序。节点预算只计算真实
 Node；孤立入口仍能给出单 Node 直达路径。后台轮询只维护探测目标和拓扑，不计算服务候选路径，
-不维护推荐路径缓存、变化比较、切换保持状态或备用路径。
+不维护路径切换状态或独立备用路径。`candidate_paths()` 为每个可用入口分别保留到各终点的一条最优路径，
+不是同一入口下的全部路径枚举，也不保证候选之间节点或链路不相交。候选缓存由 RelayAgent 拥有。
 
-TCP/TLS 每次接受本地业务连接后，在发送 `RelayOpen` 前，使用当前测量和拓扑计算候选路径。
+TCP/TLS 每次接受本地业务连接并找到服务 ServerRoute 后，在发送 `RelayOpen` 前进入候选计算协程；
+目的 Node 的缓存未命中时，才使用当前测量和拓扑重新计算候选路径。
 Forwarder 直接引用拥有它的 RelayAgent，通过 `co_spawn` 将 Agent 的计算协程绑定到拥有路由状态的 control
 执行器，在 transfer 执行器等待计算完成后继续业务连接流程；不等待新探测或拓扑请求。Agent 销毁前等待
 Forwarder 关闭，保证引用在连接计算期间有效。服务发现和控制连接建立不触发候选计算。
 已有业务连接不重新计算路径，UDP 当前也不触发这项 TCP/TLS 连接诊断。
 
-候选结果按目的 Node 缓存 15 秒，共享给同一 Node 上的 TCP/TLS 服务；拓扑结构变化或主控制连接断开
-会清空缓存。只在业务连接打开且缓存未命中时计算，后台刷新测量不打印候选结果。
+候选结果按目的 Node ID 缓存 15 秒，LRU 容量为 16 项，共享给同一 Node 上的 TCP/TLS 服务，空候选也缓存。
+命中只更新 LRU 次序，不续期，也不重新打印候选。`update_probe_targets()` 中配置入口及已发现服务节点的
+必需目标集合变化，或 primary 控制连接断开时，才显式清空缓存；接收拓扑快照（包括节点、边、指标或版本
+变化）不会直接清空缓存，普通测量刷新也不会清空或续期。缓存 TTL 与测量、快照的有效期独立。
+只在业务连接打开且缓存未命中时计算，后台刷新测量不打印候选结果。
 候选计算属于 DEB：`Routes service=lly-http/tls -> llyun-1 candidates=3 max_nodes=4`，
 随后每条候选独立记录日志级别和服务上下文，例如
 `Route #1 cost=109.285 service=lly-http/tls: agent -> llyun-1 *`。
 每个目的地保留全部入口候选，仅日志展示前三名；无测量结果时在汇总中标记 `candidates=0 ... cost=unavailable`。
 `cost` 放在候选排名之后，固定小数点后三位；行末的 `*` 表示推荐候选，其他候选不加标记。
 `cost` 是含质量、新鲜度、冷启动及中继惩罚的路由成本，不等同于 RTT。
+`calculate_service_paths()` 返回 `awaitable<void>`，命中缓存后直接返回，计算后只记录和存入候选；
+它不向 Forwarder 返回选定路径，不更换 ServerRoute，也不把 Node 序列放入 `relay.open`。
+无可用测量或空候选不会阻止现有直连请求。日志行末的 `*` 仅表示成本排名第一，不表示业务实际采用该路径。
 当前候选结果用于诊断，业务仍直连服务 Node。Relay 流程日志通过服务名与 UUID 关联，
 不重复打印连接入口地址；路径展示使用完整候选节点序列，不以单个跳板地址代替。
 
@@ -1053,16 +1099,18 @@ Forwarder 的容器按职责确定所有权：
 
 每个 stream forward 持有一个本地 acceptor 和固定配置。收到本地 socket 后：
 
-1. 按 `(service, protocol)` 查找 ServerRoute；
-2. 锁定 route 中的 weak TLSChannel；失败则关闭本地 socket；
-3. 分配 `request_id`，把本地 socket 放入 `pending_stream_opens`；
-4. 发送 `relay.open`，并启动 `relay.open_timeout_ms`；
-5. 收到同一服务器的 `relay.opened` 后按 `request_id` 取出 pending socket；
-6. 创建以 `(server_id, uuid)` 标识的 Consumer StreamRelay；
-7. 连接响应指定的 `data_port`，TLS 协议还要完成数据 TLS 握手；
-8. 发送 Consumer `relay.attach`，开始本地 socket 与 transfer stream 的双向复制。
+1. 按 `(service, protocol)` 查找服务所在节点的 ServerRoute；没有路由或通道弱引用已失效时立即关闭本地 socket；
+2. 在 `control_io` 上 `co_spawn(RelayAgent::calculate_service_paths(...))`，transfer 侧等待其结束；缓存命中直接返回，未命中才计算和记录候选，不等待新测量。此时本地 socket 已接受，但尚未发送 `relay.open` 或建立远端数据连接；
+3. 返回后检查 Forwarder 仍在 Running，分配 `request_id`，创建 Consumer StreamRelay 并把本地 socket 和原 ServerRoute 放入该对象；
+4. `send_control()` 再锁定原 ServerRoute 的 weak TLSChannel，发送只含 `request_id/service/protocol` 的 `relay.open`；失败则取消并关闭该对象；
+5. 发送投递成功后把 StreamRelay 放入 `pending_stream_opens_`，启动 `relay.open_timeout_ms`；此期限从发送后开始，不包括步骤 2；
+6. 收到 `relay.opened` 后按 `request_id` 取出原 StreamRelay，核对消息来源的 `ServerRoute.id` 和协议，取消 open timer，保存 `uuid` 并加入 `(server_id, uuid)` active 弱索引；
+7. 连接原服务节点的 `ServerRoute.host + data_port`，TLS 协议还要完成该节点的数据 mTLS 握手；
+8. 写完 Consumer `relay.attach` 首帧后，立即开始本地 socket 与 transfer stream 的双向复制，不等待控制面的 `relay.ready`。
 
-超时发生时取消 pending request，并通过原 ServerRoute 发送 `relay.cancel(request_id)`。响应在超时后到达时找不到 pending 项，不会复活已经关闭的本地连接。
+超时发生时通过原 ServerRoute 发送 `relay.cancel(request_id)`，取消 pending request 并关闭本地 socket。
+响应在超时后到达时找不到 pending 项，会向响应来源发送 `relay.cancel(uuid)`，不会复活已经关闭的本地连接。
+路径计算后当前代码继续使用计算前取得的 ServerRoute；计算协程的返回不是选路成功或该控制通道仍可用的确认。
 
 ### 8.3 Stream Producer 流程
 
@@ -1070,10 +1118,13 @@ Forwarder 的容器按职责确定所有权：
 
 1. 验证消息协议和 service 是否存在于本地 `services` 配置；
 2. 创建 Producer StreamRelay；
-3. 同时准备连接本地 `target_host:target_port` 和消息来源服务器的数据端口；
-4. TLS 协议在数据连接上验证同一服务器地址；
+3. 先等待本地 `target_host:target_port` 连接成功，再连接消息来源服务器的 `ServerRoute.host + data_port`，两次连接是顺序执行；
+4. TLS 协议完成数据 mTLS 握手并验证同一服务器地址；
 5. 发送 Producer `relay.attach`；
-6. 两侧连接就绪后在本地 target socket 与 transfer stream 之间复制。
+6. attach 首帧写完后就在本地 target socket 与 transfer stream 之间复制，不等待 `relay.ready`。
+
+Producer 的 offer 流程不调用 Consumer 的候选计算。两侧 Agent 的 `Relay [+]` 表示该侧已写完 attach 并进入
+复制协程；Node 的 `Relay [+]` 才表示两侧 attach 均通过校验并开始节点内转发。
 
 如果 attach 前无法连接本地服务或数据服务器，Producer 发送 `relay.reject(uuid, reason)`；Consumer 侧会收到 `relay.error`。如果 Consumer attach 前失败，则发送 `relay.cancel(uuid)`。attach 后的普通数据错误只结束当前 Relay，不自动重新播放业务字节。
 
@@ -1135,6 +1186,9 @@ data endpoint = ServerRoute.host + response.data_port
 ```
 
 ServerRoute 来自已经完成 mTLS 和 `server.identified` 的控制连接。这样控制消息属于哪个节点，数据连接就回到哪个节点，不会把未经连接上下文校验的 host 字段引入协议。TCP、TLS、UDP 都遵循同一规则。
+
+因此仅把候选第一跳替换成数据 host 不能实现多跳：其他 Node 当前没有该 Relay 的等待状态或 ticket，
+服务节点也没有把 Consumer 半边接到上游 Node 的接口。多跳需要新的路径控制与分段数据面，不能只改一次 connect。
 
 ## 9. CtrlMessage 控制协议模块
 
@@ -1268,24 +1322,41 @@ manager 按 `uuid` 查找 Relay，再验证 ticket 是否属于声明的 role。
 sequenceDiagram
     participant U as 本地应用
     participant C as Consumer RelayAgent
+    participant R as Consumer control_io / AgentRouting
     participant S as 服务所在 RelayNode
     participant P as Producer RelayAgent
     participant T as 本地服务
 
     U->>C: 连接本地 forward
-    C->>S: relay.open
-    S-->>C: relay.opened(uuid, consumer ticket)
-    S-->>P: relay.offer(uuid, producer ticket)
-    P->>T: 连接 target_host:target_port
-    C->>S: 数据连接 + Consumer attach
-    P->>S: 数据连接 + Producer attach
+    C->>C: 查找服务节点 ServerRoute
+    C->>R: co_spawn calculate_service_paths，等待结束
+    R->>R: 缓存命中返回；未命中计算、记录并缓存候选
+    R-->>C: void，不替换 ServerRoute
+    C->>S: 原控制通道 relay.open(request_id, service, protocol)
+    S->>S: 本机 Registry 查 Producer，post 到 StreamPipeline
+    S->>S: 分配 uuid、双方 ticket，启动 setup timer
+    S-->>C: relay.opened(uuid, data_port, consumer ticket)
+    S-->>P: relay.offer(uuid, data_port, producer ticket)
+    par Consumer 数据接入
+        C->>S: 连接服务 Node 数据端口，TLS 时先 mTLS，再 Consumer attach
+        C->>C: attach 写完即开始复制
+    and Producer 数据接入
+        P->>T: 先连接 target_host:target_port
+        P->>S: 再连接同一 Node 数据端口，TLS 时先 mTLS，再 Producer attach
+        P->>P: attach 写完即开始复制
+    end
+    S->>S: 双方 attach 校验完成，取消 setup timer，relaying=true
     S-->>C: relay.ready
     S-->>P: relay.ready
-    U->>T: 经两条 client-server 数据连接发送
+    S->>S: 启动两方向数据复制
+    U->>T: Consumer Agent → 服务 Node → Producer Agent
     T-->>U: 经原路径返回
 ```
 
-服务器在 `relay.open` 时建立等待中的 Relay 和 setup timer。两侧都 attach 后取消 timer、发出 `relay.ready` 并开始复制。任何一侧失败都会清理等待状态并释放容量。
+服务器在 `relay.open` 时建立等待中的 Relay 和 setup timer。两侧都 attach 后取消 timer、发出 `relay.ready`
+并启动复制。两侧 attach 到达顺序没有要求；Agent 写完 attach 后可先写业务字节，Node 在配对完成前不启动
+业务读取与转发，这些字节受 socket 缓冲和传输背压约束，没有额外的 ready 前用户态 payload 队列。
+`Forwarder::relay_ready()` 对 TCP/TLS 直接返回，仅 UDP 使用它推进 ready 状态。
 
 StreamPipeline 中一项流式 Relay 的阶段为：
 
@@ -1293,12 +1364,17 @@ StreamPipeline 中一项流式 Relay 的阶段为：
 open
   -> Waiting(producer half=null, consumer half=null, setup timer active)
   -> 一侧 attach（保存对应 TCP socket 或 TLS stream）
-  -> 两侧 attach（取消 setup timer，移出等待表）
+  -> 两侧 attach（取消 setup timer，设置 relaying=true）
   -> Active（两个方向复制）
   -> Closed（关闭两侧，释放会话弱引用和统计引用）
 ```
 
 Producer 和 Consumer 获得不同 ticket。attach 顺序没有要求；先到的一侧保存在 Relay 中等待另一侧。`max_setup_connections` 限制尚未解析出有效 uuid/role 的接入 socket，`max_relays` 限制已经由 `relay.open` 创建的 Relay，两者解决的是不同资源耗尽问题。
+
+等待和活动 Relay 都保存在同一个 `relays_` 表中，配对时不会移出该表，容量统计覆盖两种状态。
+setup 超时、合法 reject/cancel、控制会话断开等终止等待 Relay 时释放状态和容量，并向 Consumer 发
+`relay.error`。无效 attach 只拒绝该接入 socket，不直接销毁仍在等待的 Relay；其余接入仍可在期限内完成。
+活动 Relay 在 I/O 结束或控制会话断开时关闭并释放；当前 stream 没有 `relay.closed` 通知，不自动重放或换路。
 
 控制会话和 Relay 互相只保留完成操作所需的所有权。Relay 中的 Producer/Consumer 是 weak 控制会话；
 控制会话断开时 ControlRouter 按 session 通知两个 StreamPipeline 和 DatagramMgr 清理，Relay 本身不延长
@@ -1535,7 +1611,7 @@ TLSChannel 的发送队列满时拒绝本帧、记录原因并直接关闭通道
 
 ### 15.1 RelayNode 停止流程
 
-`RelayNode::stop()` 是同步收敛接口，由 `control_io`、`transfer_tcp_io`、`transfer_udp_io` 之外的线程调用。
+`RelayNode::stop()` 是同步收敛接口，由 `control_io`、`transfer_tcp_io`、`transfer_udp_io`、`cluster_data_io` 之外的线程调用。
 它通过一次性状态保护执行以下流程：
 
 ```mermaid
@@ -1547,6 +1623,8 @@ sequenceDiagram
 
     X->>C: co_spawn control stop
     C->>C: close control acceptor, ControlRouter.stop
+    C->>C: 拒绝新 Node link 申请并完成等待者
+    C->>C: co_await NodeLinkMgr.stop（结束 Link/Flow 请求，排空数据任务并等待通知退出）
     C->>C: co_await Topology.close（排空 DNS / ICMP）
     C->>C: co_await ClusterMgr.async_stop
     C->>C: wait all ControlSession tasks
@@ -1561,7 +1639,7 @@ sequenceDiagram
     X->>X: state=Stopped
 ```
 
-三个停止阶段分别由对应 executor 执行，外部同步 `stop()` 通过 `use_future` 逐阶段等待。control 侧先让
+Node 共享数据任务首先在独立 cluster_data_io 中取消并等待退出，再关闭集群控制连接；最后主程序 join 数据线程。其余三个停止阶段分别由对应 executor 执行，外部同步 `stop()` 通过 `use_future` 逐阶段等待。control 侧先让
 Registry 停止接受新状态并断开现有普通会话，等待 ClusterMgr 和全部 ControlSession 结束，确保
 ControlRouter 不会再产生数据面投递。随后把 TCP/TLS stop 放到 transfer_tcp 队列尾部；此前的 reject/cancel
 可能向 UDP 产生后继投递，因此 TCP/TLS 阶段完成后才把 DatagramMgr stop 放到 transfer_udp 队列尾部。
@@ -1687,6 +1765,7 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 
 - `tls_channel_mtls`：双向证书、主机名校验、握手失败与通道生命周期；
 - `cluster_integration`：ClusterRoom 广播与定向发送、来源、保留/重复 ID、非法命令、成员证书、固定 5 秒重连、无历史回放和停止；
+- `links`：共享 TCP/UDP 双向多流、并发复用、master 端点、单次失败与外层重试、凭据/旧 ID、保活失效、epoch/离线、端口差异、监听回滚和停止排空；
 - `agent_cluster`：两个节点上的服务同时转发、primary 离线时附加节点恢复、服务迁移、首次目标失败、过期发现响应；
 - `relay_protocol`：控制命令枚举映射、自定义命令、三种协议 attach、帧校验、UDP session header
   和限速基础逻辑；

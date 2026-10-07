@@ -68,6 +68,23 @@ static constexpr std::pair<CtrlCommand, std::string_view> ctrl_commands[] = {
     {CtrlCommand::RelayCancel, "relay.cancel"},
     {CtrlCommand::RelayClosed, "relay.closed"},
     {CtrlCommand::RelayError, "relay.error"},
+    {CtrlCommand::LinkPrepare, "link.prepare"},
+    {CtrlCommand::LinkPrepared, "link.prepared"},
+    {CtrlCommand::LinkConnect, "link.connect"},
+    {CtrlCommand::LinkReady, "link.ready"},
+    {CtrlCommand::LinkError, "link.error"},
+    {CtrlCommand::LinkClose, "link.close"},
+    {CtrlCommand::LinkClosed, "link.closed"},
+    {CtrlCommand::LinkStatus, "link.status"},
+    {CtrlCommand::LinkAttach, "link.attach"},
+    {CtrlCommand::LinkAttached, "link.attached"},
+    {CtrlCommand::FlowPrepare, "flow.prepare"},
+    {CtrlCommand::FlowPrepared, "flow.prepared"},
+    {CtrlCommand::FlowCommit, "flow.commit"},
+    {CtrlCommand::FlowCommitted, "flow.committed"},
+    {CtrlCommand::FlowError, "flow.error"},
+    {CtrlCommand::FlowClose, "flow.close"},
+    {CtrlCommand::FlowClosed, "flow.closed"},
     {CtrlCommand::ClusterJoin, "cluster.join"},
     {CtrlCommand::ClusterJoined, "cluster.joined"},
     {CtrlCommand::ClusterError, "cluster.error"},
@@ -674,4 +691,106 @@ RelayAttach RelayAttach::from_msg(const CtrlMessage &message)
     const auto role = *role_iterator == Producer ? Producer : Consumer;
 
     return {role, config::require_unsigned(params, "uuid", true), config::require_unsigned(params, "ticket", true)};
+}
+
+namespace
+{
+void encode_lnk_integer(std::span<std::uint8_t> output, std::uint64_t value)
+{
+    for (std::size_t i = output.size(); i != 0; --i)
+    {
+        output[i - 1] = static_cast<std::uint8_t>(value);
+        value >>= 8;
+    }
+}
+std::uint64_t decode_lnk_integer(std::span<const std::uint8_t> input)
+{
+    std::uint64_t value = 0;
+    for (const auto byte : input)
+    {
+        value = (value << 8) | byte;
+    }
+    return value;
+}
+} // namespace
+
+void LnkFrameHeader::validate() const
+{
+    if (!epoch || body_length > maximum_payload)
+    {
+        throw std::invalid_argument("invalid node frame epoch or body length");
+    }
+    switch (kind)
+    {
+    case LnkFrType::Data:
+    case LnkFrType::Fin:
+    case LnkFrType::Reset:
+        if (!id || sequence || (kind == LnkFrType::Fin && body_length) ||
+            (kind == LnkFrType::Reset && body_length > maximum_reason))
+        {
+            throw std::invalid_argument("invalid NodeFlow header");
+        }
+        break;
+    case LnkFrType::Ping:
+    case LnkFrType::Pong:
+        if (id || !sequence || body_length || reverse)
+        {
+            throw std::invalid_argument("invalid node heartbeat header");
+        }
+        break;
+    case LnkFrType::Attach:
+    case LnkFrType::Attached:
+        if (id || sequence || !body_length || reverse)
+        {
+            throw std::invalid_argument("invalid node bootstrap header");
+        }
+        break;
+    default:
+        throw std::invalid_argument("unknown node frame kind");
+    }
+}
+
+LnkFrameHeader::Buffer LnkFrameHeader::encode() const noexcept
+{
+    Buffer output{};
+    output[0] = magic;
+    output[1] = version;
+    output[2] = static_cast<std::uint8_t>(kind);
+    output[3] = reverse ? 1 : 0;
+    auto bytes = std::span(output);
+    encode_lnk_integer(bytes.subspan<4, 4>(), body_length);
+    encode_lnk_integer(bytes.subspan<8, 8>(), epoch);
+    encode_lnk_integer(bytes.subspan<16, 8>(), id);
+    encode_lnk_integer(bytes.subspan<24, 8>(), sequence);
+    return output;
+}
+
+LnkFrameHeader LnkFrameHeader::decode(std::span<const std::uint8_t, length> header)
+{
+    if (header[0] != magic || header[1] != version || header[3] > 1)
+    {
+        throw std::invalid_argument("invalid node frame magic, version or flags");
+    }
+    LnkFrameHeader result{static_cast<LnkFrType>(header[2]),
+                          header[3] != 0,
+                          static_cast<std::uint32_t>(decode_lnk_integer(header.subspan<4, 4>())),
+                          decode_lnk_integer(header.subspan<8, 8>()),
+                          decode_lnk_integer(header.subspan<16, 8>()),
+                          decode_lnk_integer(header.subspan<24, 8>())};
+    result.validate();
+    return result;
+}
+
+void FlowFrame::validate() const
+{
+    if (!epoch || !flow_id || payload.size() > LnkFrameHeader::maximum_payload ||
+        reason.size() > LnkFrameHeader::maximum_reason || (kind != LnkFrType::Data && !payload.empty()) ||
+        (kind != LnkFrType::Reset && !reason.empty()))
+    {
+        throw std::invalid_argument("invalid NodeFlow frame");
+    }
+    if (kind != LnkFrType::Data && kind != LnkFrType::Fin && kind != LnkFrType::Reset)
+    {
+        throw std::invalid_argument("unknown Flow frame kind");
+    }
 }

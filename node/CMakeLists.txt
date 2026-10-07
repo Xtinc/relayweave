@@ -8,6 +8,9 @@ add_library(relayweave_node_lib
     src/relay_node.cpp
     src/cluster_mgr.cpp
     src/topology.cpp
+    src/nodelink_mgr.cpp
+    src/lnk_channel.cpp
+    src/lnk_channel_flows.cpp
 )
 target_link_libraries(relayweave_node_lib PUBLIC
     relayweave_protocol

@@ -415,6 +415,7 @@ int main(int argc, char *argv[])
         asio::io_context control_io(1);
         asio::io_context transfer_tcp_io(1);
         asio::io_context transfer_udp_io(1);
+        TestClusterDataIO cluster_data;
         asio::io_context endpoint_io(1);
         const auto control_port = unused_tcp_port(control_io);
         const auto tcp_port = unused_tcp_port(transfer_tcp_io);
@@ -438,7 +439,7 @@ int main(int argc, char *argv[])
         config.datagram.service_wait_timeout = 5s;
         config.channel = channel_config();
 
-        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, server_context,
+        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
                                                   std::move(config));
         server->start();
         std::thread control_thread([&control_io]() { control_io.run(); });

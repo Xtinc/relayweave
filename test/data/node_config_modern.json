@@ -3,7 +3,9 @@
     "role": "master",
     "node_id": "master-1",
     "address": "0.0.0.0",
-    "port": 18447
+    "control_port": 18447,
+    "tcp_port": 18448,
+    "udp_port": 18448
   },
   "control": {
     "address": "127.0.0.1",

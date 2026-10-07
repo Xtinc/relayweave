@@ -170,6 +170,11 @@ for file in "${required_files[@]}"; do
 done
 
 if [[ "$role" == node ]]; then
+    command -v relayweave-node >/dev/null 2>&1 || {
+        echo "relayweave-node is required to validate cluster listener configuration." >&2
+        exit 1
+    }
+    relayweave-node --check-cluster-config "$config_file"
     openssl verify -CAfile "$cert_dir/server-ca.pem" -purpose sslserver "$certificate_file"
     openssl verify -CAfile "$cert_dir/server-ca.pem" -purpose sslclient "$certificate_file"
     for host in "${verify_hosts[@]}"; do

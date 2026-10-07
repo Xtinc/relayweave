@@ -45,15 +45,16 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix='relayweave-dashboard-smoke-') as directory:
         work = Path(directory)
         reserved = []
-        for _ in range(12 if args.two_nodes else 8):
+        for _ in range(16 if args.two_nodes else 10):
             sock = socket.socket()
             sock.bind(('127.0.0.1', 0))
             reserved.append(sock)
         control, tcp, tls, udp, cluster, http, forward_tcp, forward_tls = [
             sock.getsockname()[1] for sock in reserved
         ][:8]
+        link_tcp, link_udp = [sock.getsockname()[1] for sock in reserved[8:10]]
         config = json.loads((ROOT / 'node' / 'node.example.json').read_text())
-        config['cluster'].update(role='master', node_id='dashboard-smoke', address='127.0.0.1', port=cluster)
+        config['cluster'].update(role='master', node_id='dashboard-smoke', address='127.0.0.1', control_port=cluster, tcp_port=link_tcp, udp_port=link_udp)
         config['control'].update(address='127.0.0.1', advertise_address='127.0.0.1', port=control)
         for name, port in [('tcp', tcp), ('tls', tls), ('udp', udp)]:
             config[name].update(address='127.0.0.1', port=port)
@@ -67,7 +68,11 @@ def main() -> None:
         if args.two_nodes:
             slave_config = json.loads(json.dumps(config))
             slave_config['cluster'].update(role='slave', node_id='dashboard-slave')
-            slave_control, slave_tcp, slave_tls, slave_udp = [sock.getsockname()[1] for sock in reserved[8:]]
+            slave_control, slave_tcp, slave_tls, slave_udp = [sock.getsockname()[1] for sock in reserved[10:14]]
+            # This dashboard fixture keeps both TLS peers on the certificate's 127.0.0.1.
+            # It does not request Node links; shared links with uniform ports are tested in node_links.
+            slave_link_tcp, slave_link_udp = [sock.getsockname()[1] for sock in reserved[14:16]]
+            slave_config['cluster'].update(tcp_port=slave_link_tcp, udp_port=slave_link_udp)
             slave_config['control']['port'] = slave_control
             for name, port in [('tcp', slave_tcp), ('tls', slave_tls), ('udp', slave_udp)]:
                 slave_config[name]['port'] = port

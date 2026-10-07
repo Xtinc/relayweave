@@ -27,6 +27,14 @@ class Topology
     std::optional<CtrlMessage> snapshot_message(std::uint64_t request_id) const;
     bool is_master() const noexcept;
     std::string_view master_id() const noexcept;
+    const std::map<std::string, std::string> &members() const noexcept
+    {
+        return members_;
+    }
+    std::uint64_t epoch() const noexcept
+    {
+        return epoch_;
+    }
     static void validate_snapshot(const njson &params, std::string_view location);
 
   private:

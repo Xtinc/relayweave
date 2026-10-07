@@ -326,7 +326,7 @@ class ClusterMgr::Connector
         if (joined_)
         {
             PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=node stopping", config_.node_id.c_str(),
-                             config_.address.c_str(), static_cast<unsigned int>(config_.port));
+                             config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
         }
         joined_ = false;
         if (operations_)
@@ -354,9 +354,9 @@ class ClusterMgr::Connector
                 try
                 {
                     PROXY_DEBUG_PRINT("Cluster connecting -> %s:%u", config_.address.c_str(),
-                                      static_cast<unsigned int>(config_.port));
+                                      static_cast<unsigned int>(config_.control_port));
                     auto endpoints = co_await operations.resolver.async_resolve(
-                        config_.address, std::to_string(config_.port),
+                        config_.address, std::to_string(config_.control_port),
                         asio::cancel_after(std::chrono::seconds(5), asio::use_awaitable));
                     if (!running_)
                     {
@@ -382,7 +382,7 @@ class ClusterMgr::Connector
                     {
                         joined_ = true;
                         PROXY_INFO_PRINT("Cluster [+] node=%s peer=%s:%u", config_.node_id.c_str(),
-                                         config_.address.c_str(), static_cast<unsigned int>(config_.port));
+                                         config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
                         manager_.receive(CtrlMessage{CtrlCommand::ClusterJoined});
                         while (running_)
                         {
@@ -405,13 +405,13 @@ class ClusterMgr::Connector
                                       error->code() == asio::experimental::error::channel_closed))
                         {
                             PROXY_DEBUG_PRINT("Cluster retry node=%s peer=%s:%u delay=5000ms", config_.node_id.c_str(),
-                                              config_.address.c_str(), static_cast<unsigned int>(config_.port));
+                                              config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
                         }
                         else
                         {
                             PROXY_ERROR_PRINT("Cluster failed node=%s peer=%s:%u reason=%s retry=5000ms",
                                               config_.node_id.c_str(), config_.address.c_str(),
-                                              static_cast<unsigned int>(config_.port), exception.what());
+                                              static_cast<unsigned int>(config_.control_port), exception.what());
                         }
                     }
                     asio::error_code ignored;
@@ -421,10 +421,16 @@ class ClusterMgr::Connector
                 if (joined_)
                 {
                     PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=%s", config_.node_id.c_str(),
-                                     config_.address.c_str(), static_cast<unsigned int>(config_.port),
+                                     config_.address.c_str(), static_cast<unsigned int>(config_.control_port),
                                      running_ ? "channel closed" : "node stopping");
+                    // Invalidate old Flows before reconnecting, including receive-side/heartbeat failures.
+                    joined_ = false;
+                    if (running_)
+                    {
+                        manager_.receive(CtrlMessage{CtrlCommand::ClusterError,
+                                                    njson{{"reason", "cluster control disconnected"}}});
+                    }
                 }
-                joined_ = false;
                 if (channel)
                 {
                     co_await channel->async_disconnect();
@@ -498,7 +504,7 @@ void ClusterMgr::start()
             asio::error_code ignored;
             acceptor_.close(ignored);
         });
-        tcp::endpoint endpoint(asio::ip::make_address(config_.address), config_.port);
+        tcp::endpoint endpoint(asio::ip::make_address(config_.address), config_.control_port);
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(tcp::acceptor::reuse_address(true));
         acceptor_.bind(endpoint);

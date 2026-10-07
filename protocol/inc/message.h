@@ -58,6 +58,23 @@ enum class CtrlCommand
     RelayCancel,
     RelayClosed,
     RelayError,
+    LinkPrepare,
+    LinkPrepared,
+    LinkConnect,
+    LinkReady,
+    LinkError,
+    LinkClose,
+    LinkClosed,
+    LinkStatus,
+    LinkAttach,
+    LinkAttached,
+    FlowPrepare,
+    FlowPrepared,
+    FlowCommit,
+    FlowCommitted,
+    FlowError,
+    FlowClose,
+    FlowClosed,
     ClusterJoin,
     ClusterJoined,
     ClusterError,
@@ -128,6 +145,53 @@ class MessageReceiver
     BytesBuf assembled_;
     std::size_t next_page_ = 0;
     std::size_t page_count_ = 0;
+};
+
+// Node data sockets use this fixed binary header after TCP bootstrap, and for every UDP packet.
+enum class LnkFrType : std::uint8_t
+{
+    Data = 1,
+    Fin = 2,
+    Reset = 3,
+    Ping = 4,
+    Pong = 5,
+    Attach = 7,
+    Attached = 8
+};
+
+struct LnkFrameHeader
+{
+    static constexpr std::uint8_t magic = 0x4e;
+    static constexpr std::uint8_t version = 1;
+    static constexpr std::size_t length = 32;
+    static constexpr std::size_t maximum_payload = 4096;
+    static constexpr std::size_t maximum_reason = 512;
+    using Buffer = std::array<std::uint8_t, length>;
+
+    LnkFrType kind = LnkFrType::Data;
+    bool reverse = false;
+    std::uint32_t body_length = 0;
+    std::uint64_t epoch = 0;
+    std::uint64_t id = 0;       // Flow ID; zero for NodeLink control frames.
+    std::uint64_t sequence = 0; // PING/PONG sequence; otherwise zero.
+
+    // Pure encoding. Local callers validate their input before constructing this header.
+    Buffer encode() const noexcept;
+    static LnkFrameHeader decode(std::span<const std::uint8_t, length> header);
+
+  private:
+    void validate() const;
+};
+
+struct FlowFrame
+{
+    std::uint64_t epoch = 0;
+    std::uint64_t flow_id = 0;
+    bool reverse = false;
+    LnkFrType kind = LnkFrType::Data;
+    BytesBuf payload;
+    std::string reason;
+    void validate() const;
 };
 
 struct DatagramHeader

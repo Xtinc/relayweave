@@ -23,7 +23,9 @@ TrafficLimitConfig parse_traffic_limit_config(const njson &parent, std::string_v
 std::size_t required_capacity(const njson &parent, std::string_view name, std::string_view location)
 {
     if (!parent.contains(name))
+    {
         throw std::invalid_argument(std::string(location) + "." + std::string(name) + " is required");
+    }
     return static_cast<std::size_t>(config::optional_unsigned(parent, name, 0, 1, config::max_queue_size, location));
 }
 
@@ -48,13 +50,48 @@ StreamNodeConfig parse_stream_node_config(const njson &root, std::string_view na
 }
 } // namespace
 
+ClusterConfig parse_cluster_config(const njson &root)
+{
+    using namespace config;
+    ClusterConfig result;
+    const auto &cluster = required_object(root, "cluster", "root");
+    reject_unknown_fields(cluster, {"role", "node_id", "address", "control_port", "tcp_port", "udp_port"}, "cluster");
+    const auto role = required_string(cluster, "role", "cluster");
+    if (role != "master" && role != "slave")
+    {
+        throw std::invalid_argument("cluster.role must be master or slave");
+    }
+    result.role = role == "master" ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave;
+    result.node_id = required_string(cluster, "node_id", "cluster");
+    if (result.node_id == cluster_broadcast_target)
+    {
+        throw std::invalid_argument("cluster.node_id must not be all");
+    }
+    result.address = required_string(cluster, "address", "cluster");
+    result.control_port = required_port(cluster, "control_port", "cluster");
+    result.tcp_port = required_port(cluster, "tcp_port", "cluster");
+    result.udp_port = required_port(cluster, "udp_port", "cluster");
+
+    const auto control = required_port(required_object(root, "control", "root"), "port", "control");
+    const auto tcp = required_port(required_object(root, "tcp", "root"), "port", "tcp");
+    const auto tls = required_port(required_object(root, "tls", "root"), "port", "tls");
+    const auto udp = required_port(required_object(root, "udp", "root"), "port", "udp");
+    if (result.tcp_port == control || result.tcp_port == tcp || result.tcp_port == tls || result.udp_port == udp ||
+        (result.role == ClusterConfig::Role::Master &&
+         (result.control_port == control || result.control_port == tcp || result.control_port == tls ||
+          result.control_port == result.tcp_port)))
+    {
+        throw std::invalid_argument("cluster listener ports conflict with another local listener");
+    }
+    return result;
+}
+
 NodeConfig load_node_config(const std::filesystem::path &path)
 {
     using namespace config;
     const auto root = load_json(path);
 
-    reject_unknown_fields(root, {"log", "control", "cluster", "tcp", "tls", "udp", "certificate", "channel"},
-                          "root");
+    reject_unknown_fields(root, {"log", "control", "cluster", "tcp", "tls", "udp", "certificate", "channel"}, "root");
     const auto &control = required_object(root, "control", "root");
     reject_unknown_fields(
         control,
@@ -70,24 +107,16 @@ NodeConfig load_node_config(const std::filesystem::path &path)
                           "certificate");
 
     NodeConfig result;
-    const auto &cluster = required_object(root, "cluster", "root");
-    reject_unknown_fields(cluster, {"role", "node_id", "address", "port"}, "cluster");
-    const auto role = required_string(cluster, "role", "cluster");
-    if (role != "master" && role != "slave")
-        throw std::invalid_argument("cluster.role must be master or slave");
-    result.cluster.role = role == "master" ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave;
-    result.cluster.node_id = required_string(cluster, "node_id", "cluster");
-    if (result.cluster.node_id == cluster_broadcast_target)
-        throw std::invalid_argument("cluster.node_id must not be all");
-    result.cluster.address = required_string(cluster, "address", "cluster");
-    result.cluster.port = required_port(cluster, "port", "cluster");
+    result.cluster = parse_cluster_config(root);
 
     result.control.address = required_string(control, "address", "control");
     result.control.advertise_address = required_string(control, "advertise_address", "control");
     asio::error_code advertise_error;
     const auto advertise_ip = asio::ip::make_address(result.control.advertise_address, advertise_error);
     if (!advertise_error && advertise_ip.is_unspecified())
+    {
         throw std::invalid_argument("control.advertise_address must identify a reachable server address");
+    }
     result.control.port = required_port(control, "port", "control");
     result.control.max_connections = static_cast<std::size_t>(optional_unsigned(
         control, "max_connections", result.control.max_connections, 1, max_connection_count, "control"));
@@ -97,7 +126,9 @@ NodeConfig load_node_config(const std::filesystem::path &path)
         optional_unsigned(control, "max_services_per_session", result.control.max_services_per_session, 1,
                           NodeConfig::maximum_services, "control"));
     if (result.control.max_services_per_session > result.control.max_services)
+    {
         throw std::invalid_argument("control.max_services_per_session must not exceed control.max_services");
+    }
 
     result.tcp = parse_stream_node_config(root, "tcp");
     result.tls = parse_stream_node_config(root, "tls");

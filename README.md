@@ -4,11 +4,22 @@
 `protocol/src/xfr_channel.cpp` 和 `protocol/src/tls_channel.cpp` 的既有风格。
 
 设计、配置、链路质量与推荐路径、测试入口见 [RelayWeave 设计](docs/RelayWeave设计.md)。
+RelayNode 直接持有 node/nodelink_mgr，统一协调 NodeLink 建连与 NodeFlow 路径事务，层次与 Pipeline/DatagramMgr 一致。
+NodeLink 共享 TCP/UDP 通道与 NodeFlow 分派由管理器直接持有的 node/lnk_channel 管理；protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBOR。
+控制通知使用有界协程收发接口，数据域直接逐跳分派，不通过模块回调注册。
+Flow 提交后不做周期续租；控制连接断开、epoch/路径成员失效、NodeLink 断开或显式关闭时清理。
+超时仅用于建立阶段和关闭确认，NodeLink 与集群控制连接使用各自的心跳检测失联。
+当前由 master 显式指定路径，Agent 路径提交及业务 socket 桥接为后续阶段，详见
+[Node 共享数据通道与按路径转发实施计划](docs/Node共享数据通道与按路径转发实施计划.md)。
 部署见 [打包与安装](docs/RelayWeave打包与安装.md)、[证书制作与部署](docs/证书制作与部署.md)
 和 [管理面板部署说明](dashboard/README.md)。
 
 ## C++ / Asio 编码约束
 
+- 每条普通变量声明只声明一个变量，并独占一行，适用于局部变量、成员变量和全局变量。
+  即使类型相同，也不得使用逗号连写，例如 `bool left_ready = false, right_ready = false;` 应拆成两行独立声明。
+- 头文件避免重复包含应使用防卫式声明，不使用 `#pragma once`。
+- 模块间尽量避免使用回调函数或函数包装器解耦合。对于生命周期具有明确所属权的对象，优先直接持有或引用；
 - 异步控制流使用 C++20 协程，优先使用 `asio::awaitable`、`co_await` 和 Asio 协程组合，避免回调链。
 - 谨慎使用 `asio::co_spawn` 启动协程链。项目可控的内部协程调用应在注释中说明所需执行器，并直接
   `co_await`；需要独立协程链或跨执行器边界时才使用 `co_spawn`。

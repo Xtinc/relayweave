@@ -60,7 +60,7 @@ void verify_server_config(const DataFiles &files)
 {
     const auto modern = load_node_config(files.modern_server_config);
     require(modern.cluster.role == ClusterConfig::Role::Master && modern.cluster.node_id == "master-1" &&
-                modern.cluster.port == 18447, "Cluster configuration was not parsed");
+                modern.cluster.control_port == 18447, "Cluster configuration was not parsed");
     require(modern.control.advertise_address == "198.51.100.10",
             "Modern server advertise_address was not parsed");
     require(modern.control.max_connections == 12, "Modern server max_connections was not parsed");
@@ -133,7 +133,7 @@ void verify_server_config(const DataFiles &files)
         candidate.erase(object);
         require_rejected(std::move(candidate), std::string("missing ") + object);
     }
-    for (const auto *object : {"control", "cluster", "tcp", "tls", "udp"})
+    for (const auto *object : {"control", "tcp", "tls", "udp"})
     {
         for (const auto *field : {"address", "port"})
         {
@@ -141,6 +141,38 @@ void verify_server_config(const DataFiles &files)
             candidate[object].erase(field);
             require_rejected(std::move(candidate), std::string("missing ") + object + "." + field);
         }
+    }
+    for (const auto *field : {"address", "control_port", "tcp_port", "udp_port"})
+    {
+        auto candidate = baseline;
+        candidate["cluster"].erase(field);
+        require_rejected(candidate, std::string("missing cluster.") + field);
+        if (std::string_view(field) == "address")
+        {
+            continue;
+        }
+        for (auto value : {-1, 0, 65536})
+        {
+            candidate = baseline;
+            candidate["cluster"][field] = value;
+            require_rejected(candidate, std::string("invalid cluster.") + field);
+        }
+    }
+    {
+        auto candidate = baseline;
+        candidate["cluster"]["port"] = 18447;
+        require_rejected(candidate, "legacy cluster.port");
+    }
+    for (const auto *field : {"control_port", "tcp_port"})
+    {
+        auto candidate = baseline;
+        candidate["cluster"][field] = candidate["tcp"]["port"];
+        require_rejected(candidate, "conflicting TCP listeners");
+    }
+    {
+        auto candidate = baseline;
+        candidate["cluster"]["udp_port"] = candidate["udp"]["port"];
+        require_rejected(candidate, "conflicting UDP listeners");
     }
     {
         auto candidate = baseline;
@@ -333,6 +365,7 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
     {
         asio::io_context control_io(1);
         asio::io_context transfer_io(1);
+        TestClusterDataIO cluster_data;
         NodeConfig config = make_test_node_config();
         config.control.address = "127.0.0.1";
         config.control.port = 1;
@@ -347,7 +380,7 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         try
         {
             [[maybe_unused]] auto server =
-                std::make_shared<RelayNode>(control_io, transfer_io, transfer_io, server_context, std::move(config));
+                std::make_shared<RelayNode>(control_io, transfer_io, transfer_io, cluster_data.io, server_context, std::move(config));
         }
         catch (const std::invalid_argument &)
         {
@@ -360,6 +393,7 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         asio::io_context control_io(1);
         asio::io_context transfer_tcp_io(1);
         asio::io_context transfer_udp_io(1);
+        TestClusterDataIO cluster_data;
         const auto control_port = unused_port(control_io);
 
         NodeConfig config = make_test_node_config();
@@ -371,7 +405,7 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         config.tls.port = 0;
         config.datagram.address = "127.0.0.1";
         config.datagram.port = config.tcp.port;
-        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, server_context,
+        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
                                                   std::move(config));
 
         bool failed = false;
@@ -391,6 +425,7 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         asio::io_context control_io(1);
         asio::io_context transfer_tcp_io(1);
         asio::io_context transfer_udp_io(1);
+        TestClusterDataIO cluster_data;
         const auto control_port = unused_port(control_io);
         auto transfer_port = unused_port(transfer_tcp_io);
         while (transfer_port == control_port)
@@ -407,7 +442,7 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         config.tls.port = 0;
         config.datagram.address = "127.0.0.1";
         config.datagram.port = transfer_port;
-        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, server_context,
+        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
                                                   std::move(config));
         std::weak_ptr<RelayNode> weak_server = server;
         server->start();
@@ -839,6 +874,7 @@ int main(int argc, char *argv[])
         asio::io_context control_io(1);
         asio::io_context transfer_tcp_io(1);
         asio::io_context transfer_udp_io(1);
+        TestClusterDataIO cluster_data;
         const auto control_port = unused_port(control_io);
         auto transfer_port = unused_port(transfer_tcp_io);
         while (transfer_port == control_port)
@@ -876,7 +912,7 @@ int main(int argc, char *argv[])
         server_config.tls.setup_timeout = 500ms;
         server_config.datagram.service_wait_timeout = 500ms;
         server_config.channel = channel_config();
-        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, server_context,
+        auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
                                                   std::move(server_config));
         server->start();
 

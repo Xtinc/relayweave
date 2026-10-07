@@ -44,7 +44,10 @@ int main()
     const char *stage = "initialise";
     try
     {
-        asio::io_context control_io(1), tcp_io(1), udp_io(1);
+        asio::io_context control_io(1);
+        asio::io_context tcp_io(1);
+        asio::io_context udp_io(1);
+        TestClusterDataIO cluster_data;
         auto settings = make_test_node_config();
         settings.control.address = settings.tcp.address = settings.tls.address = settings.datagram.address =
             "127.0.0.1";
@@ -54,11 +57,13 @@ int main()
         context.load_verify_file(settings.server_ca_file.string());
 
         stage = "construct RelayNode";
-        auto owner = std::make_shared<RelayNode>(control_io, tcp_io, udp_io, context, settings);
+        auto owner = std::make_shared<RelayNode>(control_io, tcp_io, udp_io, cluster_data.io, context, settings);
         stage = "construct topology";
         auto cluster = std::make_shared<ClusterMgr>(*owner, control_io.get_executor(), context, settings.cluster,
                                                     settings.channel, 16);
-        std::atomic<std::uint32_t> control_delay{1}, tcp_delay{2}, udp_delay{3};
+        std::atomic<std::uint32_t> control_delay{1};
+        std::atomic<std::uint32_t> tcp_delay{2};
+        std::atomic<std::uint32_t> udp_delay{3};
         Topology topology(control_io, "master", true, *cluster, control_delay, tcp_delay, udp_delay);
 
         stage = "update members";

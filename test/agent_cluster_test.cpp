@@ -66,6 +66,7 @@ NodeConfig server_config(std::string node_id, ClusterConfig::Role role, std::uin
     auto config = make_test_node_config();
     const bool is_master = node_id == "master";
     config.cluster = {role, std::move(node_id), "127.0.0.1", cluster_port};
+    configure_test_cluster_data(config.cluster);
     config.control.address = is_master ? "0.0.0.0" : "127.0.0.1";
     config.control.advertise_address = is_master ? "localhost" : "127.0.0.1";
     config.control.port = control_port;
@@ -129,7 +130,8 @@ asio::awaitable<void> round_trip(tcp::socket &socket, std::string payload)
 asio::awaitable<void> verify_two_services(std::uint16_t forward_a, std::uint16_t forward_b)
 {
     const auto executor = co_await asio::this_coro::executor;
-    tcp::socket a(executor), b(executor);
+    tcp::socket a(executor);
+    tcp::socket b(executor);
     co_await a.async_connect({asio::ip::address_v4::loopback(), forward_a},
                              asio::cancel_after(1s, asio::use_awaitable));
     co_await b.async_connect({asio::ip::address_v4::loopback(), forward_b},
@@ -362,7 +364,10 @@ int main(int argc, char *argv[])
         configure_server(server_context, data);
         configure_client(client_context, data);
 
-        asio::io_context control_io(1), transfer_io(1), udp_io(1);
+        asio::io_context control_io(1);
+        asio::io_context transfer_io(1);
+        asio::io_context udp_io(1);
+        TestClusterDataIO cluster_data;
         auto control_work = asio::make_work_guard(control_io);
         auto transfer_work = asio::make_work_guard(transfer_io);
         auto udp_work = asio::make_work_guard(udp_io);
@@ -383,10 +388,10 @@ int main(int argc, char *argv[])
         asio::co_spawn(transfer_io, echo_loop(echo_b), asio::detached);
 
         auto master = std::make_shared<RelayNode>(
-            control_io, transfer_io, udp_io, server_context,
+            control_io, transfer_io, udp_io, cluster_data.io, server_context,
             server_config("master", ClusterConfig::Role::Master, cluster_port, control_a, transfer_a));
         auto slave = std::make_shared<RelayNode>(
-            control_io, transfer_io, udp_io, server_context,
+            control_io, transfer_io, udp_io, cluster_data.io, server_context,
             server_config("slave", ClusterConfig::Role::Slave, cluster_port, control_b, transfer_b));
         master->start();
         slave->start();
@@ -531,7 +536,7 @@ int main(int argc, char *argv[])
         master->stop();
         slave->stop();
         slave = std::make_shared<RelayNode>(
-            control_io, transfer_io, udp_io, server_context,
+            control_io, transfer_io, udp_io, cluster_data.io, server_context,
             server_config("slave", ClusterConfig::Role::Slave, cluster_port, control_b, transfer_b));
         slave->start();
         wait_for_service(forward_b, "Slave recovery while entry is offline");
@@ -539,7 +544,7 @@ int main(int argc, char *argv[])
                        asio::use_future).get();
 
         master = std::make_shared<RelayNode>(
-            control_io, transfer_io, udp_io, server_context,
+            control_io, transfer_io, udp_io, cluster_data.io, server_context,
             server_config("master", ClusterConfig::Role::Master, cluster_port, control_a, transfer_a));
         master->start();
         wait_for_service(forward_a, "Entry recovery");

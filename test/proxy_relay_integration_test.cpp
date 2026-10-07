@@ -224,6 +224,7 @@ int main()
         asio::io_context control_io(1);
         asio::io_context transfer_tcp_io(1);
         asio::io_context transfer_udp_io(1);
+        TestClusterDataIO cluster_data;
         asio::io_context proxy_io(1);
         const auto control_port = unused_port(control_io);
         const auto tcp_port = unique_port(transfer_tcp_io, {control_port});
@@ -257,7 +258,7 @@ int main()
         node_config.datagram.address = "127.0.0.1";
         node_config.datagram.port = tcp_port;
         node_config.channel = channel_config();
-        auto node = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, server_context,
+        auto node = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
                                                 std::move(node_config));
         node->start();
 

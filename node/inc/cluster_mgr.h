@@ -19,7 +19,9 @@ struct ClusterConfig
     Role role = Role::Master;
     std::string node_id;
     std::string address;
-    std::uint16_t port = 0;
+    std::uint16_t control_port = 0;
+    std::uint16_t tcp_port = 0;
+    std::uint16_t udp_port = 0;
     std::string advertise_address;
 };
 

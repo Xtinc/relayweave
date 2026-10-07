@@ -5,7 +5,8 @@
 
 void print_usage(std::string_view program)
 {
-    std::cerr << "Usage: " << program << " <node-config.json>\n";
+    std::cerr << "Usage: " << program << " <node-config.json>\n"
+              << "       " << program << " --check-cluster-config <node-config.json>\n";
 }
 
 int main(int argc, char *argv[])
@@ -21,6 +22,19 @@ int main(int argc, char *argv[])
         return 0;
     }
 
+    if (argc == 3 && std::string_view(argv[1]) == "--check-cluster-config")
+    {
+        try
+        {
+            static_cast<void>(parse_cluster_config(config::load_json(argv[2])));
+            return 0;
+        }
+        catch (const std::exception &e)
+        {
+            std::cerr << "[FAIL] " << e.what() << '\n';
+            return 1;
+        }
+    }
     if (argc != 2)
     {
         print_usage(argc > 0 ? argv[0] : "relayweave-node");
@@ -35,6 +49,7 @@ int main(int argc, char *argv[])
         asio::io_context control_io(1);
         asio::io_context transfer_tcp_io(1);
         asio::io_context transfer_udp_io(1);
+        asio::io_context cluster_data_io(1);
         asio::io_context signal_io(1);
         asio::ssl::context ssl_context(asio::ssl::context::tls_server);
         ssl_context.set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2 |
@@ -48,8 +63,8 @@ int main(int argc, char *argv[])
         }
         ssl_context.load_verify_file(config.ca_file.string());
 
-        auto node =
-            std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, ssl_context, std::move(config));
+        auto node = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data_io,
+                                                ssl_context, std::move(config));
         node->start();
 
         asio::signal_set signals(signal_io, SIGINT, SIGTERM);
@@ -69,8 +84,10 @@ int main(int argc, char *argv[])
             set_current_thread_scheduler_policy();
             transfer_udp_io.run();
         });
+        std::thread cluster_data_thread([&]() { cluster_data_io.run(); });
         signal_io.run();
 
+        cluster_data_thread.join();
         control_thread.join();
         transfer_tcp_thread.join();
         transfer_udp_thread.join();

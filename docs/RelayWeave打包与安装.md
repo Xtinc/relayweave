@@ -217,6 +217,11 @@ sudo apt install ./relayweave-proxy_1.0.0-2_arm64.deb
 混用旧质量格式。Agent 的 routing 配置默认启用且只接受可选 `max_nodes`（默认 4，范围 1–16）；
 旧配置中的 `routing.enabled` 必须删除，dpkg 保留的 conffile 不会自动完成这一修改。
 
+Node 配置需要将旧 `cluster.port` 改为必填 `cluster.control_port`，并增加必填的
+`cluster.tcp_port/udp_port`。所有 Node 的两个数据端口一致，不能与各自普通数据监听冲突。
+新的部署工具使用同版本 `relayweave-node --check-cluster-config FILE` 验证这些字段。
+Node 升级时先停止服务、安装新包、迁移配置，再使用部署工具 `--start`；保留的 conffile 不会自动迁移。
+
 升级后检查：
 
 ```console

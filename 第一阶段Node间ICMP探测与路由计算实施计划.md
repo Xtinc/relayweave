@@ -1,5 +1,11 @@
 # 第一阶段：Node 间 ICMP 探测与路由计算实施计划
 
+> 历史预研计划，非当前实现说明。2026-10-07 核对代码时，探测/拓扑/计算实际采用
+> `ICMP/LinkQuality/ProbeSet/Topology/AgentRouting/RouteGraph`，复用现有 control executor，默认探测，
+> Agent 在 stream open 前查询候选缓存或计算路径。本文的独立线程、`routing::Mgr`、`routing.enabled`、
+> 一次性固定目标和主备路接口不能当作当前代码契约。当前行为见 [RelayWeave 设计](docs/RelayWeave设计.md)，
+> 后续路径执行见 [Node 共享数据通道与按路径转发实施计划](docs/Node共享数据通道与按路径转发实施计划.md)。
+
 ## 1. 本阶段目标
 
 在不改变现有 Agent、服务注册和 Relay 数据路径的前提下，为 RelayNode 增加一个独立的路由管理器：

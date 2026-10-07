@@ -1,4 +1,5 @@
 #include "pipeline_mgr.h"
+#include "frame_io.h"
 #include <vector>
 
 namespace
@@ -11,23 +12,6 @@ auto remaining_timeout(std::chrono::steady_clock::time_point deadline)
     return remaining;
 }
 
-template <typename Stream>
-asio::awaitable<RelayAttach> read_relay_attach(Stream &stream, std::chrono::steady_clock::time_point deadline,
-                                               std::string_view transport)
-{
-    WireMessage::Header header{};
-    auto [header_error, header_size] = co_await asio::async_read(
-        stream, asio::buffer(header), asio::cancel_after(remaining_timeout(deadline), use_nothrow_awaitable));
-    if (header_error)
-        throw asio::system_error(header_error, std::string(transport) + " relay frame header read failed");
-
-    BytesBuf payload(WireMessage::decode_length(header));
-    auto [payload_error, payload_size] = co_await asio::async_read(
-        stream, asio::buffer(payload), asio::cancel_after(remaining_timeout(deadline), use_nothrow_awaitable));
-    if (payload_error)
-        throw asio::system_error(payload_error, std::string(transport) + " relay frame payload read failed");
-    co_return RelayAttach::from_msg(CtrlMessage::deserialize(payload));
-}
 } // namespace
 
 TcpTransport::TcpTransport(asio::ssl::context &) noexcept
@@ -199,7 +183,7 @@ asio::awaitable<void> StreamPipeline<Transport>::run_transfer_session(tcp::socke
     {
         const auto deadline = std::chrono::steady_clock::now() + setup_timeout_;
         auto stream = co_await transport_.prepare(std::move(socket), deadline);
-        const auto message = co_await read_relay_attach(stream, deadline, Transport::name);
+        const auto message = RelayAttach::from_msg(co_await read_ctrl_frame(stream, deadline));
         attach(message.role, message.uuid, message.ticket, std::move(stream));
     }
     catch (const std::exception &exception)

@@ -4,13 +4,13 @@
 #include <future>
 
 RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tcp_io, asio::io_context &transfer_udp_io,
-                     asio::ssl::context &ssl_context, NodeConfig config)
+                     asio::io_context &cluster_data_io, asio::ssl::context &ssl_context, NodeConfig config)
     : control_executor_(control_io.get_executor()), transfer_tcp_executor_(transfer_tcp_io.get_executor()),
-      transfer_udp_executor_(transfer_udp_io.get_executor()), control_probe_timer_(control_executor_),
-      transfer_tcp_probe_timer_(transfer_tcp_executor_), transfer_udp_probe_timer_(transfer_udp_executor_),
-      traffic_sample_timer_(control_executor_), control_sessions_done_(control_executor_),
-      control_acceptor_(control_executor_), ssl_context_(ssl_context), config_(std::move(config)),
-      cluster_messages_(control_executor_, config_.channel.max_queued_messages),
+      transfer_udp_executor_(transfer_udp_io.get_executor()), cluster_data_executor_(cluster_data_io.get_executor()),
+      control_probe_timer_(control_executor_), transfer_tcp_probe_timer_(transfer_tcp_executor_),
+      transfer_udp_probe_timer_(transfer_udp_executor_), traffic_sample_timer_(control_executor_),
+      control_sessions_done_(control_executor_), control_acceptor_(control_executor_), ssl_context_(ssl_context),
+      config_(std::move(config)), cluster_messages_(control_executor_, config_.channel.max_queued_messages),
       relay_id_allocator_(std::make_shared<RelayIdAllocator>()),
       tcp_pipeline_(std::make_shared<TcpPipeline>(
           transfer_tcp_executor_, ssl_context_, relay_id_allocator_, config_.tcp.address, config_.tcp.port,
@@ -24,8 +24,12 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
           config_.datagram.max_relays, config_.datagram.service_wait_timeout, config_.datagram.traffic))
 {
     control_sessions_done_.expires_at(std::chrono::steady_clock::time_point::max());
-    if (&control_io == &transfer_tcp_io || &control_io == &transfer_udp_io || &transfer_tcp_io == &transfer_udp_io)
-        throw std::invalid_argument("Control, TCP transfer, and UDP transfer require distinct io_context instances");
+    if (&control_io == &transfer_tcp_io || &control_io == &transfer_udp_io || &transfer_tcp_io == &transfer_udp_io ||
+        &cluster_data_io == &control_io || &cluster_data_io == &transfer_tcp_io || &cluster_data_io == &transfer_udp_io)
+    {
+        throw std::invalid_argument(
+            "Control, TCP transfer, UDP transfer, and cluster data require distinct io_context instances");
+    }
 
     cluster_context_.set_options(asio::ssl::context::default_workarounds | asio::ssl::context::no_sslv2 |
                                  asio::ssl::context::no_sslv3 | asio::ssl::context::no_tlsv1 |
@@ -33,7 +37,9 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
     cluster_context_.use_certificate_chain_file(config_.certificate_chain.string());
     cluster_context_.use_private_key_file(config_.private_key.string(), asio::ssl::context::pem);
     if (SSL_CTX_check_private_key(cluster_context_.native_handle()) != 1)
+    {
         throw std::invalid_argument("Cluster certificate and private key do not match");
+    }
     cluster_context_.load_verify_file(config_.server_ca_file.string());
 
     config_.cluster.advertise_address = config_.control.advertise_address;
@@ -42,6 +48,9 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
     topology_ = std::make_unique<Topology>(
         control_io, config_.cluster.node_id, config_.cluster.role == ClusterConfig::Role::Master, *cluster_mgr_,
         control_queue_delay_us_, transfer_tcp_queue_delay_us_, transfer_udp_queue_delay_us_);
+    nodelink_mgr_ =
+        std::make_unique<NodeLinkMgr>(control_executor_, cluster_data_executor_, config_.cluster, config_.tcp.address,
+                                      config_.datagram.address, *cluster_mgr_, *topology_);
     control_router_ = std::make_unique<ControlRouter>(
         transfer_tcp_executor_, transfer_udp_executor_,
         ControlRouterConfig{config_.cluster.node_id, config_.control.advertise_address, config_.control.port,
@@ -70,10 +79,73 @@ asio::awaitable<CtrlMessage> RelayNode::async_receive_cluster()
     co_return co_await self->cluster_messages_.async_receive(asio::use_awaitable);
 }
 
+asio::awaitable<LinkResult> RelayNode::async_ensure_link(std::string left, std::string right, RelayProtocol transport)
+{
+    auto self = shared_from_this();
+    if (self->state_.load() != State::Running)
+    {
+        co_return LinkResult{0, "ensure", "node stopping or not started"};
+    }
+    // External entry: bind the complete coordinator chain to control_io.
+    co_return co_await asio::co_spawn(control_executor_,
+                                      self->nodelink_mgr_->ensure_link(std::move(left), std::move(right), transport),
+                                      asio::use_awaitable);
+}
+
+asio::awaitable<LinkStatus> RelayNode::async_link_status(std::uint64_t id)
+{
+    auto self = shared_from_this();
+    if (self->state_.load() != State::Running)
+    {
+        co_return LinkStatus{{id, "status", "node stopping or not started"}};
+    }
+    co_return co_await asio::co_spawn(control_executor_, self->nodelink_mgr_->link_status(id), asio::use_awaitable);
+}
+
+asio::awaitable<void> RelayNode::async_close_link(std::uint64_t id)
+{
+    auto self = shared_from_this();
+    co_await asio::co_spawn(control_executor_, self->nodelink_mgr_->close_link(id), asio::use_awaitable);
+}
+
+asio::awaitable<FlowResult> RelayNode::async_open_flow(std::vector<std::string> path, RelayProtocol transport)
+{
+    auto self = shared_from_this();
+    if (state_.load() != State::Running)
+    {
+        co_return FlowResult{0, 0, "open", "node not running"};
+    }
+    co_return co_await asio::co_spawn(control_executor_, self->nodelink_mgr_->open_flow(std::move(path), transport),
+                                      asio::use_awaitable);
+}
+asio::awaitable<FlowSendResult> RelayNode::async_send_flow(FlowFrame frame)
+{
+    auto self = shared_from_this();
+    co_return co_await asio::co_spawn(
+        cluster_data_executor_,
+        [self, frame = std::move(frame)]() mutable -> asio::awaitable<FlowSendResult> {
+            co_return self->nodelink_mgr_->channel().send_flow(std::move(frame));
+        },
+        asio::use_awaitable);
+}
+asio::awaitable<FlowFrame> RelayNode::async_receive_flow(std::uint64_t epoch, std::uint64_t id)
+{
+    auto self = shared_from_this();
+    co_return co_await asio::co_spawn(cluster_data_executor_, self->nodelink_mgr_->channel().receive_flow(epoch, id),
+                                      asio::use_awaitable);
+}
+asio::awaitable<void> RelayNode::async_close_flow(std::uint64_t epoch, std::uint64_t id)
+{
+    auto self = shared_from_this();
+    co_await asio::co_spawn(control_executor_, self->nodelink_mgr_->close_flow(epoch, id), asio::use_awaitable);
+}
+
 void RelayNode::start()
 {
     if (state_.load() != State::Created)
+    {
         throw std::logic_error("RelayWeave Node can only be started once");
+    }
 
     try
     {
@@ -85,9 +157,11 @@ void RelayNode::start()
         tcp_pipeline_->start();
         tls_pipeline_->start();
         datagram_mgr_->start();
+        nodelink_mgr_->start();
         control_router_->start();
         cluster_mgr_->start();
         topology_->start();
+        nodelink_mgr_->activate();
         state_.store(State::Running);
     }
     catch (...)
@@ -95,6 +169,7 @@ void RelayNode::start()
         state_.store(State::Stopped);
         asio::error_code ignored;
         control_acceptor_.close(ignored);
+        nodelink_mgr_->rollback();
         tcp_pipeline_->stop();
         tls_pipeline_->stop();
         datagram_mgr_->stop();
@@ -119,8 +194,10 @@ void RelayNode::start()
 void RelayNode::stop()
 {
     if (control_executor_.running_in_this_thread() || transfer_tcp_executor_.running_in_this_thread() ||
-        transfer_udp_executor_.running_in_this_thread())
+        transfer_udp_executor_.running_in_this_thread() || cluster_data_executor_.running_in_this_thread())
+    {
         throw std::logic_error("Synchronous server stop must be called outside the server executors");
+    }
 
     std::call_once(stop_once_, [this]() {
         const auto current = state_.load();
@@ -131,7 +208,9 @@ void RelayNode::stop()
             return;
         }
         if (current != State::Running)
+        {
             throw std::logic_error("Server is not running");
+        }
         state_.store(State::Stopping);
 
         const auto save_stop_error = [this](auto &completion) {
@@ -142,7 +221,9 @@ void RelayNode::stop()
             catch (...)
             {
                 if (!stop_error_)
+                {
                     stop_error_ = std::current_exception();
+                }
             }
         };
 
@@ -156,6 +237,8 @@ void RelayNode::stop()
                 self->control_acceptor_.close(ignored);
                 self->control_router_->stop();
                 ScopeGuard close_messages([self]() noexcept { self->cluster_messages_.close(); });
+
+                co_await self->nodelink_mgr_->stop();
 
                 std::exception_ptr topology_error;
                 try
@@ -178,11 +261,17 @@ void RelayNode::stop()
                 }
 
                 if (self->active_control_sessions_ != 0)
+                {
                     co_await self->control_sessions_done_.async_wait(use_nothrow_awaitable);
+                }
                 if (topology_error)
+                {
                     std::rethrow_exception(topology_error);
+                }
                 if (cluster_error)
+                {
                     std::rethrow_exception(cluster_error);
+                }
             },
             asio::use_future);
         control_stopped.wait();
@@ -218,7 +307,9 @@ void RelayNode::stop()
     });
 
     if (stop_error_)
+    {
         std::rethrow_exception(stop_error_);
+    }
 }
 
 asio::awaitable<void> RelayNode::control_accept_loop()
@@ -230,7 +321,9 @@ asio::awaitable<void> RelayNode::control_accept_loop()
         if (error)
         {
             if (state != State::Running || error == asio::error::operation_aborted)
+            {
                 co_return;
+            }
             PROXY_ERROR_PRINT("Control accept failed reason=%s category=%s", error.message().c_str(),
                               error.category().name());
             continue;
@@ -297,7 +390,9 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
         {
             auto message = co_await session->async_receive();
             if (state_.load() == State::Running)
+            {
                 control_router_->handle(id, session, std::move(message));
+            }
         }
     }
     catch (const asio::system_error &exception)
@@ -323,11 +418,15 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
     {
         PROXY_INFO_PRINT("Control [x] session_id=%llu peer=%.*s reason=%s", static_cast<unsigned long long>(id),
                          static_cast<int>(session->peer().size()), session->peer().data(),
-                         state_.load() != State::Running ? "node stopping" : failure.empty() ? "channel closed" : "error");
+                         state_.load() != State::Running ? "node stopping"
+                         : failure.empty()               ? "channel closed"
+                                                         : "error");
     }
     if (!failure.empty() && state_.load() == State::Running)
+    {
         PROXY_ERROR_PRINT("Control failed session_id=%llu peer=%.*s reason=%s", static_cast<unsigned long long>(id),
                           static_cast<int>(session->peer().size()), session->peer().data(), failure.c_str());
+    }
 }
 
 void RelayNode::handle_cluster_message(CtrlMessage message)
@@ -335,12 +434,28 @@ void RelayNode::handle_cluster_message(CtrlMessage message)
     if (message.type() == CtrlCommand::TopologyMembers)
     {
         topology_->update_members(config::message_params(message));
+        if (state_.load() == State::Running)
+        {
+            nodelink_mgr_->members_changed();
+        }
         return;
     }
     if (message.type() == CtrlCommand::TopologyReport)
     {
         topology_->update_report(config::message_params(message));
         return;
+    }
+    if (message.command.starts_with("link.") || message.command.starts_with("flow."))
+    {
+        if (state_.load() == State::Running)
+        {
+            nodelink_mgr_->handle(std::move(message));
+        }
+        return;
+    }
+    if (message.type() == CtrlCommand::ClusterError && state_.load() == State::Running)
+    {
+        nodelink_mgr_->control_failed(config::message_params(message).value("reason", "cluster control failed"));
     }
     control_router_->handle_cluster(std::move(message));
 }
@@ -354,7 +469,9 @@ void RelayNode::schedule_queue_probe(asio::steady_timer &timer, std::atomic<std:
     const auto deadline = timer.expiry();
     timer.async_wait([self = shared_from_this(), &timer, &queue_delay_us, deadline](const asio::error_code &error) {
         if (error || self->state_.load() != State::Running)
+        {
             return;
+        }
         const auto elapsed = std::chrono::steady_clock::now() - deadline;
         const auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
         const auto max_valid = static_cast<std::chrono::microseconds::rep>(invalid - 1);
@@ -369,7 +486,9 @@ void RelayNode::schedule_traffic_sample()
     traffic_sample_timer_.expires_after(std::chrono::seconds(1));
     traffic_sample_timer_.async_wait([self = shared_from_this()](const asio::error_code &error) {
         if (error || self->state_.load() != State::Running)
+        {
             return;
+        }
         self->control_router_->sample_traffic();
         self->schedule_traffic_sample();
     });

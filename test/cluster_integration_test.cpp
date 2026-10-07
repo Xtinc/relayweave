@@ -83,7 +83,9 @@ asio::awaitable<std::shared_ptr<TLSChannel>> connect(asio::ssl::context &context
 asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, asio::ssl::context &client_context,
                              asio::ssl::context &anonymous_context)
 {
-    asio::io_context tcp_io(1), udp_io(1);
+    asio::io_context tcp_io(1);
+    asio::io_context udp_io(1);
+    TestClusterDataIO cluster_data;
     tcp::acceptor reservation(io, {asio::ip::address_v4::loopback(), 0});
     const auto port = reservation.local_endpoint().port();
     reservation.close();
@@ -94,7 +96,10 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
     channel.heartbeat_interval = 100ms;
     channel.heartbeat_timeout = 2s;
 
-    Inbox master_inbox, a_inbox, b_inbox, duplicate_inbox;
+    Inbox master_inbox;
+    Inbox a_inbox;
+    Inbox b_inbox;
+    Inbox duplicate_inbox;
     std::vector<std::shared_ptr<RelayNode>> owners;
     std::vector<std::shared_ptr<ClusterMgr>> nodes;
     auto make_owner = [&](const ClusterConfig &cluster) {
@@ -103,7 +108,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
             "127.0.0.1";
         settings.cluster = cluster;
         settings.channel = channel;
-        auto owner = std::make_shared<RelayNode>(io, tcp_io, udp_io, context, std::move(settings));
+        auto owner = std::make_shared<RelayNode>(io, tcp_io, udp_io, cluster_data.io, context, std::move(settings));
         owners.push_back(owner);
         return owner;
     };
@@ -117,7 +122,9 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         return node;
     };
 
-    std::shared_ptr<RelayNode> master_owner, a_owner, b_owner;
+    std::shared_ptr<RelayNode> master_owner;
+    std::shared_ptr<RelayNode> a_owner;
+    std::shared_ptr<RelayNode> b_owner;
     auto master = make(ClusterConfig::Role::Master, "master", master_owner);
     auto a = make(ClusterConfig::Role::Slave, "a", a_owner);
     auto b = make(ClusterConfig::Role::Slave, "b", b_owner);
@@ -277,7 +284,8 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
                                                     std::move(limited_config), channel, 1);
         nodes.push_back(limited);
         limited->start();
-        tcp::socket first(io), second(io);
+        tcp::socket first(io);
+        tcp::socket second(io);
         co_await first.async_connect({asio::ip::address_v4::loopback(), port}, asio::use_awaitable);
         co_await second.async_connect({asio::ip::address_v4::loopback(), port}, asio::use_awaitable);
         std::array<char, 1> byte{};
@@ -312,20 +320,25 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
 
 void verify_relay_node(asio::ssl::context &context)
 {
-    asio::io_context control(1), tcp_io(1), udp_io(1);
+    asio::io_context control(1);
+    asio::io_context tcp_io(1);
+    asio::io_context udp_io(1);
+    TestClusterDataIO cluster_data;
     tcp::acceptor reservation(control, {asio::ip::address_v4::loopback(), 0});
     const auto port = reservation.local_endpoint().port();
     reservation.close();
 
-    Inbox master_inbox, slave_inbox;
+    Inbox master_inbox;
+    Inbox slave_inbox;
     auto settings = make_test_node_config();
     settings.control.address = settings.tcp.address = settings.tls.address = settings.datagram.address = "127.0.0.1";
-    settings.cluster.port = port;
+    settings.cluster.control_port = port;
     settings.channel.disconnect_timeout = 100ms;
-    auto master = std::make_shared<RelayNode>(control, tcp_io, udp_io, context, settings);
+    auto master = std::make_shared<RelayNode>(control, tcp_io, udp_io, cluster_data.io, context, settings);
     settings.cluster.role = ClusterConfig::Role::Slave;
     settings.cluster.node_id = "slave";
-    auto slave = std::make_shared<RelayNode>(control, tcp_io, udp_io, context, settings);
+    configure_test_cluster_data(settings.cluster);
+    auto slave = std::make_shared<RelayNode>(control, tcp_io, udp_io, cluster_data.io, context, settings);
     master->start();
     slave->start();
     auto collect = [&control](const std::shared_ptr<RelayNode> &server, Inbox &inbox) {
@@ -396,7 +409,8 @@ int main()
     {
         const auto data = std::filesystem::path(__FILE__).parent_path() / "data";
         asio::io_context io(1);
-        asio::ssl::context context(asio::ssl::context::tls), client_context(asio::ssl::context::tls);
+        asio::ssl::context context(asio::ssl::context::tls);
+        asio::ssl::context client_context(asio::ssl::context::tls);
         asio::ssl::context anonymous_context(asio::ssl::context::tls);
         configure(context, data);
         configure(client_context, data, true);

@@ -1,5 +1,16 @@
 # RelayWeave 多 Node 自适应低时延中继路由分步实施计划
 
+> 历史预研计划，非当前实现说明。2026-10-07 核对代码时，实际已使用 `Topology/ProbeSet/AgentRouting/RouteGraph`，
+> 状态复用现有 control executor，Agent 已计算多入口候选；本文的 `routing::Mgr`、独立线程、固定入口及主备路
+> 设计尚未按此方案实现。当前行为见 [RelayWeave 设计](docs/RelayWeave设计.md)，从现有实现继续推进 stream
+> 路径执行的工作见 [Node 共享数据通道与按路径转发实施计划](docs/Node共享数据通道与按路径转发实施计划.md)。
+> 新计划以中心指挥、共享明文 TCP/UDP 通道为准；本文的独立通道、额外 executor 等预研选择不再作为实施要求。
+> 共享通道与第二阶段的 master 显式路径、Node 双向逐跳转发已实现。按 README 约束修正后，
+> NodeLink 物理通道与 NodeFlow 分派由 node/lnk_channel 直接拥有，protocol/message 提供固定二进制帧编解码；
+> Agent 路径提交及真实业务接入随后进行。
+> 当前 NodeFlow 模型先采用唯一 flow_id 与固定路径，物理通道、会话分派和首末业务相对独立；
+> 信用、调度、池化及换路按后续任务扩展。本文下方的历史阶段编号、Route/Flow 模型与模块名不作为当前任务清单。
+
 > 本文把《多Node自适应低时延中继路由预研与专利方案》拆解为可独立交付、可量化验证、可灰度和可回退的工程阶段。
 
 ## 1. 已确定的系统边界

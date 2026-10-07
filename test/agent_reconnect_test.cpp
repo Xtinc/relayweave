@@ -232,6 +232,7 @@ int main(int argc, char *argv[])
         asio::io_context control_io(1);
         asio::io_context transfer_io(1);
         asio::io_context server_udp_io(1);
+        TestClusterDataIO cluster_data;
         auto control_work = asio::make_work_guard(control_io);
         auto transfer_work = asio::make_work_guard(transfer_io);
         const auto control_port = unused_port(control_io);
@@ -254,7 +255,7 @@ int main(int argc, char *argv[])
         tcp::acceptor echo_acceptor(transfer_io, tcp::endpoint(asio::ip::address_v4::loopback(), target_port));
         asio::co_spawn(transfer_io, echo_accept_loop(echo_acceptor), asio::detached);
 
-        auto server = std::make_shared<RelayNode>(control_io, transfer_io, server_udp_io, server_context,
+        auto server = std::make_shared<RelayNode>(control_io, transfer_io, server_udp_io, cluster_data.io, server_context,
                                                   server_config(control_port, transfer_port));
         server->start();
 
@@ -304,7 +305,7 @@ int main(int argc, char *argv[])
         active_relay_closed.get();
         active_relay.reset();
         server_udp_io.restart();
-        auto replacement = std::make_shared<RelayNode>(control_io, transfer_io, server_udp_io, server_context,
+        auto replacement = std::make_shared<RelayNode>(control_io, transfer_io, server_udp_io, cluster_data.io, server_context,
                                                        server_config(control_port, transfer_port));
         replacement->start();
         server_udp_thread = std::thread([&server_udp_io]() { server_udp_io.run(); });

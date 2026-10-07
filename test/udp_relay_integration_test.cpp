@@ -253,6 +253,7 @@ int main(int argc, char *argv[])
         asio::io_context server_control_io(1);
         asio::io_context server_transfer_tcp_io(1);
         asio::io_context server_transfer_udp_io(1);
+        TestClusterDataIO cluster_data;
         asio::io_context consumer_control_io(1);
         asio::io_context consumer_transfer_io(1);
         asio::io_context producer_control_io(1);
@@ -282,7 +283,7 @@ int main(int argc, char *argv[])
         settings.datagram.traffic.tx_bytes_per_second = 100000000;
         settings.datagram.traffic.tx_burst_bytes = DatagramHeader::maximum_user_payload;
         auto server = std::make_shared<RelayNode>(server_control_io, server_transfer_tcp_io,
-                                                  server_transfer_udp_io, server_context, std::move(settings));
+                                                  server_transfer_udp_io, cluster_data.io, server_context, std::move(settings));
         server->start();
         std::thread server_control_thread([&server_control_io]() { server_control_io.run(); });
         std::thread server_transfer_tcp_thread([&server_transfer_tcp_io]() { server_transfer_tcp_io.run(); });

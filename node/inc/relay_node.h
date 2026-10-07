@@ -3,6 +3,7 @@
 
 #include "cluster_mgr.h"
 #include "datagram_mgr.h"
+#include "nodelink_mgr.h"
 #include "pipeline_mgr.h"
 #include "topology.h"
 #include <atomic>
@@ -55,6 +56,7 @@ struct NodeConfig
     TLSChannelConfig channel;
 };
 
+ClusterConfig parse_cluster_config(const njson &root);
 NodeConfig load_node_config(const std::filesystem::path &path);
 
 class RelayNode : public std::enable_shared_from_this<RelayNode>
@@ -65,7 +67,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 
   public:
     RelayNode(asio::io_context &control_io, asio::io_context &transfer_tcp_io, asio::io_context &transfer_udp_io,
-              asio::ssl::context &ssl_context, NodeConfig config);
+              asio::io_context &cluster_data_io, asio::ssl::context &ssl_context, NodeConfig config);
     ~RelayNode();
 
     void start();
@@ -73,6 +75,13 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     void send_cluster(std::string target, CtrlMessage message);
     void broadcast_cluster(CtrlMessage message);
     asio::awaitable<CtrlMessage> async_receive_cluster();
+    asio::awaitable<LinkResult> async_ensure_link(std::string left, std::string right, RelayProtocol transport);
+    asio::awaitable<LinkStatus> async_link_status(std::uint64_t id);
+    asio::awaitable<void> async_close_link(std::uint64_t id);
+    asio::awaitable<FlowResult> async_open_flow(std::vector<std::string> path, RelayProtocol transport);
+    asio::awaitable<FlowSendResult> async_send_flow(FlowFrame frame);
+    asio::awaitable<FlowFrame> async_receive_flow(std::uint64_t epoch, std::uint64_t id);
+    asio::awaitable<void> async_close_flow(std::uint64_t epoch, std::uint64_t id);
 
   private:
     friend class ClusterMgr;
@@ -86,6 +95,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     asio::io_context::executor_type control_executor_;
     asio::io_context::executor_type transfer_tcp_executor_;
     asio::io_context::executor_type transfer_udp_executor_;
+    asio::io_context::executor_type cluster_data_executor_;
     asio::steady_timer control_probe_timer_;
     asio::steady_timer transfer_tcp_probe_timer_;
     asio::steady_timer transfer_udp_probe_timer_;
@@ -105,6 +115,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     std::shared_ptr<TlsPipeline> tls_pipeline_;
     std::shared_ptr<DatagramMgr> datagram_mgr_;
     std::unique_ptr<Topology> topology_;
+    std::unique_ptr<NodeLinkMgr> nodelink_mgr_;
     std::unique_ptr<ControlRouter> control_router_;
     std::once_flag stop_once_;
     std::exception_ptr stop_error_;
