@@ -1,0 +1,17 @@
+[Unit]
+Description=RelayWeave Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/relayweave-node /etc/relayweave/node.json
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+AmbientCapabilities=CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_BIND_SERVICE
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

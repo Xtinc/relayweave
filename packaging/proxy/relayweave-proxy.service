@@ -1,0 +1,20 @@
+[Unit]
+Description=RelayWeave Application Proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/relayweave-proxy /etc/relayweave/proxy.json
+Restart=on-failure
+RestartSec=5s
+DynamicUser=true
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=RelayWeave Cluster Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=relayweave-dashboard
+Group=relayweave-dashboard
+StateDirectory=relayweave-dashboard
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/relayweave-dashboard
+ExecStart=/usr/bin/relayweave-dashboard /etc/relayweave/dashboard.json --database /var/lib/relayweave-dashboard/history.sqlite3
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=60s
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

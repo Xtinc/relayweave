@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+
+service_name=relayweave-agent.service
+unit_file=/lib/systemd/system/$service_name
+
+if [ "$1" = configure ]; then
+    grep -Eq '^AmbientCapabilities=.*CAP_NET_RAW([[:space:]]|$)' "$unit_file" || {
+        echo "$service_name must grant CAP_NET_RAW" >&2
+        exit 1
+    }
+    grep -Eq '^CapabilityBoundingSet=.*CAP_NET_RAW([[:space:]]|$)' "$unit_file" || {
+        echo "$service_name must retain CAP_NET_RAW in CapabilityBoundingSet" >&2
+        exit 1
+    }
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if ambient_capabilities=$(systemctl show "$service_name" --property=AmbientCapabilities --value 2>/dev/null) &&
+            bounding_capabilities=$(systemctl show "$service_name" --property=CapabilityBoundingSet --value 2>/dev/null); then
+            printf '%s\n' "$ambient_capabilities" | grep -qiw cap_net_raw || {
+                echo "$service_name effective AmbientCapabilities must include CAP_NET_RAW" >&2
+                exit 1
+            }
+            printf '%s\n' "$bounding_capabilities" | grep -qiw cap_net_raw || {
+                echo "$service_name effective CapabilityBoundingSet must include CAP_NET_RAW" >&2
+                exit 1
+            }
+        fi
+        if [ -z "${2:-}" ]; then
+            systemctl enable "$service_name" >/dev/null 2>&1 || true
+        elif systemctl is-active --quiet "$service_name"; then
+            systemctl restart "$service_name"
+        fi
+    fi
+fi
+
+exit 0

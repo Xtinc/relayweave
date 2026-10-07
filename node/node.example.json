@@ -1,0 +1,64 @@
+{
+  "log": {
+    "debug_enable": false
+  },
+  "cluster": {
+    "role": "master",
+    "node_id": "master-1",
+    "address": "0.0.0.0",
+    "port": 18447
+  },
+  "control": {
+    "address": "0.0.0.0",
+    "advertise_address": "203.0.113.10",
+    "port": 18443,
+    "max_connections": 512,
+    "max_services": 256,
+    "max_services_per_session": 64
+  },
+  "tcp": {
+    "address": "0.0.0.0",
+    "port": 18444,
+    "max_setup_connections": 512,
+    "max_relays": 128,
+    "setup_timeout_ms": 10000,
+    "rx_bytes_per_second": 2000000,
+    "rx_max_burst_bytes": 262144,
+    "tx_bytes_per_second": 2000000,
+    "tx_max_burst_bytes": 262144
+  },
+  "tls": {
+    "address": "0.0.0.0",
+    "port": 18446,
+    "max_setup_connections": 512,
+    "max_relays": 128,
+    "setup_timeout_ms": 10000,
+    "rx_bytes_per_second": 2000000,
+    "rx_max_burst_bytes": 262144,
+    "tx_bytes_per_second": 2000000,
+    "tx_max_burst_bytes": 262144
+  },
+  "udp": {
+    "address": "0.0.0.0",
+    "port": 18445,
+    "max_relays": 128,
+    "service_wait_timeout_ms": 300000,
+    "rx_bytes_per_second": 2000000,
+    "rx_max_burst_bytes": 262144,
+    "tx_bytes_per_second": 2000000,
+    "tx_max_burst_bytes": 262144
+  },
+  "certificate": {
+    "server_ca_file": "/etc/relayweave/certs/server-ca.pem",
+    "ca_file": "/etc/relayweave/certs/client-ca.pem",
+    "certificate_chain": "/etc/relayweave/certs/server.pem",
+    "private_key": "/etc/relayweave/certs/server.key"
+  },
+  "channel": {
+    "handshake_timeout_ms": 5000,
+    "disconnect_timeout_ms": 5000,
+    "heartbeat_interval_ms": 5000,
+    "heartbeat_timeout_ms": 20000,
+    "max_queued_messages": 100
+  }
+}

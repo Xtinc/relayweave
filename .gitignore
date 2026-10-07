@@ -1,0 +1,10 @@
+/vendor
+/build*
+__pycache__/
+*.py[cod]
+/dashboard/*.sqlite3*
+/server/*.pem
+/server/*.key
+/client/*.pem
+/client/*.key
+/cert

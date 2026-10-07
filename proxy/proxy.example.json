@@ -1,0 +1,19 @@
+{
+  "log": {
+    "debug_enable": false
+  },
+  "proxy": {
+    "max_connections": 512,
+    "handshake_timeout_ms": 10000,
+    "connect_timeout_ms": 10000
+  },
+  "socks5": {
+    "address": "127.0.0.1",
+    "port": 11080
+  },
+  "http": {
+    "address": "127.0.0.1",
+    "port": 11081,
+    "max_header_bytes": 32768
+  }
+}

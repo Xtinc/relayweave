@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+
+service_name=relayweave-proxy.service
+
+if [ "$1" = configure ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [ -z "${2:-}" ]; then
+        systemctl enable "$service_name" >/dev/null 2>&1 || true
+    elif systemctl is-active --quiet "$service_name"; then
+        systemctl restart "$service_name"
+    fi
+fi
+
+exit 0

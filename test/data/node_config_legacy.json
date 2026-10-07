@@ -1,0 +1,20 @@
+{
+  "listen": {
+    "address": "127.0.0.1",
+    "port": 18443
+  },
+  "data_listen": {
+    "address": "127.0.0.1",
+    "port": 18444,
+    "max_pending_relays": 11
+  },
+  "udp_listen": {
+    "address": "127.0.0.1",
+    "port": 18445
+  },
+  "certificate": {
+    "ca_file": "tls_channel_test_client_ca.pem",
+    "certificate_chain": "tls_channel_test_server.pem",
+    "private_key": "tls_channel_test_server.key"
+  }
+}

@@ -1,0 +1,1166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>RelayWeave Dashboard</title>
+<style>
+  /* ---- Design-system-agnostic palette (reference instance, validated) ---- */
+  .viz-root {
+    color-scheme: light;
+    --surface-1:      #fcfcfb;   /* chart surface */
+    --surface-2:      #ffffff;   /* card surface */
+    --page-plane:     #f4f4f1;
+    --text-primary:   #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted:     #898781;
+    --gridline:       #e1e0d9;
+    --baseline:       #c3c2b7;
+    --border:         rgba(11,11,11,0.10);
+    --series-1: #2a78d6;  /* control queue delay  */
+    --series-2: #eb6834;  /* TCP transfer queue   */
+    --series-4: #eda100;  /* UDP transfer queue    */
+    --series-5: #e87ba4;  /* bandwidth: RX (down)  */
+    --series-6: #008300;  /* bandwidth: TX (up)    */
+    --status-good:      #0ca30c;
+    --status-warning:   #fab219;
+    --status-critical:  #d03b3b;
+    --status-neutral:   #898781;
+    --shadow: 0 1px 2px rgba(11,11,11,0.04), 0 8px 24px rgba(11,11,11,0.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:where(:not([data-theme="light"])) .viz-root {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --surface-2: #212120;
+      --page-plane: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --text-muted: #898781;
+      --gridline: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-4: #c98500;
+      --series-5: #d55181;
+      --series-6: #008300;
+      --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.5);
+    }
+  }
+  :root[data-theme="dark"] .viz-root {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --surface-2: #212120;
+    --page-plane: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --gridline: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+    --shadow: 0 1px 2px rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.5);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--page-plane);
+    color: var(--text-primary);
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  .viz-root { min-height: 100vh; }
+
+  header.topbar {
+    display: flex; align-items: center; gap: 16px;
+    padding: 18px 24px;
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--border);
+  }
+  header.topbar h1 { font-size: 17px; font-weight: 600; margin: 0; }
+  header.topbar .peer { color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+  .node-select { min-width: 150px; }
+  header.topbar .spacer { flex: 1; }
+  .conn-badge {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 6px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 500;
+    border: 1px solid var(--border);
+    background: var(--surface-1);
+  }
+  .conn-badge .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--status-neutral); }
+  .conn-badge[data-state="connected"] .dot { background: var(--status-good); }
+  .conn-badge[data-state="connecting"] .dot { background: var(--status-warning); }
+  .conn-badge[data-state="disconnected"] .dot { background: var(--status-critical); }
+  .conn-badge .label { color: var(--text-primary); }
+
+  main { padding: 20px 24px 48px; max-width: 1320px; margin: 0 auto; }
+
+  /* ---- Stat tiles ---- */
+  .tile-row {
+    display: grid; gap: 16px;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    margin-bottom: 20px;
+  }
+  @media (max-width: 800px) {
+    .tile-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .tile-row .tile:last-child { grid-column: 1 / -1; }
+  }
+  @media (max-width: 540px) {
+    main { padding: 16px 12px 32px; }
+    header.topbar { padding: 14px 12px; flex-wrap: wrap; gap: 10px; }
+    header.topbar .peer { overflow-wrap: anywhere; }
+    .card-head { flex-wrap: wrap; }
+    .card-head .head-text { flex-basis: 100%; }
+  }
+  .tile {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .tile .label {
+    color: var(--text-secondary); font-size: 12.5px;
+    text-transform: none; letter-spacing: 0;
+    display: flex; align-items: flex-start; gap: 8px; min-height: 38px;
+  }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; margin-top: 4px; }
+  .tile .value {
+    font-size: 30px; font-weight: 600; line-height: 1.15;
+    margin-top: 8px; color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+  }
+  .tile .sub { color: var(--text-muted); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  .tile .spark { margin-top: 10px; height: 34px; width: 100%; display: block; }
+
+  /* ---- Chart cards ---- */
+  .chart-row { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 20px; }
+  .chart-row .card { min-width: 0; }
+  .chart-row .card-head { flex-wrap: wrap; }
+  .chart-row .card-head .head-text {
+    flex: 1 0 100%; flex-direction: column; align-items: flex-start; gap: 2px;
+  }
+  .section-head { display: flex; align-items: baseline; gap: 12px; margin: 24px 0 12px; flex-wrap: wrap; }
+  .section-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
+  .section-head .hint { color: var(--text-secondary); font-size: 12px; }
+  .table-card { margin-bottom: 20px; }
+  @media (max-width: 1000px) { .chart-row { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px 20px 14px;
+    box-shadow: var(--shadow);
+  }
+  .card-head h2 { font-size: 15px; font-weight: 600; margin: 0; }
+  .card-head .hint { color: var(--text-muted); font-size: 12px; }
+  .legend { display: flex; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
+  .legend .item { display: inline-flex; align-items: center; gap: 7px; color: var(--text-secondary); font-size: 12.5px; }
+  .legend .key { width: 14px; height: 2px; border-radius: 1px; }
+  /* Range selector: a compact dropdown on the right of the card head. */
+  .card-head { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  .card-head .head-text { display: flex; align-items: baseline; gap: 12px; flex: 1; min-width: 0; }
+  .range-select {
+    appearance: none; -webkit-appearance: none;
+    border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--text-secondary); border-radius: 8px;
+    padding: 5px 26px 5px 10px; font: inherit; font-size: 12.5px;
+    cursor: pointer; flex: none;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%23898781' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat; background-position: right 9px center;
+  }
+  .range-select:hover { color: var(--text-primary); border-color: var(--baseline); }
+  .range-select:focus { outline: none; border-color: var(--series-1); }
+  svg.chart { width: 100%; height: 240px; display: block; overflow: visible; }
+  svg.chart .gridline { stroke: var(--gridline); stroke-width: 1; shape-rendering: crispEdges; }
+  svg.chart .axis     { stroke: var(--baseline); stroke-width: 1; shape-rendering: crispEdges; }
+  svg.chart .tick, svg.spark .tick { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  /* .series is scoped to BOTH chart and sparkline: the line path must have
+     fill:none, or SVG defaults it to black and fills the polygon closed by
+     start->end (the "black triangle" artifact on sparklines). */
+  svg.chart .series, svg.spark .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  svg.chart .marker, svg.spark .marker { stroke: var(--surface-2); stroke-width: 2; }
+  svg.chart .crosshair{ stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0; }
+  svg.chart .hover-hit{ fill: transparent; cursor: crosshair; }
+  /* Collapsed time-gap indicator: a faint dashed line through the plot, plus a
+     "//" break mark on the axis signalling the x-axis is discontinuous there. */
+  svg.chart .gap-line   { stroke: var(--gridline); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.75; }
+  svg.chart .axis-break { stroke: var(--baseline); stroke-width: 1.3; shape-rendering: crispEdges; }
+  .table-wrap { overflow-x: auto; }
+
+  .tooltip {
+    position: absolute; pointer-events: none; z-index: 10;
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 8px; padding: 8px 10px; min-width: 150px;
+    box-shadow: var(--shadow); display: none;
+    font-size: 12px;
+  }
+  .tooltip .t-head { color: var(--text-muted); margin-bottom: 4px; font-variant-numeric: tabular-nums; }
+  .tooltip .row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+  .tooltip .row .name { color: var(--text-secondary); display: inline-flex; align-items: center; gap: 7px; }
+  .tooltip .row .key { width: 12px; height: 2px; border-radius: 1px; }
+  .tooltip .row .val { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  /* ---- Table ---- */
+  table.svc { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table.svc th, table.svc td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--border); }
+  table.svc th { color: var(--text-secondary); font-size: 12px; font-weight: 500; }
+  table.svc td { color: var(--text-primary); font-size: 13px; }
+  table.svc td.num, table.svc th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.svc tr:last-child td { border-bottom: none; }
+  table.traffic-table { min-width: 900px; table-layout: fixed; }
+  table.traffic-table .col-index { width: 52px; }
+  table.traffic-table .col-node { width: 140px; }
+  table.traffic-table .col-service { width: 300px; }
+  table.traffic-table .col-protocol { width: 96px; }
+  table.traffic-table .col-rate { width: 142px; }
+  table.traffic-table .col-total { width: 126px; }
+  .proto-pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11.5px;
+          background: var(--surface-1); border: 1px solid var(--border); color: var(--text-secondary);
+          text-transform: uppercase; letter-spacing: 0.04em; }
+  .rate-cell {
+    display: inline-grid; grid-template-columns: 8px 12ch;
+    align-items: center; gap: 7px; white-space: nowrap;
+  }
+  .rate-cell .key { width: 8px; height: 8px; border-radius: 2px; }
+  .rate-cell .metric-value, .traffic-table .total-value {
+    display: inline-block; width: 12ch; text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .rate-cell.rx .key { background: var(--series-5); }
+  .rate-cell.tx .key { background: var(--series-6); }
+  .cum-cell { color: var(--text-muted); font-size: 12px; }
+  .service-tree { min-width: 250px; padding: 2px 0; }
+  .service-tree-root {
+    display: flex; align-items: center; gap: 7px; min-height: 22px;
+    font-weight: 600;
+  }
+  .service-tree-root::before {
+    content: ""; width: 8px; height: 8px; border-radius: 2px;
+    background: var(--series-1); flex: none;
+  }
+  .access-count {
+    color: var(--text-muted); font-size: 11px; font-weight: 400;
+    white-space: nowrap;
+  }
+  .service-tree-children {
+    list-style: none; margin: 3px 0 0 3px; padding: 0 0 0 18px;
+    border-left: 1px solid var(--baseline);
+  }
+  .service-tree-children li {
+    position: relative; min-height: 22px; padding: 2px 0 2px 10px;
+    color: var(--text-secondary); font-size: 12px;
+  }
+  .service-tree-children li::before {
+    content: ""; position: absolute; left: -18px; top: 11px;
+    width: 15px; border-top: 1px solid var(--baseline);
+  }
+  .service-tree-children li:last-child::after {
+    content: ""; position: absolute; left: -19px; top: 12px; bottom: -3px;
+    width: 2px; background: var(--surface-2);
+  }
+  .service-tree-children .no-accessor { color: var(--text-muted); font-style: italic; }
+  .accessor-location {
+    color: var(--text-primary); margin-right: 5px; white-space: nowrap;
+    cursor: help;
+  }
+  .connection-count { color: var(--text-muted); margin-left: 5px; }
+  .empty { color: var(--text-muted); padding: 18px 12px; font-size: 13px; }
+  /* The bandwidth chart's per-service selector lives next to the range select. */
+  .svc-select {
+    appearance: none; -webkit-appearance: none;
+    border: 1px solid var(--border); background: var(--surface-1);
+    color: var(--text-primary); border-radius: 8px;
+    padding: 5px 26px 5px 10px; font: inherit; font-size: 12.5px;
+    cursor: pointer; flex: none; min-width: 140px; max-width: 240px;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%23898781' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat; background-position: right 9px center;
+  }
+  .svc-select:hover { border-color: var(--baseline); }
+  .svc-select:focus { outline: none; border-color: var(--series-1); }
+
+  .error-banner {
+    background: rgba(208,59,59,0.08); border: 1px solid rgba(208,59,59,0.35);
+    color: var(--text-primary); border-radius: 10px; padding: 10px 14px;
+    margin-bottom: 16px; font-size: 13px;
+  }
+  .footer-note { color: var(--text-muted); font-size: 12px; margin-top: 24px; }
+  .stale { opacity: 0.5; transition: opacity 0.3s; }
+</style>
+</head>
+<body class="viz-root">
+<div id="root">
+
+  <header class="topbar">
+    <h1>RelayWeave Dashboard</h1>
+    <span class="conn-badge" id="conn-badge" data-state="disconnected">
+      <span class="dot"></span><span class="label" id="conn-label">disconnected</span>
+    </span>
+    <span class="spacer"></span>
+    <select class="svc-select node-select" id="node-select" aria-label="Selected server node"></select>
+    <span class="peer" id="peer">—</span>
+  </header>
+
+  <main>
+    <div class="error-banner" id="error-banner" style="display:none"></div>
+
+    <div class="section-head">
+      <h2>Node health</h2>
+      <span class="hint" id="node-health-hint">Select a Node in the header</span>
+    </div>
+
+    <div class="tile-row">
+      <div class="tile">
+        <div class="label"><span class="swatch" style="background:var(--series-1)"></span>Control queue</div>
+        <div class="value" id="tile-cqd">—</div>
+        <div class="sub">scheduler lag</div>
+        <svg class="spark" id="spark-cqd"></svg>
+      </div>
+      <div class="tile">
+        <div class="label"><span class="swatch" style="background:var(--series-2)"></span>TCP transfer queue</div>
+        <div class="value" id="tile-tcpqd">—</div>
+        <div class="sub">scheduler lag</div>
+        <svg class="spark" id="spark-tcpqd"></svg>
+      </div>
+      <div class="tile">
+        <div class="label"><span class="swatch" style="background:var(--series-4)"></span>UDP transfer queue</div>
+        <div class="value" id="tile-udpqd">—</div>
+        <div class="sub">scheduler lag</div>
+        <svg class="spark" id="spark-udpqd"></svg>
+      </div>
+      <div class="tile">
+        <div class="label">Services registered</div>
+        <div class="value" id="tile-svc">—</div>
+        <div class="sub" id="tile-svc-sub">refreshed —</div>
+      </div>
+      <div class="tile">
+        <div class="label">Server uptime</div>
+        <div class="value" id="tile-up">—</div>
+        <div class="sub" id="tile-up-sub">report refreshed —</div>
+      </div>
+    </div>
+
+    <div class="chart-row">
+      <div class="card">
+        <div class="card-head">
+          <span class="head-text">
+            <h2>Control &amp; transfer queue delay</h2>
+            <span class="hint">Control / TCP / UDP scheduling delay · µs</span>
+          </span>
+          <select class="range-select" data-chart="chart-queue" aria-label="Queue chart time range"></select>
+        </div>
+        <div class="legend">
+          <span class="item"><span class="key" style="background:var(--series-1)"></span>Control queue</span>
+          <span class="item"><span class="key" style="background:var(--series-2)"></span>TCP transfer queue</span>
+          <span class="item"><span class="key" style="background:var(--series-4)"></span>UDP transfer queue</span>
+        </div>
+        <div style="position:relative">
+          <svg class="chart" id="chart-queue"></svg>
+          <div class="tooltip" id="tip-queue"></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head">
+          <span class="head-text">
+            <h2>Service bandwidth</h2>
+            <span class="hint">Choose a service · RX / TX over time</span>
+          </span>
+          <select class="svc-select" id="svc-select-bandwidth" aria-label="Bandwidth chart service"></select>
+          <select class="range-select" data-chart="chart-bandwidth" aria-label="Bandwidth chart time range"></select>
+        </div>
+        <div class="legend">
+          <span class="item"><span class="key" style="background:var(--series-5)"></span>RX (service → client)</span>
+          <span class="item"><span class="key" style="background:var(--series-6)"></span>TX (client → service)</span>
+        </div>
+        <div style="position:relative">
+          <svg class="chart" id="chart-bandwidth"></svg>
+          <div class="tooltip" id="tip-bandwidth"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card table-card">
+      <div class="card-head">
+        <h2>Registered services</h2>
+        <span class="hint" id="svc-hint">Across all Nodes · waiting for reports</span>
+      </div>
+      <div class="table-wrap">
+        <table class="svc traffic-table">
+          <colgroup>
+            <col class="col-index" />
+            <col class="col-node" />
+            <col class="col-service" />
+            <col class="col-protocol" />
+            <col class="col-rate" />
+            <col class="col-rate" />
+            <col class="col-total" />
+            <col class="col-total" />
+          </colgroup>
+          <thead><tr>
+            <th>#</th>
+            <th>Node</th>
+            <th>Service / active accessors</th>
+            <th>Protocol</th>
+            <th class="num">RX rate</th>
+            <th class="num">TX rate</th>
+            <th class="num">RX total</th>
+            <th class="num">TX total</th>
+          </tr></thead>
+          <tbody id="svc-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <p class="footer-note">Services cover the whole cluster. Node health follows the Node selected in the header; bandwidth follows the selected service.</p>
+  </main>
+</div>
+
+<script>
+"use strict";
+const UNSET = 0xFFFFFFFF;          // queue-delay sentinel from the server
+const POLL_MS = 2000;
+const HISTORY_HIGH_WATER = 2500;
+const HISTORY_COMPACT_TO = 2000;
+
+// ---------- tiny helpers ----------
+const $ = (id) => document.getElementById(id);
+function fmtUs(us){ if(us===undefined||us===null||us===UNSET) return "—"; return us<1000 ? us+" µs" : (us/1000).toFixed(1)+" ms"; }
+// Bandwidth: server reports bytes/second; render bits/s for readability.
+// Round every branch — niceTicks can emit fractional tick values like 0.6000000000000001
+// (0.2+0.2+0.2 in float), and 0.6 B/s * 8 would otherwise print 4.800000000000001.
+function fmtBps(bps){ if(bps===undefined||bps===null||bps<=0) return "0 b/s"; const bits=bps*8;
+  const u=[["G",1e9],["M",1e6],["K",1e3]]; for(const [l,s] of u){ if(bits>=s) return (bits/s).toFixed(2)+" "+l+"b/s"; }
+  return Math.round(bits)+" b/s"; }
+function fmtBytes(n){ if(n===undefined||n===null) return "—"; const u=[["TiB",2**40],["GiB",2**30],["MiB",2**20],["KiB",2**10]];
+  for(const [l,s] of u){ if(n>=s) return (n/s).toFixed(2)+" "+l; } return n+" B"; }
+function fmtUptime(s){
+  if(s===null||s===undefined||s<0) return "—";
+  s=Math.floor(s);
+  const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60),x=s%60;
+  if(d) return d+"d "+h+"h";
+  if(h) return h+"h "+m+"m";
+  if(m) return m+"m "+x+"s";
+  return x+"s";
+}
+function fmtAge(s){
+  if(s===null||s===undefined) return "—";
+  s=Math.max(0,Math.round(s));
+  const d=Math.floor(s/86400),h=Math.floor((s%86400)/3600),m=Math.floor((s%3600)/60);
+  if(d) return d+"d "+h+"h ago";
+  if(h) return h+"h "+m+"m ago";
+  if(m) return m+"m ago";
+  return s+"s ago";
+}
+function serviceTree(t){
+  const accessors = Object.entries(t.accessors);
+  const connections = accessors.reduce((sum, [, count]) => sum + count, 0);
+  const children = accessors.length
+    ? accessors.map(([client, count]) => {
+        const location = t.accessor_locations?.[client] || {label:"🌐 ---", title:"Location lookup pending"};
+        return `<li role="treeitem"><span class="accessor-location" title="${escapeAttribute(location.title)}">${escapeText(location.label)}</span><span>${escapeText(client)}</span><span class="connection-count">(${count})</span></li>`;
+      }).join("")
+    : `<li role="treeitem" class="no-accessor">No active accessors</li>`;
+  return `<div class="service-tree" role="tree" aria-label="Service access tree">
+    <div class="service-tree-root" role="treeitem" aria-expanded="true"><span>${escapeText(t.service)}</span><span class="access-count">${connections} active</span></div>
+    <ul class="service-tree-children" role="group">${children}</ul>
+  </div>`;
+}
+// Fixed-format axis labels (locale-independent), so the same data renders the
+// same labels on every machine. Two lines on the x-axis: a date row shown only
+// when the date changes (or at the first tick), and a time row on every tick.
+function _pad2(n){ return n < 10 ? "0"+n : ""+n; }
+function fmtAxisDate(timestamp){ const d=new Date(timestamp*1000); return _pad2(d.getMonth()+1)+"-"+_pad2(d.getDate()); }
+function fmtAxisTime(timestamp){ const d=new Date(timestamp*1000); return _pad2(d.getHours())+":"+_pad2(d.getMinutes())+":"+_pad2(d.getSeconds()); }
+function fmtChartTime(timestamp){ const d=new Date(timestamp*1000);
+  return _pad2(d.getMonth()+1)+"-"+_pad2(d.getDate())+" "+_pad2(d.getHours())+":"+_pad2(d.getMinutes())+":"+_pad2(d.getSeconds()); }
+function escapeText(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
+function escapeAttribute(s){ return escapeText(s).replaceAll('"', "&quot;").replaceAll("'", "&#39;"); }
+
+// ---------- chart range selection ----------
+// Each big chart remembers its selected window in seconds; "All" = null.
+// Presets are time-based so they stay correct regardless of poll interval.
+const RANGE_PRESETS = [
+  {label:"1m",  secs: 60},
+  {label:"5m",  secs: 300},
+  {label:"15m", secs: 900},
+  {label:"60m", secs: 3600},
+  {label:"All", secs: null},
+];
+const chartRanges = { "chart-queue": 300, "chart-bandwidth": 300 }; // default 5m
+// Bandwidth chart selection is independent from the node overview selection.
+// The compound key keeps same-named services on different nodes distinct.
+let bandwidthSelection = null;
+let selectedNodeKey = null;
+
+function windowHistory(hist, secs, now){
+  if(secs == null || !hist.length) return hist;
+  const cutoff = now - secs;
+  return hist.filter(point => point.t >= cutoff && point.t <= now);
+}
+
+function populateRangeSelect(sel){
+  const cid = sel.getAttribute("data-chart");
+  const current = chartRanges[cid];
+  sel.innerHTML = RANGE_PRESETS.map(p => {
+    const val = p.secs == null ? "all" : String(p.secs);
+    const selected = (p.secs === current) ? " selected" : "";
+    return `<option value="${val}"${selected}>${p.label}</option>`;
+  }).join("");
+}
+
+function wireRangeSelects(){
+  document.querySelectorAll(".range-select").forEach(sel => {
+    if(!sel.dataset.wired){
+      sel.addEventListener("change", () => {
+        const cid = sel.getAttribute("data-chart");
+        const v = sel.value;
+        chartRanges[cid] = (v === "all") ? null : Number(v);
+        resetHistoryAndPoll();
+      });
+      sel.dataset.wired = "1";
+    }
+  });
+}
+
+function populateServiceSelect(services){
+  const sel = $("svc-select-bandwidth");
+  const signature = services.map(item => item.key + "\n" + item.label).join("\n");
+  const same = sel.dataset.lastServices === signature
+               && services.some(item => item.key === bandwidthSelection);
+  if(same && sel.dataset.wired === "1") return;
+  sel.dataset.lastServices = signature;
+  if(!services.length){
+    bandwidthSelection = null;
+    sel.replaceChildren(new Option("no services", ""));
+    return;
+  }
+  if(!services.some(item => item.key === bandwidthSelection)){
+    bandwidthSelection = services[0].key;
+  }
+  sel.replaceChildren(...services.map(item => {
+    const option = new Option(item.label, item.key);
+    option.selected = item.key === bandwidthSelection;
+    return option;
+  }));
+  if(!sel.dataset.wired){
+    sel.addEventListener("change", () => {
+      bandwidthSelection = sel.value || null;
+      if(currentData) render(currentData);
+    });
+    sel.dataset.wired = "1";
+  }
+}
+
+function nodeName(node){
+  return node.node_id || node.key || "unknown";
+}
+
+function nodeState(node){
+  return node.connected ? "connected" : (node.connecting ? "connecting" : "disconnected");
+}
+
+function populateNodeSelect(nodes){
+  const sel = $("node-select");
+  if(!nodes.length){
+    selectedNodeKey = null;
+    sel.innerHTML = `<option value="">no nodes</option>`;
+    return;
+  }
+  if(!selectedNodeKey || !nodes.some(node => node.key === selectedNodeKey)){
+    const useful = nodes.find(node => node.connected && (node.service_traffic || []).length)
+      || nodes.find(node => node.connected);
+    selectedNodeKey = (useful || nodes[0]).key;
+  }
+  sel.innerHTML = nodes.map(node => {
+    const selected = node.key === selectedNodeKey ? " selected" : "";
+    return `<option value="${escapeAttribute(node.key)}"${selected}>${escapeText(nodeName(node))}</option>`;
+  }).join("");
+  if(!sel.dataset.wired){
+    sel.addEventListener("change", () => {
+      selectedNodeKey = sel.value;
+      if(currentData) render(currentData);
+    });
+    sel.dataset.wired = "1";
+  }
+}
+
+// ---------- SVG chart drawing ----------
+function cs(key){ return getComputedStyle(document.body).getPropertyValue(key).trim(); }
+
+function makeScale(domainMin, domainMax, rangeMin, rangeMax){
+  const span = Math.max(1e-9, domainMax - domainMin);
+  return (v) => rangeMin + ((v - domainMin) / span) * (rangeMax - rangeMin);
+}
+
+// A gap-aware x scale for the time axis.
+//
+// Problem: the proxy client samples live data every ~2s, but a reconnect or a
+// dashboard gap leaves multi-minute holes. A plain linear scale over [tMin,tMax]
+// collapses each live cluster into a hairline at one edge and draws a single
+// long straight line across the gap — the "everything jammed to the right, with
+// a big straight line joining the ends" artifact on the 60m / All views.
+//
+// Fix: detect gaps longer than GAP_FACTOR * medianStep, collapse each to a
+// fixed small width, and redistribute the freed space to the real runs. The
+// axis keeps a linear time scale *within* each run, but is discontinuous across
+// gaps — marked with "//" break ticks so the reader knows the axis is not one
+// continuous timeline. Falls back to a plain linear scale when there are no
+// gaps (the common 5m/15m case), so those charts are byte-for-byte unchanged.
+const GAP_FACTOR = 8;          // a gap > 8x the median step counts as a break
+const GAP_COLLAPSE_WIDTH = 24; // px allotted to each collapsed gap on screen
+
+function buildGapScale(history, rangeMin, rangeMax, timeDomain=null){
+  const n = history.length;
+  const tMin = timeDomain ? timeDomain.start : history[0].t;
+  const tMax = timeDomain ? timeDomain.end : history[n-1].t;
+  const linearSpan = tMax - tMin;
+  const sxLin = makeScale(tMin, tMax, rangeMin, rangeMax);
+  const txLin = makeScale(rangeMin, rangeMax, tMin, tMax);
+
+  if(n < 3 || linearSpan <= 0){
+    return { map: sxLin, invert: txLin, gaps: [] };
+  }
+
+  // median inter-sample step
+  const steps = [];
+  for(let i=1;i<n;i++){
+    const step = history[i].t - history[i-1].t;
+    if(step > 0) steps.push(step);
+  }
+  if(!steps.length) return { map: sxLin, invert: txLin, gaps: [] };
+  steps.sort((a,b)=>a-b);
+  const medianStep = steps[Math.floor(steps.length/2)] || linearSpan / (n-1);
+
+  // gaps: indices [i,i+1] where the step is an actual break (much larger than
+  // the sampling cadence AND a meaningful chunk of the whole span).
+  const gaps = [];
+  for(let i=0;i<n-1;i++){
+    const dt = history[i+1].t - history[i].t;
+    if(dt > GAP_FACTOR * medianStep && dt > linearSpan * 0.02){
+      gaps.push({ i, t0: history[i].t, t1: history[i+1].t });
+    }
+  }
+  if(!gaps.length){
+    return { map: sxLin, invert: txLin, gaps: [] };
+  }
+
+  // Keep at least half of the plot for measured runs when there are many gaps.
+  const skipped = gaps.reduce((sum, gap) => sum + gap.t1-gap.t0, 0);
+  const measured = Math.max(0, linearSpan-skipped);
+  const pxTotal = rangeMax - rangeMin;
+  const gapPxTotal = measured > 0
+    ? Math.min(gaps.length*GAP_COLLAPSE_WIDTH, pxTotal/2)
+    : pxTotal;
+  const gapWidth = gapPxTotal/gaps.length;
+  const pxPerSec = measured > 0 ? (pxTotal-gapPxTotal)/measured : 0;
+
+  // Lay measured time and fixed-width gap slots out from left to right. Gap
+  // boundary samples stay on opposite sides of the slot; neither is collapsed
+  // onto the other.
+  function map(t){
+    if(t <= tMin) return rangeMin;
+    if(t >= tMax) return rangeMax;
+    let x = rangeMin;
+    let cursor = tMin;
+    for(const gap of gaps){
+      if(t <= gap.t0) return x + (t-cursor)*pxPerSec;
+      x += (gap.t0-cursor)*pxPerSec;
+      if(t < gap.t1){
+        return x + (t-gap.t0)/(gap.t1-gap.t0)*gapWidth;
+      }
+      x += gapWidth;
+      cursor = gap.t1;
+    }
+    return x + (t-cursor)*pxPerSec;
+  }
+
+  function invert(x){
+    if(x <= rangeMin) return tMin;
+    if(x >= rangeMax) return tMax;
+    let cursorX = rangeMin;
+    let cursorT = tMin;
+    for(const gap of gaps){
+      const runWidth = (gap.t0-cursorT)*pxPerSec;
+      if(x <= cursorX+runWidth){
+        return cursorT + (x-cursorX)/pxPerSec;
+      }
+      cursorX += runWidth;
+      if(x < cursorX+gapWidth){
+        return gap.t0 + (x-cursorX)/gapWidth*(gap.t1-gap.t0);
+      }
+      cursorX += gapWidth;
+      cursorT = gap.t1;
+    }
+    return cursorT + (x-cursorX)/pxPerSec;
+  }
+  return { map, invert, gaps };
+}
+
+// Build a path string for a polyline through points (already scaled).
+function linePath(pts){
+  if(!pts.length) return "";
+  let d = "M" + pts[0].x.toFixed(2) + " " + pts[0].y.toFixed(2);
+  for(let i=1;i<pts.length;i++) d += " L" + pts[i].x.toFixed(2) + " " + pts[i].y.toFixed(2);
+  return d;
+}
+// Same as linePath but splits the path across gap indices, so the line does not
+// bridge a collapsed disconnect gap with a misleading straight segment. `gaps`
+// is the array returned by buildGapScale (each carries .i, the left index).
+function linePathGapped(pts, gaps){
+  if(!pts.length) return "";
+  const gapIdx = new Set((gaps||[]).map(g => g.i));
+  let d = "M" + pts[0].x.toFixed(2) + " " + pts[0].y.toFixed(2);
+  for(let i=1;i<pts.length;i++){
+    d += (gapIdx.has(i-1) ? " M" : " L") + pts[i].x.toFixed(2) + " " + pts[i].y.toFixed(2);
+  }
+  return d;
+}
+function areaPath(pts, baseY){
+  if(!pts.length) return "";
+  return linePath(pts) + " L" + pts[pts.length-1].x.toFixed(2) + " " + baseY.toFixed(2)
+       + " L" + pts[0].x.toFixed(2) + " " + baseY.toFixed(2) + " Z";
+}
+
+// Nice axis ticks: returns array of values.
+function niceTicks(min, max, count){
+  if(min===max){ min=min-1; max=max+1; }
+  const span = max - min;
+  const step0 = span / count;
+  const mag = Math.pow(10, Math.floor(Math.log10(step0)));
+  const norm = step0 / mag;
+  let step;
+  if(norm < 1.5) step = 1; else if(norm < 3) step = 2; else if(norm < 7) step = 5; else step = 10;
+  step *= mag;
+  const start = Math.floor(min/step)*step;
+  const ticks = [];
+  for(let v=start; v<=max+1e-9; v+=step) if(v>=min-1e-9) ticks.push(v);
+  return ticks;
+}
+
+// Round a magnitude up to a clean "nice" ceiling (1, 1.5, 2, 3, 5, 10 × 10^n).
+// Keeps the y-axis top stable and grid-aligned instead of jittering every sample.
+// When the data peak lands exactly on a nice value (e.g. 100000 B/s shows as
+// 800.00 Kb/s, and niceCeil(100000) == 100000), the top tick equals the peak and
+// the line/end-marker sit on the top gridline with no headroom — visually
+// "over the boundary". Step up one nice level in that case so the axis always
+// clears the data.
+function niceCeil(v){
+  if(v <= 0) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(v)));
+  const norm = v / mag;
+  let step;
+  if(norm <= 1) step = 1; else if(norm <= 1.5) step = 1.5; else if(norm <= 2) step = 2;
+  else if(norm <= 3) step = 3; else if(norm <= 5) step = 5; else step = 10;
+  let ceil = step * mag;
+  if(ceil <= v){
+    if(step === 1) ceil = 1.5 * mag;
+    else if(step === 1.5) ceil = 2 * mag;
+    else if(step === 2) ceil = 3 * mag;
+    else if(step === 3) ceil = 5 * mag;
+    else if(step === 5) ceil = 10 * mag;
+    else ceil = 1.5 * mag * 10;
+  }
+  return ceil;
+}
+
+// Draw a sparkline: area wash + line + end-dot. The area path carries its own
+// fill; the line path must end up with fill:none (see the .series rule, which
+// is scoped to both svg.chart and svg.spark) — otherwise SVG defaults the line
+// path's fill to black and it fills the polygon closed by start->end.
+function drawSpark(svg, values, colorVar){
+  const w = svg.clientWidth || 200, h = svg.clientHeight || 34;
+  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+  const color = cs(colorVar);
+  const clean = values.filter(v => v !== UNSET);
+  if(clean.length < 2){ svg.innerHTML = ""; return; }
+  const max = Math.max(...clean);
+  const yMax = niceCeil(max) || 1;
+  const sx = makeScale(0, values.length-1, 2, w-2);
+  const sy = makeScale(0, yMax, h-3, 3);
+  const pts = values.map((v,i)=> v===UNSET ? null : {x:sx(i),y:sy(v)}).filter(Boolean);
+  // area wash anchored to the zero baseline
+  const area = areaPath(pts, h-3);
+  svg.innerHTML =
+    `<path d="${area}" fill="${color}" opacity="0.10"/>` +
+    `<path class="series" stroke="${color}" d="${linePath(pts)}"/>` +
+    `<circle class="marker" cx="${pts[pts.length-1].x.toFixed(2)}" cy="${pts[pts.length-1].y.toFixed(2)}" r="3" fill="${color}"/>`;
+}
+
+// Draw a full chart with axes + crosshair tooltip. series: [{name,colorVar,key(xData)}]
+function drawChart(svg, tipEl, history, series, fmtY, timeDomain=null){
+  const W = svg.clientWidth || 600, H = svg.clientHeight || 240;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const m = {l:48, r:14, t:10, b:38};  // b: two-line x-axis (date + time)
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+  if(history.length < 2){
+    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" class="tick">waiting for data…</text>`;
+    tipEl.style.display = "none";
+    return;
+  }
+  // Latency/queue-delay metrics start at 0. Pin the baseline to 0 so the line
+  // doesn't get visually "lifted" when the window's minimum drifts upward; a
+  // floating baseline exaggerates noise and makes the whole graph jump. The top
+  // is a clean ceiling over the data max, so the axis stays stable across polls.
+  let dataMax = 0;
+  for(const s of series) for(const p of history){ const v = p[s.key]; if(v!==UNSET && v!=null){ dataMax=Math.max(dataMax,v); } }
+  if(dataMax <= 0){ dataMax = 1; }
+  const yMin = 0;
+  const yMax = niceCeil(dataMax);
+  // Finite ranges keep their exact [now-range, now] endpoints. Within either
+  // a finite range or All, long gaps use short break slots so separated live
+  // runs remain readable.
+  const fixedTimeDomain = timeDomain && timeDomain.end > timeDomain.start;
+  const gapScale = buildGapScale(
+    history,
+    m.l,
+    m.l+pw,
+    fixedTimeDomain ? timeDomain : null,
+  );
+  const sx = gapScale.map;
+  const gaps = gapScale.gaps;
+  const sy = makeScale(yMin, yMax, m.t+ph, m.t);
+  const yticks = niceTicks(yMin, yMax, 4);
+  let parts = "";
+  // gridlines + y ticks
+  for(const tv of yticks){
+    const y = sy(tv);
+    parts += `<line class="gridline" x1="${m.l}" x2="${m.l+pw}" y1="${y.toFixed(2)}" y2="${y.toFixed(2)}"/>`;
+    parts += `<text class="tick" x="${m.l-8}" y="${(y+3).toFixed(2)}" text-anchor="end">${fmtY(tv)}</text>`;
+  }
+  // Space ticks evenly after gap folding, then convert each screen position
+  // back to its real timestamp. This keeps labels out of collapsed clusters
+  // while preserving the exact first and last time boundaries.
+  const xtickCount = Math.min(6, Math.max(2, Math.floor(pw/80)));
+  const xticks = [];
+  for(let i=0; i<=xtickCount; i++){
+    xticks.push(gapScale.invert(m.l + pw*i/xtickCount));
+  }
+  let prevDate = null;
+  for(const timestamp of xticks){
+    const x = sx(timestamp);
+    parts += `<line class="gridline" x1="${x.toFixed(2)}" x2="${x.toFixed(2)}" y1="${m.t}" y2="${m.t+ph}"/>`;
+    // Two-line x label: date row shown only when it differs from the previous
+    // tick's date (avoids repeating the same date on every tick of a short
+    // window); time row on every tick.
+    const dateStr = fmtAxisDate(timestamp);
+    const timeStr = fmtAxisTime(timestamp);
+    const showDate = dateStr !== prevDate;
+    prevDate = dateStr;
+    parts += `<text class="tick" x="${x.toFixed(2)}" y="${(m.t+ph+15).toFixed(2)}" text-anchor="middle">${showDate ? escapeText(dateStr) : ""}<tspan x="${x.toFixed(2)}" dy="13">${escapeText(timeStr)}</tspan></text>`;
+  }
+  // collapsed-gap markers: a faint dashed vertical through the plot at each gap,
+  // plus a "//" break on the x-axis signalling the timeline is discontinuous.
+  if(gaps.length){
+    const axY = m.t+ph, by = m.t+ph+6, dy = m.t+ph-6;
+    for(const g of gaps){
+      const gx = sx(g.t0) + (sx(g.t1) - sx(g.t0)) / 2;
+      parts += `<line class="gap-line" x1="${gx.toFixed(2)}" x2="${gx.toFixed(2)}" y1="${m.t}" y2="${(m.t+ph).toFixed(2)}"/>`;
+      parts += `<path class="axis-break" d="M${(gx-3).toFixed(2)} ${by} L${(gx+3).toFixed(2)} ${dy} M${(gx-3).toFixed(2)} ${dy} L${(gx+3).toFixed(2)} ${by}"/>`;
+    }
+  }
+  // axis frame
+  parts += `<line class="axis" x1="${m.l}" x2="${m.l+pw}" y1="${(m.t+ph).toFixed(2)}" y2="${(m.t+ph).toFixed(2)}"/>`;
+  parts += `<line class="axis" x1="${m.l}" x2="${m.l}" y1="${m.t}" y2="${(m.t+ph).toFixed(2)}"/>`;
+  // series
+  const seriesPts = [];
+  for(const s of series){
+    const pts = history.map(p => { const v = p[s.key]; if(v===UNSET||v==null) return null; return {x:sx(p.t), y:sy(v)}; }).filter(Boolean);
+    seriesPts.push({s, pts});
+    const color = cs(s.colorVar);
+    parts += `<path class="series" stroke="${color}" d="${linePathGapped(pts, gaps)}"/>`;
+  }
+  // markers (end dots) + surface ring
+  for(const sp of seriesPts){
+    if(!sp.pts.length) continue;
+    const last = sp.pts[sp.pts.length-1];
+    const color = cs(sp.s.colorVar);
+    parts += `<circle class="marker" cx="${last.x.toFixed(2)}" cy="${last.y.toFixed(2)}" r="4" fill="${color}"/>`;
+  }
+  // crosshair + invisible hit area
+  parts += `<line class="crosshair" id="ch-x" x1="0" x2="0" y1="${m.t}" y2="${m.t+ph}"/>`;
+  parts += `<rect class="hover-hit" x="${m.l}" y="${m.t}" width="${pw}" height="${ph}"/>`;
+
+  svg.innerHTML = parts;
+  const chx = svg.querySelector("#ch-x");
+  const hit = svg.querySelector(".hover-hit");
+
+  function move(ev){
+    const rect = svg.getBoundingClientRect();
+    const px = (ev.clientX - rect.left) / rect.width * W;
+    // nearest data index by x
+    let best = 0, bd = Infinity;
+    for(let i=0;i<history.length;i++){ const d = Math.abs(sx(history[i].t) - px); if(d<bd){bd=d;best=i;} }
+    const x = sx(history[best].t);
+    chx.setAttribute("x1", x); chx.setAttribute("x2", x); chx.style.opacity = 0.9;
+    // tooltip
+    const rows = series.map(sp => {
+      const p = history[best];
+      const v = p[sp.key];
+      const valTxt = (v===UNSET||v==null) ? "no data" : fmtY(v);
+      return `<div class="row"><span class="name"><span class="key" style="background:${cs(sp.colorVar)}"></span>${escapeText(sp.name)}</span><span class="val">${escapeText(valTxt)}</span></div>`;
+    }).join("");
+    const head = fmtChartTime(history[best].t);
+    tipEl.innerHTML = `<div class="t-head">${escapeText(head)}</div>${rows}`;
+    tipEl.style.display = "block";
+    // position tooltip near cursor, clamped
+    const tw = tipEl.offsetWidth, th = tipEl.offsetHeight;
+    let tx = ev.clientX - rect.left + 12, ty = ev.clientY - rect.top - th - 8;
+    if(tx + tw > rect.width) tx = ev.clientX - rect.left - tw - 12;
+    if(ty < 0) ty = ev.clientY - rect.top + 12;
+    tipEl.style.left = tx + "px"; tipEl.style.top = ty + "px";
+  }
+  function leave(){ chx.style.opacity = 0; tipEl.style.display = "none"; }
+  hit.onmousemove = move;
+  hit.onmouseleave = leave;
+}
+
+// ---------- render ----------
+let currentData = null;
+let historyCursor = null;
+let pollInFlight = false;
+let pollPending = false;
+let pollTimer = null;
+let pollGeneration = 0;
+
+function compactHistory(points){
+  if(points.length <= HISTORY_HIGH_WATER) return points;
+  const compacted = [];
+  const last = points.length - 1;
+  for(let i=0; i<HISTORY_COMPACT_TO; i++){
+    compacted.push(points[Math.round(i * last / (HISTORY_COMPACT_TO - 1))]);
+  }
+  return compacted;
+}
+
+function mergeHistory(previous, updates, rangeSeconds, now){
+  let merged;
+  if(!previous || !previous.length){
+    merged = (updates || []).slice();
+  } else if(!updates || !updates.length){
+    merged = previous.slice();
+  } else if(updates[0].t > previous[previous.length-1].t){
+    merged = previous.concat(updates);
+  } else {
+    const byTimestamp = new Map(previous.map(point => [point.t, point]));
+    updates.forEach(point => byTimestamp.set(point.t, point));
+    merged = Array.from(byTimestamp.values()).sort((a,b) => a.t-b.t);
+  }
+  if(rangeSeconds != null){
+    const cutoff = now - rangeSeconds;
+    merged = merged.filter(point => point.t >= cutoff && point.t <= now);
+  }
+  return compactHistory(merged);
+}
+
+function mergeSnapshot(previous, update){
+  if(!previous || update.history_mode !== "delta") return update;
+  const previousNodes = new Map((previous.nodes || []).map(node => [node.key, node]));
+  const now = Number(update.now) || Date.now()/1000;
+  update.nodes = (update.nodes || []).map(node => {
+    const old = previousNodes.get(node.key);
+    if(!old) return node;
+    node.history = mergeHistory(
+      old.history, node.history, chartRanges["chart-queue"], now
+    );
+    const oldTraffic = old.traffic_history || {};
+    const newTraffic = node.traffic_history || {};
+    const currentServices = new Set((node.service_traffic || []).map(service => service.service));
+    const names = new Set([...Object.keys(oldTraffic), ...Object.keys(newTraffic)]);
+    node.traffic_history = {};
+    names.forEach(name => {
+      const history = mergeHistory(
+        oldTraffic[name], newTraffic[name], chartRanges["chart-bandwidth"], now
+      );
+      if(history.length || currentServices.has(name)) node.traffic_history[name] = history;
+    });
+    return node;
+  });
+  return update;
+}
+
+function resetHistoryAndPoll(){
+  historyCursor = null;
+  currentData = null;
+  pollGeneration++;
+  pollPending = true;
+  if(pollTimer !== null){ clearTimeout(pollTimer); pollTimer = null; }
+  poll();
+}
+
+function render(data){
+  currentData = data;
+  const nodes = data.nodes || [];
+  const renderNow = Number(data.now) || Date.now()/1000;
+  populateNodeSelect(nodes);
+  const badge = $("conn-badge");
+  const connectedNodes = Number(data.connected_nodes || 0);
+  const totalNodes = Number(data.total_nodes || nodes.length);
+  const entryConnected = Boolean(data.entry_connected);
+  const state = !entryConnected
+    ? (data.entry_connecting ? "connecting" : "disconnected")
+    : (totalNodes > 0 && connectedNodes === totalNodes ? "connected" : "connecting");
+  badge.setAttribute("data-state", state);
+  $("conn-label").textContent = connectedNodes + "/" + totalNodes + " connected";
+
+  // error banner
+  const eb = $("error-banner");
+  const unavailable = nodes.filter(item => !item.connected);
+  const errors = [];
+  if(data.entry_error) errors.push("Entry: " + data.entry_error);
+  if(unavailable.length) errors.push("Unavailable nodes: " + unavailable.map(item =>
+      nodeName(item) + " (" + (item.last_error || nodeState(item)) + ")"
+    ).join("; "));
+  if(errors.length){
+    eb.textContent = errors.join(" · ");
+    eb.style.display = "block";
+  } else {
+    eb.style.display = "none";
+  }
+
+  const node = nodes.find(item => item.key === selectedNodeKey) || nodes[0];
+  const topologyNode = node && data.topology
+    ? (data.topology.nodes || []).find(item => item.node_id === node.node_id)
+    : null;
+  $("node-health-hint").textContent = node ? nodeName(node) + " · " + nodeState(node) : "Waiting for Node reports";
+  $("peer").textContent = topologyNode ? topologyNode.address : (data.entry_peer || "—");
+  const hist = node ? node.history || [] : [];
+  const last = topologyNode ? {
+    cqd:topologyNode.control_queue_delay_us,
+    tcp_qd:topologyNode.transfer_tcp_queue_delay_us,
+    udp_qd:topologyNode.transfer_udp_queue_delay_us,
+  } : null;
+
+  // tiles
+  $("tile-cqd").textContent = last ? fmtUs(last.cqd) : "—";
+  $("tile-tcpqd").textContent = last ? fmtUs(last.tcp_qd) : "—";
+  $("tile-udpqd").textContent = last ? fmtUs(last.udp_qd) : "—";
+  $("tile-svc").textContent = node ? (node.service_traffic || []).length : "—";
+  $("tile-svc-sub").textContent = node ? "on " + nodeName(node) + " · refreshed " + fmtAge(node.service_traffic_age_s) : "waiting for reports";
+  $("tile-up").textContent = !node || node.uptime_s === null ? "—" : fmtUptime(node.uptime_s);
+  $("tile-up-sub").textContent = node ? "report refreshed " + fmtAge(node.report_age_s) : "waiting for reports";
+
+  // sparklines (last 60 samples)
+  const win = hist.slice(-60);
+  drawSpark($("spark-cqd"), win.map(p=>p.cqd), "--series-1");
+  drawSpark($("spark-tcpqd"), win.map(p=>p.tcp_qd), "--series-2");
+  drawSpark($("spark-udpqd"), win.map(p=>p.udp_qd), "--series-4");
+
+  // charts (scoped to the selected range)
+  const queueRange = chartRanges["chart-queue"];
+  const queueHist = windowHistory(hist, queueRange, renderNow);
+  const queueDomain = queueRange == null
+    ? null
+    : {start:renderNow-queueRange, end:renderNow};
+  drawChart($("chart-queue"), $("tip-queue"), queueHist,
+    [{name:"Control queue", colorVar:"--series-1", key:"cqd"},
+     {name:"TCP transfer queue", colorVar:"--series-2", key:"tcp_qd"},
+     {name:"UDP transfer queue", colorVar:"--series-4", key:"udp_qd"}],
+    fmtUs, queueDomain);
+
+  // Services from every node remain visible while charts follow the selected node.
+  const body = $("svc-body");
+  const allServices = [];
+  nodes.forEach(item => (item.service_traffic || []).forEach(service => {
+    allServices.push({node: nodeName(item), ...service});
+  }));
+  allServices.sort((a,b) => a.node.localeCompare(b.node) || a.service.localeCompare(b.service));
+  $("svc-hint").textContent = allServices.length + " services across " + totalNodes + " Nodes";
+  if(!allServices.length){
+    body.innerHTML = `<tr><td colspan="8" class="empty">No services registered in the discovered cluster.</td></tr>`;
+  } else {
+    body.innerHTML = allServices.map((t,i) => {
+      return `<tr>
+        <td>${i+1}</td>
+        <td>${escapeText(t.node)}</td>
+        <td>${serviceTree(t)}</td>
+        <td><span class="proto-pill">${escapeText(t.protocol)}</span></td>
+        <td class="num"><span class="rate-cell rx"><span class="key"></span><span class="metric-value">${fmtBps(t.rx_bytes_per_second)}</span></span></td>
+        <td class="num"><span class="rate-cell tx"><span class="key"></span><span class="metric-value">${fmtBps(t.tx_bytes_per_second)}</span></span></td>
+        <td class="num cum-cell"><span class="total-value">${fmtBytes(t.rx_bytes)}</span></td>
+        <td class="num cum-cell"><span class="total-value">${fmtBytes(t.tx_bytes)}</span></td>
+      </tr>`;
+    }).join("");
+  }
+
+  // Bandwidth can follow any discovered node/service, independently of the
+  // node selected for tiles and queue charts.
+  const bandwidthServices = [];
+  nodes.forEach(item => {
+    Object.entries(item.traffic_history || {}).forEach(([service, history]) => {
+      bandwidthServices.push({
+        key: JSON.stringify([item.key, service]),
+        label: nodeName(item) + " · " + service,
+        history,
+      });
+    });
+  });
+  bandwidthServices.sort((a,b) => a.label.localeCompare(b.label));
+  populateServiceSelect(bandwidthServices);
+  const selectedBandwidth = bandwidthServices.find(item => item.key === bandwidthSelection);
+  const bwHist = selectedBandwidth ? selectedBandwidth.history : [];
+  const bandwidthRange = chartRanges["chart-bandwidth"];
+  const bwWindow = windowHistory(bwHist, bandwidthRange, renderNow);
+  const bandwidthDomain = bandwidthRange == null
+    ? null
+    : {start:renderNow-bandwidthRange, end:renderNow};
+  drawChart($("chart-bandwidth"), $("tip-bandwidth"), bwWindow,
+    [{name:"RX (service → client)", colorVar:"--series-5", key:"rx_bps"},
+     {name:"TX (client → service)", colorVar:"--series-6", key:"tx_bps"}],
+    fmtBps, bandwidthDomain);
+}
+
+// ---------- poll ----------
+async function poll(){
+  if(pollInFlight){ pollPending = true; return; }
+  pollInFlight = true;
+  pollPending = false;
+  const generation = pollGeneration;
+  try{
+    const query = new URLSearchParams({
+      queue_range: chartRanges["chart-queue"] === null ? "all" : chartRanges["chart-queue"],
+      bandwidth_range: chartRanges["chart-bandwidth"] === null ? "all" : chartRanges["chart-bandwidth"],
+    });
+    if(historyCursor !== null) query.set("history_after", String(historyCursor));
+    const r = await fetch("/api/snapshot?" + query, {cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    const data = await r.json();
+    if(generation !== pollGeneration) return;
+    currentData = mergeSnapshot(currentData, data);
+    if(data.history_cursor !== null && data.history_cursor !== undefined){
+      historyCursor = Number(data.history_cursor);
+    }
+    render(currentData);
+    document.querySelectorAll(".card").forEach(c=>c.classList.remove("stale"));
+  }catch(e){
+    if(generation !== pollGeneration) return;
+    document.querySelectorAll(".card").forEach(c=>c.classList.add("stale"));
+    const eb = $("error-banner");
+    eb.textContent = "Dashboard request failed: " + (e && e.message ? e.message : String(e));
+    eb.style.display = "block";
+  }finally{
+    pollInFlight = false;
+    if(pollPending){
+      poll();
+    } else {
+      pollTimer = setTimeout(poll, POLL_MS);
+    }
+  }
+}
+// init range selectors, then start polling
+(function initRangeSelects(){
+  document.querySelectorAll(".range-select").forEach(sel => populateRangeSelect(sel));
+  wireRangeSelects();
+})();
+poll();
+window.addEventListener("resize", ()=>{ if(currentData) render(currentData); });
+</script>
+</body>
+</html>

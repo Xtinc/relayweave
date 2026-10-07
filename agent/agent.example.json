@@ -1,0 +1,54 @@
+{
+  "log": {
+    "debug_enable": false
+  },
+  "server": {
+    "host": "203.0.113.10",
+    "port": 18443,
+    "connect_timeout_ms": 5000
+  },
+  "certificate": {
+    "ca_file": "/etc/relayweave/certs/server-ca.pem",
+    "certificate_chain": "/etc/relayweave/certs/shared-client.pem",
+    "private_key": "/etc/relayweave/certs/shared-client.key",
+    "server_name": ""
+  },
+  "services": [
+    {
+      "name": "lly-ssh",
+      "target_host": "127.0.0.1",
+      "target_port": 22,
+      "protocol": "tls"
+    },
+    {
+      "name": "lly-sock5",
+      "target_host": "127.0.0.1",
+      "target_port": 11080,
+      "protocol": "tls"
+    },
+    {
+      "name": "lly-http-proxy",
+      "target_host": "127.0.0.1",
+      "target_port": 11081,
+      "protocol": "tls"
+    }
+  ],
+  "forwards": [],
+  "routing": {
+    "max_nodes": 4
+  },
+  "relay": {
+    "open_timeout_ms": 10000
+  },
+  "reconnect": {
+    "initial_delay_ms": 500,
+    "max_delay_ms": 10000
+  },
+  "channel": {
+    "handshake_timeout_ms": 5000,
+    "disconnect_timeout_ms": 5000,
+    "heartbeat_interval_ms": 5000,
+    "heartbeat_timeout_ms": 20000,
+    "max_queued_messages": 100
+  }
+}

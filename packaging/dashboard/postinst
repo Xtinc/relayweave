@@ -1,0 +1,21 @@
+#!/bin/sh
+set -e
+
+service_name=relayweave-dashboard.service
+
+if [ "$1" = configure ]; then
+    if ! getent passwd relayweave-dashboard >/dev/null; then
+        adduser --system --group --home /var/lib/relayweave-dashboard --no-create-home relayweave-dashboard
+    fi
+    install -d -o root -g relayweave-dashboard -m 0750 /etc/relayweave/dashboard-certs
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        if [ -z "${2:-}" ]; then
+            systemctl enable "$service_name" >/dev/null 2>&1 || true
+        elif systemctl is-active --quiet "$service_name"; then
+            systemctl restart "$service_name"
+        fi
+    fi
+fi
+
+exit 0
