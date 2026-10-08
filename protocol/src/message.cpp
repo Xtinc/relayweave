@@ -781,16 +781,21 @@ LnkFrameHeader LnkFrameHeader::decode(std::span<const std::uint8_t, length> head
     return result;
 }
 
-void FlowFrame::validate() const
+bool FlowFrame::validate() const noexcept
 {
-    if (!epoch || !flow_id || payload.size() > LnkFrameHeader::maximum_payload ||
-        reason.size() > LnkFrameHeader::maximum_reason || (kind != LnkFrType::Data && !payload.empty()) ||
-        (kind != LnkFrType::Reset && !reason.empty()))
+    if (!epoch || !flow_id)
     {
-        throw std::invalid_argument("invalid NodeFlow frame");
+        return false;
     }
-    if (kind != LnkFrType::Data && kind != LnkFrType::Fin && kind != LnkFrType::Reset)
+    switch (kind)
     {
-        throw std::invalid_argument("unknown Flow frame kind");
+    case LnkFrType::Data:
+        return reason.empty() && payload.size() <= LnkFrameHeader::maximum_payload;
+    case LnkFrType::Fin:
+        return payload.empty() && reason.empty();
+    case LnkFrType::Reset:
+        return payload.empty() && reason.size() <= LnkFrameHeader::maximum_reason;
+    default:
+        return false;
     }
 }

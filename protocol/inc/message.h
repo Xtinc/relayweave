@@ -191,7 +191,7 @@ struct FlowFrame
     LnkFrType kind = LnkFrType::Data;
     BytesBuf payload;
     std::string reason;
-    void validate() const;
+    [[nodiscard]] bool validate() const noexcept;
 };
 
 struct DatagramHeader

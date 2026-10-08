@@ -79,7 +79,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     asio::awaitable<LinkStatus> async_link_status(std::uint64_t id);
     asio::awaitable<void> async_close_link(std::uint64_t id);
     asio::awaitable<FlowResult> async_open_flow(std::vector<std::string> path, RelayProtocol transport);
-    asio::awaitable<FlowSendResult> async_send_flow(FlowFrame frame);
+    asio::awaitable<FlowSendStatus> async_send_flow(FlowFrame frame);
     asio::awaitable<FlowFrame> async_receive_flow(std::uint64_t epoch, std::uint64_t id);
     asio::awaitable<void> async_close_flow(std::uint64_t epoch, std::uint64_t id);
 

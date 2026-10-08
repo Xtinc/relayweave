@@ -167,7 +167,7 @@ void integration()
                         {flow.epoch, flow.id, false, LnkFrType::Data, {0, 255, std::uint8_t(i)}, {}});
                     auto reverse = co_await nodes[1]->async_send_flow(
                         {flow.epoch, flow.id, true, LnkFrType::Data, {std::uint8_t(i), 0}, {}});
-                    require(forward.status == FlowSendStatus::Queued && reverse.status == FlowSendStatus::Queued,
+                    require(forward == FlowSendStatus::Queued && reverse == FlowSendStatus::Queued,
                             "business flow send failed");
                 }
                 for (std::uint64_t i = 1; i <= 12; ++i)
@@ -315,6 +315,8 @@ void data_failures()
         std::exception_ptr failure;
         try
         {
+            // Let the empty monitor enter its indefinite wait before the first prepare.
+            co_await pause(20ms);
             auto parameters = [&](std::uint64_t id, std::string transport, std::string address) {
                 return njson{{"id", id},
                              {"epoch", 7},
@@ -352,6 +354,17 @@ void data_failures()
             module->connect(2);
             co_await until_error(2);
             require(events.back().params->at("stage") == "resolve", "DNS failure phase lost");
+
+            // Close before the independently spawned UDP resolver has started.
+            auto cancelled = parameters(11, "udp", "invalid host name !");
+            module->prepare(cancelled);
+            module->close(11);
+            co_await pause(20ms);
+            require(std::ranges::none_of(events,
+                                         [](const auto &m) {
+                                             return m.type() == CtrlCommand::LinkError && m.params->at("id") == 11;
+                                         }),
+                    "closed UDP preparation resumed resolving");
 
             // Receive the bootstrap and deliberately drop its acknowledgement. Count
             // packets to prove bootstrap is sent once, including repeated connect calls.
@@ -410,21 +423,169 @@ void data_failures()
             co_await pause(100ms);
             require(peer.available() == 0, "wrong credential, NodeLink ID, version or UDP length was accepted");
             p["id"] = 4;
-            co_await send_peer(CtrlMessage(CtrlCommand::LinkAttach, p), 4);
             co_await send_peer(CtrlMessage(CtrlCommand::LinkAttached, p), 4);
+            co_await pause(20ms);
+            require(std::ranges::none_of(events,
+                                         [](const auto &m) {
+                                             return m.type() == CtrlCommand::LinkReady && m.params->at("id") == 4;
+                                         }),
+                    "UDP acknowledgement alone made the link Ready");
+            co_await send_peer(CtrlMessage(CtrlCommand::LinkAttach, p), 4);
             size = co_await peer.async_receive_from(asio::buffer(bytes), source, asio::use_awaitable);
             co_await pause(100ms);
             require(std::ranges::any_of(
                         events,
                         [](const auto &m) { return m.type() == CtrlCommand::LinkReady && m.params->at("id") == 4; }),
                     "fresh outer UDP attempt did not become Ready");
-            // Deliberately stop responding: Ready links must expire, without reconnecting.
-            co_await pause(20500ms);
+            njson udp_flow{{"epoch", std::uint64_t(7)},
+                           {"flow_id", std::uint64_t(24)},
+                           {"request_id", std::uint64_t(24)},
+                           {"path", std::vector<std::string>{"b", "a"}},
+                           {"links", std::vector<std::uint64_t>{4}},
+                           {"transport", "udp"},
+                           {"ttl_ms", 10000U}};
+            module->prepare_flow(udp_flow);
+            module->commit_flow(24);
+            const auto udp_link_header = DatagramHeader::encode(4);
+            const auto large_header =
+                LnkFrameHeader{LnkFrType::Data, false, LnkFrameHeader::maximum_payload, 7, 24}.encode();
+            BytesBuf oversized(LnkFrameHeader::maximum_payload + 1, 0xee);
+            for (int padding : {1, 1024})
+            {
+                oversized.resize(LnkFrameHeader::maximum_payload + padding, 0xee);
+                const std::array<asio::const_buffer, 3> buffers{
+                    asio::buffer(udp_link_header), asio::buffer(large_header), asio::buffer(oversized)};
+                co_await peer.async_send_to(buffers, source, asio::use_awaitable);
+            }
+            const auto valid_header = LnkFrameHeader{LnkFrType::Data, false, 1, 7, 24}.encode();
+            const std::array<std::uint8_t, 1> valid_payload{42};
+            const std::array<asio::const_buffer, 3> valid_buffers{
+                asio::buffer(udp_link_header), asio::buffer(valid_header), asio::buffer(valid_payload)};
+            co_await peer.async_send_to(valid_buffers, source, asio::use_awaitable);
+            auto udp_received = co_await module->receive_flow(7, 24);
+            require(udp_received.payload == BytesBuf{42}, "truncated oversized UDP frame entered the flow");
+            module->close_flow(24);
+            // Delay Pong 1 until Ping 2 has been sent. An older, unacknowledged Ping
+            // still proves liveness; duplicate and unsent sequences must not renew it.
+            auto receive_ping = [&]() -> asio::awaitable<LnkFrameHeader> {
+                const auto received = co_await peer.async_receive_from(
+                    asio::buffer(bytes), source, asio::cancel_after(6s, asio::use_awaitable));
+                require(received == DatagramHeader::length + LnkFrameHeader::length &&
+                            DatagramHeader::decode(std::span(bytes).first<DatagramHeader::length>()) == 4,
+                        "unexpected heartbeat datagram");
+                const auto header = LnkFrameHeader::decode(
+                    std::span(bytes).subspan<DatagramHeader::length, LnkFrameHeader::length>());
+                require(header.kind == LnkFrType::Ping, "missing UDP Ping");
+                co_return header;
+            };
+            const auto first_ping = co_await receive_ping();
+            const auto second_ping = co_await receive_ping();
+            require(second_ping.sequence > first_ping.sequence, "heartbeat sequence did not advance");
+            auto send_pong = [&](std::uint64_t sequence) -> asio::awaitable<void> {
+                const auto link_header = DatagramHeader::encode(4);
+                const auto header = LnkFrameHeader{LnkFrType::Pong, false, 0, 7, 0, sequence}.encode();
+                const std::array<asio::const_buffer, 2> buffers{asio::buffer(link_header), asio::buffer(header)};
+                co_await peer.async_send_to(buffers, source, asio::use_awaitable);
+            };
+            co_await send_pong(first_ping.sequence);
+            co_await pause(10500ms);
+            require(std::ranges::none_of(
+                        events,
+                        [](const auto &m) { return m.type() == CtrlCommand::LinkError && m.params->at("id") == 4; }),
+                    "delayed Pong for an earlier Ping did not keep the link alive");
+            co_await send_pong(first_ping.sequence);
+            co_await send_pong(second_ping.sequence + 100);
+            co_await pause(10s);
             require(std::ranges::any_of(
                         events,
                         [](const auto &m) { return m.type() == CtrlCommand::LinkError && m.params->at("id") == 4; }),
-                    "missing Ready keepalive expiration");
+                    "duplicate or unsent Pong renewed the link, or keepalive expiration was missed");
             module->close(4);
+
+            // Queued datagrams must neither retain a closed link nor target a replacement epoch.
+            while (peer.available())
+            {
+                peer.receive_from(asio::buffer(bytes), source);
+            }
+            for (std::uint64_t id : {9, 10})
+            {
+                auto queued_link = parameters(id, "udp", "127.0.0.2");
+                module->prepare(queued_link);
+                co_await pause(100ms);
+                module->connect(id);
+                size = co_await peer.async_receive_from(
+                    asio::buffer(bytes), source, asio::cancel_after(1s, asio::use_awaitable));
+                auto identity = *decode_ctrl_datagram(
+                                     std::span(bytes).subspan(DatagramHeader::length + LnkFrameHeader::length,
+                                                              size - DatagramHeader::length - LnkFrameHeader::length))
+                                     .params;
+                identity["node"] = "b";
+                co_await send_peer(CtrlMessage(CtrlCommand::LinkAttach, identity), id);
+                co_await send_peer(CtrlMessage(CtrlCommand::LinkAttached, identity), id);
+                co_await peer.async_receive_from(asio::buffer(bytes), source,
+                                                 asio::cancel_after(1s, asio::use_awaitable));
+                co_await pause(5ms);
+                auto queued_flow = udp_flow;
+                queued_flow["flow_id"] = id + 20;
+                queued_flow["request_id"] = id + 20;
+                queued_flow["links"] = std::vector<std::uint64_t>{id};
+                module->prepare_flow(queued_flow);
+                module->commit_flow(id + 20);
+                // No yield between queueing and close: even a directly handed-off send item is still pending.
+                for (int i = 0; i < 3; ++i)
+                {
+                    require(module->send_flow({7, id + 20, true, LnkFrType::Data, {43}, {}}) == FlowSendStatus::Queued,
+                            "could not queue UDP frame before close");
+                }
+                module->close(id);
+                if (id == 10)
+                {
+                    queued_link["epoch"] = 8;
+                    module->prepare(queued_link);
+                }
+                co_await pause(20ms);
+                require(peer.available() == 0, "queued UDP frame was sent after its link closed");
+                require(std::ranges::none_of(events,
+                                             [id](const auto &message) {
+                                                 return message.type() == CtrlCommand::LinkError &&
+                                                        message.params->at("id") == id &&
+                                                        message.params->at("epoch") == 8;
+                                             }),
+                        "stale queued UDP frame failed the replacement epoch");
+                module->close(id);
+            }
+
+            // A peer can process its connect command before the local command arrives.
+            auto early_peer = parameters(12, "udp", "127.0.0.2");
+            module->prepare(early_peer);
+            co_await pause(100ms);
+            source = {asio::ip::address_v4::loopback(), up};
+            njson early_identity{{"id", 12},
+                                 {"epoch", 7},
+                                 {"node", "b"},
+                                 {"token", "test-token"},
+                                 {"data_version", LnkFrameHeader::version}};
+            co_await send_peer(CtrlMessage(CtrlCommand::LinkAttach, early_identity), 12);
+            size = co_await peer.async_receive_from(asio::buffer(bytes), source,
+                                                    asio::cancel_after(1s, asio::use_awaitable));
+            require(LnkFrameHeader::decode(std::span(bytes).subspan<8, LnkFrameHeader::length>()).kind ==
+                        LnkFrType::Attached,
+                    "peer Attach before local connect was not acknowledged");
+            module->connect(12);
+            module->connect(12);
+            size = co_await peer.async_receive_from(asio::buffer(bytes), source,
+                                                    asio::cancel_after(1s, asio::use_awaitable));
+            require(LnkFrameHeader::decode(std::span(bytes).subspan<8, LnkFrameHeader::length>()).kind ==
+                        LnkFrType::Attach,
+                    "early peer Attach prevented local bootstrap");
+            co_await send_peer(CtrlMessage(CtrlCommand::LinkAttached, early_identity), 12);
+            co_await pause(20ms);
+            require(std::ranges::count_if(events,
+                                          [](const auto &m) {
+                                              return m.type() == CtrlCommand::LinkReady && m.params->at("id") == 12;
+                                          }) == 1 && peer.available() == 0,
+                    "early peer Attach lost progress or duplicate connect resent bootstrap");
+            module->close(12);
 
             auto inbound = parameters(6, "tcp", "127.0.0.1");
             inbound["left"] = "0";
@@ -511,7 +672,7 @@ void data_failures()
             co_await send(7, 21, false, {96});
             module->prepare_flow(flow);
             module->commit_flow(21);
-            require(module->send_flow({7, 21, true, LnkFrType::Data, {1}, {}}).status == FlowSendStatus::Closed,
+            require(module->send_flow({7, 21, true, LnkFrType::Data, {1}, {}}) == FlowSendStatus::Closed,
                     "retired identity was revived");
             flow["flow_id"] = flow["request_id"] = std::uint64_t(22);
             module->prepare_flow(flow);
@@ -523,7 +684,7 @@ void data_failures()
             malformed[4] = 0xff;
             co_await asio::async_write(socket, asio::buffer(malformed), asio::use_awaitable);
             co_await until_error(8);
-            require(module->send_flow({7, 22, true, LnkFrType::Data, {1}, {}}).status == FlowSendStatus::Closed,
+            require(module->send_flow({7, 22, true, LnkFrType::Data, {1}, {}}) == FlowSendStatus::Closed,
                     "malformed transport left its business flow alive");
             // Stop with a resolver/bootstrap task still in flight; Flow receiver cleanup is tested separately.
             auto pending = parameters(5, "udp", "127.0.0.2");
@@ -584,6 +745,37 @@ void delayed_activation()
     udp::socket rebound_udp(io, {asio::ip::address_v4::loopback(), up});
 }
 
+void concurrent_stop()
+{
+    asio::io_context io(1);
+    const auto tp = tcp_port(io);
+    const auto up = udp_port(io);
+    auto module = std::make_shared<LnkChannel>(io.get_executor(), "stopping", "127.0.0.1", tp, "127.0.0.1", up);
+    module->start();
+    module->activate();
+    module->activate();
+    asio::cancellation_signal cancellation;
+    auto stop_with_cancellation = [&]() -> asio::awaitable<void> {
+        // Queue cancellation before stop queues the completion of its pending data operations.
+        asio::post(io, [&] { cancellation.emit(asio::cancellation_type::all); });
+        co_await module->stop();
+    };
+    auto cancelled = asio::co_spawn(io, stop_with_cancellation(),
+                                    asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
+    auto concurrent = asio::co_spawn(io, module->stop(), asio::use_future);
+    io.run();
+    cancelled.get();
+    concurrent.get();
+    require(io.stopped(), "concurrent or cancelled stop retained data tasks");
+
+    io.restart();
+    auto repeated = asio::co_spawn(io, module->stop(), asio::use_future);
+    io.run();
+    repeated.get();
+    tcp::acceptor rebound(io, {asio::ip::address_v4::loopback(), tp});
+    udp::socket rebound_udp(io, {asio::ip::address_v4::loopback(), up});
+}
+
 void notification_overflow()
 {
     asio::io_context io(1);
@@ -625,6 +817,7 @@ int main()
         integration();
         data_failures();
         delayed_activation();
+        concurrent_stop();
         notification_overflow();
         std::cout << "[PASS] shared TCP/UDP node links\n";
         return 0;

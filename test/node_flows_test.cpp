@@ -1,4 +1,5 @@
 #include "node_test_config.h"
+#include <asio/experimental/awaitable_operators.hpp>
 #include <future>
 #include <iostream>
 using namespace std::chrono_literals;
@@ -83,7 +84,7 @@ void flow_integration()
                               LnkFrType kind = LnkFrType::Data) -> asio::awaitable<void> {
                 auto result =
                     co_await nodes[node]->async_send_flow({s.epoch, s.id, reverse, kind, std::move(payload), {}});
-                require_flow(result.status == FlowSendStatus::Queued, "flow send failed");
+                require_flow(result == FlowSendStatus::Queued, "flow send failed");
             };
             auto receive = [&](std::size_t node, const FlowResult &s, bool reverse,
                                BytesBuf expected) -> asio::awaitable<void> {
@@ -200,11 +201,9 @@ void flow_integration()
                 co_await receive(3, s1, false, {});
                 auto wrong = co_await nodes[middle_index]->async_send_flow(
                     {s1.epoch, s1.id, false, LnkFrType::Data, {5}, {}});
-                require_flow(wrong.status == FlowSendStatus::Invalid && wrong.unsent.payload == BytesBuf{5},
-                             "middle Node injected data");
+                require_flow(wrong == FlowSendStatus::Invalid, "middle Node injected data");
                 wrong = co_await nodes[1]->async_send_flow({s1.epoch + 1, s1.id, false, LnkFrType::Data, {6}, {}});
-                require_flow(wrong.status == FlowSendStatus::Closed && wrong.unsent.payload == BytesBuf{6},
-                             "old epoch accepted");
+                require_flow(wrong == FlowSendStatus::Closed, "old epoch accepted");
                 if (transport == RelayProtocol::Tcp)
                 {
                     co_await queued(1, s1, false, {9});
@@ -213,9 +212,21 @@ void flow_integration()
                     auto fin = co_await nodes[3]->async_receive_flow(s1.epoch, s1.id);
                     require_flow(fin.kind == LnkFrType::Fin, "FIN did not follow DATA");
                     wrong = co_await nodes[1]->async_send_flow({s1.epoch, s1.id, false, LnkFrType::Data, {7}, {}});
-                    require_flow(wrong.status == FlowSendStatus::Invalid, "DATA after FIN accepted");
+                    require_flow(wrong == FlowSendStatus::Invalid, "DATA after FIN accepted");
+                    wrong = co_await nodes[1]->async_send_flow({s1.epoch, s1.id, false, LnkFrType::Fin, {}, {}});
+                    require_flow(wrong == FlowSendStatus::Invalid, "duplicate FIN accepted");
                     co_await queued(3, s1, true, {8});
                     co_await receive(1, s1, true, {8});
+                }
+                else
+                {
+                    for (const auto kind : {LnkFrType::Fin, LnkFrType::Reset})
+                    {
+                        wrong = co_await nodes[1]->async_send_flow({s1.epoch, s1.id, false, kind, {}, {}});
+                        require_flow(wrong == FlowSendStatus::Invalid, "UDP accepted FIN or RESET");
+                    }
+                    co_await queued(1, s1, false, {8});
+                    co_await receive(3, s1, false, {8});
                 }
                 co_await nodes[0]->async_close_flow(s1.epoch, s1.id);
                 co_await nodes[0]->async_close_flow(s1.epoch, s1.id);
@@ -224,7 +235,9 @@ void flow_integration()
                 auto reused = co_await nodes[0]->async_ensure_link(middle, "a", transport);
                 require_flow(reused.id == shared.id, "closing flow destroyed shared NodeLink");
                 // Node ID order reverses the forward path on every edge.
-                auto reversed = co_await nodes[0]->async_open_flow({"c", middle, "a"}, transport);
+                // Keep the initializer-list temporary out of co_await to avoid a GCC 14 ICE.
+                const std::vector<std::string> reversed_path{"c", middle, "a"};
+                auto reversed = co_await nodes[0]->async_open_flow(reversed_path, transport);
                 require_flow(bool(reversed), "reverse path failed");
                 co_await queued(3, reversed, false, {11});
                 co_await receive(1, reversed, false, {11});
@@ -235,7 +248,7 @@ void flow_integration()
                 {
                     auto result = co_await nodes[1]->async_send_flow(
                         {crowded.epoch, crowded.id, false, LnkFrType::Data, {12}, {}});
-                    if (result.status == FlowSendStatus::Closed || result.status == FlowSendStatus::WouldBlock)
+                    if (result == FlowSendStatus::Closed || result == FlowSendStatus::CapacityExceeded)
                     {
                         break;
                     }
@@ -244,7 +257,7 @@ void flow_integration()
                 co_await delay_flow(100ms);
                 auto blocked =
                     co_await nodes[3]->async_send_flow({crowded.epoch, crowded.id, true, LnkFrType::Data, {13}, {}});
-                require_flow(blocked.status == FlowSendStatus::Closed, "full endpoint queue did not fail flow");
+                require_flow(blocked == FlowSendStatus::Closed, "full endpoint queue did not fail flow");
                 co_await queued(1, s2, false, {14});
                 co_await receive(4, s2, false, {14});
                 reused = co_await nodes[0]->async_ensure_link("a", middle, transport);
@@ -252,17 +265,22 @@ void flow_integration()
                 if (transport == RelayProtocol::Tcp)
                 {
                     auto reset = co_await nodes[0]->async_open_flow(path1, transport);
-                    co_await queued(1, reset, false, {}, LnkFrType::Reset);
-                    bool failed = false;
-                    try
-                    {
-                        static_cast<void>(co_await nodes[3]->async_receive_flow(reset.epoch, reset.id));
-                    }
-                    catch (const std::exception &e)
-                    {
-                        failed = std::string(e.what()) == "flow reset";
-                    }
-                    require_flow(failed, "RESET did not preserve failure reason for the receiver");
+                    auto receive_reset = [&]() -> asio::awaitable<void> {
+                        std::string reason;
+                        try
+                        {
+                            static_cast<void>(co_await nodes[3]->async_receive_flow(reset.epoch, reset.id));
+                        }
+                        catch (const std::exception &e)
+                        {
+                            reason = e.what();
+                        }
+                        require_flow(reason == "flow reset", ("RESET receiver failed with: " + reason).c_str());
+                    };
+                    // Start the receiver first on the shared data executor, before RESET can remove the Flow.
+                    using namespace asio::experimental::awaitable_operators;
+                    co_await asio::co_spawn(data, receive_reset() && queued(1, reset, false, {}, LnkFrType::Reset),
+                                            asio::use_awaitable);
                 }
                 co_await nodes[0]->async_close_flow(s2.epoch, s2.id);
             }

@@ -118,12 +118,12 @@ asio::awaitable<FlowResult> RelayNode::async_open_flow(std::vector<std::string> 
     co_return co_await asio::co_spawn(control_executor_, self->nodelink_mgr_->open_flow(std::move(path), transport),
                                       asio::use_awaitable);
 }
-asio::awaitable<FlowSendResult> RelayNode::async_send_flow(FlowFrame frame)
+asio::awaitable<FlowSendStatus> RelayNode::async_send_flow(FlowFrame frame)
 {
     auto self = shared_from_this();
     co_return co_await asio::co_spawn(
         cluster_data_executor_,
-        [self, frame = std::move(frame)]() mutable -> asio::awaitable<FlowSendResult> {
+        [self, frame = std::move(frame)]() mutable -> asio::awaitable<FlowSendStatus> {
             co_return self->nodelink_mgr_->channel().send_flow(std::move(frame));
         },
         asio::use_awaitable);

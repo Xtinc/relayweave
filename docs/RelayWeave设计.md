@@ -535,7 +535,7 @@ link.attach，并互相响应 link.attached。只有双方 ready 才完成 ensur
 并发申请合并，失败由外层处理，不反向尝试、不重发接入、不自动重连。
 数据接入绑定 master epoch、唯一 NodeLink ID 和控制通道下发凭据。NodeFlow 的 DATA 使用原始二进制
 payload，共享连接按 flow_id 分派。每 5 秒保活、20 秒无匹配响应失效。Node 数据不应用服务限速或统计。
-`LnkChannel` 位于 node/lnk_channel，直接拥有物理通道和逻辑流分派状态；
+`LnkChannel` 位于 protocol/lnk_channel，直接拥有物理通道和逻辑流分派状态；
 protocol/message 定义固定 32 字节 Node 帧头，DATA/FIN/RESET 与保活不经过 JSON/CBOR。
 TCP 首帧接入沿用 CBOR 并校验 data_version；UDP 使用 8 字节 NodeLink ID + 同一二进制帧头，接入帧体才承载 CBOR。原有回调注册与独立 Forwarder 已移除，数据域共用一个监控计时器。
 NodeLinkMgr 的一个控制协程等待有界通知队列并直接处理 Link/Flow 状态；通知任务由管理器启动、停止和等待，业务帧不经过该队列。
@@ -550,10 +550,23 @@ prepare/commit 共用 10 秒建立期限，各端仅对未提交表项检查准�
 close 等待全路径确认，最多 10 秒；关闭与拥塞不会关闭共享 NodeLink，重连须重新申请 Flow。
 首末 Node 的内部收发接口已支持分叉、回程和失败验证，不依赖 Agent/服务对象。
 Agent 路径提交、首末 socket 桥接和真实业务背压仍待第三、第四阶段实现，现有业务连接仍直达服务所在 Node。
-物理通道、逻辑流协调/分派和首末业务保持独立；信用、调度、池化和换路在这些边界内后续扩展，
+物理通道、逻辑流协调/分派和首末业务保持独立；信用、调度和换路在这些边界内后续扩展，
 现有 Pipeline/DatagramMgr 不承担中间节点状态。
 数据格式在本地 NodeFlow 注入或每跳网络解码时校验一次；内部转发直接编码，不重复校验/查出边。
 数据域使用不可变类型化身份与协议字段，热路径不查 JSON；测试专用 Diagnostic/直接发帧接口已删除。
+NodeLink 使用 Preparing/Resolving/Prepared/WaitingForPeer/Connecting/Attaching/Ready/Closed 状态枚举，
+只额外保留 attached、acknowledged 两个独立握手标志，支持 UDP 握手乱序及对端 Attach 先于本地 connect 到达。
+connect 在启动协程前离开 Prepared，重复请求不会启动第二条连接链；Closed 不会被异步完成覆盖。
+通知 stage 从状态映射，心跳超时显式报告 keepalive，不在对象内保存阶段字符串。
+monitor 等待最近的建立、PING、PONG 失效、Flow 准备或关闭身份回收期限，没有对象时无限期等待。
+PONG 仅在序号大于 last_ack_ping 且不超过已发送 PING 时刷新存活时间，重复响应不延长期限。
+内部 Frame 使用独占的 PooledBuffer，由单线程数据域内的 unsynchronized_pool_resource 分配；
+TCP 直接读入缓冲，UDP 接收后切片，中间节点只移动载荷所有权。UDP 队列只保存 Frame 和 link_id，
+出队校验 ID/epoch，并复制 endpoint 跨越发送等待，不持有 NodeLink。
+公共 FlowFrame 独立拥有 vector/string，接口边界复制一次；端点预算按原始分配大小加每帧 128 字节计费。
+池缓存可复用的块，未保证整个热路径没有动态分配，也未以功能测试代替吞吐测量。
+async_send_flow 返回 FlowSendStatus；CapacityExceeded 表示帧未入队且该 Flow 已关闭，不支持原帧重试。
+接收协程保留 NodeFlow 和 LnkChannel，允许 Flow 从表中删除后安全收尾，确保缓冲归还早于内存池销毁。
 详细接口及后续步骤见 [共享数据通道与按路径转发计划](Node共享数据通道与按路径转发实施计划.md)。
 
 ### 5.2 ControlSession 与 RegistryMgr
@@ -1581,7 +1594,8 @@ TLSChannel 的发送队列满时拒绝本帧、记录原因并直接关闭通道
 | 业务消息发送后断线 | 不保存、不补发、不自动重试；由协议响应和业务超时判断 |
 | RelayNode/RelayAgent 停止 | 取消监听、解析、连接、timer 和 Relay，等待所属协程退出 |
 
-系统不包含 master 选举、备用 master、全局服务目录同步、跨节点数据中继、历史消息或恰好一次投递保证。
+系统不包含 master 选举、备用 master、全局服务目录同步、Agent 业务多跳桥接、历史消息或恰好一次投递保证。
+Node 内部的显式路径转发已实现，尚未接入 Agent 业务 socket。
 
 ## 14. 安全边界
 
@@ -1713,6 +1727,9 @@ sequenceDiagram
 | ClusterMgr | RelayNode 的 `shared_ptr` 成员 | 非拥有的 `RelayNode&` 反向引用 | `async_stop()` 已等待主循环和成员会话退出 |
 | ControlRouter | RelayNode 的 `unique_ptr` 成员，且声明在所借用的 manager 之后 | 对 ClusterMgr、StreamPipeline、DatagramMgr 保存非拥有引用 | Registry 停止且控制会话退出；析构先于所借用对象 |
 | StreamPipeline / DatagramMgr | RelayNode 的 `shared_ptr` 成员；运行中的内部协程按需自持 | ControlRouter 只保存引用 | stop 关闭入口并取消 Relay，内部协程随后自然退出 |
+| NodeLinkMgr / LnkChannel | RelayNode 直接拥有管理器；管理器持有通道 | 控制参数按值跨域；数据任务 completion 保留通道 | 停止申请、清空表并等待数据任务和通知任务退出；接收等待者收尾后释放通道 |
+| lnk::NodeLink | LnkChannel 的 links_ 表及运行中的解析、连接、读写协程 | 同步函数借用 const shared_ptr&；协程按值持有 | close 置 Closed、取消 I/O 并删除表项，最后一个异步持有者退出后销毁 |
+| lnk::NodeFlow | LnkChannel 的 flows_ 表及挂起的 receive_flow 协程 | 同步函数借用 const shared_ptr&；接收协程保留副本 | 关闭队列并删除表项后，等待接收者收尾；retired_ 只保存 ID/期限，不拥有 Flow |
 | TLSChannel | 自己的 run 协程和当前连接协程 | manager/route 使用 `weak_ptr` | 任一读写、心跳、关闭分支结束 |
 | ControlSession | 当前 session 协程 | Registry 和 Relay 使用 weak 引用 | 接收循环结束并完成 disconnect |
 | ClusterRoom | master accept_loop 协程栈 | ClusterSession 保存引用，且必须先于 room 退出 | accept/delivery 停止并等待 participant 清空 |
@@ -1765,7 +1782,9 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 
 - `tls_channel_mtls`：双向证书、主机名校验、握手失败与通道生命周期；
 - `cluster_integration`：ClusterRoom 广播与定向发送、来源、保留/重复 ID、非法命令、成员证书、固定 5 秒重连、无历史回放和停止；
-- `links`：共享 TCP/UDP 双向多流、并发复用、master 端点、单次失败与外层重试、凭据/旧 ID、保活失效、epoch/离线、端口差异、监听回滚和停止排空；
+- `node_links`：共享 TCP/UDP、并发复用、握手乱序、单次失败与外层重试、凭据/旧 ID、有效 PONG、epoch/离线、超长 UDP、过期发送项、监听回滚及并发/取消停止；
+- `node_flows`、`lnk_channel_flows`：双向及分叉转发、方向/epoch/FIN、RESET 与满队列、容量隔离、准备期限、控制失效、接收者唤醒及停止后公开载荷有效性；
+- `lnk_frame`、`pooled_buffer`：固定二进制头和非抛异常的本地帧校验；独占缓冲移动、偏移归还、队列转移及池预热后的上游分配复用；
 - `agent_cluster`：两个节点上的服务同时转发、primary 离线时附加节点恢复、服务迁移、首次目标失败、过期发现响应；
 - `relay_protocol`：控制命令枚举映射、自定义命令、三种协议 attach、帧校验、UDP session header
   和限速基础逻辑；
@@ -1795,6 +1814,7 @@ python test/dashboard_service_smoke.py --build-dir build --two-nodes
 - [`node/src/control_router.cpp`](../node/src/control_router.cpp)：控制命令、服务发现、状态报告和数据面投递；
 - [`node/src/pipeline_mgr.cpp`](../node/src/pipeline_mgr.cpp)：TCP/TLS StreamPipeline 模板、transport policy、Relay 配对和流式转发；
 - [`node/src/cluster_mgr.cpp`](../node/src/cluster_mgr.cpp)：ClusterRoom、ClusterSession、slave connector 和集群消息路由；
+- [`node/src/nodelink_mgr.cpp`](../node/src/nodelink_mgr.cpp)：共享 NodeLink 建连与复用、NodeFlow 路径准备/提交/关闭及数据通知消费；
 - [`node/src/topology.cpp`](../node/src/topology.cpp)：成员探测、报告校验、master 汇总与完整拓扑快照；
 - [`node/src/registry_mgr.cpp`](../node/src/registry_mgr.cpp)：控制会话和本机服务注册；
 - [`node/src/datagram_mgr.cpp`](../node/src/datagram_mgr.cpp)：UDP Relay、session 路由和 endpoint 校验；
@@ -1808,7 +1828,10 @@ python test/dashboard_service_smoke.py --build-dir build --two-nodes
 - [`route/src/icmp.cpp`](../route/src/icmp.cpp)：共享原始 IPv4 socket、探测/接收协程及安全关闭；
 - [`route/src/route_graph.cpp`](../route/src/route_graph.cpp)：纯成本图和按真实节点数量分层的多入口搜索；
 - [`protocol/src/tls_channel.cpp`](../protocol/src/tls_channel.cpp)：mTLS 握手、收发队列、心跳和通道关闭；
+- [`protocol/inc/lnk_channel.h`](../protocol/inc/lnk_channel.h)：NodeLink/NodeFlow、统一 Frame、独占池化缓冲与通道状态；
+- [`protocol/src/lnk_channel.cpp`](../protocol/src/lnk_channel.cpp)：Node TCP/UDP 接入、物理收发、心跳与任务排空；
+- [`protocol/src/lnk_channel_flows.cpp`](../protocol/src/lnk_channel_flows.cpp)：逻辑流安装、分派、容量计费和接收等待；
 - [`protocol/src/message.cpp`](../protocol/src/message.cpp)：控制命令映射、WireMessage、CtrlMessage、RelayAttach 和
-  DatagramHeader；
+  DatagramHeader、Node 二进制帧头及公开 FlowFrame 校验；
 - [`protocol/src/xfr_channel.cpp`](../protocol/src/xfr_channel.cpp)：TCP/TLS/UDP 双向复制、限速和流量计数；
 - [`protocol/inc/dualindex_map.h`](../protocol/inc/dualindex_map.h)：可变次索引、主次键联合查询和批量遍历。

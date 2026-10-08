@@ -20,15 +20,20 @@ target_link_libraries(test_lnk_frame PRIVATE relayweave_protocol)
 add_test(NAME lnk_frame COMMAND test_lnk_frame)
 set_tests_properties(lnk_frame PROPERTIES TIMEOUT 10 LABELS "protocol;unit")
 
+add_executable(test_pooled_buffer pooled_buffer_test.cpp)
+target_link_libraries(test_pooled_buffer PRIVATE relayweave_protocol)
+add_test(NAME pooled_buffer COMMAND test_pooled_buffer)
+set_tests_properties(pooled_buffer PROPERTIES TIMEOUT 10 LABELS "protocol;unit")
+
 add_executable(test_node_flows node_flows_test.cpp)
 target_link_libraries(test_node_flows PRIVATE relayweave_node_lib)
 add_test(NAME node_flows COMMAND test_node_flows)
 set_tests_properties(node_flows PROPERTIES TIMEOUT 100 LABELS "cluster;integration")
 
 add_executable(test_lnk_channel_flows lnk_channel_flows_test.cpp)
-target_link_libraries(test_lnk_channel_flows PRIVATE relayweave_node_lib)
+target_link_libraries(test_lnk_channel_flows PRIVATE relayweave_protocol)
 add_test(NAME lnk_channel_flows COMMAND test_lnk_channel_flows)
-set_tests_properties(lnk_channel_flows PROPERTIES TIMEOUT 45 LABELS "cluster;unit")
+set_tests_properties(lnk_channel_flows PROPERTIES TIMEOUT 45 LABELS "protocol;unit")
 
 add_subdirectory(route)
 

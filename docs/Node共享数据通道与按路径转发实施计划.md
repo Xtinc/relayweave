@@ -55,16 +55,79 @@ Topology::Link / RouteGraph::Link 表示质量报告中的链路或路由图边�
 
 RelayNode 显式接收第四个单线程 `cluster_data_io`。
 `NodeLinkMgr` 协调状态属于 `control_io`，由 RelayNode 直接拥有，直接持有 LnkChannel；
-`node/inc/lnk_channel.h`、`node/src/lnk_channel.cpp` 和 `node/src/lnk_channel_flows.cpp`
+`protocol/inc/lnk_channel.h`、`protocol/src/lnk_channel.cpp` 和 `protocol/src/lnk_channel_flows.cpp`
 中的 LnkChannel 直接持有 TCP/UDP socket、解析/发送队列和逻辑流分派状态，全部属于数据执行域。
+LnkChannel 只依赖 protocol 组件、Asio 和标准库，不依赖 node 的拓扑或协调器；
+NodeLinkMgr 留在 node，负责物理链路协调和完整路径事务，再向 LnkChannel 下发执行参数。
 帧类型与编解码位于 protocol/message。物理读写和逻辑流分派共用一个监控计时器，没有回调注册层。
 跨域使用参数副本、post 和 co_spawn 完成事件，不共享可变 NodeLink 状态。
 启动时同步绑定监听，任何监听失败直接回滚；随后 activate 将任务启动投递到数据执行域，
 任务计数的增加与减少都在该域完成。UDP NodeLink 不创建 TCP socket 或 TCP 发送队列。
+activate 启动 accept、UDP 接收、UDP 发送、monitor 四条独立任务链，复用统一 spawn 计数与退出通知；
+TCP 在握手后按连接启动发送链并继续读取，不为每个数据包启动协程。
 
 公共 `frame_io.h` 提供精确首帧读取和完整 datagram 长度校验；endpoint 直接使用 operator==/!= 比较。
 Agent–Node 的 Pipeline/DatagramMgr 接入也调用这些函数，保留原有配对和限速行为。
 Node 接入握手复用 CtrlMessage/WireMessage，普通数据使用 LnkFrameHeader，UDP 复用 DatagramHeader，不使用 TLS、TokenBucket、服务流量统计或双 socket 复制函数。
+
+### LnkChannel 内部概念
+
+`lnk_channel.h` 在 `lnk` 命名空间中声明独立的 NodeLink、NodeFlow、Frame 与 Datagram，
+不再将领域对象嵌套在 LnkChannel 类中，也不新增文件。
+LnkChannel 是单线程数据域的容器，直接管理 `links_` 和 `flows_` 两张表及共享 I/O、内存池、通知与任务生命周期。
+NodeFlow 与 NodeLink 通过身份关联：一个 NodeFlow 在本节点最多引用 previous/next 两条邻接 Link，
+一条 NodeLink 可以承载多个 Flow。完整路径的选择和事务协调属于 NodeLinkMgr。
+
+| 概念 | 职责与状态 |
+|---|---|
+| NodeFlow | 一条逻辑流在本节点的状态：epoch、transport、previous/next、Prepared/Active/Closed、双向 FIN、准备期限、接收队列及占用字节 |
+| NodeLink | 与一个邻居之间的物理通道：身份、接入握手、Ready/Closed、建立期限、PING/PONG；TCP 持有 socket 和发送队列，UDP 使用 endpoint 与通道共享 socket |
+| Frame | 结构化 LnkFrameHeader 与独占载荷；分派、TCP 发送与终点接收使用同一种表示 |
+| Datagram | UDP 发送项，由 Frame 和目标 link_id 组成，进入共享 udp_writes_ 队列，不持有 NodeLink |
+| PooledBuffer | 字节块所有权与载荷视图；移动、切片只转移所有权或调整视图，存储来自通道拥有的 PMR 池 |
+
+`FrameQueue` 是保存 Frame 的 Asio channel 类型别名，TCP 发送和终点接收复用此队列类型。
+公开接口使用独立拥有载荷的 FlowFrame，在进入和离开数据域时转换为内部 Frame。
+中继路径为 `Frame → TCP 写出` 或 `Frame → Datagram → UDP 写出`，载荷仅移动所有权；写出前在协程帧内编码固定帧头。
+UDP 出队时按 link_id 与帧头 epoch 验证目标仍存在；目标 endpoint 复制到发送协程局部变量，
+不跨 co_await 保存 NodeLink 引用或表迭代器。发送错误时重新查表并校验身份后才关闭 Link，
+正常 UDP 排队和发送无需增减 NodeLink 的共享引用计数。
+业务帧由 header.kind 判定，不另存 business 标记。终点 RESET 直接关闭 Flow 并以原因唤醒接收者，
+无需进入随即被取消的接收队列，也不受接收队列容量影响；中间节点仍按原方向转发 RESET 再关闭本地 Flow。
+
+共享支撑状态由 LnkChannel 持有：`events_` 向控制域报告结果；`monitor_timer_` 调度 Link 心跳、
+Flow 准备和 retired_ 去重记录的到期；`buffered_bytes_` 汇总终点接收缓存，`udp_pending_data_`
+统计共享 UDP 发送队列中的业务项；`tasks_` 与 `tasks_done_` 在停止时等待所有数据任务退出。
+`acceptor_`、`accepting_` 和 `udp_socket_` 管理接入及共享 UDP I/O。
+PMR 池声明在持有缓冲的队列之前，使缓冲先于池销毁。
+
+NodeLink/NodeFlow 的 shared_ptr 用于表项删除与异步任务收尾之间的保活，不代表对象可以活得比通道更久。
+解析、连接、TCP 读写协程按值持有 NodeLink；close 的局部副本保留对象直到删除表项及通知完成。
+receive_flow 在协程帧中同时保留 NodeFlow 和 LnkChannel，关闭后恢复读取状态和原因，再释放对象及池化载荷。
+同步辅助函数的 const shared_ptr& 不增加引用计数；fail_flow 最后调用 close_flow，之后不再访问可能失效的参数引用。
+retired_ 仅保存关闭 ID 和回收期限，不保留 NodeFlow。单线程避免并行访问，不能替代跨挂起点的对象保活。
+
+容量、帧开销、池参数和超时常量只放在两个实现文件中，头文件保留类型与运行状态。
+monitor 提前推进迭代器后直接清理到期 Link，无需临时收集过期项。
+
+### 校验边界
+
+| 入口或阶段 | 保留的校验 |
+|---|---|
+| NodeLinkMgr 控制入口 | 参数类型与非零身份、授权、路径形状及本节点成员资格、重复 prepare 的内容一致性 |
+| LnkChannel prepare | 数据域容量、关闭身份去重、邻接 Link 的 Ready/epoch/peer/transport；这些状态可能在跨域投递后变化 |
+| 本地 send_flow | Flow 存在且 Active、epoch、端点注入方向；FlowFrame 格式、双向 FIN 状态与 UDP 只允许 DATA，在载荷分配前确认 |
+| TCP/UDP 网络入口 | 二进制帧格式与长度、Link epoch；UDP 来源 endpoint 与接入凭据、TCP 接入身份 |
+| incoming_flow | Flow 存在且 Active、预期入边与方向、FIN 状态和 UDP 帧类型 |
+| 内部 deliver/enqueue | 发送队列和终点接收缓存容量；内部帧长度、Link 存活与 Ready 只保留 Debug 断言 |
+| 异步恢复与 UDP 出队 | TCP/解析任务恢复后的 Closed 状态、接收等待后的 Flow 状态、UDP 目标 ID/epoch；防止等待期间关闭或换代 |
+
+FlowFrame::validate 返回 `bool noexcept`，格式错误直接得到 Invalid；准备失败与 UDP 接入容量失败直接报告状态，
+不再主动抛异常后在同一函数中接住。真实 I/O 和网络解码失败仍通过相应入口处理。
+控制参数不在数据域重复验证。停止会在首次等待前清空 Flow/Link 表，查表入口无需重复检查 stopping_。
+Flow 安装时确认邻接 Link 与其 epoch 一致，运行期间 Link 身份、epoch 和 transport 不变；
+关闭 Link 同步删除关联 Flow。因此无等待的内部分派无需再次检查出边 Ready、重复比较 Flow epoch，
+或在 UDP 出队校验 ID/epoch 后重复判定 transport。异步等待后的生命周期校验保留。
 
 ### 身份与协调
 
@@ -91,6 +154,23 @@ TCP/UDP 分别建立和复用。master 自身也可以作为端点。
 并发查询合并，每轮使用独立 request_id；回复同时验证当前 epoch、NodeLink ID、Node 对、
 transport 和认证 source，只接收本轮两端的回复。查询最多等待 5 秒，不重发；
 关闭、成员失效或停止会取消查询并返回原因。回复不携带匹配凭据。
+
+### NodeLink 状态
+
+NodeLink 使用 `Preparing / Resolving / Prepared / WaitingForPeer / Connecting / Attaching / Ready / Closed`
+状态枚举；只保留 `attached`、`acknowledged` 两个独立握手标志，以支持 UDP 握手乱序。
+connect 在启动协程前离开 Prepared，重复请求不会启动新任务。控制通知的 stage 从状态映射，
+心跳超时显式报告 keepalive，不在对象内保存阶段字符串。
+
+| 路径 | 状态转换 |
+|---|---|
+| TCP 发起端 | Preparing → Prepared → Resolving → Connecting → Attaching → Ready |
+| TCP 接收端 | Preparing → Prepared → WaitingForPeer → Attaching → Ready；对端接入早到时可直接从 Prepared 进入 Attaching |
+| UDP | Preparing → Resolving → Prepared → Attaching → Ready |
+| 关闭 | 任意存活状态 → Closed；异步任务恢复后不能覆盖 Closed |
+
+UDP 在 Prepared 期间可以确认对端 Attach 并记录 attached，不跳过本地 connect。
+在 Attaching 期间收齐两个握手标志才进入 Ready，收到确认和收到对端 Attach 的顺序不受限制。
 
 ### TCP
 
@@ -130,12 +210,12 @@ TCP 每连接发送队列 100 帧，UDP 共享发送队列 100 包；各 NodeFlo
 - stop 先拒绝新申请并完成等待者，再关闭数据监听、连接、队列、resolver、timer，等待全部数据任务退出。
 - 数据任务退出后才停止集群控制连接，最后主程序退出并 join 数据线程。
 
-## 第二阶段：独立的 NodeFlow与逐跳转发（已实现）
+## 第二阶段：独立的 NodeFlow 与逐跳转发（已实现）
 
 ### 目标与范围
 
 保留第一阶段的共享通道：每对 Node 复用一条双向 TCP，UDP 使用固定 socket。
-master 显式提交路径，一条逻辑逻辑流对应一条固定路径；中间 Node 按逻辑流和方向分派数据。
+master 显式提交路径，一条逻辑流对应一条固定路径；中间 Node 按逻辑流和方向分派数据。
 首末 Node 使用内部测试接口注入/接收，验证 A→B→C、A→B→D 共用 A–B 通道。
 
 本阶段实现 Node 数据面的最小闭环，独立于 Agent 服务注册、业务 socket、限速与统计。
@@ -148,7 +228,7 @@ NodeLinkMgr、LnkChannel、flow.* 命令和内部逻辑流接口已接入 RelayN
 | 模块 | 执行域 | 直接职责 |
 |---|---|---|
 | NodeLinkMgr | control_io | 成员/epoch 校验、相邻 Node 建连与复用、全路径准备/提交/关闭、回复关联及控制失效清理 |
-| LnkChannel（node） | cluster_data_io | socket、首帧身份、物理读写链、队列、保活及本地逻辑流分派 |
+| LnkChannel（protocol） | cluster_data_io | socket、首帧身份、物理读写链、队列、保活及本地逻辑流分派 |
 | 首末端桥接（后续） | 对应业务/数据执行域 | 将 Agent 业务 socket 绑定到逻辑流，转换数据、半关闭、取消和可写等待 |
 
 RelayNode 与 Pipeline/DatagramMgr 同层直接拥有 NodeLinkMgr；NodeLinkMgr 在内部协调相邻建连和完整路径事务。
@@ -181,10 +261,10 @@ RelayNode 提供以下内部接口：
 | async_receive_flow(epoch, id) | 按逻辑流接收 DATA/FIN；RESET 或失效以异常唤醒等待者，避免多个逻辑流竞争同一个接收队列 |
 | async_close_flow(epoch, id) | master 幂等关闭，等待全路径 closed，最多 10 秒；释放逻辑流状态并保留共享 NodeLink，失联/停止向等待者返回错误 |
 
-发送结果明确区分 queued、would_block、closed、invalid。
-queued 只表示入本地队列；would_block 必须未入队，且保留或返还 payload 给调用方，
-不能部分接收一个帧，也不能要求调用方重发已经成功入队的数据。
-本阶段遇到容量不足使受影响逻辑流失败并报告原因；未来可在相同发送边界加入异步可写等待。
+发送接口直接返回 FlowSendStatus，区分 queued、capacity_exceeded、closed、invalid。
+接口接管输入帧，被拒绝的帧自动释放。queued 只表示完整帧已进入本地队列，不能要求调用方重发已入队数据；
+capacity_exceeded 表示帧未入队。
+capacity_exceeded 会关闭受影响逻辑流并报告原因，不表示可以等待后重试；未来可在相同发送边界加入异步可写等待。
 
 ### 步骤 2：最小逻辑流帧与统一入口
 
@@ -195,15 +275,15 @@ DATA 为最多 4096 字节的原始二进制 payload；测试序号放在测试 
 Node 逻辑流标识独立于 Agent 的现有 UDP session 标识；UDP 外层 DatagramHeader 仍标识相邻 NodeLink，
 不能用它代替跨整条路径的 flow_id，也不能直接透传 Agent datagram 头作为 Node 头。
 FIN 表示一个逻辑方向结束，RESET 表示该逻辑流失败，均不关闭承载其他逻辑流的物理 TCP。
-UDP DATA 保留 datagram 边界，不提供可靠投递、排序或重传；UDP 关闭通过逻辑流控制流程完成，
-不依赖 UDP FIN/RESET 一定送达。
+UDP DATA 保留 datagram 边界，不提供可靠投递、排序或重传；UDP Flow 不接受 FIN/RESET，
+关闭通过逻辑流控制流程完成。
 
 forward 沿提交路径，reverse 沿原路径返回，与 TCP 发起方 Node ID 排序无关。
 当前静态路径先验证无重复 Node/无环，每段严格验证预期入边和邻居，不增加 hop_limit 或换路版本状态。
 转发保持逻辑流身份、方向、帧类型和内容；UDP 将外层 NodeLink ID 替换为出边身份。
 
 物理解析完成后只有一个逻辑流帧分派入口，直接调用同数据域的 LnkChannel。
-DATA/FIN/RESET 直接进入 FlowFrame 分派；PING/PONG 由通道处理。
+DATA/FIN/RESET 直接以内部 Frame 分派；PING/PONG 由通道处理，FlowFrame 仅用于公开收发边界。
 每个逻辑流只消费自己的 receive_flow 队列，不提供所有流竞争的诊断接收队列。
 
 ### 步骤 3：显式路径安装与生命周期
@@ -238,6 +318,23 @@ NodeLink 与集群 mTLS 控制连接分别使用现有心跳，健康控制连�
 关闭/过期身份保留 10 秒的有界去重记录，覆盖本轮 prepare/commit 期限；期间迟到 prepare 不能复活它，
 commit 始终不能创建表项。控制消息使用有序的现有 mTLS 通道，外层重建使用新身份。
 NodeLink PING/PONG 仅判断物理连接，不混入业务 DATA。
+PING 间隔为 5 秒，20 秒未收到新的有效 PONG 则关闭 Link。`last_ack_ping` 记录已确认的最大序号，
+允许确认较早发出但尚未确认的 PING；重复、倒退或超出已发送范围的 PONG 不延长存活期限。
+LnkChannel 使用一个定时器等待最近的建立、心跳、Flow 准备或关闭身份回收期限，不再每 100ms 扫描。
+新增更早期限时重新唤醒并计算；没有待检查对象时无限期等待，stop 取消等待并回收任务。
+
+LnkChannel 的内部载荷使用 `lnk_channel.h` 中独占、可移动的 PooledBuffer，存储来自同一数据执行器上的
+`std::pmr::unsynchronized_pool_resource`，不添加锁或 strand。缓冲保存原始分配大小及载荷视图，
+移动、偏移和排队不复制载荷，析构时以原地址和大小归还池；新分配的字节不做初始化写入。
+所有权由带 PMR 释放器的 `std::unique_ptr` 管理，载荷视图使用 `std::span`，切片只调整视图。
+移动时清空源视图，数据访问直接读取视图，不在每次访问时检查存储是否存在。
+TCP 直接读入池化缓冲；UDP 直接接收到最大合法报文大小加 1 字节的池化缓冲，验证后移除头部视图并转交发送队列，
+不再从公共接收数组复制载荷。多出的 1 字节用于识别超长报文，避免截断后的报文被当成完整帧。
+空载荷不分配字节块，UDP 心跳和 bootstrap 可复用当前接收块。
+公开 FlowFrame 继续独立拥有 vector/string，在发送和接收接口边界复制一次，池化缓冲不跨执行器泄漏。
+等待 receive_flow 时保持 LnkChannel 存活，池声明在持有缓冲的队列之前，所有缓冲先于池销毁。
+端点 8MiB 缓存预算按缓冲原始分配大小加帧开销计费，避免 UDP 小载荷仍持有完整接收块却只按有效字节计费。
+池可向上游按块申请并缓存内存，不承诺零上游分配或新的总内存硬上限；现有队列容量限制保留。
 
 ### 步骤 4：逐跳分派与结束事件
 
@@ -252,7 +349,8 @@ LnkChannel 的本地表项保存逻辑流身份、transport、前后邻居/NodeL
 | S2：A→B→D | A–B → B–D | B–D → A–B |
 
 TCP 同一逻辑流、同一方向的 DATA 和 FIN 保持顺序：FIN 不能被优先发送到此前 DATA 前面。
-FIN 后拒绝该方向的新 DATA，另一方向仍可继续；FIN 后仍允许 RESET。
+FIN 后拒绝该方向的新 DATA 和重复 FIN，另一方向仍可继续；FIN 后仍允许 RESET。
+即使两个方向都收到 FIN，也不自动删除 Flow，最终由显式 close 或失效流程释放。
 RESET 释放该逻辑流并以失败原因唤醒终点等待者。
 此处先验证逻辑事件传播，真实 socket 的 shutdown_send/排空在第四阶段由首末桥接实现。
 
@@ -260,15 +358,17 @@ RESET 释放该逻辑流并以失败原因唤醒终点等待者。
 
 - LnkChannel 保持每条 TCP 一个读链、一个写链；发送队列有界，并为通道保活帧保留少量容量。
 - LnkChannel 的活动表项加关闭去重记录最多 1000 条，每逻辑流终点队列最多 16 帧，
-  全模块终点暂存最多 8 MiB（payload/reason 字节加每帧固定开销）。中间转发直接入物理队列，
+  全模块终点暂存最多 8 MiB（缓冲原始分配大小加每帧 128 字节）。中间转发直接入物理队列，
   TCP 每 NodeLink 和 UDP 全局队列保留 4 个名额给控制帧，DATA/FIN/RESET 的准入上限为 96。
-  容量不足返回 would_block/逻辑流错误，不无限增加 detached 协程或隐藏缓冲。
+  容量不足返回 capacity_exceeded/逻辑流错误，不无限增加 detached 协程或隐藏缓冲。
 - 逻辑流拥塞、逻辑关闭和畸形逻辑流帧不走 fail(link)。最小版不承诺慢逻辑流完全不影响其他逻辑流的延迟，
   也不把拥塞失败处理当作信用控制或业务背压。
 - 物理 NodeLink 断开时，依赖它的逻辑流全部失败；控制连接失效、成员离线/地址变化和 epoch 改变同样清理。
   已入物理队列或网络的旧帧由终点逻辑流身份/状态验证拒绝，不重新建路。
 - stop 先拒绝逻辑流请求并取消控制事务，再清理转发表/队列/等待者，
   最后按现有顺序排空通道数据任务、停止集群控制连接、join 数据线程。
+  LnkChannel 使用 AsyncEvent 等待全部数据任务退出，停止过程屏蔽调用方取消，支持并发和重复停止；
+  activate 只启动一组后台任务，停止后不能再次激活。NodeFlow 使用 Prepared/Active/Closed 表达生命周期。
 - 中间 Node 不使用 TokenBucket、服务限速、业务流量统计，也不依赖 Agent 的重连策略。
 
 ### 步骤 6：后续机制放置的位置
@@ -309,7 +409,7 @@ queued、socket 写完成和终点已消费是三个不同事件，未来信用�
 |---|---|
 | protocol/inc/message.h、protocol/src/message.cpp | flow.* 控制命令、LnkFrameHeader 固定头编解码及 FlowFrame 校验 |
 | protocol/inc/async_event.h | 一次性广播完成事件；单个等待者取消不影响共享事务 |
-| node/inc/lnk_channel.h、node/src/lnk_channel.cpp、node/src/lnk_channel_flows.cpp | 共享 TCP/UDP、直接逻辑流分派、容量及统一监控 |
+| protocol/inc/lnk_channel.h、protocol/src/lnk_channel.cpp、protocol/src/lnk_channel_flows.cpp | 共享 TCP/UDP、直接逻辑流分派、容量及统一监控 |
 | node/inc/nodelink_mgr.h、node/src/nodelink_mgr.cpp | control_io 内的建连、复用、路径与逻辑流事务、通知及停止管理 |
 | node/inc/relay_node.h、node/src/relay_node.cpp | 直接所有权、内部逻辑流接口、控制分发及停止编排 |
 | protocol/CMakeLists.txt、node/CMakeLists.txt、test/CMakeLists.txt | 按模块归属编译与注册测试 |
@@ -348,6 +448,9 @@ TLS 继续用于现有 Agent–Node 接入，Node 间传输使用共享明文 TC
 
 保留首末端原有服务限速和流量统计；中间 Node 只做校验和分派。
 验证真实应用、分叉回程、多服务、多流、半关闭、局部断链和事务回滚，再让新连接实际采用计算路径。
+
+以下保留各轮历史实现和验证记录，旧名称、平台及测试数量只对应当轮。
+当前结构以正文为准，当前 Linux 审查结果见文末。
 
 ## 第一阶段验证
 
@@ -422,7 +525,7 @@ NodeLinks 保留建连协调；NodeSessions 在控制域协调路径，NodeSessi
 - node_channel_protocol 仅链接 protocol，检查独立启动/停止、监听释放和 DATA/FIN/RESET 编解码；
   拒绝缺失参数、错方向、混合 flow/session 身份、超长 payload 和非法 FIN。
 - node_session_forwarder 使用独立协议通道和数据模块，验证错方向/旧 epoch/未知会话拒绝，
-  已关闭身份不能由 prepare/commit/refresh 复活，FIN 后 RESET、准入满时完整返还 payload，
+  已关闭身份不能由 prepare/commit/refresh 复活，FIN 后 RESET、准入满时关闭受影响 Flow，
   准备超时、无控制续期的 20 秒租约清理、等待者取消，以及共享 Link 保活与新会话继续使用。
 - node_sessions 在五个真实 Node、四个独立执行域上验证 TCP/UDP 的 A→B→C 与 A→B→D，
   交错双向数据、反向路径、并发申请、共享边复用、方向结束和错误原因传播、慢会话容量失败，
@@ -494,7 +597,7 @@ TCP 的 link.attach/attached 首帧继续复用 WireMessage/CBOR，双方匹配�
 
 UDP 每个 datagram 均为 8 字节 Link ID + 32 字节帧头 + 帧体，精确校验整体长度、epoch 和固定 endpoint。ATTACH/ATTACHED 的帧体为原有 WireMessage/CBOR；普通数据与保活不解析 CBOR。仍各发送一次接入包，不增加重传、重连或可靠投递。
 
-发送队列直接拥有固定头和原始载荷，TCP 使用两个 buffer，UDP 使用三个 buffer，一次发送完整帧/datagram。中间节点只解析头并移动载荷到出边队列，首末接收队列也移动 DATA 载荷；不为每跳生成 JSON 对象、编码 CBOR 或拼接整帧副本。接收仍需要独立缓冲区，RESET 原因仍有小量字符串复制，不宣称系统级零拷贝。拒绝准入时完整返还未发送载荷，继续保持原有队列容量、保活、租约、FIN/RESET 与停止语义。
+发送队列直接拥有固定头和原始载荷，TCP 使用两个 buffer，UDP 使用三个 buffer，一次发送完整帧/datagram。中间节点只解析头并移动载荷到出边队列，首末接收队列也移动 DATA 载荷；不为每跳生成 JSON 对象、编码 CBOR 或拼接整帧副本。接收仍需要独立缓冲区，RESET 原因仍有小量字符串复制，不宣称系统级零拷贝。拒绝准入时自动释放未发送载荷，继续保持原有队列容量、保活、租约、FIN/RESET 与停止语义。
 
 数据线格式已变更，Node 需要统一升级；没有旧数据格式兼容分支。本次未接入 Agent 业务桥接或增加流控/调度层。
 
@@ -505,7 +608,7 @@ UDP 每个 datagram 均为 8 字节 Link ID + 32 字节帧头 + 帧体，精确�
 ## 命名统一与冗余清理（2026-10-07）
 
 保留 NodeFlow 的原始领域含义：数据域表项使用 LnkChannel::NodeFlow，控制域路径协调器使用 NodeFlows。
-不引起歧义的辅助类型统一为 FlowFrame、FlowResult、FlowSendResult、FlowSendStatus，以及 LinkResult、LinkStatus、LinkData。
+不引起歧义的辅助类型统一为 FlowFrame、FlowResult、FlowSendStatus，以及 LinkResult、LinkStatus、LinkData。
 物理通道协调器为 Links，数据实现为 LnkChannel；对应文件为 links.*、node_flows.*、lnk_channel.* 和 lnk_channel_flows.cpp。
 二进制协议公共类型为 LnkFrameHeader/LnkFrType，仍放在 protocol/message，固定头布局和版本保持一致。
 
@@ -640,3 +743,25 @@ probe_integration 在 Debug 崩溃、Release 本次报实际发送计数断言�
 
 日志为 build/final-review-debug-tests.log 与 build/final-review-release-tests.log。
 完整暂存内容的 git diff --check 通过。未做 Linux 多机、部署脚本运行、Dashboard Python 或性能基准验证。
+
+## 当前 Linux 数据通道审查（2026-10-08）
+
+本轮审查全部 Git 改动及未跟踪的新文件，包括 protocol 文件迁移、公开发送返回值、非抛异常帧校验、
+单定时器调度、NodeLink 状态机、NodeFlow 生命周期、PMR 载荷及相关测试，未发现需要继续修改的生产代码问题。
+保留现有 State 加两个握手 bool、统一 Frame、独占缓冲和同步 shared_ptr 引用接口，没有增加额外抽象层。
+
+已同步本文和《RelayWeave 设计》的模块归属、状态转换、所有权、最近期限唤醒、有效 PONG、
+内存转移、发送拒绝语义、容量计费、测试名称及源码索引。历史记录中的旧名称和结果不代表当前实现。
+NodeLink/NodeFlow 从表中删除后由在途协程保活，通道和池覆盖这些任务的收尾；UDP 排队不持有 NodeLink。
+公开 FlowFrame 不引用内部池，FIN 不自动释放 Flow，UDP Flow 只接受 DATA。
+
+验证环境为 Linux ARM64、GCC 14.2、C++20、Debug。`cmake --build build --parallel 1` 全目标成功，无编译警告。
+首次 CTest 在受限沙箱内因禁止创建 socket 出现初始化失败；允许本地 socket 后重跑完整 26 项：
+25 项通过、0 项失败、1 项跳过，总用时 77.91 秒。
+跳过项为 probe_integration，程序明确报告缺少 Linux CAP_NET_RAW；普通 TCP/UDP、Agent、Proxy、
+NodeLink/NodeFlow、二进制帧、池化缓冲和路由测试均通过。
+
+git diff --check、修改及新增 C++ 文件的行尾空白检查、相关文档本地链接检查通过。
+本轮日志为 `/tmp/relayweave-final-review-build.log` 和 `/tmp/relayweave-final-review-tests-unsandboxed.log`；
+沙箱首次运行记录在 `/tmp/relayweave-final-review-tests.log`。
+本轮未重新执行 Release、ICMP 实测或吞吐/CPU 基准，不将池复用单元测试视为端到端性能提升的证明。

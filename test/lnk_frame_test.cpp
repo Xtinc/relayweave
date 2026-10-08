@@ -104,7 +104,15 @@ int main()
             }
             check(rejected);
         }
-        for (int invalid = 0; invalid < 5; ++invalid)
+        static_assert(noexcept(FlowFrame{}.validate()));
+        for (const auto &frame : {FlowFrame{7, 9, false, LnkFrType::Data, {}, {}},
+                                  FlowFrame{7, 9, true, LnkFrType::Data, BytesBuf(4096), {}},
+                                  FlowFrame{7, 9, false, LnkFrType::Fin, {}, {}},
+                                  FlowFrame{7, 9, true, LnkFrType::Reset, {}, std::string(512, 'x')}})
+        {
+            check(frame.validate());
+        }
+        for (int invalid = 0; invalid < 8; ++invalid)
         {
             FlowFrame frame{7, 9, false, LnkFrType::Data, {0, 255, 3}, {}};
             if (invalid == 0)
@@ -127,16 +135,23 @@ int main()
             {
                 frame.flow_id = 0;
             }
-            bool rejected = false;
-            try
+            if (invalid == 5)
             {
-                frame.validate();
+                frame.epoch = 0;
             }
-            catch (const std::invalid_argument &)
+            if (invalid == 6)
             {
-                rejected = true;
+                frame.kind = LnkFrType::Reset;
+                frame.payload.clear();
+                frame.reason.resize(513);
             }
-            check(rejected);
+            if (invalid == 7)
+            {
+                frame.kind = LnkFrType::Fin;
+                frame.payload.clear();
+                frame.reason = "unexpected FIN reason";
+            }
+            check(!frame.validate());
         }
         std::cout << "[PASS] binary Node frame headers\n";
     }
