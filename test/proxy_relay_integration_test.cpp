@@ -282,7 +282,7 @@ int main()
         consumer_config.connect_timeout = 1s;
         consumer_config.reconnect_initial_delay = 50ms;
         consumer_config.reconnect_max_delay = 200ms;
-        consumer_config.stream_open_timeout = 2s;
+        consumer_config.relay_open_timeout = 2s;
         consumer_config.channel = channel_config();
         consumer_config.forwards = {
             {"proxy-http", "127.0.0.1", local_http_port, RelayProtocol::Tls},

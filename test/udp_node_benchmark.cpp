@@ -436,7 +436,7 @@ int main(int argc, char *argv[])
         config.tcp.max_relays = 1;
         config.datagram.max_relays = 1;
         config.tcp.setup_timeout = 5s;
-        config.datagram.service_wait_timeout = 5s;
+        config.datagram.setup_timeout = 5s;
         config.channel = channel_config();
 
         auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,

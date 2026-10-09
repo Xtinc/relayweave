@@ -1,5 +1,4 @@
-#include "control_router.h"
-#include "topology.h"
+#include "relay_node.h"
 
 namespace
 {
@@ -13,11 +12,15 @@ void validate_server_status(const njson &params, std::string_view location)
 
     const auto services = params.find("services");
     if (services == params.end() || !services->is_array())
+    {
         throw std::invalid_argument(std::string(location) + ".services must be an array");
+    }
     for (const auto &service : *services)
     {
         if (!service.is_object())
+        {
             throw std::invalid_argument(std::string(location) + ".services entries must be objects");
+        }
         reject_unknown_fields(
             service,
             {"service", "protocol", "rx_bytes", "tx_bytes", "rx_bytes_per_second", "tx_bytes_per_second", "accessors"},
@@ -30,77 +33,26 @@ void validate_server_status(const njson &params, std::string_view location)
         require_unsigned(service, "tx_bytes_per_second");
         const auto accessors = service.find("accessors");
         if (accessors == service.end() || !accessors->is_object())
+        {
             throw std::invalid_argument(std::string(location) + ".services.accessors must be an object");
+        }
         for (const auto &[client, connections] : accessors->items())
         {
             if (client.empty())
+            {
                 throw std::invalid_argument(std::string(location) + ".services.accessors client must not be empty");
+            }
             if (!connections.is_number_unsigned() || connections.get<std::uint64_t>() == 0)
+            {
                 throw std::invalid_argument(std::string(location) + ".services.accessors.connections must be positive");
+            }
         }
     }
 }
 } // namespace
 
-ControlRouter::ControlRouter(asio::any_io_executor transfer_tcp_executor, asio::any_io_executor transfer_udp_executor,
-                             ControlRouterConfig config, std::shared_ptr<ClusterMgr> cluster_mgr,
-                             std::shared_ptr<TcpPipeline> tcp_pipeline, std::shared_ptr<TlsPipeline> tls_pipeline,
-                             std::shared_ptr<DatagramMgr> datagram_mgr, Topology &topology,
-                             ClusterMessageChannel &cluster_messages,
-                             const std::atomic<std::uint32_t> &control_queue_delay_us,
-                             const std::atomic<std::uint32_t> &transfer_tcp_queue_delay_us,
-                             const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us)
-    : transfer_tcp_executor_(std::move(transfer_tcp_executor)),
-      transfer_udp_executor_(std::move(transfer_udp_executor)), config_(std::move(config)),
-      cluster_mgr_(std::move(cluster_mgr)), tcp_pipeline_(std::move(tcp_pipeline)),
-      tls_pipeline_(std::move(tls_pipeline)), datagram_mgr_(std::move(datagram_mgr)), topology_(topology),
-      cluster_messages_(cluster_messages), control_queue_delay_us_(control_queue_delay_us),
-      transfer_tcp_queue_delay_us_(transfer_tcp_queue_delay_us),
-      transfer_udp_queue_delay_us_(transfer_udp_queue_delay_us),
-      registry_(config_.max_connections, config_.max_services, config_.max_services_per_session)
-{
-    if (!cluster_mgr_ || !tcp_pipeline_ || !tls_pipeline_ || !datagram_mgr_)
-        throw std::invalid_argument("ControlRouter managers must not be null");
-}
-
-void ControlRouter::start()
-{
-    started_at_ = std::chrono::steady_clock::now();
-}
-
-void ControlRouter::stop()
-{
-    registry_.stop();
-}
-
-bool ControlRouter::full() noexcept
-{
-    return registry_.full();
-}
-
-std::size_t ControlRouter::session_count() noexcept
-{
-    return registry_.session_count();
-}
-
-ControlRouter::SessionId ControlRouter::add_session(const ControlSessionPtr &session)
-{
-    const auto id = allocate_session_id();
-    registry_.add(id, session);
-    return id;
-}
-
-void ControlRouter::remove_session(SessionId id, const ControlSessionPtr &session)
-{
-    registry_.remove(id);
-    asio::post(transfer_tcp_executor_, [tcp = tcp_pipeline_, tls = tls_pipeline_, session]() {
-        tcp->disconnect(session);
-        tls->disconnect(session);
-    });
-    asio::post(transfer_udp_executor_, [datagram = datagram_mgr_, session]() { datagram->disconnect(session); });
-}
-
-void ControlRouter::handle(SessionId id, const ControlSessionPtr &session, CtrlMessage message)
+// Public Node control state and queries require control_io.
+void RelayNode::handle_control_message(SessionId id, const ControlSessionPtr &session, CtrlMessage message)
 {
     const auto &params = config::message_params(message);
     switch (message.type())
@@ -109,7 +61,10 @@ void ControlRouter::handle(SessionId id, const ControlSessionPtr &session, CtrlM
         register_service(id, session, params);
         break;
     case CtrlCommand::ServerIdentify:
-        session->send(CtrlMessage{CtrlCommand::ServerIdentified, njson{{"node_id", config_.node_id}}});
+        session->send(CtrlMessage{CtrlCommand::ServerIdentified, njson{{"node_id", config_.cluster.node_id}}});
+        break;
+    case CtrlCommand::NodeLookup:
+        locate_node(id, session, params);
         break;
     case CtrlCommand::ServiceLookup:
         locate_service(id, session, params);
@@ -130,23 +85,26 @@ void ControlRouter::handle(SessionId id, const ControlSessionPtr &session, CtrlM
         report_topology(id, session, params);
         break;
     case CtrlCommand::RelayOpen:
-        open_relay(session, params);
-        break;
     case CtrlCommand::RelayReject:
-        reject_relay(session, params);
-        break;
     case CtrlCommand::RelayCancel:
-        cancel_relay(session, params);
+        handle_relay(session, message);
         break;
     default:
         throw std::invalid_argument("Unknown control command: " + message.command);
     }
 }
 
-void ControlRouter::handle_cluster(CtrlMessage message)
+void RelayNode::handle_control_cluster_message(CtrlMessage message)
 {
     switch (message.type())
     {
+    case CtrlCommand::NodeLookup:
+        handle_node_lookup(config::message_params(message));
+        break;
+    case CtrlCommand::NodeLocated:
+    case CtrlCommand::NodeError:
+        handle_node_location(std::move(message));
+        break;
     case CtrlCommand::ServiceLookup:
         handle_cluster_lookup(config::message_params(message));
         break;
@@ -167,24 +125,21 @@ void ControlRouter::handle_cluster(CtrlMessage message)
         break;
     default:
         if (!cluster_messages_.try_send(asio::error_code{}, std::move(message)))
+        {
             PROXY_ERROR_PRINT("Cluster receive rejected reason=queue full");
+        }
         break;
     }
 }
 
-void ControlRouter::sample_traffic()
-{
-    registry_.sample_traffic();
-}
-
-void ControlRouter::broadcast_client_query(SessionId id, CtrlMessage message)
+void RelayNode::broadcast_client_query(SessionId id, CtrlMessage message)
 {
     static_cast<void>(config::message_params(message));
     (*message.params)["session_id"] = id;
     cluster_mgr_->broadcast(std::move(message));
 }
 
-void ControlRouter::attach_cluster_reply_route(CtrlMessage &reply, const njson &query)
+void RelayNode::attach_cluster_reply_route(CtrlMessage &reply, const njson &query)
 {
     auto &params = *reply.params;
     params.erase("node_id");
@@ -193,14 +148,18 @@ void ControlRouter::attach_cluster_reply_route(CtrlMessage &reply, const njson &
     params["request_id"] = query.at("request_id");
 }
 
-ControlSessionPtr ControlRouter::prepare_client_reply(CtrlMessage &reply, std::string_view location)
+ControlSessionPtr RelayNode::prepare_client_reply(CtrlMessage &reply, std::string_view location)
 {
     const auto &params = config::message_params(reply);
-    if (config::required_string(params, "requester_node", location) != config_.node_id)
+    if (config::required_string(params, "requester_node", location) != config_.cluster.node_id)
+    {
         return {};
+    }
     auto session = registry_.find_session(config::require_unsigned(params, "session_id", true));
     if (!session)
+    {
         return {};
+    }
     (*reply.params)["node_id"] = config::required_string(params, "source", location);
     reply.params->erase("source");
     reply.params->erase("requester_node");
@@ -208,7 +167,7 @@ ControlSessionPtr ControlRouter::prepare_client_reply(CtrlMessage &reply, std::s
     return session;
 }
 
-void ControlRouter::register_service(SessionId id, const ControlSessionPtr &session, const njson &params)
+void RelayNode::register_service(SessionId id, const ControlSessionPtr &session, const njson &params)
 {
     const auto request_id = config::require_unsigned(params, "request_id");
     const auto service = config::message_service(params);
@@ -233,16 +192,10 @@ void ControlRouter::register_service(SessionId id, const ControlSessionPtr &sess
     session->send(CtrlMessage{
         CtrlCommand::ServiceOk,
         njson{{"request_id", request_id}, {"service", service}, {"protocol", relay_protocol_name(protocol)}}});
-    if (protocol == RelayProtocol::Udp)
-    {
-        asio::post(transfer_udp_executor_,
-                   [datagram = datagram_mgr_, session, service, traffic = std::move(traffic)]() {
-                       datagram->attach_service(session, service, traffic);
-                   });
-    }
+
 }
 
-void ControlRouter::locate_service(SessionId id, const ControlSessionPtr &session, const njson &params)
+void RelayNode::locate_service(SessionId id, const ControlSessionPtr &session, const njson &params)
 {
     if (auto location = service_location(params))
     {
@@ -254,14 +207,14 @@ void ControlRouter::locate_service(SessionId id, const ControlSessionPtr &sessio
                                                                              {"protocol", params.at("protocol")}}});
 }
 
-void ControlRouter::report_cluster_status(SessionId id, const ControlSessionPtr &session, const njson &params)
+void RelayNode::report_cluster_status(SessionId id, const ControlSessionPtr &session, const njson &params)
 {
     const auto request_id = config::require_unsigned(params, "request_id", true);
     session->send(server_status_message(request_id));
     broadcast_client_query(id, CtrlMessage{CtrlCommand::ServerStatusQuery, njson{{"request_id", request_id}}});
 }
 
-void ControlRouter::handle_cluster_lookup(const njson &params)
+void RelayNode::handle_cluster_lookup(const njson &params)
 {
     const auto requester = config::required_string(params, "source", "service.lookup");
     static_cast<void>(config::require_unsigned(params, "session_id", true));
@@ -272,11 +225,13 @@ void ControlRouter::handle_cluster_lookup(const njson &params)
     }
 }
 
-void ControlRouter::handle_cluster_location(CtrlMessage message)
+void RelayNode::handle_cluster_location(CtrlMessage message)
 {
     auto session = prepare_client_reply(message, "service.located");
     if (!session)
+    {
         return;
+    }
     const auto &params = config::message_params(message);
     config::require_unsigned(params, "request_id", true);
     config::message_service(params);
@@ -286,11 +241,13 @@ void ControlRouter::handle_cluster_location(CtrlMessage message)
     session->send(std::move(message));
 }
 
-void ControlRouter::handle_cluster_status_query(const njson &params)
+void RelayNode::handle_cluster_status_query(const njson &params)
 {
     const auto requester = config::required_string(params, "source", "server.status.query");
-    if (requester == config_.node_id)
+    if (requester == config_.cluster.node_id)
+    {
         return;
+    }
     static_cast<void>(config::require_unsigned(params, "session_id", true));
     const auto request_id = config::require_unsigned(params, "request_id", true);
     auto report = server_status_message(request_id);
@@ -299,48 +256,52 @@ void ControlRouter::handle_cluster_status_query(const njson &params)
     cluster_mgr_->send(requester, std::move(report));
 }
 
-void ControlRouter::handle_cluster_status_report(CtrlMessage message)
+void RelayNode::handle_cluster_status_report(CtrlMessage message)
 {
     auto session = prepare_client_reply(message, "server.status.report");
     if (!session)
+    {
         return;
+    }
     validate_server_status(config::message_params(message), "server.status.report");
     message.command = std::string(ctrl_command_name(CtrlCommand::ServerStatusReported));
     session->send(std::move(message));
 }
 
-void ControlRouter::report_topology(SessionId id, const ControlSessionPtr &session, const njson &params)
+void RelayNode::report_topology(SessionId id, const ControlSessionPtr &session, const njson &params)
 {
     const auto request_id = config::require_unsigned(params, "request_id", true);
-    if (topology_.is_master())
+    if (topology_->is_master())
     {
-        if (auto snapshot = topology_.snapshot_message(request_id))
+        if (auto snapshot = topology_->snapshot_message(request_id))
+        {
             session->send(std::move(*snapshot));
+        }
         return;
     }
     broadcast_client_query(id, CtrlMessage{CtrlCommand::TopologyQuery, njson{{"request_id", request_id}}});
 }
 
-void ControlRouter::handle_topology_query(const njson &params)
+void RelayNode::handle_topology_query(const njson &params)
 {
-    if (!topology_.is_master())
+    if (!topology_->is_master())
     {
         return;
     }
     const auto requester = config::required_string(params, "source", "topology.query");
     static_cast<void>(config::require_unsigned(params, "session_id", true));
     const auto request_id = config::require_unsigned(params, "request_id", true);
-    if (auto snapshot = topology_.snapshot_message(request_id))
+    if (auto snapshot = topology_->snapshot_message(request_id))
     {
         attach_cluster_reply_route(*snapshot, params);
         cluster_mgr_->send(requester, std::move(*snapshot));
     }
 }
 
-void ControlRouter::handle_topology_snapshot(CtrlMessage message)
+void RelayNode::handle_topology_snapshot(CtrlMessage message)
 {
     if (config::required_string(config::message_params(message), "source", "topology.snapshot") !=
-        topology_.master_id())
+        topology_->master_id())
     {
         return;
     }
@@ -354,42 +315,46 @@ void ControlRouter::handle_topology_snapshot(CtrlMessage message)
     session->send(std::move(message));
 }
 
-std::optional<CtrlMessage> ControlRouter::service_location(const njson &params)
+std::optional<CtrlMessage> RelayNode::service_location(const njson &params)
 {
     const auto request_id = config::require_unsigned(params, "request_id", true);
     const auto service = config::message_service(params);
     const auto protocol = config::message_protocol(params);
     const auto local = registry_.find_service(service);
     if (!local || local->protocol != protocol)
+    {
         return std::nullopt;
+    }
     return CtrlMessage{CtrlCommand::ServiceLocated, njson{{"request_id", request_id},
                                                           {"service", service},
                                                           {"protocol", relay_protocol_name(protocol)},
-                                                          {"node_id", config_.node_id},
-                                                          {"address", config_.advertise_address},
-                                                          {"port", config_.control_port}}};
+                                                          {"node_id", config_.cluster.node_id},
+                                                          {"address", config_.control.advertise_address},
+                                                          {"port", config_.control.port}}};
 }
 
-CtrlMessage ControlRouter::server_status_message(std::uint64_t request_id)
+CtrlMessage RelayNode::server_status_message(std::uint64_t request_id)
 {
     const auto uptime =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at_).count();
-    njson params{{"request_id", request_id}, {"node_id", config_.node_id}, {"uptime_ms", uptime < 0 ? 0 : uptime}};
+    njson params{{"request_id", request_id}, {"node_id", config_.cluster.node_id}, {"uptime_ms", uptime < 0 ? 0 : uptime}};
     params["services"] = registry_.traffic_report();
     return CtrlMessage{CtrlCommand::ServerStatusReported, std::move(params)};
 }
 
-void ControlRouter::list_services(const ControlSessionPtr &session, const njson &params)
+void RelayNode::list_services(const ControlSessionPtr &session, const njson &params)
 {
     const auto request_id = config::require_unsigned(params, "request_id");
     njson names = njson::array();
     for (auto &service : registry_.service_names())
+    {
         names.push_back(std::move(service));
+    }
     session->send(
         CtrlMessage{CtrlCommand::ServiceListed, njson{{"request_id", request_id}, {"services", std::move(names)}}});
 }
 
-void ControlRouter::report_load(const ControlSessionPtr &session, const njson &params)
+void RelayNode::report_load(const ControlSessionPtr &session, const njson &params)
 {
     const auto request_id = config::require_unsigned(params, "request_id");
     session->send(CtrlMessage{
@@ -400,90 +365,73 @@ void ControlRouter::report_load(const ControlSessionPtr &session, const njson &p
               {"transfer_udp_queue_delay_us", transfer_udp_queue_delay_us_.load(std::memory_order_relaxed)}}});
 }
 
-void ControlRouter::report_traffic(const ControlSessionPtr &session, const njson &params)
+void RelayNode::report_traffic(const ControlSessionPtr &session, const njson &params)
 {
     const auto request_id = config::require_unsigned(params, "request_id");
     session->send(CtrlMessage{CtrlCommand::ServerTrafficReported,
                               njson{{"request_id", request_id}, {"services", registry_.traffic_report()}}});
 }
 
-void ControlRouter::open_relay(const ControlSessionPtr &consumer, const njson &params)
-{
-    const auto request_id = config::require_unsigned(params, "request_id");
-    const auto service = config::message_service(params);
-    const auto protocol = config::message_protocol(params);
-    auto producer = registry_.find_service(service);
-    if ((!producer && protocol != RelayProtocol::Udp) || (producer && producer->protocol != protocol))
-    {
-        consumer->send(CtrlMessage{CtrlCommand::RelayError,
-                                   njson{{"request_id", request_id},
-                                         {"service", service},
-                                         {"protocol", relay_protocol_name(protocol)},
-                                         {"reason", !producer ? "service unavailable" : "service protocol mismatch"}}});
-        return;
-    }
-
-    auto traffic = producer ? producer->traffic : SRVTrafficPtr{};
-    if (protocol == RelayProtocol::Tcp)
-    {
-        asio::post(transfer_tcp_executor_, [pipeline = tcp_pipeline_, producer = producer->session, consumer, service,
-                                            request_id, traffic = std::move(traffic)]() mutable {
-            pipeline->open(producer, consumer, std::move(service), request_id, std::move(traffic));
-        });
-    }
-    else if (protocol == RelayProtocol::Tls)
-    {
-        asio::post(transfer_tcp_executor_, [pipeline = tls_pipeline_, producer = producer->session, consumer, service,
-                                            request_id, traffic = std::move(traffic)]() mutable {
-            pipeline->open(producer, consumer, std::move(service), request_id, std::move(traffic));
-        });
-    }
-    else
-    {
-        asio::post(transfer_udp_executor_, [datagram = datagram_mgr_,
-                                            producer = producer ? producer->session : ControlSessionPtr{}, consumer,
-                                            service, request_id, traffic = std::move(traffic)]() mutable {
-            datagram->open(consumer, std::move(service), request_id, std::move(producer), std::move(traffic));
-        });
-    }
-}
-
-void ControlRouter::reject_relay(const ControlSessionPtr &session, const njson &params)
-{
-    const auto uuid = config::require_unsigned(params, "uuid", true);
-    auto reason = config::optional_string(params, "reason", "producer rejected relay");
-    asio::post(transfer_tcp_executor_,
-               [tcp = tcp_pipeline_, tls = tls_pipeline_, datagram = datagram_mgr_,
-                udp_executor = transfer_udp_executor_, session, uuid, reason = std::move(reason)]() mutable {
-                   if (!tcp->reject(session, uuid, reason) && !tls->reject(session, uuid, reason))
-                       asio::post(udp_executor, [datagram, session, uuid, reason = std::move(reason)]() mutable {
-                           datagram->reject(session, uuid, std::move(reason));
-                       });
-               });
-}
-
-void ControlRouter::cancel_relay(const ControlSessionPtr &session, const njson &params)
-{
-    std::optional<std::uint64_t> uuid;
-    if (params.contains("uuid"))
-        uuid = config::require_unsigned(params, "uuid", true);
-    const auto request_id = config::optional_unsigned(params, "request_id");
-    asio::post(transfer_tcp_executor_, [tcp = tcp_pipeline_, tls = tls_pipeline_, datagram = datagram_mgr_,
-                                        udp_executor = transfer_udp_executor_, session, uuid, request_id]() {
-        if (!tcp->cancel(session, uuid, request_id) && !tls->cancel(session, uuid, request_id))
-            asio::post(udp_executor,
-                       [datagram, session, uuid, request_id]() { datagram->cancel(session, uuid, request_id); });
-    });
-}
-
-ControlRouter::SessionId ControlRouter::allocate_session_id()
+RelayNode::SessionId RelayNode::allocate_session_id()
 {
     SessionId id;
     do
     {
         id = next_session_id_++;
         if (next_session_id_ == 0)
+        {
             next_session_id_ = 1;
+        }
     } while (registry_.contains(id));
     return id;
+}
+
+void RelayNode::locate_node(SessionId id, const ControlSessionPtr &session, const njson &params)
+{
+    const auto request = config::require_unsigned(params, "request_id", true);
+    const auto node = config::required_string(params, "node_id", "node.lookup");
+    if (!topology_->members().contains(node))
+    {
+        session->send(CtrlMessage(CtrlCommand::NodeError,
+            njson{{"request_id", request}, {"node_id", node}, {"reason", "node unavailable"}}));
+        return;
+    }
+    if (node == config_.cluster.node_id)
+    {
+        session->send(CtrlMessage(CtrlCommand::NodeLocated,
+            njson{{"request_id", request}, {"node_id", node},
+                  {"address", config_.control.advertise_address}, {"port", config_.control.port}}));
+        return;
+    }
+    cluster_mgr_->send(node, CtrlMessage(CtrlCommand::NodeLookup,
+        njson{{"request_id", request}, {"node_id", node}, {"session_id", id}}));
+}
+
+void RelayNode::handle_node_lookup(const njson &params)
+{
+    const auto source = config::required_string(params, "source", "node.lookup");
+    if (config::required_string(params, "node_id", "node.lookup") != config_.cluster.node_id ||
+        !topology_->members().contains(source))
+    {
+        return;
+    }
+    CtrlMessage reply(CtrlCommand::NodeLocated,
+        njson{{"address", config_.control.advertise_address}, {"port", config_.control.port}});
+    attach_cluster_reply_route(reply, params);
+    cluster_mgr_->send(source, std::move(reply));
+}
+
+void RelayNode::handle_node_location(CtrlMessage message)
+{
+    if (auto session = prepare_client_reply(message, "node.located"))
+    {
+        const auto &params = config::message_params(message);
+        config::require_unsigned(params, "request_id", true);
+        if (message.type() == CtrlCommand::NodeLocated)
+        {
+            config::required_string(params, "address", "node.located");
+            config::required_port(params, "port", "node.located");
+        }
+        session->send(std::move(message));
+    }
 }

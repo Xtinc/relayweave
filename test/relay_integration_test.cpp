@@ -1,4 +1,3 @@
-#include "control_router.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
 #include "relay_node.h"
@@ -82,7 +81,7 @@ void verify_server_config(const DataFiles &files)
             "TLS data traffic limits were not parsed independently");
     require(modern.datagram.address == "127.0.0.1" && modern.datagram.port == 18445,
             "UDP listener was not parsed");
-    require(modern.datagram.max_relays == 11 && modern.datagram.service_wait_timeout == 2500ms,
+    require(modern.datagram.max_relays == 11 && modern.datagram.setup_timeout == 2500ms,
             "Modern server UDP limits were not parsed");
     require(modern.datagram.traffic.rx_bytes_per_second == 2001 &&
                 modern.datagram.traffic.rx_burst_bytes == 2002 &&
@@ -224,6 +223,10 @@ void verify_server_config(const DataFiles &files)
         candidate[field] = njson::object();
         require_rejected(std::move(candidate), std::string("legacy root field ") + field);
     }
+    auto legacy_udp_wait = baseline;
+    legacy_udp_wait["udp"]["service_wait_timeout_ms"] = 1000;
+    require_rejected(std::move(legacy_udp_wait), "removed udp.service_wait_timeout_ms");
+
     auto legacy_capacity = baseline;
     legacy_capacity["tcp"]["max_pending_relays"] = 1;
     require_rejected(std::move(legacy_capacity), "legacy tcp.max_pending_relays");
@@ -642,6 +645,7 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     const auto cancelled = co_await receive_command(consumer, "relay.error");
     require(params_of(cancelled).at("request_id") == 10U, "Cancelled Pipe returned the wrong request ID");
     require(params_of(cancelled).at("reason") == "relay cancelled", "Unexpected relay cancellation reason");
+    co_await receive_command(producer, "relay.closed");
 
     consumer->send(CtrlMessage{
         "relay.open", njson{{"request_id", 12U}, {"service", "lifecycle"}, {"protocol", "tcp"}}});
@@ -672,6 +676,7 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     const auto rejected = co_await receive_command(consumer, "relay.error");
     require(params_of(rejected).at("request_id") == 12U, "Rejected Pipe returned the wrong request ID");
     require(params_of(rejected).at("reason") == "test rejection", "Producer rejection reason was not preserved");
+    co_await receive_command(producer, "relay.closed");
     co_await require_socket_closed(producer_half, "Rejecting a one-half Pipe did not close its data socket");
 
     consumer->send(CtrlMessage{
@@ -683,6 +688,7 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
             "Zero-half Pipe timeout returned the wrong request ID");
     require(params_of(zero_half_timeout).at("reason") == "relay setup timed out",
             "Zero-half Pipe did not expire through its setup timer");
+    co_await receive_command(producer, "relay.closed");
 
     consumer->send(CtrlMessage{
         "relay.open", njson{{"request_id", 14U}, {"service", "lifecycle"}, {"protocol", "tcp"}}});
@@ -697,6 +703,7 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
             "One-half Pipe timeout returned the wrong request ID");
     require(params_of(one_half_timeout).at("reason") == "relay setup timed out",
             "One-half Pipe did not expire through its setup timer");
+    co_await receive_command(producer, "relay.closed");
     co_await require_socket_closed(timed_out_half, "One-half Pipe timeout did not close its data socket");
 
     consumer->send(CtrlMessage{
@@ -910,7 +917,7 @@ int main(int argc, char *argv[])
         server_config.datagram.max_relays = 1;
         server_config.tcp.setup_timeout = 500ms;
         server_config.tls.setup_timeout = 500ms;
-        server_config.datagram.service_wait_timeout = 500ms;
+        server_config.datagram.setup_timeout = 500ms;
         server_config.channel = channel_config();
         auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
                                                   std::move(server_config));
@@ -934,7 +941,7 @@ int main(int argc, char *argv[])
         consumer_config.connect_timeout = 1s;
         consumer_config.reconnect_initial_delay = 50ms;
         consumer_config.reconnect_max_delay = 200ms;
-        consumer_config.stream_open_timeout = 2s;
+        consumer_config.relay_open_timeout = 2s;
         consumer_config.channel = channel_config();
         consumer_config.forwards.push_back(
             AgentForwardConfig{"echo", "127.0.0.1", forward_port, RelayProtocol::Tls});

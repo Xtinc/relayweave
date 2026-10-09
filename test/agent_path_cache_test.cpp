@@ -317,13 +317,13 @@ asio::awaitable<void> verify_cache(ControlPeer &peer, std::shared_ptr<RelayAgent
     peer.channel->send(CtrlMessage{CtrlCommand::TopologySnapshot, snapshot});
     co_await peer.barrier(logs);
     co_await open_batch(ports);
-    logs.expect_calculations(1);
+    logs.expect_calculations(2);
     const auto cached_at = AgentRouting::Clock::now();
 
     peer.channel->send(CtrlMessage{CtrlCommand::TopologySnapshot, snapshot});
     co_await peer.barrier(logs);
     co_await open_batch(ports);
-    logs.expect_calculations(1);
+    logs.expect_calculations(2);
 
     // Accept fresh metrics at two regular five-second polls. They must neither
     // invalidate the destination cache nor renew its fifteen-second TTL.
@@ -341,12 +341,12 @@ asio::awaitable<void> verify_cache(ControlPeer &peer, std::shared_ptr<RelayAgent
         peer.channel->send(CtrlMessage{CtrlCommand::TopologySnapshot, std::move(metrics)});
         co_await peer.barrier(logs);
         co_await open_batch(ports);
-        logs.expect_calculations(1);
+        logs.expect_calculations(2);
     }
     asio::steady_timer expiry(co_await asio::this_coro::executor, cached_at + 15100ms);
     co_await expiry.async_wait(asio::use_awaitable);
     co_await open_batch(ports);
-    logs.expect_calculations(2);
+    logs.expect_calculations(3);
 
     co_await wait_for([&] { return peer.topology_request != request; }, "Next topology request timed out");
     auto malformed = peer.snapshot();
@@ -357,17 +357,17 @@ asio::awaitable<void> verify_cache(ControlPeer &peer, std::shared_ptr<RelayAgent
     require(logs.read().find("Topology rejected") != std::string::npos,
             "Malformed topology did not exercise rejection");
     co_await open_batch(ports);
-    logs.expect_calculations(2);
+    logs.expect_calculations(3);
 
     const auto identifications = peer.identifications;
     co_await peer.channel->async_disconnect();
     co_await pause(50ms);
     co_await open_batch(ports, 2);
-    logs.expect_calculations(2);
+    logs.expect_calculations(3);
     co_await wait_for([&] { return peer.identifications == identifications + 1; }, "Control reconnect timed out");
     co_await peer.barrier(logs);
     co_await open_batch(ports);
-    logs.expect_calculations(3);
+    logs.expect_calculations(4);
 
     co_await agent->async_stop();
     peer.acceptor.close();

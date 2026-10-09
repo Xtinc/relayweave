@@ -99,7 +99,7 @@ NodeConfig load_node_config(const std::filesystem::path &path)
         "control");
     const auto &udp = required_object(root, "udp", "root");
     reject_unknown_fields(udp,
-                          {"address", "port", "max_relays", "service_wait_timeout_ms", "rx_bytes_per_second",
+                          {"address", "port", "max_relays", "setup_timeout_ms", "rx_bytes_per_second",
                            "rx_max_burst_bytes", "tx_bytes_per_second", "tx_max_burst_bytes"},
                           "udp");
     const auto &certificate = required_object(root, "certificate", "root");
@@ -135,8 +135,8 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     result.datagram.address = required_string(udp, "address", "udp");
     result.datagram.port = required_port(udp, "port", "udp");
     result.datagram.max_relays = required_capacity(udp, "max_relays", "udp");
-    result.datagram.service_wait_timeout =
-        optional_duration(udp, "service_wait_timeout_ms", result.datagram.service_wait_timeout, "udp");
+    result.datagram.setup_timeout =
+        optional_duration(udp, "setup_timeout_ms", result.datagram.setup_timeout, "udp");
     result.datagram.traffic = parse_traffic_limit_config(udp, "udp");
 
     const auto base = configuration_directory(path);

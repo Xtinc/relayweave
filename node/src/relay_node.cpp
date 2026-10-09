@@ -1,5 +1,5 @@
 #include "relay_node.h"
-#include "control_router.h"
+#include "relay_session.h"
 #include <algorithm>
 #include <future>
 
@@ -21,8 +21,11 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
       datagram_mgr_(std::make_shared<DatagramMgr>(
           transfer_udp_executor_, relay_id_allocator_,
           asio::ip::udp::endpoint(asio::ip::make_address(config_.datagram.address), config_.datagram.port),
-          config_.datagram.max_relays, config_.datagram.service_wait_timeout, config_.datagram.traffic))
+          config_.datagram.max_relays, config_.datagram.traffic)),
+      registry_(config_.control.max_connections, config_.control.max_services, config_.control.max_services_per_session),
+      relays_done_(control_executor_)
 {
+    relays_done_.expires_at(std::chrono::steady_clock::time_point::max());
     control_sessions_done_.expires_at(std::chrono::steady_clock::time_point::max());
     if (&control_io == &transfer_tcp_io || &control_io == &transfer_udp_io || &transfer_tcp_io == &transfer_udp_io ||
         &cluster_data_io == &control_io || &cluster_data_io == &transfer_tcp_io || &cluster_data_io == &transfer_udp_io)
@@ -51,13 +54,7 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
     nodelink_mgr_ =
         std::make_unique<NodeLinkMgr>(control_executor_, cluster_data_executor_, config_.cluster, config_.tcp.address,
                                       config_.datagram.address, *cluster_mgr_, *topology_);
-    control_router_ = std::make_unique<ControlRouter>(
-        transfer_tcp_executor_, transfer_udp_executor_,
-        ControlRouterConfig{config_.cluster.node_id, config_.control.advertise_address, config_.control.port,
-                            config_.control.max_connections, config_.control.max_services,
-                            config_.control.max_services_per_session},
-        cluster_mgr_, tcp_pipeline_, tls_pipeline_, datagram_mgr_, *topology_, cluster_messages_,
-        control_queue_delay_us_, transfer_tcp_queue_delay_us_, transfer_udp_queue_delay_us_);
+
 }
 
 RelayNode::~RelayNode() = default;
@@ -158,7 +155,7 @@ void RelayNode::start()
         tls_pipeline_->start();
         datagram_mgr_->start();
         nodelink_mgr_->start();
-        control_router_->start();
+        started_at_ = std::chrono::steady_clock::now();
         cluster_mgr_->start();
         topology_->start();
         nodelink_mgr_->activate();
@@ -235,9 +232,10 @@ void RelayNode::stop()
                 self->traffic_sample_timer_.cancel();
                 asio::error_code ignored;
                 self->control_acceptor_.close(ignored);
-                self->control_router_->stop();
+                self->registry_.stop();
                 ScopeGuard close_messages([self]() noexcept { self->cluster_messages_.close(); });
 
+                co_await self->stop_relays();
                 co_await self->nodelink_mgr_->stop();
 
                 std::exception_ptr topology_error;
@@ -334,18 +332,19 @@ asio::awaitable<void> RelayNode::control_accept_loop()
             socket.close(ignored);
             co_return;
         }
-        if (control_router_->full())
+        if (registry_.full())
         {
             asio::error_code ignored;
             socket.close(ignored);
-            PROXY_ERROR_PRINT("Control rejected active=%zu limit=%zu", control_router_->session_count(),
+            PROXY_ERROR_PRINT("Control rejected active=%zu limit=%zu", registry_.session_count(),
                               config_.control.max_connections);
             continue;
         }
 
         auto session =
             std::make_shared<ControlSession>(std::move(socket), ssl_context_, TLSChannelRole::S, config_.channel);
-        const auto session_id = control_router_->add_session(session);
+        const auto session_id = allocate_session_id();
+        registry_.add(session_id, session);
         ++active_control_sessions_;
         ScopeGuard task_rollback([this]() noexcept { --active_control_sessions_; });
         asio::co_spawn(
@@ -391,7 +390,7 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
             auto message = co_await session->async_receive();
             if (state_.load() == State::Running)
             {
-                control_router_->handle(id, session, std::move(message));
+                handle_control_message(id, session, std::move(message));
             }
         }
     }
@@ -412,7 +411,8 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
         failure = "unknown exception";
     }
 
-    control_router_->remove_session(id, session);
+    cancel_relays("control session disconnected", session);
+    registry_.remove(id);
     co_await session->async_disconnect();
     if (connected)
     {
@@ -437,6 +437,7 @@ void RelayNode::handle_cluster_message(CtrlMessage message)
         if (state_.load() == State::Running)
         {
             nodelink_mgr_->members_changed();
+            invalidate_relays();
         }
         return;
     }
@@ -447,17 +448,27 @@ void RelayNode::handle_cluster_message(CtrlMessage message)
     }
     if (message.command.starts_with("link.") || message.command.starts_with("flow."))
     {
-        if (state_.load() == State::Running)
+        // Drain existing acknowledgements while relay cleanup is running; reject new remote opens during stop.
+        if (state_.load() == State::Running || message.command != "flow.open")
         {
             nodelink_mgr_->handle(std::move(message));
         }
         return;
     }
-    if (message.type() == CtrlCommand::ClusterError && state_.load() == State::Running)
+    if (message.type() == CtrlCommand::ClusterError)
     {
         nodelink_mgr_->control_failed(config::message_params(message).value("reason", "cluster control failed"));
+        invalidate_relays("cluster control failed");
     }
-    control_router_->handle_cluster(std::move(message));
+    if (message.command.starts_with("relay.peer."))
+    {
+        if (state_.load() == State::Running)
+        {
+            handle_relay_peer(std::move(message));
+        }
+        return;
+    }
+    handle_control_cluster_message(std::move(message));
 }
 
 void RelayNode::schedule_queue_probe(asio::steady_timer &timer, std::atomic<std::uint32_t> &queue_delay_us)
@@ -489,7 +500,7 @@ void RelayNode::schedule_traffic_sample()
         {
             return;
         }
-        self->control_router_->sample_traffic();
+        self->registry_.sample_traffic();
         self->schedule_traffic_sample();
     });
 }

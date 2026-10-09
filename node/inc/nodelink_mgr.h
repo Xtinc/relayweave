@@ -64,6 +64,9 @@ class NodeLinkMgr
     asio::awaitable<void> close_link(std::uint64_t id);
     asio::awaitable<FlowResult> open_flow(std::vector<std::string> path, RelayProtocol transport);
     asio::awaitable<void> close_flow(std::uint64_t epoch, std::uint64_t id);
+    bool egress_ready(std::uint64_t epoch, std::uint64_t id, const std::string &ingress,
+                      RelayProtocol transport) const;
+    asio::awaitable<std::string> wait_flow_closed(std::uint64_t epoch, std::uint64_t id);
     asio::awaitable<void> stop();
     LnkChannel &channel() const
     {
@@ -114,6 +117,26 @@ class NodeLinkMgr
         bool released = false;
         std::string close_error;
     };
+    struct RemoteFlow
+    {
+        explicit RemoteFlow(asio::any_io_executor executor) : completed(executor) {}
+        FlowResult result;
+        AsyncEvent completed;
+    };
+    struct FlowWatch
+    {
+        explicit FlowWatch(asio::any_io_executor executor) : closed(executor) {}
+        std::string reason;
+        AsyncEvent closed;
+    };
+    std::shared_ptr<FlowRequest> create_flow(std::vector<std::string> path, RelayProtocol transport,
+                                             std::uint64_t requested_id = 0);
+    asio::awaitable<FlowResult> establish_flow(std::shared_ptr<FlowRequest> request);
+    asio::awaitable<FlowResult> request_flow(std::vector<std::string> path, RelayProtocol transport);
+    asio::awaitable<void> reply_flow(std::shared_ptr<FlowRequest> request, std::string target);
+    void handle_flow_request(CtrlMessage message);
+    void flow_closed(std::uint64_t id, std::string reason);
+    void fail_remote_flows(const std::string &reason);
     void arm_flow_timeout(const std::shared_ptr<FlowRequest> &request);
     void send_all(const FlowRequest &request, CtrlCommand command);
     void finish_flow(std::shared_ptr<FlowRequest> request, std::string stage, std::string reason);
@@ -133,6 +156,9 @@ class NodeLinkMgr
     std::map<std::uint64_t, std::shared_ptr<FlowRequest>> flow_requests_;
     std::map<std::uint64_t, njson> flow_endpoints_;
     std::map<std::uint64_t, std::shared_ptr<FlowRequest>> closing_flows_;
+    std::map<std::uint64_t, std::shared_ptr<RemoteFlow>> remote_flows_;
+    std::map<std::uint64_t, std::shared_ptr<FlowWatch>> flow_watches_;
+    std::size_t flow_tasks_ = 0;
     asio::steady_timer done_;
     bool running_ = false;
     bool events_running_ = false;

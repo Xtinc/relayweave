@@ -5,11 +5,13 @@
 #include "datagram_mgr.h"
 #include "nodelink_mgr.h"
 #include "pipeline_mgr.h"
+#include "registry_mgr.h"
 #include "topology.h"
 #include <atomic>
 #include <limits>
 
-class ControlRouter;
+class ControlRouterMulti;
+class RelaySession;
 
 struct ControlNodeConfig
 {
@@ -36,7 +38,7 @@ struct DatagramNodeConfig
     std::string address;
     std::uint16_t port = 0;
     std::size_t max_relays = 1024;
-    std::chrono::steady_clock::duration service_wait_timeout = std::chrono::minutes(5);
+    std::chrono::steady_clock::duration setup_timeout = std::chrono::seconds(10);
     TrafficLimitConfig traffic;
 };
 
@@ -62,7 +64,7 @@ NodeConfig load_node_config(const std::filesystem::path &path);
 class RelayNode : public std::enable_shared_from_this<RelayNode>
 {
     using tcp = asio::ip::tcp;
-    using SessionId = std::uint64_t;
+    using SessionId = RegistryMgr::SessionId;
     using cluster_message_channel = asio::experimental::channel<void(asio::error_code, CtrlMessage)>;
 
   public:
@@ -85,12 +87,46 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 
   private:
     friend class ClusterMgr;
+    friend class ControlRouterSingle;
+    friend class ControlRouterMulti;
+    friend class RelaySession;
 
     asio::awaitable<void> control_accept_loop();
     asio::awaitable<void> run_control_session(SessionId id, ControlSessionPtr session);
     void schedule_queue_probe(asio::steady_timer &timer, std::atomic<std::uint32_t> &queue_delay_us);
     void schedule_traffic_sample();
     void handle_cluster_message(CtrlMessage message);
+    void handle_control_message(SessionId id, const ControlSessionPtr &session, CtrlMessage message);
+    void handle_control_cluster_message(CtrlMessage message);
+    void locate_node(SessionId id, const ControlSessionPtr &session, const njson &params);
+    void handle_node_lookup(const njson &params);
+    void handle_node_location(CtrlMessage message);
+    void broadcast_client_query(SessionId id, CtrlMessage message);
+    void attach_cluster_reply_route(CtrlMessage &reply, const njson &query);
+    ControlSessionPtr prepare_client_reply(CtrlMessage &reply, std::string_view location);
+    void register_service(SessionId id, const ControlSessionPtr &session, const njson &params);
+    void locate_service(SessionId id, const ControlSessionPtr &session, const njson &params);
+    void report_cluster_status(SessionId id, const ControlSessionPtr &session, const njson &params);
+    void handle_cluster_lookup(const njson &params);
+    void handle_cluster_location(CtrlMessage message);
+    void handle_cluster_status_query(const njson &params);
+    void handle_cluster_status_report(CtrlMessage message);
+    void report_topology(SessionId id, const ControlSessionPtr &session, const njson &params);
+    void handle_topology_query(const njson &params);
+    void handle_topology_snapshot(CtrlMessage message);
+    std::optional<CtrlMessage> service_location(const njson &params);
+    CtrlMessage server_status_message(std::uint64_t request_id);
+    void list_services(const ControlSessionPtr &session, const njson &params);
+    void report_load(const ControlSessionPtr &session, const njson &params);
+    void report_traffic(const ControlSessionPtr &session, const njson &params);
+    SessionId allocate_session_id();
+
+    void handle_relay(const ControlSessionPtr &session, const CtrlMessage &message);
+    void handle_relay_peer(CtrlMessage message);
+    void start_relay(std::shared_ptr<RelaySession> relay);
+    void cancel_relays(std::string reason, const ControlSessionPtr &session = {});
+    void invalidate_relays(std::string reason = {});
+    asio::awaitable<void> stop_relays();
 
     asio::io_context::executor_type control_executor_;
     asio::io_context::executor_type transfer_tcp_executor_;
@@ -116,7 +152,11 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     std::shared_ptr<DatagramMgr> datagram_mgr_;
     std::unique_ptr<Topology> topology_;
     std::unique_ptr<NodeLinkMgr> nodelink_mgr_;
-    std::unique_ptr<ControlRouter> control_router_;
+    RegistryMgr registry_;
+    std::chrono::steady_clock::time_point started_at_{};
+    SessionId next_session_id_ = 1;
+    std::vector<std::shared_ptr<RelaySession>> relay_sessions_;
+    asio::steady_timer relays_done_;
     std::once_flag stop_once_;
     std::exception_ptr stop_error_;
     std::size_t active_control_sessions_ = 0;

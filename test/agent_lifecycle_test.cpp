@@ -34,7 +34,7 @@ AgentConfig base_config(std::uint16_t control_port)
     config.connect_timeout = 200ms;
     config.reconnect_initial_delay = 100ms;
     config.reconnect_max_delay = 200ms;
-    config.stream_open_timeout = 200ms;
+    config.relay_open_timeout = 200ms;
     return config;
 }
 

@@ -19,6 +19,10 @@ class AgentRouting
     bool request_pending(Clock::time_point now) const noexcept;
     bool accept_snapshot(const nlohmann::json &snapshot, Clock::time_point now);
     void invalidate_snapshot();
+    std::uint64_t epoch() const noexcept
+    {
+        return epoch_;
+    }
     void stop();
     asio::awaitable<bool> refresh_probes();
     // Must be awaited on the Agent control io_context, like refresh_probes().
@@ -32,7 +36,7 @@ class AgentRouting
   private:
     static constexpr auto REQUEST_TIMEOUT = std::chrono::seconds(10);
     static constexpr auto SNAPSHOT_EXPIRY = std::chrono::seconds(15);
-    static constexpr std::size_t MAX_PATH_NODES = 16;
+    static constexpr std::size_t MAX_PATH_NODES = 8;
     static constexpr std::size_t MAX_SNAPSHOT_ENTRIES = 65536;
     static constexpr std::size_t MAX_SNAPSHOT_NODES = 1024;
 

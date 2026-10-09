@@ -1,65 +1,27 @@
 #include "datagram_mgr.h"
 #include "frame_io.h"
 #include <algorithm>
-#include <vector>
 
-DatagramMgr::Relay::Relay(asio::any_io_executor executor, std::uint64_t uuid, std::uint64_t producer_session_id,
-                          std::uint64_t consumer_session_id, std::uint64_t producer_ticket,
-                          std::uint64_t consumer_ticket, std::string service, const ControlSessionPtr &producer,
-                          const ControlSessionPtr &consumer, std::uint64_t request_id, const TrafficLimitConfig &config,
-                          SRVTrafficPtr traffic)
-    : uuid(uuid), producer_session_id(producer_session_id), consumer_session_id(consumer_session_id),
-      producer_session_header(DatagramHeader::encode(producer_session_id)),
-      consumer_session_header(DatagramHeader::encode(consumer_session_id)), producer_ticket(producer_ticket),
-      consumer_ticket(consumer_ticket), service(std::move(service)), producer(producer), consumer(consumer),
-      request_id(request_id), accessor(consumer->peer()), service_wait_timer(std::move(executor)),
-      rx_limiter(config.rx_bytes_per_second, config.rx_burst_bytes),
-      tx_limiter(config.tx_bytes_per_second, config.tx_burst_bytes), traffic(std::move(traffic))
-{
-}
-
-bool DatagramMgr::Relay::belongs_to(const ControlSessionPtr &session) const
-{
-    return producer.lock() == session || consumer.lock() == session;
-}
-
-bool DatagramMgr::Relay::complete() const noexcept
-{
-    return producer_endpoint && consumer_endpoint;
-}
-
-void DatagramMgr::Relay::cancel() noexcept
-{
-    try
-    {
-        service_wait_timer.cancel();
-    }
-    catch (...)
-    {
-    }
-}
-
-std::optional<DatagramMgr::udp::endpoint> &DatagramMgr::Relay::endpoint(Side side)
+std::optional<DatagramMgr::udp::endpoint> &DatagramMgr::LocalPair::endpoint(Side side)
 {
     return side == Side::Producer ? producer_endpoint : consumer_endpoint;
 }
 
-const DatagramHeader::Buffer &DatagramMgr::Relay::session_header(Side side) const
+const DatagramHeader::Buffer &DatagramMgr::LocalPair::session_header(Side side) const
 {
     return side == Side::Producer ? producer_session_header : consumer_session_header;
 }
 
-bool DatagramMgr::Relay::allow(Side side, std::size_t payload_size)
+bool DatagramMgr::LocalPair::allow(Side side, std::size_t payload_size)
 {
     return side == Side::Producer ? rx_limiter.try_consume(payload_size) : tx_limiter.try_consume(payload_size);
 }
 
 DatagramMgr::DatagramMgr(asio::any_io_executor executor, std::shared_ptr<RelayIdAllocator> id_allocator,
-                         udp::endpoint listen_endpoint, std::size_t capacity,
-                         std::chrono::steady_clock::duration service_wait_duration, TrafficLimitConfig config)
+                         udp::endpoint listen_endpoint, std::size_t capacity, TrafficLimitConfig config)
     : executor_(std::move(executor)), id_allocator_(std::move(id_allocator)),
-      listen_endpoint_(std::move(listen_endpoint)), socket_(executor_), capacity_(capacity),
-      service_wait_duration_(service_wait_duration), config_(std::move(config))
+      listen_endpoint_(std::move(listen_endpoint)), socket_(executor_), sends_(executor_, 16), capacity_(capacity),
+      config_(std::move(config))
 {
 }
 
@@ -87,206 +49,267 @@ void DatagramMgr::start()
     asio::co_spawn(
         executor_, [self = shared_from_this()]() -> asio::awaitable<void> { co_await self->receive_datagram(); },
         asio::detached);
+    // One UDP socket write chain serves both single-node and multi-node relays.
+    asio::co_spawn(
+        executor_, [self = shared_from_this()]() -> asio::awaitable<void> { co_await self->send_datagrams(); },
+        asio::detached);
 }
 
-void DatagramMgr::open(const ControlSessionPtr &consumer, std::string service, std::uint64_t request_id,
-                       ControlSessionPtr producer, SRVTrafficPtr traffic)
+// transfer_udp_io: queued packets own their bytes until this sole writer completes.
+asio::awaitable<void> DatagramMgr::send_datagrams()
 {
     try
     {
-        do_open(consumer, service, request_id, std::move(producer), std::move(traffic));
-    }
-    catch (const std::exception &exception)
-    {
-        consumer->send(CtrlMessage{CtrlCommand::RelayError, njson{{"request_id", request_id},
-                                                        {"service", service},
-                                                        {"protocol", "udp"},
-                                                        {"reason", exception.what()}}});
-    }
-    catch (...)
-    {
-        consumer->send(CtrlMessage{CtrlCommand::RelayError, njson{{"request_id", request_id},
-                                                        {"service", service},
-                                                        {"protocol", "udp"},
-                                                        {"reason", "unknown relay error"}}});
-    }
-}
-
-void DatagramMgr::do_open(const ControlSessionPtr &consumer, std::string service, std::uint64_t request_id,
-                          ControlSessionPtr producer, SRVTrafficPtr traffic)
-{
-    if (stopped_)
-    {
-        consumer->send(CtrlMessage{CtrlCommand::RelayError, njson{{"request_id", request_id},
-                                                        {"service", service},
-                                                        {"protocol", "udp"},
-                                                        {"reason", "server stopping"}}});
-        return;
-    }
-
-    if (relays_.size() >= capacity_)
-    {
-        consumer->send(CtrlMessage{CtrlCommand::RelayError, njson{{"request_id", request_id},
-                                                        {"service", service},
-                                                        {"protocol", "udp"},
-                                                        {"reason", "relay capacity reached"}}});
-        return;
-    }
-
-    const auto uuid = id_allocator_->allocate();
-    ScopeGuard id_rollback([this, uuid]() noexcept { id_allocator_->release(uuid); });
-    const auto producer_session_id = allocate_session_id();
-    std::uint64_t consumer_session_id;
-    do
-    {
-        consumer_session_id = allocate_session_id();
-    } while (consumer_session_id == producer_session_id);
-
-    const auto producer_ticket = generate_random_id();
-    std::uint64_t consumer_ticket;
-    do
-    {
-        consumer_ticket = generate_random_id();
-    } while (consumer_ticket == producer_ticket);
-
-    auto relay = std::make_shared<Relay>(executor_, uuid, producer_session_id, consumer_session_id, producer_ticket,
-                                         consumer_ticket, std::move(service), producer, consumer, request_id, config_,
-                                         std::move(traffic));
-    relays_.emplace(uuid, relay);
-    ScopeGuard relay_rollback([&]() noexcept { erase_relay(relay); });
-    id_rollback.dismiss();
-    bindings_.emplace(producer_session_id, Binding{uuid, Side::Producer});
-    bindings_.emplace(consumer_session_id, Binding{uuid, Side::Consumer});
-
-    if (!producer)
-    {
-        relay->service_wait_timer.expires_after(service_wait_duration_);
-        relay->service_wait_timer.async_wait([weak_self = std::weak_ptr<DatagramMgr>(shared_from_this()),
-                                              weak_relay = std::weak_ptr<Relay>(relay)](const asio::error_code &error) {
-            if (!error)
+        for (;;)
+        {
+            auto request = co_await sends_.async_receive(asio::use_awaitable);
+            if (request->cancelled)
             {
-                if (auto self = weak_self.lock())
-                {
-                    if (auto relay = weak_relay.lock(); relay && relay->state == RelayState::WaitingForProducer)
-                    {
-                        self->terminate_relay(std::move(relay), "service wait timed out");
-                    }
-                }
+                continue;
             }
-        });
+            if (stopped_)
+            {
+                request->done.try_send(asio::error::operation_aborted, std::size_t{});
+                continue;
+            }
+            const auto [error, size] = co_await socket_.async_send_to(
+                asio::buffer(request->data), request->destination, use_nothrow_awaitable);
+            request->done.try_send(error, size);
+        }
     }
-
-    const njson common{
-        {"uuid", uuid}, {"service", relay->service}, {"protocol", "udp"}, {"data_port", listen_endpoint_.port()}};
-    auto consumer_params = common;
-    consumer_params["request_id"] = request_id;
-    consumer_params["session_id"] = consumer_session_id;
-    consumer_params["ticket"] = consumer_ticket;
-    consumer->send(CtrlMessage{CtrlCommand::RelayOpened, std::move(consumer_params)});
-    if (producer)
+    catch (const asio::system_error &error)
     {
-        offer_producer(relay, producer);
-    }
-    relay_rollback.dismiss();
-}
-
-void DatagramMgr::attach_service(const ControlSessionPtr &producer, const std::string &service, SRVTrafficPtr traffic)
-{
-    if (stopped_)
-    {
-        return;
-    }
-
-    for (const auto &[_, relay] : relays_)
-    {
-        if (relay->state == RelayState::WaitingForProducer && relay->service == service)
+        if (!stopped_)
         {
-            relay->traffic = traffic;
-            offer_producer(relay, producer);
+            PROXY_ERROR_PRINT("UDP writer failed reason=%s", error.what());
         }
     }
 }
 
-void DatagramMgr::offer_producer(const std::shared_ptr<Relay> &relay, const ControlSessionPtr &producer)
+asio::awaitable<std::tuple<asio::error_code, std::size_t>> DatagramMgr::send_datagram(BytesBuf data, udp::endpoint destination)
 {
-    if (relay->state != RelayState::WaitingForProducer)
+    auto request = std::make_shared<DatagramSend>(executor_, std::move(data), std::move(destination));
+    // UDP queue pressure drops a packet without terminating its relay.
+    if (!sends_.try_send(asio::error_code{}, request))
+    {
+        co_return std::tuple{asio::error_code{}, std::size_t{}};
+    }
+    ScopeGuard cancel([request] { request->cancelled = true; });
+    co_return co_await request->done.async_receive(use_nothrow_awaitable);
+}
+
+njson DatagramMgr::install_endpoint(int role)
+{
+    if (role != RelayAttach::Consumer && role != RelayAttach::Producer)
+    {
+        throw std::invalid_argument("invalid relay endpoint role");
+    }
+    if (stopped_ || local_pairs_.size() + path_endpoints_.size() >= capacity_)
+    {
+        throw std::runtime_error("relay endpoint capacity reached or datagram manager stopped");
+    }
+    const auto uuid = id_allocator_->allocate();
+    ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
+    const auto session = allocate_session_id();
+    auto endpoint = std::make_shared<PathEndpoint>(executor_, role);
+    endpoint->ticket = generate_random_id();
+    endpoint->session_id = session;
+    path_endpoints_.emplace(uuid, endpoint);
+    bindings_.emplace(session, Binding{uuid, role == RelayAttach::Producer ? Side::Producer : Side::Consumer});
+    rollback.dismiss();
+    return {{"uuid", uuid}, {"ticket", endpoint->ticket}, {"session_id", session},
+            {"data_port", listen_endpoint_.port()}};
+}
+
+asio::awaitable<bool> DatagramMgr::wait_endpoint(std::uint64_t uuid)
+{
+    const auto it = path_endpoints_.find(uuid);
+    if (it == path_endpoints_.end())
+    {
+        co_return false;
+    }
+    auto endpoint = it->second;
+    co_return co_await endpoint->attached.wait() && endpoint->source && !endpoint->closed;
+}
+
+void DatagramMgr::bind_endpoint(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch,
+                                std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor)
+{
+    path_endpoints_.at(uuid)->bind(channel, epoch, flow_id, config_, std::move(traffic), std::move(accessor));
+}
+
+asio::awaitable<void> DatagramMgr::read_endpoint(std::shared_ptr<PathEndpoint> endpoint)
+{
+    for (;;)
+    {
+        auto payload = co_await endpoint->received.async_receive(asio::use_awaitable);
+        // UDP rate limits drop individual datagrams instead of delaying the shared listener.
+        auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
+        if (!limiter.try_consume(payload.size()))
+        {
+            continue;
+        }
+        const auto size = payload.size();
+        co_await endpoint->send(LnkFrType::Data, std::move(payload));
+        endpoint->count(true, size);
+    }
+}
+
+asio::awaitable<void> DatagramMgr::write_endpoint(std::shared_ptr<PathEndpoint> endpoint)
+{
+    const auto header = DatagramHeader::encode(endpoint->session_id);
+    for (;;)
+    {
+        auto frame = co_await endpoint->receive();
+        auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
+        if (!limiter.try_consume(frame.payload.size()))
+        {
+            continue;
+        }
+        BytesBuf datagram(header.begin(), header.end());
+        datagram.insert(datagram.end(), frame.payload.begin(), frame.payload.end());
+        const auto [error, sent] = co_await send_datagram(std::move(datagram), *endpoint->source);
+        if (error)
+        {
+            throw asio::system_error(error);
+        }
+        if (!sent)
+        {
+            continue;
+        }
+        if (sent != header.size() + frame.payload.size())
+        {
+            throw std::runtime_error("truncated relay datagram");
+        }
+        endpoint->count(false, frame.payload.size());
+    }
+}
+
+void DatagramMgr::activate_endpoint(std::uint64_t uuid)
+{
+    auto endpoint = path_endpoints_.at(uuid);
+    if (endpoint->closed || !endpoint->source || !endpoint->channel || endpoint->active)
+    {
+        throw std::runtime_error("relay bridge unavailable");
+    }
+    endpoint->active = true;
+}
+
+asio::awaitable<void> DatagramMgr::run_endpoint(std::uint64_t uuid)
+{
+    auto endpoint = path_endpoints_.at(uuid);
+    if (endpoint->closed || !endpoint->source || !endpoint->channel || !endpoint->active)
+    {
+        throw std::runtime_error("relay bridge unavailable");
+    }
+    if (endpoint->traffic)
+    {
+        endpoint->traffic->add_accessor(endpoint->accessor);
+    }
+    ScopeGuard accessor([endpoint] {
+        if (endpoint->traffic)
+        {
+            endpoint->traffic->remove_accessor(endpoint->accessor);
+        }
+    });
+    // Both directions are owned by this task and cancelled/drained together.
+    co_await await_transfers(read_endpoint(endpoint), write_endpoint(endpoint));
+}
+
+void DatagramMgr::close_endpoint(std::uint64_t uuid)
+{
+    const auto it = path_endpoints_.find(uuid);
+    if (it == path_endpoints_.end())
     {
         return;
     }
-
-    if (!relay->traffic)
-    {
-        throw std::logic_error("UDP relay requires service traffic statistics");
-    }
-
-    relay->producer = producer;
-    relay->service_wait_timer.cancel();
-    relay->state = RelayState::WaitingForAttach;
-
-    producer->send(CtrlMessage{CtrlCommand::RelayOffer, njson{{"uuid", relay->uuid},
-                                                    {"service", relay->service},
-                                                    {"protocol", "udp"},
-                                                    {"data_port", listen_endpoint_.port()},
-                                                    {"session_id", relay->producer_session_id},
-                                                    {"ticket", relay->producer_ticket}}});
+    auto endpoint = it->second;
+    path_endpoints_.erase(it);
+    endpoint->closed = true;
+    bindings_.erase(endpoint->session_id);
+    endpoint->received.cancel();
+    endpoint->received.close();
+    endpoint->attached.notify_all();
+    id_allocator_->release(uuid);
 }
 
-bool DatagramMgr::reject(const ControlSessionPtr &session, std::uint64_t uuid, std::string reason)
+njson DatagramMgr::install_pair()
 {
-    if (stopped_)
-    {
-        return false;
-    }
-
-    const auto relay = relays_.find(uuid);
-    if (relay == relays_.end() || relay->second->state != RelayState::WaitingForAttach ||
-        relay->second->producer.lock() != session)
-    {
-        return false;
-    }
-    terminate_relay(relay->second, std::move(reason));
-    return true;
+    if (stopped_ || local_pairs_.size() + path_endpoints_.size() >= capacity_)
+        throw std::runtime_error(stopped_ ? "server stopping" : "relay capacity reached");
+    const auto uuid = id_allocator_->allocate();
+    ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
+    auto pair = std::make_shared<LocalPair>(executor_);
+    do
+        pair->consumer_ticket = generate_random_id();
+    while (pair->consumer_ticket == pair->producer_ticket);
+    pair->producer_session_id = allocate_session_id();
+    bindings_.emplace(pair->producer_session_id, Binding{uuid, Side::Producer});
+    ScopeGuard binding_rollback([this, pair] { bindings_.erase(pair->producer_session_id); });
+    pair->consumer_session_id = allocate_session_id();
+    pair->producer_session_header = DatagramHeader::encode(pair->producer_session_id);
+    pair->consumer_session_header = DatagramHeader::encode(pair->consumer_session_id);
+    local_pairs_.emplace(uuid, pair);
+    bindings_.emplace(pair->consumer_session_id, Binding{uuid, Side::Consumer});
+    binding_rollback.dismiss();
+    rollback.dismiss();
+    return {{"producer", {{"uuid", uuid}, {"ticket", pair->producer_ticket},
+                          {"session_id", pair->producer_session_id}, {"data_port", listen_endpoint_.port()}}},
+            {"consumer", {{"uuid", uuid}, {"ticket", pair->consumer_ticket},
+                          {"session_id", pair->consumer_session_id}, {"data_port", listen_endpoint_.port()}}}};
 }
 
-bool DatagramMgr::cancel(const ControlSessionPtr &session, std::optional<std::uint64_t> uuid,
-                         std::optional<std::uint64_t> request_id)
+asio::awaitable<bool> DatagramMgr::wait_pair(std::uint64_t uuid)
 {
-    if (stopped_)
-    {
-        return false;
-    }
-
-    for (const auto &[relay_uuid, relay] : relays_)
-    {
-        if (relay->belongs_to(session) &&
-            ((uuid && *uuid == relay_uuid) || (request_id && *request_id == relay->request_id)))
-        {
-            terminate_relay(relay, "relay cancelled");
-            return true;
-        }
-    }
-    return false;
+    auto pair = local_pairs_.at(uuid);
+    co_return co_await pair->attached.wait() && !pair->closed && pair->producer_endpoint && pair->consumer_endpoint;
 }
 
-void DatagramMgr::disconnect(const ControlSessionPtr &session)
+void DatagramMgr::bind_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor)
 {
-    if (stopped_)
-    {
+    auto pair = local_pairs_.at(uuid);
+    if (pair->closed || !pair->producer_endpoint || !pair->consumer_endpoint || pair->traffic || !traffic)
+        throw std::runtime_error("local pair cannot bind service");
+    pair->traffic = std::move(traffic);
+    pair->accessor = std::move(accessor);
+    pair->rx_limiter = TokenBucket(config_.rx_bytes_per_second, config_.rx_burst_bytes);
+    pair->tx_limiter = TokenBucket(config_.tx_bytes_per_second, config_.tx_burst_bytes);
+}
+
+void DatagramMgr::activate_pair(std::uint64_t uuid)
+{
+    auto pair = local_pairs_.at(uuid);
+    if (pair->closed || !pair->traffic || pair->active)
+        throw std::runtime_error("local pair unavailable");
+    pair->active = true;
+    pair->traffic->add_accessor(pair->accessor);
+}
+
+asio::awaitable<void> DatagramMgr::run_pair(std::uint64_t uuid)
+{
+    auto pair = local_pairs_.at(uuid);
+    if (pair->closed || !pair->active)
+        throw std::runtime_error("local pair unavailable");
+    // The shared listener performs I/O; this owned wait follows the resource lifetime.
+    if (!co_await pair->finished.wait())
+        throw asio::system_error(asio::error::operation_aborted);
+}
+
+void DatagramMgr::close_pair(std::uint64_t uuid)
+{
+    const auto it = local_pairs_.find(uuid);
+    if (it == local_pairs_.end())
         return;
-    }
-
-    std::vector<std::shared_ptr<Relay>> relays;
-    for (const auto &[_, relay] : relays_)
-    {
-        if (relay->belongs_to(session))
-        {
-            relays.push_back(relay);
-        }
-    }
-    for (auto &relay : relays)
-    {
-        terminate_relay(relay, "control session disconnected");
-    }
+    auto pair = it->second;
+    local_pairs_.erase(it);
+    pair->closed = true;
+    bindings_.erase(pair->producer_session_id);
+    bindings_.erase(pair->consumer_session_id);
+    pair->attached.notify_all();
+    pair->finished.notify_all();
+    if (pair->active)
+        pair->traffic->remove_accessor(pair->accessor);
+    id_allocator_->release(uuid);
 }
 
 void DatagramMgr::stop()
@@ -297,21 +320,16 @@ void DatagramMgr::stop()
     }
 
     stopped_ = true;
+    sends_.close();
+    while (!path_endpoints_.empty())
+    {
+        close_endpoint(path_endpoints_.begin()->first);
+    }
     asio::error_code ignored;
     socket_.close(ignored);
     bindings_.clear();
-    auto relays = std::move(relays_);
-    for (auto &[uuid, relay] : relays)
-    {
-        relay->cancel();
-        if (relay->state == RelayState::Active)
-        {
-            PROXY_INFO_PRINT("Relay [x] udp service=%s uuid=%llu reason=node stopping", relay->service.c_str(),
-                             static_cast<unsigned long long>(relay->uuid));
-            relay->traffic->remove_accessor(relay->accessor);
-        }
-        id_allocator_->release(uuid);
-    }
+    while (!local_pairs_.empty())
+        close_pair(local_pairs_.begin()->first);
 }
 
 asio::awaitable<void> DatagramMgr::receive_datagram()
@@ -371,31 +389,47 @@ std::optional<DatagramMgr::RoutedDatagram> DatagramMgr::route_datagram(std::span
             return std::nullopt;
         }
 
-        const auto owner = relays_.find(attach->uuid);
-        if (owner == relays_.end() || owner->second->state != RelayState::WaitingForAttach)
+        const auto path = path_endpoints_.find(attach->uuid);
+        if (path != path_endpoints_.end())
         {
+            auto &endpoint = *path->second;
+            if (!endpoint.closed && !endpoint.source && attach->role == endpoint.role &&
+                attach->ticket == endpoint.ticket)
+            {
+                endpoint.source = source;
+                endpoint.attached.notify_all();
+            }
             return std::nullopt;
         }
-
-        const auto &relay = owner->second;
+        const auto owner = local_pairs_.find(attach->uuid);
+        if (owner == local_pairs_.end() || owner->second->active || owner->second->closed)
+            return std::nullopt;
+        const auto &pair = owner->second;
         const auto side = attach->role == RelayAttach::Producer ? Side::Producer : Side::Consumer;
-        auto &source_endpoint = relay->endpoint(side);
-        const auto expected_ticket = side == Side::Producer ? relay->producer_ticket : relay->consumer_ticket;
-        if (source_endpoint || attach->ticket != expected_ticket)
-        {
+        auto &source_endpoint = pair->endpoint(side);
+        const auto expected = side == Side::Producer ? pair->producer_ticket : pair->consumer_ticket;
+        if (source_endpoint || attach->ticket != expected)
             return std::nullopt;
-        }
-
         source_endpoint = source;
-        if (relay->complete())
-        {
-            start_relay(relay);
-        }
+        if (pair->producer_endpoint && pair->consumer_endpoint)
+            pair->attached.notify_all();
         return std::nullopt;
     }
 
-    const auto owner = relays_.find(binding->second.relay_uuid);
-    if (owner == relays_.end())
+    if (const auto path = path_endpoints_.find(binding->second.relay_uuid); path != path_endpoints_.end())
+    {
+        const auto &endpoint = path->second;
+        const auto payload = datagram.subspan(DatagramHeader::length);
+        if (endpoint->active && !endpoint->closed && endpoint->source == source &&
+            payload.size() <= LnkFrameHeader::maximum_payload)
+        {
+            // A full local UDP queue drops this datagram, like the UDP rate limiter.
+            endpoint->received.try_send(asio::error_code{}, BytesBuf(payload.begin(), payload.end()));
+        }
+        return std::nullopt;
+    }
+    const auto owner = local_pairs_.find(binding->second.relay_uuid);
+    if (owner == local_pairs_.end())
     {
         return std::nullopt;
     }
@@ -408,7 +442,7 @@ std::optional<DatagramMgr::RoutedDatagram> DatagramMgr::route_datagram(std::span
         return std::nullopt;
     }
 
-    if (*source_endpoint != source || relay->state != RelayState::Active)
+    if (*source_endpoint != source || !relay->active || relay->closed)
     {
         return std::nullopt;
     }
@@ -423,17 +457,17 @@ std::optional<DatagramMgr::RoutedDatagram> DatagramMgr::route_datagram(std::span
     const auto &destination = relay->endpoint(other_side);
     const auto &destination_header = relay->session_header(other_side);
     std::copy(destination_header.begin(), destination_header.end(), datagram.begin());
-    if (!relay->traffic)
-    {
-        return std::nullopt;
-    }
     return RoutedDatagram{*destination, relay->traffic, side, payload_size};
 }
 
 asio::awaitable<void> DatagramMgr::forward_datagram(std::span<const std::uint8_t> datagram, RoutedDatagram route)
 {
     const auto [error, sent] =
-        co_await socket_.async_send_to(asio::buffer(datagram), route.destination, use_nothrow_awaitable);
+        co_await send_datagram(BytesBuf(datagram.begin(), datagram.end()), route.destination);
+    if (!error && !sent)
+    {
+        co_return;
+    }
     if (!error && sent == datagram.size())
     {
         auto &counter = route.source_side == Side::Producer ? route.traffic->rx : route.traffic->tx;
@@ -445,93 +479,6 @@ asio::awaitable<void> DatagramMgr::forward_datagram(std::span<const std::uint8_t
         PROXY_ERROR_PRINT("Transfer send failed udp -> %s:%u reason=%s", route.destination.address().to_string().c_str(),
                           static_cast<unsigned int>(route.destination.port()),
                           error ? error.message().c_str() : "partial datagram send");
-    }
-}
-
-void DatagramMgr::start_relay(const std::shared_ptr<Relay> &relay)
-{
-    if (relay->state != RelayState::WaitingForAttach)
-    {
-        return;
-    }
-
-    auto producer = relay->producer.lock();
-    auto consumer = relay->consumer.lock();
-    if (!producer || !consumer)
-    {
-        terminate_relay(relay, "control session disconnected");
-        return;
-    }
-    relay->traffic->add_accessor(relay->accessor);
-    relay->state = RelayState::Active;
-    PROXY_INFO_PRINT("Relay [+] udp service=%s uuid=%llu", relay->service.c_str(),
-                     static_cast<unsigned long long>(relay->uuid));
-    const njson ready{{"uuid", relay->uuid}, {"protocol", "udp"}};
-    producer->send(CtrlMessage{CtrlCommand::RelayReady, ready});
-    consumer->send(CtrlMessage{CtrlCommand::RelayReady, ready});
-}
-
-bool DatagramMgr::erase_relay(const std::shared_ptr<Relay> &relay) noexcept
-{
-    const auto iterator = relays_.find(relay->uuid);
-    if (iterator == relays_.end() || iterator->second != relay)
-    {
-        return false;
-    }
-
-    const bool active = relay->state == RelayState::Active;
-    relay->state = RelayState::Closing;
-    const auto erase_binding = [this, relay](std::uint64_t session_id) {
-        const auto binding = bindings_.find(session_id);
-        if (binding != bindings_.end() && binding->second.relay_uuid == relay->uuid)
-        {
-            bindings_.erase(binding);
-        }
-    };
-
-    erase_binding(relay->producer_session_id);
-    erase_binding(relay->consumer_session_id);
-    relay->cancel();
-    if (active)
-    {
-        PROXY_INFO_PRINT("Relay [x] udp service=%s uuid=%llu", relay->service.c_str(),
-                         static_cast<unsigned long long>(relay->uuid));
-        relay->traffic->remove_accessor(relay->accessor);
-    }
-    relays_.erase(iterator);
-    id_allocator_->release(relay->uuid);
-    return true;
-}
-
-void DatagramMgr::terminate_relay(std::shared_ptr<Relay> relay, std::optional<std::string> reason)
-{
-    const bool active = relay->state == RelayState::Active;
-    if (!erase_relay(relay) || !reason)
-    {
-        return;
-    }
-
-    PROXY_DEBUG_PRINT("Relay closing udp service=%s uuid=%llu reason=%s", relay->service.c_str(),
-                      static_cast<unsigned long long>(relay->uuid), reason->c_str());
-    const auto failure = std::move(*reason);
-    auto consumer = relay->consumer.lock();
-    if (auto producer = relay->producer.lock(); producer && producer != consumer)
-    {
-        producer->send(CtrlMessage{CtrlCommand::RelayClosed, njson{{"request_id", relay->request_id},
-                                                         {"uuid", relay->uuid},
-                                                         {"service", relay->service},
-                                                         {"protocol", "udp"},
-                                                         {"reason", failure}}});
-    }
-
-    if (consumer)
-    {
-        const auto command = active ? CtrlCommand::RelayClosed : CtrlCommand::RelayError;
-        consumer->send(CtrlMessage{command, njson{{"request_id", relay->request_id},
-                                                  {"uuid", relay->uuid},
-                                                  {"service", relay->service},
-                                                  {"protocol", "udp"},
-                                                  {"reason", failure}}});
     }
 }
 

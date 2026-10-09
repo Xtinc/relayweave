@@ -5,6 +5,7 @@
 #include "lru_cache.h"
 #include "tls_channel.h"
 #include "agent_routing.h"
+#include <map>
 #include <functional>
 #include <type_traits>
 
@@ -35,7 +36,7 @@ struct AgentConfig
     std::chrono::steady_clock::duration connect_timeout = std::chrono::seconds(5);
     std::chrono::steady_clock::duration reconnect_initial_delay = std::chrono::milliseconds(500);
     std::chrono::steady_clock::duration reconnect_max_delay = std::chrono::seconds(10);
-    std::chrono::steady_clock::duration stream_open_timeout = std::chrono::seconds(10);
+    std::chrono::steady_clock::duration relay_open_timeout = std::chrono::seconds(10);
     std::vector<AgentServiceConfig> services;
     std::vector<AgentForwardConfig> forwards;
     TLSChannelConfig channel;
@@ -45,6 +46,7 @@ struct AgentConfig
 AgentConfig load_agent_config(const std::filesystem::path &path);
 
 class Forwarder;
+class AgentRelay;
 class NodeConnection;
 
 struct ServiceKey
@@ -66,6 +68,21 @@ template <> struct std::hash<ServiceKey>
     }
 };
 
+struct ServerRoute
+{
+    std::string id;
+    std::string host;
+    std::weak_ptr<TLSChannel> channel;
+};
+
+struct RelaySelection
+{
+    ServerRoute server;
+    std::vector<std::string> path;
+    std::uint64_t epoch = 0;
+    std::uint64_t lease = 0;
+};
+
 class RelayAgent : public std::enable_shared_from_this<RelayAgent>
 {
   public:
@@ -78,6 +95,8 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
   private:
     friend class NodeConnection;
     friend class Forwarder;
+    friend class AgentRelay;
+    friend struct RelayAgentTestAccess;
     static constexpr std::size_t MAX_LOGGED_CANDIDATES = 3;
     static constexpr std::size_t PATH_CACHE_CAPACITY = 16;
     static constexpr auto PATH_CACHE_TTL = std::chrono::seconds(15);
@@ -93,17 +112,35 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
 
     asio::awaitable<void> discovery_loop();
     std::shared_ptr<NodeConnection> ensure_connection(std::string node_id, std::string host, std::uint16_t port);
-    std::shared_ptr<NodeConnection> service_connection(const ServiceKey &service) const;
     void connection_ready(NodeConnection &connection, const std::shared_ptr<TLSChannel> &channel);
     void connection_closed(const NodeConnection &connection);
     void connection_finished(std::exception_ptr failure);
     void query_services(bool refresh = false);
     void query_topology();
     void update_probe_targets();
-    // Must run on control_executor_; Forwarder binds the call across its executor boundary.
-    asio::awaitable<void> calculate_service_paths(ServiceKey service, std::string connection_id);
+    // Synchronous path selection on control_executor_; no I/O or executor crossing here.
+    std::vector<std::string> calculate_service_paths(const ServiceKey &service, const std::string &destination);
+    // All selection/lease operations require control_executor_.
+    asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
+                                               std::chrono::steady_clock::time_point deadline);
+    void release_entry(std::uint64_t lease);
+    void invalidate_entries(std::string reason, const std::optional<ServiceKey> &service = std::nullopt);
+    struct EntryWait
+    {
+        EntryWait(asio::any_io_executor executor, ServiceKey service, std::string node,
+                  std::chrono::steady_clock::time_point deadline);
+        asio::steady_timer changed;
+        ServiceKey service;
+        std::string node;
+        std::chrono::steady_clock::time_point deadline;
+        njson location;
+        std::string connection;
+        std::string reason;
+    };
+    std::map<std::uint64_t, std::shared_ptr<EntryWait>> entry_waits_;
     void release_unused_connections();
     void locate_service(const njson &params);
+    void forget_service(const ServiceKey &service, std::string reason);
     void handle_control_message(const NodeConnection &connection, CtrlMessage message);
     std::uint64_t allocate_request_id();
     asio::awaitable<void> stop_on_control_executor();
@@ -121,7 +158,14 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
     std::shared_ptr<Forwarder> forwarder_;
     std::string primary_connection_id_;
     DualIndexMap<std::string, std::string, std::shared_ptr<NodeConnection>, SecondaryKeyMode::Unique> connections_;
-    DualIndexMap<ServiceKey, std::string, std::uint64_t> service_routes_;
+    struct ServiceLocation
+    {
+        std::uint64_t request = 0;
+        std::string address;
+        std::uint16_t port = 0;
+    };
+    // The secondary key is the service Node ID, independent of control connections.
+    DualIndexMap<ServiceKey, std::string, ServiceLocation> service_locations_;
     std::uint64_t next_request_id_ = 1;
     std::size_t active_tasks_ = 0;
     asio::steady_timer stopped_waiter_;

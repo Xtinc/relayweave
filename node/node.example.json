@@ -44,7 +44,7 @@
     "address": "0.0.0.0",
     "port": 18445,
     "max_relays": 128,
-    "service_wait_timeout_ms": 300000,
+    "setup_timeout_ms": 10000,
     "rx_bytes_per_second": 2000000,
     "rx_max_burst_bytes": 262144,
     "tx_bytes_per_second": 2000000,

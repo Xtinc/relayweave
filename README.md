@@ -9,7 +9,13 @@ NodeLink 共享 TCP/UDP 通道与 NodeFlow 分派由管理器直接持有的 pro
 控制通知使用有界协程收发接口，数据域直接逐跳分派，不通过模块回调注册。
 Flow 提交后不做周期续租；控制连接断开、epoch/路径成员失效、NodeLink 断开或显式关闭时清理。
 超时仅用于建立阶段和关闭确认，NodeLink 与集群控制连接使用各自的心跳检测失联。
-当前由 master 显式指定路径，Agent 路径提交及业务 socket 桥接为后续阶段，详见
+RelaySession 按所选路径直接持有 ControlRouterSingle 或 ControlRouterMulti，两者都在 control_io 协调业务；多跳首尾通过集群单播通信。
+RelayNode 直接持有唯一 RegistryMgr 和 RelaySession 容器，负责全局业务创建、查找分派和停止排空；控制器只推进自己的实例。
+master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
+Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
+Agent 服务发现只保存目的 Node 位置，选路后才取得实际入口控制连接；发现继续使用主控，不提供主控离线定位。
+Forwarder 拥有长期本地监听和业务容器，AgentRelay 统一一次 TCP/TLS/UDP 接入与复制；UDP 服务离线时只保留本地 forward。
+TCP/TLS 保留双向半关闭，UDP 多跳载荷上限为 4096 字节；服务限速和统计保留在端点，详见
 [Node 共享数据通道与按路径转发实施计划](docs/Node共享数据通道与按路径转发实施计划.md)。
 部署见 [打包与安装](docs/RelayWeave打包与安装.md)、[证书制作与部署](docs/证书制作与部署.md)
 和 [管理面板部署说明](dashboard/README.md)。

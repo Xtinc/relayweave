@@ -148,3 +148,8 @@ foreach(test_target IN ITEMS test_tls_channel_peer test_tls_channel test_relay_i
         )
     endforeach()
 endforeach()
+
+add_executable(test_relay_paths relay_paths_test.cpp)
+target_link_libraries(test_relay_paths PRIVATE relayweave_node_lib relayweave_agent_lib)
+add_test(NAME relay_paths COMMAND test_relay_paths)
+set_tests_properties(relay_paths PROPERTIES TIMEOUT 60 LABELS "cluster;integration")

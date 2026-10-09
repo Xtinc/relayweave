@@ -15,7 +15,7 @@ AgentRouting::AgentRouting(asio::io_context &io, bool discover_entries, std::siz
 {
     if (max_nodes == 0 || max_nodes > MAX_PATH_NODES)
     {
-        throw std::invalid_argument("routing.max_nodes must be between 1 and 16");
+        throw std::invalid_argument("routing.max_nodes must be between 1 and 8");
     }
 }
 

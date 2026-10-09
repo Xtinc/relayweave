@@ -183,6 +183,10 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     co_await receive_command(producer, "relay.offer");
     const auto tcp_uuid = params_of(tcp_opened).at("uuid").get<std::uint64_t>();
 
+    producer->send(CtrlMessage{
+        "service.register", njson{{"request_id", 1U}, {"service", "udp-session"}, {"protocol", "udp"}}});
+    co_await receive_command(producer, "service.ok");
+
     consumer->send(CtrlMessage{
         "relay.open", njson{{"request_id", 20U}, {"service", "udp-session"}, {"protocol", "udp"}}});
     const auto opened = co_await receive_command(consumer, "relay.opened");
@@ -198,20 +202,7 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     co_await send_datagram(consumer_socket, server,
                            udp_attach(RelayAttach::Consumer, udp_uuid, consumer_ticket));
 
-    producer->send(CtrlMessage{
-        "service.register", njson{{"request_id", 1U}, {"service", "udp-session"}, {"protocol", "udp"}}});
-    const auto first_registration_response = co_await producer->async_receive();
-    const auto second_registration_response = co_await producer->async_receive();
-    const auto responses_are_ok_and_offer =
-        (first_registration_response.command == "service.ok" &&
-         second_registration_response.command == "relay.offer") ||
-        (first_registration_response.command == "relay.offer" &&
-         second_registration_response.command == "service.ok");
-    require(responses_are_ok_and_offer,
-            "Expected service.ok and relay.offer after UDP registration, received " +
-                first_registration_response.command + " and " + second_registration_response.command);
-    const auto &offered = first_registration_response.command == "relay.offer" ? first_registration_response
-                                                                                : second_registration_response;
+    const auto offered = co_await receive_command(producer, "relay.offer");
     const auto &producer_params = params_of(offered);
     const auto producer_id = producer_params.at("session_id").get<std::uint64_t>();
     const auto producer_ticket = producer_params.at("ticket").get<std::uint64_t>();
@@ -234,6 +225,7 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", tcp_uuid}}});
     const auto tcp_cancelled = co_await receive_command(consumer, "relay.error");
     require(params_of(tcp_cancelled).at("protocol") == "tcp", "TCP cancellation reached the wrong manager");
+    co_await receive_command(producer, "relay.closed");
     consumer->send(CtrlMessage{
         "relay.open", njson{{"request_id", 12U}, {"service", "tcp-session"}, {"protocol", "tcp"}}});
     const auto replacement_opened = co_await receive_command(consumer, "relay.opened");
@@ -243,6 +235,7 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     producer->send(CtrlMessage{"relay.reject", njson{{"uuid", replacement_uuid}}});
     const auto tcp_rejected = co_await receive_command(consumer, "relay.error");
     require(params_of(tcp_rejected).at("protocol") == "tcp", "TCP rejection reached the wrong manager");
+    co_await receive_command(producer, "relay.closed");
 
     udp::socket producer_socket(executor, udp::endpoint(udp::v4(), 0));
     udp::socket attacker_socket(executor, udp::endpoint(udp::v4(), 0));
@@ -341,86 +334,71 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     co_await send_datagram(consumer_socket, server, udp_datagram(consumer_id, early_payload));
     co_await require_no_datagram(producer_socket, "Expired UDP session ID remained routable");
 
-    auto disconnecting_consumer = co_await connect_control(consumer_context, control_port);
-    disconnecting_consumer->send(CtrlMessage{
-        "relay.open", njson{{"request_id", 38U}, {"service", "disconnect-waiting"}, {"protocol", "udp"}}});
-    co_await receive_command(disconnecting_consumer, "relay.opened");
-    co_await disconnecting_consumer->async_disconnect();
-
+    // Missing services fail immediately without allocating a Node waiting instance.
     consumer->send(CtrlMessage{
-        "relay.open", njson{{"request_id", 39U}, {"service", "after-disconnect"}, {"protocol", "udp"}}});
-    const auto after_disconnect = co_await receive_command(consumer, "relay.opened");
-    require(params_of(after_disconnect).at("request_id") == 39U,
-            "Disconnecting a waiting Consumer did not release UDP capacity");
-    consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", params_of(after_disconnect).at("uuid")}}});
-    co_await receive_command(consumer, "relay.error");
+        "relay.open", njson{{"request_id", 38U}, {"service", "udp-recovery"}, {"protocol", "udp"}}});
+    const auto unavailable = co_await receive_command(consumer, "relay.error");
+    require(params_of(unavailable).at("reason") == "service unavailable" && !params_of(unavailable).contains("uuid"),
+            "Offline UDP allocated a waiting resource");
+    consumer->send(CtrlMessage{
+        "relay.open", njson{{"request_id", 39U}, {"service", "still-offline"}, {"protocol", "udp"}}});
+    require(params_of(co_await receive_command(consumer, "relay.error")).at("reason") == "service unavailable",
+            "Offline UDP consumed relay capacity");
 
     auto late_producer = co_await connect_control(producer_context, control_port);
-    consumer->send(CtrlMessage{
-        "relay.open", njson{{"request_id", 42U}, {"service", "near-timeout"}, {"protocol", "udp"}}});
-    const auto near_timeout_opened = co_await receive_command(consumer, "relay.opened");
-    asio::steady_timer near_timeout_wait(executor);
-    near_timeout_wait.expires_after(2200ms);
-    co_await near_timeout_wait.async_wait(asio::use_awaitable);
-
     late_producer->send(CtrlMessage{
-        "service.register", njson{{"request_id", 42U}, {"service", "near-timeout"}, {"protocol", "udp"}}});
-    const auto late_first = co_await late_producer->async_receive();
-    const auto late_second = co_await late_producer->async_receive();
-    require((late_first.command == "service.ok" && late_second.command == "relay.offer") ||
-                (late_first.command == "relay.offer" && late_second.command == "service.ok"),
-            "Producer registration near the service wait deadline did not match the waiting Relay");
-    const auto &near_timeout_offer = late_first.command == "relay.offer" ? late_first : late_second;
-    const auto &near_consumer_params = params_of(near_timeout_opened);
-    const auto &near_producer_params = params_of(near_timeout_offer);
-    asio::steady_timer attach_wait(executor);
-    attach_wait.expires_after(1100ms);
-    co_await attach_wait.async_wait(asio::use_awaitable);
-    udp::socket near_consumer_socket(executor, udp::endpoint(udp::v4(), 0));
-    udp::socket near_producer_socket(executor, udp::endpoint(udp::v4(), 0));
-    const auto near_uuid = near_consumer_params.at("uuid").get<std::uint64_t>();
-    co_await send_datagram(near_consumer_socket, server,
-                           udp_attach(RelayAttach::Consumer, near_uuid,
-                                      near_consumer_params.at("ticket").get<std::uint64_t>()));
-    co_await send_datagram(near_producer_socket, server,
-                           udp_attach(RelayAttach::Producer, near_uuid,
-                                      near_producer_params.at("ticket").get<std::uint64_t>()));
+        "service.register", njson{{"request_id", 43U}, {"service", "udp-recovery"}, {"protocol", "udp"}}});
+    co_await receive_command(late_producer, "service.ok");
+    co_await require_no_control_message(late_producer, "Registration revived an offline UDP request");
+
+    // The new request gets a real attach budget; a half-attached pair must expire.
+    consumer->send(CtrlMessage{
+        "relay.open", njson{{"request_id", 40U}, {"service", "udp-recovery"}, {"protocol", "udp"}}});
+    const auto incomplete = co_await receive_command(consumer, "relay.opened");
+    const auto incomplete_offer = co_await receive_command(late_producer, "relay.offer");
+    const auto old_uuid = params_of(incomplete).at("uuid").get<std::uint64_t>();
+    const auto old_session = params_of(incomplete).at("session_id").get<std::uint64_t>();
+    udp::socket recovering_consumer(executor, udp::endpoint(udp::v4(), 0));
+    udp::socket recovering_producer(executor, udp::endpoint(udp::v4(), 0));
+    co_await send_datagram(recovering_consumer, server,
+        udp_attach(RelayAttach::Consumer, old_uuid, params_of(incomplete).at("ticket").get<std::uint64_t>()));
+    const auto timeout = co_await consumer->async_receive(2s);
+    require(timeout.command == "relay.error" && params_of(timeout).at("reason") == "relay setup timed out",
+            "Half-attached UDP did not expire within its setup budget");
+    co_await receive_command(late_producer, "relay.closed");
+    co_await send_datagram(recovering_producer, server,
+        udp_attach(RelayAttach::Producer, old_uuid, params_of(incomplete_offer).at("ticket").get<std::uint64_t>()));
+    co_await send_datagram(recovering_consumer, server, udp_datagram(old_session, early_payload));
+    co_await require_no_datagram(recovering_producer, "Expired UDP pair was revived by a late attach");
+
+    consumer->send(CtrlMessage{
+        "relay.open", njson{{"request_id", 41U}, {"service", "udp-recovery"}, {"protocol", "udp"}}});
+    const auto reopened = co_await receive_command(consumer, "relay.opened");
+    const auto reoffered = co_await receive_command(late_producer, "relay.offer");
+    const auto new_uuid = params_of(reopened).at("uuid").get<std::uint64_t>();
+    require(new_uuid > old_uuid, "UDP setup timeout did not release capacity for a fresh pair");
+    co_await send_datagram(recovering_consumer, server,
+        udp_attach(RelayAttach::Consumer, new_uuid, params_of(reopened).at("ticket").get<std::uint64_t>()));
+    co_await send_datagram(recovering_producer, server,
+        udp_attach(RelayAttach::Producer, new_uuid, params_of(reoffered).at("ticket").get<std::uint64_t>()));
     co_await receive_command(consumer, "relay.ready");
     co_await receive_command(late_producer, "relay.ready");
-    consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", near_uuid}}});
-    co_await receive_command(consumer, "relay.closed");
+    asio::steady_timer runtime_wait(executor, 1100ms);
+    co_await runtime_wait.async_wait(asio::use_awaitable);
+    co_await send_datagram(recovering_consumer, server,
+        udp_datagram(params_of(reopened).at("session_id").get<std::uint64_t>(), early_payload));
+    const auto still_active = co_await receive_datagram(recovering_producer);
+    require(still_active.size() == DatagramHeader::length + early_payload.size(), "UDP setup budget expired an active pair");
+    consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", new_uuid}, {"reason", "finished recovery check"}}});
+    const auto consumer_closed = co_await receive_command(consumer, "relay.closed");
     const auto producer_closed = co_await receive_command(late_producer, "relay.closed");
-    require(params_of(producer_closed).at("uuid") == near_uuid,
-            "UDP Producer was not notified when the active Relay closed");
-
-    consumer->send(CtrlMessage{
-        "relay.open", njson{{"request_id", 40U}, {"service", "never-online"}, {"protocol", "udp"}}});
-    const auto waiting = co_await receive_command(consumer, "relay.opened");
-    require(params_of(waiting).at("request_id") == 40U, "UDP waiting relay returned the wrong request ID");
-    const auto timed_out = co_await consumer->async_receive(4s);
-    require(timed_out.command == "relay.error", "UDP waiting relay did not time out");
-    require(params_of(timed_out).at("request_id") == 40U &&
-                params_of(timed_out).at("reason") == "service wait timed out",
-            "UDP waiting relay returned the wrong timeout error");
-
-    late_producer->send(CtrlMessage{
-        "service.register", njson{{"request_id", 43U}, {"service", "never-online"}, {"protocol", "udp"}}});
-    const auto late_registration = co_await receive_command(late_producer, "service.ok");
-    require(params_of(late_registration).at("request_id") == 43U, "Late service registration returned the wrong ID");
-    co_await require_no_control_message(late_producer, "Timed-out UDP Relay was revived by late registration");
-
-    consumer->send(CtrlMessage{
-        "relay.open", njson{{"request_id", 41U}, {"service", "still-offline"}, {"protocol", "udp"}}});
-    const auto replacement = co_await receive_command(consumer, "relay.opened");
-    require(params_of(replacement).at("request_id") == 41U,
-            "UDP waiting timeout did not release relay capacity");
-    consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", params_of(replacement).at("uuid")}}});
-    const auto cancelled = co_await receive_command(consumer, "relay.error");
-    require(params_of(cancelled).at("request_id") == 41U, "Replacement UDP waiting relay was not cancelled");
+    require(params_of(consumer_closed).at("reason") == "finished recovery check" &&
+            params_of(producer_closed).at("reason") == "finished recovery check",
+            "Active single-node cancellation lost its original reason");
 
     auto aborting_consumer = co_await connect_control(consumer_context, control_port);
     aborting_consumer->send(CtrlMessage{
-        "relay.open", njson{{"request_id", 44U}, {"service", "never-online"}, {"protocol", "udp"}}});
+        "relay.open", njson{{"request_id", 44U}, {"service", "udp-recovery"}, {"protocol", "udp"}}});
     const auto aborting_opened = co_await receive_command(aborting_consumer, "relay.opened");
     const auto aborting_offer = co_await receive_command(late_producer, "relay.offer");
     const auto aborting_uuid = params_of(aborting_opened).at("uuid").get<std::uint64_t>();
@@ -468,7 +446,7 @@ int main(int argc, char *argv[])
         config.tcp.max_relays = 1;
         config.datagram.max_relays = 1;
         config.tcp.setup_timeout = 3s;
-        config.datagram.service_wait_timeout = 3s;
+        config.datagram.setup_timeout = 1s;
         config.channel = channel_config();
         auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
                                                   std::move(config));

@@ -73,8 +73,8 @@ void flow_integration()
             require_flow(!invalid, "cyclic path accepted");
             invalid = co_await nodes[0]->async_open_flow({"a", "b"}, RelayProtocol::Tls);
             require_flow(!invalid, "Node TLS accepted");
-            invalid = co_await nodes[1]->async_open_flow({"a", "b"}, RelayProtocol::Tcp);
-            require_flow(!invalid, "slave coordinated flow");
+            invalid = co_await nodes[1]->async_open_flow({"b", "c"}, RelayProtocol::Tcp);
+            require_flow(!invalid, "non-ingress requested a flow");
             static_assert(NodeLinkMgr::max_flow_nodes == 8);
             auto oversized_path = names;
             oversized_path.push_back("extra");
@@ -105,6 +105,16 @@ void flow_integration()
             }
             require_flow(bool(warm), "flow did not become Ready");
             co_await nodes[0]->async_close_flow(warm.epoch, warm.id);
+            // Open and cancel can arrive in the same receive batch; late establishment cannot resurrect the Flow.
+            const auto cancelled_id = generate_random_id();
+            nodes[1]->send_cluster("master", CtrlMessage("flow.open", njson{{"epoch", warm.epoch},
+                {"flow_id", cancelled_id}, {"path", {"a", "b", "c"}}, {"transport", "tcp"}}));
+            nodes[1]->send_cluster("master", CtrlMessage("flow.close.request",
+                njson{{"epoch", warm.epoch}, {"flow_id", cancelled_id}}));
+            co_await delay_flow(100ms);
+            const auto cancelled_send = co_await nodes[1]->async_send_flow(
+                {warm.epoch, cancelled_id, false, LnkFrType::Data, {34}, {}});
+            require_flow(cancelled_send == FlowSendStatus::Closed, "cancelled remote flow was resurrected");
             FlowResult full_path;
             for (int i = 0; i < 100; ++i)
             {
@@ -148,6 +158,17 @@ void flow_integration()
                         require_flow(bool(edge), "outer UDP ensure never became Ready");
                     }
                 }
+                // Ordinary ingress uses the same master Flow transaction and owns its local lifecycle.
+                const auto remote = co_await nodes[1]->async_open_flow({"a", "b", "c"}, transport);
+                require_flow(bool(remote), "ingress Flow request failed");
+                co_await queued(1, remote, false, {31});
+                co_await receive(3, remote, false, {31});
+                co_await queued(3, remote, true, {32});
+                co_await receive(1, remote, true, {32});
+                co_await nodes[1]->async_close_flow(remote.epoch, remote.id);
+                const auto closed = co_await nodes[1]->async_send_flow(
+                    {remote.epoch, remote.id, false, LnkFrType::Data, {33}, {}});
+                require_flow(closed == FlowSendStatus::Closed, "remote close retained the local flow");
                 asio::experimental::channel<void(asio::error_code, FlowResult)> opened(control, 2);
                 auto open = [&](std::vector<std::string> path) -> asio::awaitable<void> {
                     auto s = co_await nodes[0]->async_open_flow(std::move(path), transport);

@@ -91,8 +91,8 @@ AgentConfig client_config(std::uint16_t control_port)
     config.connect_timeout = 1s;
     config.reconnect_initial_delay = 50ms;
     config.reconnect_max_delay = 200ms;
-    // UDP lifecycle waits are owned by the Node and must ignore the stream-only Agent timeout.
-    config.stream_open_timeout = 1ms;
+    // All protocols use the Agent establishment budget; running UDP has no expiry.
+    config.relay_open_timeout = 1s;
     config.channel = channel_config();
     return config;
 }
@@ -276,7 +276,7 @@ int main(int argc, char *argv[])
         settings.tcp.max_relays = 8;
         settings.datagram.max_relays = 8;
         settings.tcp.setup_timeout = 1s;
-        settings.datagram.service_wait_timeout = 1s;
+        settings.datagram.setup_timeout = 1s;
         settings.channel = channel_config();
         settings.datagram.traffic.rx_bytes_per_second = 100000000;
         settings.datagram.traffic.rx_burst_bytes = DatagramHeader::maximum_user_payload;
@@ -294,6 +294,9 @@ int main(int argc, char *argv[])
             AgentForwardConfig{"udp-echo", "127.0.0.1", forward_port, RelayProtocol::Udp});
         consumer_settings.forwards.push_back(
             AgentForwardConfig{"udp-echo", "127.0.0.1", second_forward_port, RelayProtocol::Udp});
+        const auto self_forward_port = unused_udp_port(port_io);
+        consumer_settings.services.push_back({"udp-self", "127.0.0.1", target_port, RelayProtocol::Udp});
+        consumer_settings.forwards.push_back({"udp-self", "127.0.0.1", self_forward_port, RelayProtocol::Udp});
         auto consumer = std::make_shared<RelayAgent>(consumer_control_io, consumer_transfer_io, consumer_context,
                                                     std::move(consumer_settings));
         consumer->start();
@@ -318,8 +321,13 @@ int main(int argc, char *argv[])
         second_probe.connect(udp::endpoint(asio::ip::address_v4::loopback(), second_forward_port));
         second_probe.non_blocking(true);
 
+        udp::socket self_probe(probe_io, udp::endpoint(asio::ip::address_v4::loopback(), 0));
+        self_probe.connect(udp::endpoint(asio::ip::address_v4::loopback(), self_forward_port));
+        self_probe.non_blocking(true);
+
         const BytesBuf maximum_payload(DatagramHeader::maximum_user_payload, 0x5a);
         expect_round_trip(probe, maximum_payload);
+        expect_round_trip(self_probe, maximum_payload);
 
         const BytesBuf oversized_payload(DatagramHeader::maximum_user_payload + 1, 0x6b);
         expect_drop(probe, oversized_payload);

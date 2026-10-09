@@ -100,7 +100,7 @@ NodeConfig server_config(std::uint16_t control_port, std::uint16_t transfer_port
     config.datagram.address = "127.0.0.1";
     config.datagram.port = transfer_port;
     config.tcp.setup_timeout = 1s;
-    config.datagram.service_wait_timeout = 1s;
+    config.datagram.setup_timeout = 1s;
     config.channel = channel_config();
     return config;
 }
@@ -113,7 +113,7 @@ AgentConfig client_config(std::uint16_t control_port)
     config.connect_timeout = 500ms;
     config.reconnect_initial_delay = 50ms;
     config.reconnect_max_delay = 200ms;
-    config.stream_open_timeout = 1s;
+    config.relay_open_timeout = 1s;
     config.channel = channel_config();
     return config;
 }

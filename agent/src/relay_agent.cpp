@@ -42,9 +42,9 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
         if (routing->contains("max_nodes"))
         {
             const auto maximum = require_unsigned(*routing, "max_nodes", true);
-            if (maximum > 16)
+            if (maximum > 8)
             {
-                throw std::runtime_error("routing.max_nodes must be between 1 and 16");
+                throw std::runtime_error("routing.max_nodes must be between 1 and 8");
             }
             result.routing_max_nodes = static_cast<std::size_t>(maximum);
         }
@@ -116,7 +116,7 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
     if (relay != root.end())
     {
         reject_unknown_fields(*relay, {"open_timeout_ms"}, "relay");
-        result.stream_open_timeout = optional_duration(*relay, "open_timeout_ms", result.stream_open_timeout, "relay");
+        result.relay_open_timeout = optional_duration(*relay, "open_timeout_ms", result.relay_open_timeout, "relay");
     }
 
     const auto reconnect = root.find("reconnect");
@@ -383,7 +383,7 @@ RelayAgent::RelayAgent(asio::io_context &control_io, asio::io_context &transfer_
       routing_(control_io, !config_.forwards.empty(), config_.routing_max_nodes), discovery_timer_(control_executor_),
       forwarder_(std::make_shared<Forwarder>(*this, transfer_executor_, ssl_context_, config_.server_name,
                                              config_.channel.handshake_timeout, config_.connect_timeout,
-                                             config_.stream_open_timeout, config_.services, config_.forwards)),
+                                             config_.relay_open_timeout, config_.services, config_.forwards)),
       primary_connection_id_(config_.host + ":" + std::to_string(config_.port)), stopped_waiter_(control_executor_)
 {
     stopped_waiter_.expires_at(std::chrono::steady_clock::time_point::max());
@@ -394,7 +394,7 @@ RelayAgent::RelayAgent(asio::io_context &control_io, asio::io_context &transfer_
 
     for (const auto &forward : config_.forwards)
     {
-        service_routes_.insert(ServiceKey{forward.service, forward.protocol}, std::nullopt, std::uint64_t{0});
+        service_locations_.insert(ServiceKey{forward.service, forward.protocol}, std::nullopt, ServiceLocation{});
     }
 }
 
@@ -443,6 +443,7 @@ asio::awaitable<void> RelayAgent::stop_on_control_executor()
         PROXY_INFO_PRINT("Agent stopping");
         discovery_timer_.cancel();
         routing_.stop();
+        invalidate_entries("agent stopping");
         connections_.for_each(
             [](const std::string &, std::shared_ptr<NodeConnection> &connection) { connection->stop(); });
         try_stop_forwarder();
@@ -510,10 +511,10 @@ void RelayAgent::update_probe_targets()
 {
     const auto primary = connections_.find_primary(primary_connection_id_);
     std::map<std::string, std::string> targets{{primary ? (*primary)->node_id() : std::string{}, config_.host}};
-    service_routes_.for_each([&](const ServiceKey &service, const std::uint64_t &) {
-        if (const auto connection = service_connection(service))
+    service_locations_.for_each([&](const ServiceKey &service, const ServiceLocation &location) {
+        if (const auto node = service_locations_.secondary_key(service))
         {
-            targets.insert_or_assign(connection->node_id(), connection->route().host);
+            targets.insert_or_assign(*node, location.address);
         }
     });
     if (routing_.set_required_targets(std::move(targets)))
@@ -523,29 +524,21 @@ void RelayAgent::update_probe_targets()
     discovery_timer_.cancel();
 }
 
-asio::awaitable<void> RelayAgent::calculate_service_paths(ServiceKey service, std::string connection_id)
+std::vector<std::string> RelayAgent::calculate_service_paths(const ServiceKey &service, const std::string &destination)
 {
     if (state_ != State::Running)
     {
-        co_return;
+        return std::vector<std::string>{};
     }
 
-    const auto connection = connections_.find_primary(connection_id);
-    if (!connection || !(*connection)->ready())
-    {
-        co_return;
-    }
-
-    const auto &destination = (*connection)->node_id();
     const auto now = AgentRouting::Clock::now();
-    if (path_cache_.get(destination, now))
+    if (const auto cached = path_cache_.get(destination, now))
     {
-        co_return;
+        return cached->empty() ? std::vector<std::string>{} : cached->front().nodes;
     }
 
     auto candidates = routing_.candidate_paths(now);
     const auto alternatives = candidates.find(destination);
-    // Candidates are diagnostics; business relays still connect directly to the service node.
     // Keep one complete log record per path so journald preserves level and service context.
     if (proxy_is_debug_enabled())
     {
@@ -559,22 +552,20 @@ asio::awaitable<void> RelayAgent::calculate_service_paths(ServiceKey service, st
             std::ostringstream path;
             path << "agent";
             for (const auto &node : candidate.nodes)
+            {
                 path << " -> " << node;
+            }
             PROXY_DEBUG_PRINT("Route #%zu cost=%.3f service=%s/%s: %s%s", index + 1, candidate.cost,
                               service.service.c_str(), relay_protocol_name(service.protocol).data(),
                               path.str().c_str(), index == 0 ? " *" : "");
         }
     }
 
+    auto best = alternatives == candidates.end() || alternatives->second.empty()
+                    ? std::vector<std::string>{} : alternatives->second.front().nodes;
     path_cache_.put(destination, alternatives == candidates.end() ? std::vector<RouteGraph::Path>{}
                                                                   : std::move(alternatives->second));
-}
-
-std::shared_ptr<NodeConnection> RelayAgent::service_connection(const ServiceKey &service) const
-{
-    const auto server = service_routes_.secondary_key(service);
-    const auto connection = server ? connections_.find_primary(*server) : nullptr;
-    return connection ? *connection : nullptr;
+    return best;
 }
 
 std::shared_ptr<NodeConnection> RelayAgent::ensure_connection(std::string node_id, std::string host, std::uint16_t port)
@@ -659,24 +650,37 @@ void RelayAgent::connection_ready(NodeConnection &connection, const std::shared_
         query_topology();
     }
 
-    service_routes_.for_each_secondary(connection.id(), [&](const ServiceKey &service, std::uint64_t &request_id) {
-        request_id = 0;
-        auto route = connection.route();
-        asio::post(transfer_executor_, [forwarder = forwarder_, service, route = std::move(route)]() mutable {
-            forwarder->set_route(service.service, service.protocol, std::move(route));
-        });
-    });
+    for (auto &[id, wait] : entry_waits_)
+    {
+        if (wait->node == connection.node_id())
+        {
+            wait->changed.cancel();
+        }
+    }
 }
 
 void RelayAgent::connection_closed(const NodeConnection &connection)
 {
     asio::post(transfer_executor_, [forwarder = forwarder_, id = connection.id()]() { forwarder->clear_server(id); });
+    for (auto &[id, wait] : entry_waits_)
+    {
+        if (wait->connection == connection.id())
+        {
+            wait->reason = "entry control disconnected";
+            wait->changed.cancel();
+        }
+    }
     if (connection.id() == primary_connection_id_)
     {
+        invalidate_entries("primary control disconnected");
         routing_.invalidate_snapshot();
         path_cache_.clear();
+        service_locations_.for_each([&](const ServiceKey &service, ServiceLocation &location) {
+            location = ServiceLocation{};
+            service_locations_.set_secondary(service, std::nullopt);
+            asio::post(transfer_executor_, [forwarder = forwarder_, service] { forwarder->clear_service(service); });
+        });
         update_probe_targets();
-        service_routes_.for_each([](const ServiceKey &, std::uint64_t &request_id) { request_id = 0; });
     }
 
     if (state_ == State::Running)
@@ -706,7 +710,9 @@ void RelayAgent::release_unused_connections()
 {
     std::vector<std::string> unused;
     connections_.for_each([&](const std::string &id, const std::shared_ptr<NodeConnection> &) {
-        if (id != primary_connection_id_ && service_routes_.count_secondary(id) == 0)
+        if (id != primary_connection_id_ &&
+            std::none_of(entry_waits_.begin(), entry_waits_.end(),
+                         [&id](const auto &entry) { return entry.second->connection == id; }))
         {
             unused.push_back(id);
         }
@@ -735,59 +741,53 @@ void RelayAgent::query_services(bool refresh)
         return;
     }
 
-    service_routes_.for_each([&](const ServiceKey &service, std::uint64_t &request_id) {
-        const auto server = service_routes_.secondary_key(service);
-        const auto target = server ? connections_.find_primary(*server) : nullptr;
-        if (target && (*target)->ready())
+    service_locations_.for_each([&](const ServiceKey &service, ServiceLocation &location) {
+        if (service_locations_.secondary_key(service) || (location.request && !refresh))
         {
             return;
         }
-
-        if (request_id && !refresh)
-        {
-            return;
-        }
-
-        request_id = allocate_request_id();
-        (*primary)->send(
-            CtrlMessage{CtrlCommand::ServiceLookup, njson{{"request_id", request_id},
-                                                          {"service", service.service},
-                                                          {"protocol", relay_protocol_name(service.protocol)}}});
+        location.request = allocate_request_id();
+        (*primary)->send(CtrlMessage{CtrlCommand::ServiceLookup,
+            njson{{"request_id", location.request}, {"service", service.service}, {"protocol", relay_protocol_name(service.protocol)}}});
     });
 }
 
 void RelayAgent::locate_service(const njson &params)
 {
-    const auto request_id = config::require_unsigned(params, "request_id");
+    const auto request = config::require_unsigned(params, "request_id");
     ServiceKey service{config::message_service(params), config::message_protocol(params)};
-    const auto desired = service_routes_.find_primary(service);
-    if (!desired || !request_id || *desired != request_id)
+    const auto desired = service_locations_.find_primary(service);
+    if (!desired || !request || desired->request != request)
     {
         return;
     }
-
-    auto node_id = config::required_string(params, "node_id", "service.located");
+    auto node = config::required_string(params, "node_id", "service.located");
     auto address = config::required_string(params, "address", "service.located");
     const auto port = config::required_port(params, "port", "service.located");
-    auto connection = ensure_connection(std::move(node_id), std::move(address), port);
-    *desired = 0;
-    if (!service_routes_.set_secondary(service, connection->id()))
+    const auto previous = service_locations_.secondary_key(service);
+    if (previous && (*previous != node || desired->address != address || desired->port != port))
     {
-        throw std::logic_error("Service route is not registered");
+        invalidate_entries("service destination changed", service);
     }
-
-    PROXY_INFO_PRINT("Service located service=%s/%s -> %s@%s", service.service.c_str(),
-                     relay_protocol_name(service.protocol).data(), connection->node_id().c_str(),
-                     connection->id().c_str());
-    release_unused_connections();
+    *desired = ServiceLocation{0, std::move(address), port};
+    service_locations_.set_secondary(service, node);
+    PROXY_INFO_PRINT("Service located service=%s/%s -> %s@%s:%u", service.service.c_str(),
+        relay_protocol_name(service.protocol).data(), node.c_str(), desired->address.c_str(), static_cast<unsigned int>(port));
     update_probe_targets();
-    if (connection->ready())
+    asio::post(transfer_executor_, [forwarder = forwarder_, service = std::move(service), node = std::move(node)]() mutable {
+        forwarder->set_service(std::move(service), std::move(node));
+    });
+}
+
+void RelayAgent::forget_service(const ServiceKey &service, std::string reason)
+{
+    if (const auto location = service_locations_.find_primary(service))
     {
-        auto route = connection->route();
-        asio::post(transfer_executor_,
-                   [forwarder = forwarder_, service = std::move(service), route = std::move(route)]() mutable {
-                       forwarder->set_route(std::move(service.service), service.protocol, std::move(route));
-                   });
+        *location = ServiceLocation{};
+        service_locations_.set_secondary(service, std::nullopt);
+        invalidate_entries(std::move(reason), service);
+        update_probe_targets();
+        asio::post(transfer_executor_, [forwarder = forwarder_, service] { forwarder->clear_service(service); });
     }
 }
 
@@ -796,14 +796,71 @@ void RelayAgent::handle_control_message(const NodeConnection &connection, CtrlMe
     const auto &params = config::message_params(message);
     const auto command = message.type();
     auto route = connection.route();
+    if (command == CtrlCommand::NodeLocated || command == CtrlCommand::NodeError)
+    {
+        const auto request = config::require_unsigned(params, "request_id", true);
+        const auto it = entry_waits_.find(request);
+        if (connection.id() != primary_connection_id_ || it == entry_waits_.end() ||
+            params.at("node_id") != it->second->node || !it->second->connection.empty() ||
+            std::chrono::steady_clock::now() >= it->second->deadline || !it->second->reason.empty())
+        {
+            return;
+        }
+        if (command == CtrlCommand::NodeError)
+        {
+            it->second->reason = "node.lookup: " + config::optional_string(params, "reason", "node unavailable");
+        }
+        else
+        {
+            config::required_string(params, "address", "node.located");
+            config::required_port(params, "port", "node.located");
+            it->second->location = params;
+        }
+        it->second->changed.cancel();
+        return;
+    }
+    if (command == CtrlCommand::RelayOffer || command == CtrlCommand::RelayOpened ||
+        command == CtrlCommand::RelayReady || command == CtrlCommand::RelayClosed || command == CtrlCommand::RelayError)
+    {
+        if (command == CtrlCommand::RelayError)
+        {
+            const auto reason = config::optional_string(params, "reason", "relay failed");
+            if (reason == "service unavailable" || reason == "service protocol mismatch")
+            {
+                const ServiceKey service{config::message_service(params), config::message_protocol(params)};
+                const auto destination = service_locations_.secondary_key(service);
+                auto failed_destination = connection.node_id();
+                if (params.contains("path"))
+                {
+                    const auto path = params.at("path").get<std::vector<std::string>>();
+                    failed_destination = path.empty() ? std::string{} : path.back();
+                }
+                if (destination && *destination == failed_destination)
+                {
+                    forget_service(service, reason);
+                    query_services();
+                }
+            }
+        }
+        asio::post(transfer_executor_, [forwarder = forwarder_, route = std::move(route), message = std::move(message)]() mutable {
+            forwarder->relay_message(std::move(route), std::move(message));
+        });
+        return;
+    }
     if (command == CtrlCommand::TopologySnapshot)
     {
         if (connection.id() == primary_connection_id_)
         {
             try
             {
+                const auto old_epoch = routing_.epoch();
                 if (routing_.accept_snapshot(params, AgentRouting::Clock::now()))
                 {
+                    if (old_epoch != routing_.epoch())
+                    {
+                        path_cache_.clear();
+                        invalidate_entries("topology epoch changed");
+                    }
                     discovery_timer_.cancel();
                 }
             }
@@ -813,132 +870,30 @@ void RelayAgent::handle_control_message(const NodeConnection &connection, CtrlMe
             }
         }
     }
-    else if (command == CtrlCommand::RelayOffer)
-    {
-        auto service = config::message_service(params);
-        const auto protocol = config::message_protocol(params);
-        const auto uuid = config::require_unsigned(params, "uuid");
-        const auto transfer_port = config::message_data_port(params);
-        const auto ticket = config::require_unsigned(params, "ticket", true);
-        if (protocol != RelayProtocol::Udp)
-        {
-            asio::post(transfer_executor_, [forwarder = forwarder_, route = std::move(route), protocol,
-                                            service = std::move(service), uuid, ticket, transfer_port]() mutable {
-                forwarder->stream_relay_offer(std::move(route), protocol, std::move(service), uuid, ticket,
-                                              transfer_port);
-            });
-        }
-        else
-        {
-            const auto session_id = config::require_unsigned(params, "session_id", true);
-            asio::post(transfer_executor_,
-                       [forwarder = forwarder_, route = std::move(route), service = std::move(service), uuid,
-                        session_id, ticket, transfer_port]() mutable {
-                           forwarder->datagram_relay_offer(std::move(route), std::move(service), uuid, session_id,
-                                                           ticket, transfer_port);
-                       });
-        }
-    }
-    else if (command == CtrlCommand::RelayOpened)
-    {
-        const auto request_id = config::require_unsigned(params, "request_id");
-        const auto protocol = config::message_protocol(params);
-        const auto uuid = config::require_unsigned(params, "uuid");
-        const auto transfer_port = config::message_data_port(params);
-        const auto ticket = config::require_unsigned(params, "ticket", true);
-        if (protocol != RelayProtocol::Udp)
-        {
-            asio::post(transfer_executor_, [forwarder = forwarder_, route = std::move(route), protocol, request_id,
-                                            uuid, ticket, transfer_port]() mutable {
-                forwarder->stream_relay_opened(std::move(route), protocol, request_id, uuid, ticket, transfer_port);
-            });
-        }
-        else
-        {
-            const auto session_id = config::require_unsigned(params, "session_id", true);
-            asio::post(transfer_executor_, [forwarder = forwarder_, route = std::move(route), request_id, uuid,
-                                            session_id, ticket, transfer_port]() mutable {
-                forwarder->datagram_relay_opened(std::move(route), request_id, uuid, session_id, ticket, transfer_port);
-            });
-        }
-    }
     else if (command == CtrlCommand::ServiceOk)
     {
         const auto protocol = config::message_protocol(params);
         PROXY_INFO_PRINT("Service registered service=%s/%s -> %s", config::message_service(params).c_str(),
                          relay_protocol_name(protocol).data(), connection.node_id().c_str());
     }
-    else if (command == CtrlCommand::ServiceLocated)
+    else if (command == CtrlCommand::ServiceLocated && connection.id() == primary_connection_id_)
     {
         locate_service(params);
     }
-    else if (command == CtrlCommand::ServiceError || command == CtrlCommand::RelayError)
+    else if (command == CtrlCommand::ServiceError && connection.id() == primary_connection_id_)
     {
-        if (command == CtrlCommand::RelayError)
+        const auto reason = config::optional_string(params, "reason", "service unavailable");
+        if (params.contains("service") && params.contains("protocol"))
         {
-            if (const auto request_id = config::optional_unsigned(params, "request_id"))
+            const ServiceKey service{config::message_service(params), config::message_protocol(params)};
+            const auto location = service_locations_.find_primary(service);
+            const auto request = config::optional_unsigned(params, "request_id");
+            if (location && request && location->request == *request)
             {
-                const auto protocol = config::message_protocol(params);
-                const auto uuid = config::optional_unsigned(params, "uuid", true);
-                auto reason = config::optional_string(params, "reason", "relay failed");
-                std::optional<ServiceKey> stale_service;
-                if (reason == "service unavailable" || reason == "service protocol mismatch")
-                {
-                    stale_service.emplace(config::message_service(params), protocol);
-                    const auto service_route = service_routes_.find_primary(*stale_service);
-                    const auto server = service_routes_.secondary_key(*stale_service);
-                    if (!service_route || !server || *server != connection.id())
-                    {
-                        stale_service.reset();
-                    }
-                    else
-                    {
-                        *service_route = 0;
-                        service_routes_.set_secondary(*stale_service, std::nullopt);
-                        update_probe_targets();
-                    }
-                }
-                asio::post(transfer_executor_, [forwarder = forwarder_, route = std::move(route),
-                                                request_id = *request_id, protocol, uuid, reason = std::move(reason),
-                                                stale_service]() mutable {
-                    forwarder->relay_open_failed(std::move(route), request_id, protocol, uuid, std::move(reason));
-                    if (stale_service)
-                        forwarder->clear_route(stale_service->service, stale_service->protocol);
-                });
-
-                if (stale_service)
-                {
-                    release_unused_connections();
-                    query_services();
-                }
-                // Forwarder reports the rejection once, with the pending relay context.
-                return;
+                forget_service(service, reason);
             }
         }
-        PROXY_ERROR_PRINT("Server rejected node=%s command=%s service=%s request_id=%llu uuid=%llu reason=%s",
-                          connection.node_id().c_str(), message.command.c_str(),
-                          config::optional_string(params, "service", "-").c_str(),
-                          static_cast<unsigned long long>(config::optional_unsigned(params, "request_id").value_or(0)),
-                          static_cast<unsigned long long>(config::optional_unsigned(params, "uuid").value_or(0)),
-                          config::optional_string(params, "reason", "unspecified").c_str());
-    }
-    else if (command == CtrlCommand::RelayReady)
-    {
-        const auto uuid = config::require_unsigned(params, "uuid", true);
-        const auto protocol = config::message_protocol(params);
-        asio::post(transfer_executor_, [forwarder = forwarder_, route = std::move(route), uuid, protocol]() mutable {
-            forwarder->relay_ready(std::move(route), uuid, protocol);
-        });
-    }
-    else if (command == CtrlCommand::RelayClosed)
-    {
-        const auto uuid = config::require_unsigned(params, "uuid", true);
-        const auto protocol = config::message_protocol(params);
-        auto reason = config::optional_string(params, "reason", "relay closed");
-        asio::post(transfer_executor_, [forwarder = forwarder_, route = std::move(route), uuid, protocol,
-                                        reason = std::move(reason)]() mutable {
-            forwarder->relay_closed(std::move(route), uuid, protocol, std::move(reason));
-        });
+        PROXY_DEBUG_PRINT("Service discovery failed reason=%s", reason.c_str());
     }
     else if (command == CtrlCommand::ServiceListed)
     {
@@ -986,7 +941,119 @@ void RelayAgent::try_stop_forwarder()
 void RelayAgent::complete_stop() noexcept
 {
     connections_.clear();
-    service_routes_.clear();
+    service_locations_.clear();
+    entry_waits_.clear();
     state_ = State::Stopped;
     stopped_waiter_.cancel();
+}
+
+RelayAgent::EntryWait::EntryWait(asio::any_io_executor executor, ServiceKey service, std::string node,
+                               std::chrono::steady_clock::time_point deadline)
+    : changed(executor), service(std::move(service)), node(std::move(node)), deadline(deadline)
+{
+}
+
+asio::awaitable<RelaySelection> RelayAgent::select_relay(ServiceKey service, std::string destination,
+                                                       std::chrono::steady_clock::time_point deadline)
+{
+    const auto current = service_locations_.secondary_key(service);
+    const auto location = service_locations_.find_primary(service);
+    if (state_ != State::Running || !current || *current != destination || !location)
+    {
+        throw std::runtime_error("service unavailable");
+    }
+    auto path = calculate_service_paths(service, destination);
+    const auto entry = path.size() > 1 ? path.front() : destination;
+    if (entry_waits_.size() >= 1000)
+    {
+        throw std::runtime_error("entry lookup capacity reached");
+    }
+    const auto epoch = routing_.epoch();
+    const auto request = allocate_request_id();
+    auto wait = std::make_shared<EntryWait>(control_executor_, service, entry, deadline);
+    entry_waits_.emplace(request, wait);
+    ScopeGuard rollback([this, request] { release_entry(request); });
+    if (const auto existing = connections_.find_secondary(entry))
+    {
+        wait->connection = (*existing)->id();
+    }
+    else if (entry == destination)
+    {
+        wait->location = njson{{"address", location->address}, {"port", location->port}};
+    }
+    else
+    {
+        const auto primary = connections_.find_primary(primary_connection_id_);
+        if (!primary || !(*primary)->ready())
+        {
+            throw std::runtime_error("node.lookup: primary control unavailable");
+        }
+        (*primary)->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", request}, {"node_id", entry}}));
+    }
+    for (;;)
+    {
+        if (state_ != State::Running || !wait->reason.empty())
+        {
+            throw std::runtime_error(wait->reason.empty() ? "agent stopping" : wait->reason);
+        }
+        const auto current_destination = service_locations_.secondary_key(service);
+        if (routing_.epoch() != epoch || !current_destination || *current_destination != destination)
+        {
+            throw std::runtime_error("route epoch or service destination changed");
+        }
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            if (entry == destination)
+            {
+                forget_service(service, "service control connection timed out");
+                query_services();
+            }
+            throw std::runtime_error("entry control connection timed out");
+        }
+        if (!wait->location.empty() && wait->connection.empty())
+        {
+            auto connection = ensure_connection(entry, config::required_string(wait->location, "address", "node.located"),
+                                                 config::required_port(wait->location, "port", "node.located"));
+            wait->connection = connection->id();
+        }
+        if (!wait->connection.empty())
+        {
+            if (const auto connection = connections_.find_primary(wait->connection); connection && (*connection)->ready())
+            {
+                rollback.dismiss();
+                co_return RelaySelection{(*connection)->route(), std::move(path), epoch, request};
+            }
+        }
+        wait->changed.expires_at(deadline);
+        const auto [error] = co_await wait->changed.async_wait(use_nothrow_awaitable);
+        if (error && error != asio::error::operation_aborted)
+        {
+            throw asio::system_error(error);
+        }
+        if ((co_await asio::this_coro::cancellation_state).cancelled() != asio::cancellation_type::none)
+        {
+            throw asio::system_error(asio::error::operation_aborted);
+        }
+    }
+}
+
+void RelayAgent::release_entry(std::uint64_t lease)
+{
+    entry_waits_.erase(lease);
+    release_unused_connections();
+}
+
+void RelayAgent::invalidate_entries(std::string reason, const std::optional<ServiceKey> &service)
+{
+    for (auto &[id, wait] : entry_waits_)
+    {
+        if (!service || *service == wait->service)
+        {
+            wait->reason = reason;
+            wait->changed.cancel();
+        }
+    }
+    asio::post(transfer_executor_, [forwarder = forwarder_, reason = std::move(reason), service] {
+        forwarder->invalidate_relays(reason, service);
+    });
 }

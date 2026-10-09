@@ -41,7 +41,7 @@
     "address": "127.0.0.1",
     "port": 18445,
     "max_relays": 11,
-    "service_wait_timeout_ms": 2500,
+    "setup_timeout_ms": 2500,
     "rx_bytes_per_second": 2001,
     "rx_max_burst_bytes": 2002,
     "tx_bytes_per_second": 2003,

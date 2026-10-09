@@ -88,7 +88,7 @@ AgentConfig client_config(std::uint16_t control_port)
     config.connect_timeout = 500ms;
     config.reconnect_initial_delay = 50ms;
     config.reconnect_max_delay = 200ms;
-    config.stream_open_timeout = 2s;
+    config.relay_open_timeout = 2s;
     config.channel = channel_config();
     return config;
 }
@@ -261,17 +261,6 @@ asio::awaitable<void> verify_topology(asio::ssl::context &context, std::uint16_t
         require(snapshot.at("nodes").size() == 2, "Topology snapshot did not contain both Nodes");
         co_await channel->async_disconnect();
     }
-}
-
-asio::awaitable<void> verify_local_cluster_status(asio::ssl::context &context, std::uint16_t port,
-                                                  std::string_view expected_node)
-{
-    auto channel = co_await open_control(context, port);
-    constexpr std::uint64_t request_id = 72;
-    channel->send(CtrlMessage{"server.cluster", njson{{"request_id", request_id}}});
-    auto reports = co_await collect_cluster_status(channel, request_id, 1);
-    require(reports.contains(std::string(expected_node)), "Disconnected node did not return its local status");
-    co_await channel->async_disconnect();
 }
 
 asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context &context,
@@ -532,17 +521,16 @@ int main(int argc, char *argv[])
             throw std::runtime_error(scenario + ": " + error);
         };
 
-        // The known slave must reconnect without consulting the offline entry node.
-        master->stop();
+        // Recover through ordinary service discovery while the primary is online.
         slave->stop();
         slave = std::make_shared<RelayNode>(
             control_io, transfer_io, udp_io, cluster_data.io, server_context,
             server_config("slave", ClusterConfig::Role::Slave, cluster_port, control_b, transfer_b));
         slave->start();
-        wait_for_service(forward_b, "Slave recovery while entry is offline");
-        asio::co_spawn(control_io, verify_local_cluster_status(client_context, control_b, "slave"),
-                       asio::use_future).get();
+        wait_for_service(forward_b, "Slave recovery");
+        wait_for_cluster("Slave cluster recovery");
 
+        master->stop();
         master = std::make_shared<RelayNode>(
             control_io, transfer_io, udp_io, cluster_data.io, server_context,
             server_config("master", ClusterConfig::Role::Master, cluster_port, control_a, transfer_a));

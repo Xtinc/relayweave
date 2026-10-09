@@ -2,6 +2,7 @@ add_library(relayweave_agent_lib
     src/agent_routing.cpp
     src/relay_agent.cpp
     src/forwarder.cpp
+    src/agent_relay.cpp
 )
 target_link_libraries(relayweave_agent_lib PUBLIC relayweave_protocol relayweave_routing_lib)
 target_include_directories(relayweave_agent_lib PUBLIC inc)

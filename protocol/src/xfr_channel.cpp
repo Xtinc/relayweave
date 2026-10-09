@@ -347,3 +347,56 @@ asio::awaitable<void> relay_udp_connected(udp::socket &local_socket, udp::socket
     co_await (send_udp_payloads(local_socket, transfer_socket, session_header) &&
               receive_udp_payloads(transfer_socket, local_socket, session_header));
 }
+
+// Same transfer executor. Transport EOF represents one business direction only.
+template <typename From, typename To>
+static asio::awaitable<void> transfer_halfclose(From &from, To &to)
+{
+    std::array<std::uint8_t, 64 * 1024> buffer;
+    for (;;)
+    {
+        const auto [error, size] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
+        if (error == asio::error::eof || error == asio::ssl::error::stream_truncated)
+        {
+            asio::error_code shutdown_error;
+            to.lowest_layer().shutdown(tcp::socket::shutdown_send, shutdown_error);
+            if (shutdown_error && shutdown_error != asio::error::not_connected)
+            {
+                throw asio::system_error(shutdown_error);
+            }
+            co_return;
+        }
+        if (error)
+        {
+            throw asio::system_error(error);
+        }
+        co_await asio::async_write(to, asio::buffer(buffer.data(), size), asio::use_awaitable);
+    }
+}
+
+asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming)
+{
+    const auto executor = co_await asio::this_coro::executor;
+    const auto [order, outgoing_error, incoming_error] = co_await asio::experimental::make_parallel_group(
+        asio::co_spawn(executor, std::move(outgoing), asio::deferred),
+        asio::co_spawn(executor, std::move(incoming), asio::deferred)
+    ).async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
+    // operator&& retains only the outgoing exception if both fail; that can hide the original I/O error.
+    for (const auto index : order)
+    {
+        if (const auto error = index == 0 ? outgoing_error : incoming_error)
+        {
+            std::rethrow_exception(error);
+        }
+    }
+}
+
+asio::awaitable<void> relay_halfclose(tcp::socket &local, tcp::socket &transfer)
+{
+    co_await await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
+}
+
+asio::awaitable<void> relay_halfclose(tcp::socket &local, tls_stream &transfer)
+{
+    co_await await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
+}

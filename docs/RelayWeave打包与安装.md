@@ -119,6 +119,8 @@ dpkg-deb --contents build-package/packages/relayweave-proxy_*.deb
 四个组件包均在 `/usr/share/doc/relayweave-<role>/` 安装设计、打包与安装、证书部署文档；Dashboard
 另包含其 README。route 模块静态链接到 Node 和 Agent，不单独打包；测试、诊断程序及测试证书不安装。
 
+Node 的 UDP 建立超时使用 `udp.setup_timeout_ms`，默认 10000 毫秒；旧 `udp.service_wait_timeout_ms` 已删除，升级已有配置时需要移除旧字段。服务离线仅在 Agent 本地等待，不分配 Node 资源。
+
 配置文件分别由 `agent/agent.example.json`、`node/node.example.json` 和 `proxy/proxy.example.json` 安装而来，并通过 Debian `conffiles` 机制管理。升级时 dpkg 保留管理员修改；如果新包也修改了模板，dpkg 按标准 conffile 规则决定是否询问替换。
 
 Node 和 Agent 包只创建证书目录，不包含证书或私钥；Proxy 不需要证书目录。不同主机需要部署的具体文件见 [证书制作与部署](证书制作与部署.md)。手工复制或由部署工具安装的证书不属于包文件，卸载或 purge 脚本不会主动删除它们。
@@ -214,7 +216,7 @@ sudo apt install ./relayweave-proxy_1.0.0-2_arm64.deb
 - 三个组件是独立包，可以分别升级。
 
 链路质量协议使用 `quality: {cost, confidence, usable}`，Node、Agent、Dashboard 应统一升级，不支持
-混用旧质量格式。Agent 的 routing 配置默认启用且只接受可选 `max_nodes`（默认 4，范围 1–16）；
+混用旧质量格式。Agent 的 routing 配置默认启用且只接受可选 `max_nodes`（默认 4，范围 1–8）；
 旧配置中的 `routing.enabled` 必须删除，dpkg 保留的 conffile 不会自动完成这一修改。
 
 Node 配置需要将旧 `cluster.port` 改为必填 `cluster.control_port`，并增加必填的

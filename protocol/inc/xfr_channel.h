@@ -67,6 +67,13 @@ asio::awaitable<void> relay_tls(asio::ssl::stream<asio::ip::tcp::socket> &left,
                                 TrafficCounter *left_to_right_traffic = nullptr,
                                 TrafficCounter *right_to_left_traffic = nullptr);
 
+// Routed streams preserve the opposite direction after EOF and propagate I/O failures.
+// Same executor: drain both tasks and preserve the first failure, rather than sibling cancellation.
+asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming);
+asio::awaitable<void> relay_halfclose(asio::ip::tcp::socket &local, asio::ip::tcp::socket &transfer);
+asio::awaitable<void> relay_halfclose(asio::ip::tcp::socket &local,
+                                     asio::ssl::stream<asio::ip::tcp::socket> &transfer);
+
 asio::awaitable<void> relay_udp_connected(asio::ip::udp::socket &local_socket, asio::ip::udp::socket &transfer_socket,
                                           DatagramHeader::Buffer session_header);
 

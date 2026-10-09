@@ -2,11 +2,187 @@
 
 ## 范围与现状
 
-Agent 已在 Stream 建连前计算推荐路径，但业务仍直接连接服务所在 Node。
 第一阶段已完成 master 协调的 Node 间共享 TCP/UDP 数据通道和基本分帧收发。
-第二阶段已实现 Node 间逐跳转发，由 master 显式指定路径并使用内部测试数据验证；
-第三、第四阶段再接入 Agent 计算路径、首末 socket 和真实业务。
+第二阶段已完成 NodeFlow 建立、提交及 Node 间逐跳转发，并使用内部数据验证。
+第三阶段已实现 Agent 最佳路径提交、首 Node 定位及 TCP/TLS/UDP 首末接入，实施与验证记录见文末。
+service.lookup/located 保持服务发现原义，多跳使用 node.lookup/located 查询首 Node；
+Agent 沿用现有控制连接建立方式连接首 Node 后提交最佳路径。
+第四阶段已补齐首末 socket↔NodeFlow 桥接和真实业务；首端确认两端接入和绑定后，首末各自激活并通过已有 relay.ready 开始业务，第三、第四阶段整体上线。
+不增加阶段专用接口、临时协议或上线开关。
 本文阶段编号针对共享数据通道与路径执行，区别于历史探测/自适应路由预研的编号。
+
+## 端到端职责重构：分步实施计划（2026-10-09）
+
+本节为当前已完成的重构方案，优先于下文第三、第四阶段的历史结构描述。
+已完成的业务功能和 NodeLink/NodeFlow 是回归基线；重构完成后整体使用，不发布中间步骤，
+不添加临时协议、兼容开关、业务 prepare 或额外 master 协调。
+
+### 完整流程与三个生命周期
+
+```mermaid
+flowchart LR
+    F[Agent forward 本地监听] --> A[请求方 AgentRelay]
+    A --> H[首 Node RelaySession]
+    H --> D{单节点或多节点}
+    D -->|单节点本地复制| P[服务方 AgentRelay]
+    D -->|已有 NodeFlow| T[末 Node RelaySession]
+    T --> P
+    P --> S[目标服务 socket]
+```
+
+forward 拥有配置和本地监听，持续存在；AgentRelay 拥有一次业务接入和复制资源；
+RelaySession 拥有一次 Node 本地业务实例、所选控制器和数据资源句柄。
+TCP/TLS 每个已接受的应用连接创建一个 AgentRelay；UDP 每个 forward 保留当前业务实例，
+应用来源和重试状态归 forward。中间 Node 只有第二阶段的 NodeFlow，不创建 Agent 业务实例。
+
+建立顺序固定为：服务发现 → 最佳路径选择 → 获取/复用入口控制连接 → relay.open →
+Node 资源建立 → opened/offer → 请求方接入、服务方连接目标并接入 → ready → 双向传输。
+单节点与多节点在路径确定以后选择各自控制器；协议 I/O 的差异由数据资源处理。
+没有可用计算路径或最佳路径只有一个 Node 时，使用服务位置走单节点接入，保留现有回退规则。
+
+service.lookup/located 只返回服务所在 Node 的身份和位置，不因发现服务就连接服务所在 Node。
+请求方用 Node 身份计算路径；单节点入口就是服务 Node，多节点入口是路径首 Node。
+需要时才通过已有主控制连接发送 node.lookup/located 查询入口位置，并复用现有控制连接表。
+服务方继续使用已注册服务的控制连接。活动业务保留入口控制连接引用，退出后释放；
+主控制连接独立存活。有效 LRU 只取最佳路径并附当前 epoch，不复用上一次业务的票据或 Flow。
+默认 max_nodes 仍为 4，上限为 8，包含首尾 Node、不包含 Agent。
+服务发现沿用主控制连接；当前不设计主控断线后的服务定位，不增加位置缓存或备用发现通道。
+主控制恢复后重新注册和发现。单节点入口地址不可达时清除该次发现结果并重新查询；
+多节点首 Node 定位失败不删除仍有效的服务所在 Node 位置。
+
+服务离线时，UDP 只保留 Agent 本地 forward，不建立 Node 等待实例、不分配端点或 Flow。
+此时本地报文丢弃；服务上线后重新选择路径和连接入口，再申请新的业务实例。
+单节点和多节点使用同一规则。TCP/TLS 当前无法建立的应用连接关闭，监听继续存在。
+活动业务失效时先结束当前 AgentRelay；UDP 后续恢复同样从服务发现和路径选择开始。
+
+### 类的职责与执行域
+
+| 类 | 拥有和负责 | 不承担的职责 |
+|---|---|---|
+| RelayAgent | control_io：控制连接表、注册/发现、服务位置、选路及入口引用 | 应用 socket 复制、Node 业务协调 |
+| NodeConnection | control_io：一条控制连接的识别、消息、心跳和重连 | 服务路径选择和数据接入 |
+| AgentRouting / 路径 LRU | control_io：拓扑、探测、最佳路径 | 控制连接和业务资源 |
+| Forwarder | transfer_io：forward 和 AgentRelay 容器、事件分派、关闭排空 | 拓扑计算、Node 事务 |
+| StreamForward / DatagramForward | transfer_io：长期监听；UDP 来源、当前实例及重试 | Node 资源、服务等待实例 |
+| AgentRelay | transfer_io：一次请求方/服务方接入、目标连接、ready 等待、业务复制和清理 | 全局发现、另一端协调 |
+| RelayNode | control_io：注册查询、RelaySession 容器、请求/集群消息分派及停止排空 | socket 复制、master 业务状态 |
+| RelaySession | control_io：直接拥有 Single 或 Multi 控制器、端点句柄；跨执行域调用数据操作 | 第二份业务状态机、共享监听、NodeLink 建路 |
+| ControlRouterSingle | control_io：本 Node 两个 Agent 的接入、ready、建立超时、取消与通知 | 全局查询/容器、数据复制和 UDP 等待服务 |
+| ControlRouterMulti | control_io：首末 attached/ready/finished/close、Flow 失效、预算与取消 | 全局消息查表/创建、master 业务协调 |
+| StreamPipeline / DatagramMgr | transfer_tcp_io / transfer_udp_io：监听、票据校验、本地配对或端点、实际 I/O、限速计数 | Agent 控制引用、业务阶段、服务等待和控制通知 |
+| NodeLinkMgr / LnkChannel | 原执行域：第二阶段既有建路、共享通道和逐跳传输 | Agent 接入与业务生命周期 |
+
+RelaySession 通过 std::variant 直接持有 ControlRouterSingle 或 ControlRouterMulti，
+不增加第三个控制器、公共控制器基类、
+Impl 或回调注册框架。两个控制器具有相同层次、执行域和外部作用；差别仅在本地配对与首末协调。
+
+### 实施步骤与检查标准
+
+每一步单独整理、构建和执行相应回归，通过以后继续下一步；这里的拆分只是开发顺序，
+不引入阶段专用运行流程。开始前保存完整工作区基线，只撤回本次重构，不覆盖此前第三、第四阶段改动。
+
+| 步骤 | 状态 | 修改内容 | 完成标准 |
+|---|---|---|---|
+| 1. 名称和边界 | 已完成 | RelayPipeline 改名 RelaySession，同步源码、构建清单和当前结构文档；此步保留现有运行行为 | 无旧类型/文件引用；Node 和多跳回归通过；明确单节点统一由第 4 步落实 |
+| 2. 发现与入口 | 已完成 | 服务位置与控制连接分开；按目的 Node 计算路径，然后取得入口连接；删除仅为发现目的而创建的尾 Node 连接 | 单节点只连接服务 Node；多节点请求方只取得首 Node；路径缓存、断开/epoch、Agent 集群和多跳回归通过 |
+| 3. Agent 业务统一 | 已完成 | 以 AgentRelay 合并 StreamRelay / DatagramRelay / PathRelay 的接入和生命周期；保留协议 I/O 与角色差异 | opened/offer/ready/error/closed 共用实例分派；UDP 仅本地等待服务，上线后重新选路；真实双 Agent 全链路通过 |
+| 4. Node 单节点统一 | 已完成 | RelaySession 同层拥有 Single/Multi；Single 协调移到 control_io；数据管理器只留下本地配对/端点 API 和 I/O | 删除数据域控制器、控制弱引用、服务等待定时器和 attach_service；缺服务直接失败；取消/建立超时/限速统计/单节点回归通过 |
+| 5. Node 全局与实例分离 | 已完成 | open/reject/cancel、peer 查找/创建移到 RelayNode；控制器只操作自身实例；统一实例容器和停止排空 | Single/Multi 不再静态操作 Node 全局表；无重复阶段/请求/流身份；正常 FIN 与异常清理及分叉隔离通过 |
+| 6. 整理与验证 | 已完成 | 删除替代代码和无用成员，核对所有权与跨域参数，更新配置说明、架构和本实施文档 | Debug/Release 全目标及完整 CTest；说明跳过项和实测限制；git diff --check 与文档链接检查通过 |
+
+第 3、4 步共同落实 UDP 离线规则：Agent 不再提交无服务请求，Node 也不保留旧的等待服务流程。
+第 4 步删除 udp.service_wait_timeout_ms，使用 udp.setup_timeout_ms 限制实际接入，
+默认 10 秒，与 TCP/TLS 一致；测试、配置样例和部署文档同步更新，不保留旧字段兼容分支。
+多节点建立继续使用请求剩余预算。建立超时只覆盖建立阶段，业务运行期间不加租约或到期扫描。
+
+数据管理器对单节点提供本地配对操作，对多节点提供本地端点操作；均明确执行
+install/wait/bind/activate/run/close。RelaySession 只在跨域边界调用这些操作，
+业务阶段、超时和控制通知只有控制器一份；数据侧仅保留票据、接入事件和实际 I/O 状态。
+Flow 失效监视必须由 Multi 实例拥有，并随业务退出取消、排空，不能成为 RelayNode 的另一套业务生命周期。
+
+### 必须保留的正确性条件
+
+- 本地监听与单次业务分开；业务失败或服务离线不销毁 forward。
+- 接入票据、角色和 UDP 来源检查继续保留；单节点 UDP 原载荷范围、多跳 0..4096 字节继续保留。
+- 首末控制只通过既有集群通道交流；master 继续只负责第二阶段 Flow 建路和消息转交。
+- Multi 的 attached/ready 保证可开始传输，finished 保证最后 DATA/FIN 排空，不因简化而提前关闭 Flow。
+- 正常结束不提前取消 Agent 数据读取；异常保留原始原因。跨执行域任务取消后必须排空，再释放资源。
+- UDP 共享 socket 保留唯一发送链及有界队列；服务计数只在末端或单节点统计一次。
+- 节点停止先取消并排空业务实例，再停止 NodeLinkMgr；共享 NodeLink 与其他 Flow 不受单实例关闭影响。
+
+### 执行记录
+
+- 第 1 步已完成：源码类型与文件统一为 RelaySession / relay_session.*；实例引用和容器同步为 relay_ / multi_sessions_。
+  源码、CMake、README 和设计文档引用已同步；旧类型/文件名仅保留在本节名称迁移说明中。
+  与 build/architecture-before 的 Node 基线逐文件比对，确认 7 个源码/构建文件只有名称变化，没有业务行为改动。
+- 第 1 步验证：Release 全目标构建通过，无 C++ 编译警告；relay_integration、udp_relay_integration、
+  udp_session_routing、relay_paths 四项回归全部通过，耗时 25.45 秒。
+  git diff --check 和相关文档 41 个本地链接检查通过。
+  日志：build/architecture-step1-build.log、build/architecture-step1-tests.log。
+  本步未运行 Debug、全量 CTest、多机或吞吐测试；完整验证安排在第 6 步。
+- 第 2、3 步已合并完成：服务发现只保存目的 Node 身份及地址，选路后取得实际入口。
+  多节点请求方不因发现就连接尾 Node，入口连接在多个业务间复用，最后一个业务退出后释放。
+  合并实施使连接引用直接归 AgentRelay，不增加旧三种实例的临时连接管理逻辑。
+- AgentRelay 统一请求方与服务方的 opened/offer/ready/error/closed 分派、接入预算、数据复制和清理。
+  Forwarder 只拥有监听、来源及重试状态、业务容器；删除 StreamRelay/DatagramRelay/PathRelay 和 forwarder_paths.cpp。
+  单节点同一 Agent 的两种角色均接收 ready；多节点 TCP/TLS 仍等待 FIN 排空再释放入口。
+  UDP 服务离线时 Agent 只保留本地 forward，发现服务后每个新实例重新选路。
+- 服务发现仍经主控；不设计主控断线定位，不增加位置缓存或备用通道。
+  接入地址不可达时单节点重新发现，多节点首 Node 失败不清除有效目的位置；迟到发现回复按 request_id 丢弃。
+- 第 2、3 步验证：Release 全目标构建通过，无 C++ 编译警告；完整 CTest 26 项通过、probe_integration 跳过，耗时 161.89 秒。
+  真实多跳 TCP/TLS/UDP、TCP/TLS 半关闭、同一 Agent 单节点双角色、UDP 最大载荷及来源检查、
+  首 Node 连接复用与最后引用释放、有效 LRU/epoch、主控在线的从节点恢复、服务迁移和迟到定位回复均通过。
+  git diff --check 及相关文档 41 个本地链接检查通过；Debug 和跨机器验证仍安排在第 6 步。
+  日志：build/architecture-step2-agent-build.log、build/architecture-step2-discovery-tests.log、build/architecture-step2-agent-tests.log。
+- 第 4、5 步已合并完成：Node 所有业务由 RelaySession 持有 Single/Multi variant，两个控制器均在 control_io。
+  RelayNode 在 relay_node_relays.cpp 创建、查找和分派实例，统一 relay_sessions_ 容器、取消和停止排空；
+  删除控制器静态全局入口、独立多跳任务计数和 Node 全局 Flow watcher。
+  Multi 的 Flow 监视由本实例的结构化子任务拥有，任一分支结束后取消并排空另一分支，不延长实例生命周期。
+- 数据 manager 只管理本地配对与多节点端点；业务通过 install/wait/bind/activate/run/close 操作数据资源。
+  数据域不再保存 ControlRouterSingle、控制会话弱引用、服务名/请求身份、业务建立 timer 或业务控制通知。
+  保留原票据与来源校验、单节点配对复制、多节点 FIN 桥接、协议容量及限速统计。
+- 删除 Node UDP WaitingForProducer、attach_service 和服务等待 timer；无服务的 open 立即失败，不分配资源。
+  udp.service_wait_timeout_ms 已删除，配置、样例和测试使用 udp.setup_timeout_ms，默认 10 秒；无旧字段兼容分支。
+  单节点建立失败通知请求方 error 和已获 offer 的服务方 closed，避免留下额外 ready 等待；
+  活动单节点 TCP/TLS 仍通过数据 socket 结束，多节点正常结束仍等待 FIN 排空。
+- 第 4、5 步验证：Release 全目标构建通过，无 C++ 编译警告；relay_integration、udp_relay_integration、
+  udp_session_routing、agent_reconnect、agent_cluster、proxy_relay_integration、relay_paths 七项全部通过，耗时 39.32 秒。
+  新规则验证包括离线不占 Node 容量、注册不复活旧请求、半接入超时、迟到票据丢弃、ready 后无运行到期，
+  以及首末控制断开保留原始原因和分叉 Flow 隔离。日志：build/architecture-step4-build.log、build/architecture-step4-tests.log。
+- 第 6 步已完成：Debug/Release 全目标构建通过，无 C++ 编译警告；完整 CTest 均为 26 项通过、
+  probe_integration 因缺少 Windows 管理员权限或 Linux CAP_NET_RAW 跳过。
+  Debug 耗时 162.77 秒，Release 耗时 158.30 秒。
+  日志：build/architecture-final-debug-build.log、build/architecture-final-debug-tests.log、
+  build/architecture-step4-build.log、build/architecture-final-release-tests.log。
+- 所有权和冗余审查完成：控制器直接拥有业务状态，RelaySession 只保存所选控制器和数据句柄；
+  Node 容器拥有并排空实例，Multi 子任务随实例取消、排空后才释放端点和 Flow。
+  对比 build/architecture-step4-before，Node 源码由 7350 行减少至 6840 行；
+  本轮未修改 Agent、协议及第二阶段 NodeLinkMgr / LnkChannel / ClusterMgr / Topology 的实现。
+  README、设计文档、配置升级说明和本计划已同步；git diff --check、54 个本地文档链接及配置样例检查通过。
+  本次未执行跨机器或吞吐测试；下文第三、第四阶段的测试结果是本次重构前的基线。
+
+### 完整流程简化复查（2026-10-09）
+
+沿 forward → AgentRelay → RelaySession → Single/Multi → 数据管理器复查：
+
+- 路径计算只访问 control_io 内的路由和有效 LRU，改为同步函数；定位和建连等待继续由 select_relay 协程管理。
+- RelaySession 的 variant 与数据 API 收为内部实现。控制器明确传入接入角色、accessor、epoch/flow_id，
+  不再由 RelaySession 读取控制器私有成员。Multi 只保存使用中的 epoch/flow_id，
+  不保留建路结果中未使用的 stage/reason，也不跨域复制整份 FlowResult。
+- 数据端点用实际 stream / UDP source 表达已接入，删除重复 connected 标记；
+  UDP 配对只在绑定了统计资源后激活，逐包转发不重复检查该已成立条件。
+- 服务离线只向每个受影响的 AgentRelay 分派一次取消，forward 继续管理监听及重试。
+  单节点同一 Agent 的双方通过一条 ready 通知统一分派，删除重复通知。
+- 单节点在 attach 完成后、绑定前确认控制参与方仍有效；正常复制返回不覆盖已记录的取消原因。
+  票据、来源、建立期限、跨域排空及 Multi 的 FIN/finished 规则保留。
+
+Debug/Release 全目标构建通过，无 C++ 编译警告；完整 CTest 均为 26 项通过、probe_integration 因权限跳过，
+分别耗时 163.66 / 157.72 秒。新增断言确认活动单节点 UDP 的两端关闭通知保留取消原因；
+真实单/多节点 TCP/TLS/UDP、同一 Agent 双角色、FIN 排空、限速统计、共享隔离、恢复与路径缓存均通过。
+日志：build/architecture-review-debug-build.log、build/architecture-review-debug-tests.log、
+build/architecture-review-release-build.log、build/architecture-review-release-tests.log。
+git diff --check 与 54 个本地文档链接检查通过。本轮未修改协议和第二阶段 NodeLink/NodeFlow 实现；
+未新增缓存、控制器基类、回调层、握手或 master 业务流程，未执行跨机器或吞吐基准。
 
 ## 命名约定
 
@@ -19,6 +195,7 @@ Agent 已在 Stream 建连前计算推荐路径，但业务仍直接连接服务
 | LnkChannel / lnk_channel.* | 数据域内直接拥有 NodeLink 和 NodeFlow 状态、监听、读写与逐跳分派的类 / 文件 |
 | LnkFrameHeader / LnkFrType | 数据 socket 上的二进制头和类型，区别于 CtrlMessage/WireMessage 控制帧 |
 | ControlSession | 原有 Agent 控制连接会话，session_id 保持原义，与 flow_id 无关 |
+| RelaySession | Node 本地的一次业务中继实例；区别于长期共享的 StreamPipeline / DatagramMgr |
 
 外部转发接口统一使用 async_open/send/receive/close_flow；控制命令使用平级 flow.*，身份字段为 flow_id。
 业务数据只通过 NodeFlow 收发接口；第一阶段的 LinkData/Diagnostic 测试通道已删除。
@@ -256,10 +433,10 @@ RelayNode 提供以下内部接口：
 
 | 能力 | 输入/输出与语义 |
 |---|---|
-| async_open_flow(path, transport) | 运行中的 master 输入有序 Node 路径和 TCP/UDP；使用当前 epoch，返回身份及建立阶段/原因 |
+| async_open_flow(path, transport) | 运行中的 master 或普通首 Node 输入有序 Node 路径和 TCP/UDP；使用当前 epoch，返回身份及建立阶段/原因。普通首 Node 通过通用 flow.open/opened 请求复用 master 原有事务，不携带 Agent 业务信息 |
 | async_send_flow(frame) | 输入身份、forward/reverse、DATA/FIN/RESET 和 payload；不能由调用者指定任意出边 |
 | async_receive_flow(epoch, id) | 按逻辑流接收 DATA/FIN；RESET 或失效以异常唤醒等待者，避免多个逻辑流竞争同一个接收队列 |
-| async_close_flow(epoch, id) | master 幂等关闭，等待全路径 closed，最多 10 秒；释放逻辑流状态并保留共享 NodeLink，失联/停止向等待者返回错误 |
+| async_close_flow(epoch, id) | 幂等关闭并保留共享 NodeLink。master 等待全路径 closed，最多 10 秒；普通首 Node 发送 flow.close.request，由 master 执行相同关闭事务，调用方等待自己的本地 Flow 关闭，最多 10 秒。失联/停止唤醒等待者 |
 
 发送接口直接返回 FlowSendStatus，区分 queued、capacity_exceeded、closed、invalid。
 接口接管输入帧，被拒绝的帧自动释放。queued 只表示完整帧已进入本地队列，不能要求调用方重发已入队数据；
@@ -428,26 +605,255 @@ Node 数据面无需 Agent/服务对象即可运行和测试，后续机制修�
 
 ## 第三阶段：Agent 路径提交与首末接入准备
 
-第二阶段验收后，Agent 路径计算返回选中的完整路径，并将路径、拓扑 epoch、目标服务/协议和请求信息
-发给入口 Node，再转给 master。入口需要建立或复用 Agent 控制连接，不能继续固定使用服务 Node 的连接。
-master 除第二阶段的路径校验外，还验证服务所在 Node、请求者控制逻辑流及访问关系，并调用既有建路入口。
-计算结果只有一个 Node 时沿用该 Node 的现有单节点 Relay，无需安装跨 Node 路由。
+### 目标与阶段边界
 
-补充首末端接入准备和 ticket/逻辑流身份绑定：请求方 Agent 接入首节点，服务方 Agent 接入末节点。
-复用现有 relay.offer/opened/attach 流程与解析，在 Node 路由就绪并且首末接入完成后才允许业务 DATA。
-Agent 路径计算、建路失败和服务失效的结果回到原请求者，由外层决定是否重新选路。
-本阶段先完成控制与接入闭环，后续真实流式转发使用第四阶段的业务语义。
+本节为第三阶段已确认设计，同时覆盖 TCP、TLS、UDP；本轮实施记录见文末。
+复用前两阶段 NodeFlow，第三阶段完成控制与接入，第四阶段完成桥接；最终流程如下：
+
+```text
+Agent 通过已有主控制连接发现服务终点、获取拓扑
+                         ↓
+              读取有效缓存或计算最佳路径
+                         ↓
+       ┌─────────────────┴─────────────────┐
+  失败、不可达或单节点                  多节点路径
+       ↓                                  ↓
+ 原有单节点中继                    经主控制连接查询首 Node
+                                          ↓
+                                  node.located 返回首 Node
+                                          ↓
+                                  建立或复用首 Node 控制连接
+                                          ↓
+                                  向首 Node 提交最佳路径
+                                          ↓
+                                  首 Node 申请已有 NodeFlow
+                                          ↓
+                                  首 Node 通过集群消息通知末 Node
+                                          ↓
+                                  首末通过各自控制连接通知接入
+                                          ↓
+                                  首末 Agent 分别接入
+                                          ↓
+                                  安装首末数据桥接（第四阶段）
+                                          ↓
+                                  relay.ready 后业务转发
+```
+
+首 Node 已有就绪控制连接时跳过位置查询，直接复用。第三、第四阶段仅划分实现和测试工作，完成后整体上线。
+直接实现最终使用的多跳建立流程，不增加 prepare_only 模式、专用准备 API、试验开关或阶段成功通知。
+多跳只提交最佳路径，建立失败返回原请求者，由外层决定是否重新选路；内部不自动尝试其他候选或回退直连。
+
+### 与原有单节点中继的关系
+
+Agent–Node 控制与接入方式沿用原架构：单节点时两端连接同一个服务 Node，多跳时两端分别连接路径首尾 Node。
+
+| 行为 | 原有单节点中继 | 多跳中继 |
+|---|---|---|
+| 请求方控制连接 | 服务所在 Node | 最佳路径首 Node |
+| 服务方控制连接 | 服务注册所在 Node | 不变，即路径末 Node |
+| relay.open / opened | 请求方与该 Node 通信 | 请求方与首 Node 通信 |
+| relay.offer / reject | 服务方与该 Node 通信 | 服务方与末 Node 通信 |
+| 数据接入 | 各自控制连接主机与回复的数据端口，使用 ticket 和 attach | 同样的接入方式，只是分别接入首尾 Node |
+
+不为多跳另建一套 Agent–Node 控制通道协议。新增的是最佳路径提交、Node 间协调及 Flow 绑定，
+多跳建连只保留最终业务所需的就绪等待，不改变原有单节点数据复制流程。
+跨 Node 时不能直接复用要求 producer/consumer 都在本地的 Relay 配对状态；复用接入基础能力，
+首尾各自保存一个本地端点，中间 Node 只保存已有 NodeFlow 转发表项。
+
+### 路径计算与 LRU 缓存
+
+- routing.max_nodes 统计完整路径中的真实 Node，包含首尾，不包含 Agent；A→B→C 计为 3，单节点路径计为 1。
+- Agent 配置解析、AgentRouting 构造校验和计算上限统一为 8，默认保持 4，即最多首尾加两个中间 Node。
+  原有 9..16 配置明确拒绝，同步修改错误提示、配置说明和测试；AgentConfig 默认值和示例配置保持 4。
+- calculate_service_paths() 返回最佳路径；内部保留现有候选计算、排序及诊断日志，提交消息不携带候选集合或成本。
+- 保留现有 LRU 结构及 TTL。有效缓存命中后直接取最佳路径，提交时读取当前 epoch，不在缓存中增加 epoch 字段。
+- epoch 变化时清空缓存，保留现有拓扑失效及服务终点变化时的清理；普通质量快照更新不强制清空有效缓存。
+- 计算失败、不可达或结果只有一个 Node 时，沿用现有单节点中继，不安装 NodeFlow。
+
+### 服务发现与首 Node 定位
+
+Agent 启动时通过配置的 server.host/port 建立主控制连接，用它注册服务、发现服务和获取拓扑。
+service.lookup/located 仅用于原有服务发现，始终返回服务所在 Node，不增加入口定位分支。
+多跳首 Node 定位使用独立的 node.lookup/located，复用已有的集群转交、回复关联和连接建立方式。
+两种位置回复的 address/port 均为 Agent 控制地址和端口，Agent 继续调用 ensure_connection() 建立或复用连接。
+
+路径计算必须先知道服务终点。首次 service.located 取得服务 Node，保留现有服务关联后计算或读取最佳路径。
+已有有效服务终点信息时不重复发现：
+
+| 场景 | 查询与后续行为 |
+|---|---|
+| 原有服务发现 | service.lookup/located 返回服务 Node，保持原流程 |
+| 计算失败、不可达或单节点 | 使用服务 Node 位置取得入口连接，AgentRelay 发送原有单节点 relay.open |
+| 多节点，首 Node 尚无就绪控制连接 | node.lookup 指定最佳路径首 Node，node.located 返回其控制端点；建立或复用连接后提交路径 |
+| 多节点，首 Node 已有就绪控制连接 | 跳过定位，直接复用该连接并提交路径 |
+
+node.lookup 通过已有主控制连接发送，只带本次 request_id 和目标 node_id，不携带服务名或完整路径。
+接收 Node 将它定向单播给指定首 Node；首 Node 使用自身 advertise_address/control.port 回复，
+沿用现有 session_id/request_id 集群回复关联。主控制 Node 即为首 Node 时本地回复。
+指定 Node 只需是当前成员，不要求注册目标服务；不存在时返回 node.error，无回复受业务建立期限限制。
+该查询不重新计算路径、不安装 Flow、不广播搜索其他入口，定位失败也不误删服务终点记录。
+
+service.located 保存 service_locations_ 中的服务 Node 位置，不建立尾 Node 控制连接；
+node.located 只完成本次多跳业务的入口连接等待，
+不写回服务终点关联，不把首 Node 当作路由目的地，也不复制一份服务注册表。
+不同查询和 Relay 建立使用各自请求 ID；定位回复须匹配预期首 Node，迟到回复不能覆盖更新后的路径或连接。
+
+请求方通过首 Node 控制连接提交多跳 relay.open，服务方继续复用在末 Node 注册服务的控制连接。
+relay.opened/offer 分别由首末 Node 发送，数据主机继续取各自控制连接主机，数据端口和 ticket 由回复给出。
+主控制 Node 可以在业务路径之外；不是首 Node 时只负责发现/拓扑请求，是首 Node 时直接复用主控制连接。
+不扩展拓扑控制端口字段、不新增地址注册服务，也不增加 relay.opened/offer 的数据主机字段。
+首 Node 定位或控制连接失败返回原请求者，不在内部重新选路或回退直连。
+
+### 最小协议增量与身份
+
+| 消息 | 多跳增量与语义 |
+|---|---|
+| service.lookup / located | 保持原有服务发现语义和字段 |
+| node.lookup（新增） | request_id、node_id，用于查询已选首 Node 的控制端点 |
+| node.located（新增） | request_id、node_id、address、port，返回指定 Node 的控制端点 |
+| node.error（新增） | request_id、node_id、reason，返回本次节点定位失败 |
+| relay.open | 在原有 service、protocol、request_id 上增加 path、epoch 和剩余预算 budget_ms；只携带最佳路径 |
+| relay.offer / opened | 增加 epoch、flow_id 和剩余建立预算 budget_ms；沿用本地 uuid、data_port、ticket，UDP 保留 session_id；不回传路径，数据主机取控制连接主机 |
+| relay.attach | 保持 role、uuid、ticket 格式；RelaySession 关联本地端点与 Flow，接入帧不增加 Flow 身份 |
+| relay.ready | 复用现有通知；全路径已提交、两端 attach 成功且首末桥接可用后才发送，允许业务转发 |
+| relay.error / closed | 建立失败返回关联请求及失败 stage、原始 reason；就绪后失效通知 closed |
+
+Node 间业务协调使用 relay.peer.open / attached / close，由首尾各自中继实例持有的 ControlRouterMulti 处理。
+首 Node 本地按实际 consumer ControlSession 与 request_id 关联请求，首尾通信仅使用 (epoch, flow_id)；
+不把请求方会话或请求 ID 发给末端或 master。集群来源使用认证控制通道给出的 source，不信任 Agent 自报身份。
+master 不保存 Agent 业务事务；flow.open / opened / close.request 只补齐普通首 Node 请求第二阶段建路/关闭的入口，
+参数只有 Flow 身份、有序 Node 路径和传输协议，不携带服务、Agent 会话、票据或 attach 状态。
+Flow 身份继续为 (epoch, flow_id)，首末分别分配本地 uuid、ticket 和 UDP session_id，不要求两端相同。
+ticket 只下发对应 Agent，未知或过期身份不能通过 attach 创建新端点。
+
+### 多跳建立顺序与首尾职责
+
+1. Agent 已发现服务终点，读取有效缓存或计算最佳路径。多节点时复用首 Node 就绪控制连接，
+   否则经主控制连接发送 node.lookup，并根据 node.located 建立或复用首 Node 连接。
+2. 请求方向首 Node 提交服务、协议、请求 ID、最佳路径和当前 epoch；首 Node 创建 RelaySession，
+   该实例直接持有 ControlRouterMulti、请求方真实控制会话及本地数据端点句柄。
+3. 首 Node 通过 NodeLinkMgr::open_flow() 申请 Flow；普通 Node 的远程申请由 NodeLinkMgr 内部处理，
+   master 只执行第二阶段已有建路事务。TCP/TLS 使用 TCP NodeFlow，UDP 使用 UDP NodeFlow。
+4. Flow 提交后，首 Node 使用 relay.peer.open 通知末 Node，包含 Flow 身份、服务、协议和剩余预算；
+   末 Node 校验既有本地 Flow 元数据中的首尾身份，复用服务注册表查找 producer 会话，创建自己的 RelaySession。
+5. 首末各自安装本地接入端点，并立即通过各自控制连接发送 relay.opened / relay.offer。
+   各自生成本地 uuid、ticket 和数据端口，不增加预留或安装屏障；任一端失败由首尾直接通知并回滚。
+6. 两端 Agent 沿用控制连接主机及回复的数据端口发送 attach。首末各自把端点绑定到现有 NodeFlow；
+   末端 attach 和绑定完成后发送 relay.peer.attached，首 Node 汇总两端状态。
+7. 首端激活本地端点并发送 relay.peer.ready；末端收到后激活本地端点。
+   首末分别通知自己的 Agent relay.ready，再开始 socket↔NodeFlow 桥接；接入本身不能提前启动业务。
+8. 失败、取消或控制断开时，双方立即清理各自端点，通过 relay.peer.close 通知对方；首 Node 发起关闭本 Flow，
+   共享 NodeLink 保留。关闭幂等；首端取消后的迟到建路结果不能复活请求。
+
+2..8 节点、无重复节点及成员资格等路径检查复用 NodeLinkMgr；首尾仅补充当前 epoch、真实会话与 Flow 端点身份检查。
+不重新计算路由、不比较成本、不增加 ACL 系统。master 既不下发 Agent 端点绑定，也不等待 attach 或协调业务 ready。
+集群单播仍可经 master 转交，这只是既有通信路由；master 恰好位于首尾时按普通端点角色参与。
+
+### 代码与执行域边界
+
+| 入口或模块 | 修改边界 |
+|---|---|
+| Agent 路径计算后 | 单节点或计算失败调用原流程，多节点定位/连接首 Node 后调用独立多跳建立函数 |
+| service.lookup/located | 原有服务发现保持不变 |
+| node.lookup/located/error | 独立的节点定位处理，复用集群转交、回复关联和 ensure_connection，不修改服务关联 |
+| RelayNode 分派 relay.open/reject/cancel | 创建或查找 RelaySession，再交给该实例的 Single/Multi 控制器；共用业务容器和停止排空 |
+| ControlRouterSingle | control_io 上推进本地双方接入、建立期限、ready、取消及通知；数据复制仍归所属数据 manager |
+| RelaySession / ControlRouterMulti | 每个多跳实例直接持有控制对象与本地数据句柄，首尾通过集群消息直接协调；master 无业务状态 |
+| RelayNode / RegistryMgr | Node 直接持有唯一注册表，处理公共注册、发现、拓扑和状态查询；删除原 ControlRouter 及重复配置、依赖和包装入口 |
+| Agent 收到 relay.offer/opened | 无 Flow 身份调用原处理，有 Flow 身份调用独立多跳接入处理 |
+| Pipeline / DatagramMgr | 复用监听和 attach 解析，按 uuid 所属端点表分派；多跳使用独立端点状态和处理方法 |
+| NodeLinkMgr / LnkChannel | 复用现有路径事务与数据面，不加入 Agent 业务逐帧处理 |
+
+复用 TLS 握手、编解码及 ticket 基础校验，不向原有 Relay 对象或复制循环加入多跳模式分支。
+不新增通用协调框架、回调注册层或第二套路径管理器。
+公共控制状态、RelaySession、ControlRouterSingle/Multi 和 NodeLinkMgr 路径状态属于 control_io；
+socket、UDP endpoint 保持原有传输执行域归属；
+跨域传递参数副本并用 post/co_spawn 下发操作和返回完成结果，不共享可变端点状态。
+
+### 业务就绪、失效与停止
+
+RelayNode 创建 RelaySession 时按所选路径构造 Single/Multi variant，创建后类型固定；
+同一 Node 的共享数据管理器可并发承载本地配对和多节点端点。
+多跳建立由首端协程顺序推进，只保存本实例请求与本地端点状态，不增加 master 业务表或通用协调框架。
+不新增业务 Prepared 终态或 relay.prepared 通知；Agent–Node 继续使用已有 relay.ready 表达业务可转发。
+
+就绪等待是最终转发的一部分：必须确认 NodeFlow 已提交、两端 attach 成功、首末桥接可用，才允许发送业务数据。
+第三阶段实现路径与接入，第四阶段补齐桥接和最终就绪推进；不为未完成的增量建立单独产品模式或专用入口。
+
+- TCP/TLS 多跳接入完成后等待 relay.ready，收到后进入第四阶段的 socket↔NodeFlow 桥接，不调用单节点双 socket 复制函数。
+- UDP 沿用已有 relay.ready 等待语义；就绪前不转发业务包，不增加业务缓存。
+- 原有单节点就绪与复制流程保持原样；多跳使用独立状态和处理方法，复用控制连接、握手与帧解析。
+
+第二阶段已有的 flow.prepare/commit 继续保留：它们负责各 Node 安装、确认并提交路径表项，失败时回滚全路径，
+属于最终产品的建路事务，与本轮删除的阶段专用业务准备通知无关。
+
+整次建立沿用 Agent 建立超时预算，包含首 Node 定位、控制连接等待、建路和首末接入，阶段切换不重新计时；
+跨 Node 下发剩余时长，各 Node 保留已有建路、接入及关闭超时。建立事务和本地端点占用现有容量预算，等待及通知有界。
+
+失败、取消、超时、服务失效、控制断开、Flow 失效及停止时，唤醒请求等待者，释放首末 socket、ticket、uuid、
+UDP binding，并通过既有接口关闭本 Flow，保留共享 NodeLink。consumer 控制连接所属节点为首 Node，
+其离线或控制会话断开清理所属业务事务。沿用主控制连接断开时的拓扑失效及连接重连处理，
+主连接不作为额外的 Flow 身份或业务回复跳点。
+多跳末端服务失效时，按 service/protocol 和路径末 Node 关联真实服务终点进行失效处理，不能把首 Node 当作服务节点。
+
+同会话同请求 ID 的一致重复请求关联已有事务，参数不一致返回冲突；关闭幂等，重复 attach 不替换已有端点。
+取消后的迟到建立成功立即回收，不取消其他调用者共享的 NodeLink 建立请求。
+定位请求及连接等待受同一建立事务取消约束，取消后的迟到回复不能重新建立业务。
+等待期间 epoch 变化或服务终点改变时取消该建立事务，由外层重新选择；不能把已失效的待提交路径换上新 epoch 继续建路。
+首 Node 控制连接被待建立或活动 Relay 引用期间不得被 release_unused_connections 回收，
+复用同连接的并发事务各自释放引用，原有服务/主连接引用继续有效。
+
+业务就绪后不增加运行期租约，通过显式取消及现有失效机制释放。
+NodeLinkMgr 增加基于现有关闭完成事件的 Flow 终止等待接口，供业务事务感知断链，不新增轮询。
+停止先拒绝新事务、取消等待并清理端点，再排空 Flow 和后台任务，最后关闭集群控制连接。
+
+### 实施增量与验收
+
+| 增量 | 交付 |
+|---|---|
+| 3.1 最佳路径与定位 | 默认 4、上限 8、最佳路径与有效缓存复用；独立 node.lookup/located 定位首 Node，复用控制连接建立 |
+| 3.2 多跳控制 | 实例持有 ControlRouterSingle/Multi；首 Node 管理请求并与末端直接通信，NodeLinkMgr 提供普通首端 Flow 申请 |
+| 3.3 首末接入 | 独立端点及 Agent 接入处理、复用各自控制连接主机与数据端口；与第四阶段桥接及 relay.ready 衔接 |
+| 3.4 清理回归 | 取消竞态、超时、断链、控制失效、停止排空及文档同步 |
+
+测试至少覆盖：
+
+- max_nodes 包含首尾、不包含 Agent；省略配置默认 4、显式配置生效、8 节点支持，超过 8 的配置拒绝。
+- 有效缓存命中携带当前 epoch，epoch 变化清缓存。
+- service.lookup/located 保持原有行为；node.lookup/located 返回指定首 Node，未注册目标服务也能定位，两种请求不混淆。
+- 主控制 Node 在路径外/首末/中间；首 Node 连接已存在时复用，不存在时通过定位回复建立，不重复建连。
+- 首 Node 定位不覆盖服务终点或重新计算到首 Node 的路径；错请求 ID、迟到回复、并发定位及取消正确关联。
+- 首 Node 不存在时定位明确失败，不广播或改路；定位失败不误删服务终点，末端服务失效不误认首 Node。
+- 首末数据主机沿用各自控制连接，控制端口与数据端口不同、首末数据端口不同的情况下，实际接入目标正确。
+- 单节点及计算失败沿用原中继；只提交最佳路径，多跳失败准确返回而不内部换路。
+- TCP/TLS/UDP 均完成首末接入；最终缺少任一端或桥接未就绪时不能 relay.ready，提前业务数据不被转发。
+- 不存在阶段专用准备 API、业务 Prepared 终态、relay.prepared 消息或临时上线开关。
+- A→B→C、A→B→D 共享 A–B，master 在路径外/首末/中间；身份隔离，单 Flow 关闭不影响其他 Flow。
+- 服务失效、旧 epoch、错 ticket、重复 attach、UDP 错 endpoint、重复请求、超时和取消竞态。
+- 首 Node consumer 控制断开、producer 控制断开、NodeLink 断链及停止完整清理并唤醒等待者；
+  首 Node 连接不被空闲回收，并发事务关闭不提前回收共享控制连接。
+
+路径测试使用现有显式 ingress 输入能力构造确定性候选，不依赖 ICMP 权限或实际 RTT。
+完成 Debug/Release 构建，运行新增测试及既有 Agent、集群、TCP/TLS/UDP Relay、NodeLink/NodeFlow 回归，
+分别记录失败与权限跳过项。第三阶段验收内部路径及首末端点绑定、失败传播和清理，不新增测试专用生产入口。
+第三、第四阶段完成后联合验收真实业务、就绪等待及单节点回归，再整体上线。
 
 ## 第四阶段：真实业务转发与回归
 
 把 Agent–Node socket 绑定到已准备的 Node 逻辑流，形成“本地 socket ↔ 逻辑流”的读写桥接。
-TCP/TLS 业务补齐接入确认、DATA/FIN/RESET、socket 半关闭、取消及必要背压，
-不能将第二阶段有界队列的拥塞失败处理直接当作真实流式业务的流控。
-公平调度、连接池和存量换路按后续单独任务实施，首末桥接通过逻辑流接口协作。
+沿用第三阶段的独立 node.lookup/located 首 Node 定位流程，首末数据主机继续取各自控制连接主机；
+桥接安装完成后再发送多跳 relay.ready，允许业务 DATA。
+TCP/TLS 业务补齐接入确认、DATA/FIN/RESET、socket 半关闭和取消。
+公平调度、连接池和存量换路暂不考虑实施，首末桥接通过逻辑流接口协作。
 TLS 继续用于现有 Agent–Node 接入，Node 间传输使用共享明文 TCP；UDP 接入保留 session 和源 endpoint。
 
-保留首末端原有服务限速和流量统计；中间 Node 只做校验和分派。
-验证真实应用、分叉回程、多服务、多流、半关闭、局部断链和事务回滚，再让新连接实际采用计算路径。
+首末使用原有速率配置：TCP/TLS 等待令牌，UDP 超限逐包丢弃；服务流量与 accessor 只在服务末端统计，避免跨跳重复计数。
+中间 Node 只做校验和分派。DATA 直接在传输执行域与 cluster_data_io 间传递，不经过 control_io。
+TCP/TLS 双向排空后，首末交换 relay.peer.finished，再关闭 Flow；Agent 正常结束等待 Node 完成通知，收到正常关闭也继续排空数据 socket。
+多跳 UDP 保留独立本地 session 和固定源地址，载荷最多 4096 字节，空报文有效；超长报文丢弃且保留会话，不增加分片协议。
+本地 UDP 接收队列与共享 socket 写队列各最多 16 包，队列满时丢弃当前报文；NodeFlow 发送超出既有容量终止本 Flow，不增加信用或调度层。
+验证真实应用、分叉回程、多服务、多流、半关闭、局部断链和事务回滚，与第三阶段一起完成最终就绪流程后整体上线。
+不维护阶段专用模式、临时协议、独立准备入口或多跳上线开关。
 
 以下保留各轮历史实现和验证记录，旧名称、平台及测试数量只对应当轮。
 当前结构以正文为准，当前 Linux 审查结果见文末。
@@ -765,3 +1171,153 @@ git diff --check、修改及新增 C++ 文件的行尾空白检查、相关文�
 本轮日志为 `/tmp/relayweave-final-review-build.log` 和 `/tmp/relayweave-final-review-tests-unsandboxed.log`；
 沙箱首次运行记录在 `/tmp/relayweave-final-review-tests.log`。
 本轮未重新执行 Release、ICMP 实测或吞吐/CPU 基准，不将池复用单元测试视为端到端性能提升的证明。
+
+
+## 第三阶段实施与简化审查（2026-10-09）
+
+本节保留第三阶段结束时的结构与验证记录；第四阶段在这些边界上补齐业务桥接，最新实现见文末。
+第三阶段只完成控制与首末接入，当时不发送多跳 relay.ready；第四阶段补齐绑定、激活和正常结束排空。
+
+### 第三阶段代码分工
+
+| 代码 | 职责与所属执行域 |
+|---|---|
+| agent/src/relay_agent.cpp | control_io 上返回最佳路径，处理有效 LRU、epoch 失效、首 Node 定位、控制连接复用与引用保留；默认 4、上限 8 个 Node，包含首尾、不含 Agent |
+| agent/src/agent_relay.cpp | 当前统一单/多节点 Agent 接入及生命周期；第三阶段原 forwarder_paths.cpp 和 direct 函数已在职责重构第 3 步替换 |
+| node/src/relay_node_control.cpp | RelayNode 的公共注册、服务发现、节点定位、拓扑及状态查询，直接使用 Node 唯一 RegistryMgr；原 handle_cluster_lookup/location/status_query/status_report 保留在此文件 |
+| node/src/control_router_single.cpp | control_io 上的单节点双方接入、建立期限、ready、取消与通知，不做全局查表或数据复制 |
+| node/src/control_router_multi.cpp | control_io 上的首末 attached/ready/finished/close、实例预算、Flow 监视及失败清理；全局分派移到 Node |
+| node/src/relay_session.cpp | 单/多节点实例直接持有 Single/Multi variant、本地数据句柄和唯一取消信号，跨域等待 install/wait/bind/activate/bridge/close |
+| node/src/relay_node_relays.cpp | Node 的全局创建、请求/peer 查找和分派、统一实例容器、取消与停止排空 |
+| node/src/pipeline_mgr.cpp、datagram_mgr.cpp | 数据域的本地配对和多节点端点、attach 校验及实际 I/O；无控制引用、服务等待或业务通知 |
+| node/src/nodelink_requests.cpp | 普通首 Node 远程调用第二阶段已有 Flow 建路事务，参数仅含 Flow 身份、路径和传输协议，不携带 Agent 或服务业务状态 |
+
+Node 不再持有公共 ControlRouter 或 ControlRouterConfig。公共查询直接进入 RelayNode，
+全局业务入口进入 RelayNode，实例选择 ControlRouterSingle/Multi；没有第三个控制器、第二份注册表或额外业务协调层。
+master 只承担原有 Flow 建路和集群转交，首尾通过 relay.peer.open/attached/close 直接协调。
+
+### 第三阶段删除的冗余
+
+- 第三阶段删除 RelayEndpoint 当时未使用的 epoch、flow_id 和与端点表键重复的 uuid。
+  第四阶段只为实际数据收发绑定 epoch、flow_id；uuid 仍不重复保存。
+- UDP session_id 仅存在于 DatagramMgr 的端点，TCP/TLS 端点不携带无用途的 UDP 字段。
+- Agent 多跳接入在同一 transfer_io 中直接 co_await attach_path_relay，删除额外 co_spawn 和外层重复超时。
+  DNS、connect、TLS 和 attach I/O 仍受剩余建立预算限制，ready 等待使用同一个绝对截止时间。
+- 重复请求直接复用已有通知函数，删除仅调用一次的 replay 包装；清理无用途的包含、友元和函数末尾 return。
+- 文档合并此前已被替代的第三阶段实施记录，删除旧 master 业务事务和旧文件入口的描述，保留一份当前流程说明。
+
+### 保留的必要流程与状态
+
+首末各自只有一个 RelaySession，由其 ControlRouterMulti 保存本次请求、Flow 身份、对端和建立截止时间；
+数据管理器仅保存本地 attach 校验、socket/UDP 地址及接入完成事件。中间 Node 不增加 Agent 业务对象。
+首端仅在 open_flow 成功且 epoch 一致后安装端点；末端先核对本地已提交 Flow 的首尾身份与协议。
+这些建立检查位于拥有 Flow 元数据的控制层；第四阶段数据端点绑定业务帧所需身份，不重复执行路径校验。
+
+取消信号、Flow 关闭事件等待和 Node 任务计数用于及时终止接入并排空后台任务，不能用删除这些状态来简化生命周期。
+停止顺序为取消多跳实例、关闭本地端点与本 Flow、排空多跳任务，再停止 NodeLinkMgr 和集群控制；共享 NodeLink 保留。
+跨执行域 co_spawn 保留；同域 co_spawn 仅在独立失效监视或需要给整个子操作施加超时时使用。
+
+没有新增预留、安装或业务 prepare 屏障，没有阶段专用通知、试验开关或多候选重试流程。
+已有 flow.prepare/commit 是第二阶段全路径安装事务，继续复用；第三阶段只补齐首末 Agent 接入及必要的失效清理。
+
+### 验证
+
+此前控制入口重构后的 Debug 与 Release 完整回归均为 26 项通过、0 失败，1 项 ICMP 权限跳过。
+本轮精简后 Debug 全目标构建通过，无编译警告；完整 CTest 共 27 项，26 项通过、0 失败，
+probe_integration 因 ICMP 权限跳过，总用时 166.48 秒。
+覆盖公共查询、单节点 TCP/TLS/UDP、NodeLink/Flow、路径缓存与 Agent 生命周期、多跳首末接入、
+同一监听上的单节点/多跳并存、重复请求/attach、错票据、取消、控制断开、分叉隔离、断链与停止排空。
+构建与回归日志分别为 build/phase3-review-build.log 和 build/phase3-review-tests.log。
+本轮未重跑 Release；源码差异空白检查与相关文档 41 个本地链接检查通过。
+
+## 第四阶段实施与审查（2026-10-09）
+
+### 最终业务流程
+
+沿用第三阶段的路径选择、node.lookup/located 和首尾控制连接，不改变服务发现。
+单节点和多节点均由 RelaySession 管理，分别直接持有 ControlRouterSingle 和 ControlRouterMulti。
+master 仅执行第二阶段建路及既有集群消息转交，中间 Node 不持有 Agent 业务状态。
+
+多跳建立顺序为 Flow 提交 → 首末端点安装 → opened/offer → Agent attach → 本地 Flow 绑定。
+末端绑定后发送 relay.peer.attached；首端激活并发送 relay.peer.ready，末端随后激活。
+首末分别发送已有 relay.ready，Agent 才开始业务复制。激活只用于切换本地端点的可转发状态，
+没有新增业务 prepare、预留事务、安装确认屏障或阶段专用接口。
+
+TCP/TLS 读取本地 socket 形成 DATA；读到 EOF 发送 FIN，收到 FIN 只关闭 socket 的发送方向。
+TLS 专用接入流使用底层 TCP 半关闭，EOF/stream_truncated 表示该业务方向结束，另一方向继续排空。
+两端各自双向结束后交换 relay.peer.finished，再关闭 Flow；正常关闭通知不会提前取消 Agent 数据读取。
+Agent 在正常复制完成后等待 Node 完成通知再释放首 Node 控制连接引用，避免取消消息抢在最后 DATA/FIN 前关闭路径。
+I/O 错误通过 RESET 与既有 peer.close/Flow close 收敛；显式取消不额外发送掩盖原始原因的 RESET。
+双向传输协程统一在本执行域等待、取消和排空，保留最先发生的原始错误。
+
+UDP 沿用原有监听、session 头和固定来源；本地 session 去头后直接作为 NodeFlow DATA，返回时写入接收端本地 session 头。
+多跳载荷为 0..4096 字节；超长、错误来源和未就绪报文丢弃，不关闭会话、不增加分片。
+复用原 bindings_ 索引分派单节点与多节点会话，删除重复扫描端点表的 session 分配检查。
+本地接收队列和共享 socket 写队列各最多 16 包，满时丢弃当前报文；NodeFlow 发送仍遵守第二阶段的有界容量，容量不足关闭该 Flow。
+单节点与多节点 UDP 通过同一条写链发送，等待者取消后跳过未发送报文；队列独立拥有报文字节，避免重用接收缓冲或跨流并发写 socket。
+
+首末继续使用现有传输速率配置；TCP/TLS 等待令牌，UDP 超限逐包丢弃。
+服务统计只在末端累计成功转发的 payload，rx 为服务向请求方，tx 为请求方向服务，不重复计算帧头或跨跳字节。
+accessor 来自请求方真实控制会话，建立时加入、退出时移除。中间 Node 不做服务限速或统计。
+
+### 代码边界与精简
+
+| 代码 | 第四阶段职责 |
+|---|---|
+| node/src/relay_endpoint.cpp | 最小公共端点绑定、跨域收发和限速/计数；只为真实业务帧保存 epoch/flow_id，不重复保存 uuid 或路径 |
+| node/src/pipeline_mgr.cpp | TCP/TLS 独立端点的双向桥接、FIN 半关闭和失败 RESET；单节点复制流程保持原样 |
+| node/src/datagram_mgr.cpp | UDP 独立端点队列、共享单写链、session/来源校验、NodeFlow 桥接及退出清理 |
+| node/src/relay_session.cpp | 通过已有数据管理器执行 install/wait/bind/activate/bridge/close，直接拥有本地句柄及自己的控制器 |
+| node/src/control_router_multi.cpp | 首尾 attached/ready/finished/close 推进，建立预算与运行期分离，取消后等待桥接退出再释放端点和 Flow |
+| agent/src/agent_relay.cpp | 同一传输执行域顺序执行接入与业务复制；多跳 TCP/TLS 双向排空，UDP 复用本地监听与来源；原 forwarder_paths.cpp 已替换 |
+| protocol/src/xfr_channel.cpp | 多跳 Agent 半关闭复制及双向任务的原始错误传播，不改变单节点复制函数 |
+
+业务 payload 直接在 transfer_io 与 cluster_data_io 间传递，control_io 只处理控制及完成结果。
+RelayNode 停止时先取消并排空多跳任务，再停止 NodeLinkMgr；原有共享 NodeLink 和其他 Flow 的生命周期保持独立。
+没有新增抽象控制器基类、业务总管、回调注册层、公平调度、连接池或存量换路。
+
+### 验证范围
+
+relay_paths 使用五个真实本地 Node、真实请求方/服务方 Agent 和应用 socket。
+测试通过编译期友元填入现有有效 LRU，固定多跳路径，避免依赖 ICMP；不增加生产协议、配置开关或运行时测试入口。
+多地址测试证书仅供该测试使用，覆盖 127.0.0.1..5，复用现有测试私钥，生产 TLS 主机名校验保持原样。
+覆盖 TCP/TLS 多帧双向数据、应用半关闭后回包、超过建立预算仍可传输、两个方向的 socket RESET、
+并发 UDP 会话、session 改写/来源/空报文/载荷上限、服务限速和精确字节统计，以及活动分叉流隔离、局部断链、取消和停止排空。
+同一监听上的单节点并存、错票据、重复请求/attach、服务缺失和目标连接失败继续回归。
+
+### 最终验证结果
+
+Linux / GCC 14 / Asio 1.38.2 下，Debug 与 Release 全目标构建成功，均无 C++ 编译警告。
+最终 Debug CTest 共 27 项：26 项通过、0 失败、1 项 probe_integration 因 ICMP 权限跳过，用时 161.89 秒。
+最终 Release CTest 同为 26 项通过、0 失败、1 项相同权限跳过，用时 157.68 秒。
+多跳集成 relay_paths 在两种构建中均通过，包含真实双 Agent 全链路业务及上述故障、限速、统计和生命周期检查。
+
+构建日志：build/phase4-build.log、build/phase4-release-build.log。
+回归日志：build/phase4-debug-tests.log、build/phase4-release-tests.log；独立多跳验证见 build/phase4-paths-tests.log。
+git diff --check、修改文本的尾部空白检查及 41 个本地文档链接检查通过。
+本轮为本机多 Node / 多执行域集成验证，未进行多机网络或持续吞吐测试。
+
+### 第四阶段业务完整后的再次复查
+
+按实际入口、接入、传输和关闭流程重新核对成员及函数调用，进一步精简如下：
+
+- ControlRouterMulti 首末共用一次对端状态等待和一次本地激活。首端等待 attached，末端等待 ready；
+  两个状态的含义仍明确保留，去掉重复等待、激活和检查分支，不增加公共状态机或回调层。
+- 单节点 TCP/TLS、UDP Relay 删除仅转调 ControlRouterSingle::belongs_to 的包装函数，直接调用所属控制器。
+- NodeLinkMgr 原 endpoint_ready 仅有末端调用，改为 egress_ready，删除没有使用场景的 ingress 参数和首端判断分支。
+- Agent UDP 本地接收去掉临时 lambda 和重复查表，将来源 IP 检查放到单节点/多节点分支之前。
+  修正多节点分支绕过原来源检查的问题，保留原有同 IP 更换端口后更新回包地址的行为。
+
+保留的状态均有实际用途：ticket/role 用于接入校验，connected/active 分别表示已接入和允许转发，
+epoch/flow_id 用于真实业务帧，peer_finished 用于正常 FIN 排空，取消信号和任务计数用于停止排空，
+首 Node 控制连接引用用于业务期间保持连接。没有新增占位成员或预留接口。
+UDP 共享写链及有界队列继续保留，保证多个 Flow 共用一个监听 socket 时只有一条发送链并持有待发送字节。
+
+新增真实双 Agent UDP 回归：拒绝不同本地来源 IP 的报文、允许原 IP 使用新端口、回包发往更新后的端点。
+仅加入来源拒绝断言时，修正前的 Release relay_paths 已失败并准确复现问题，日志见 build/phase4-review-red-test.log。
+
+本次复查后的 Release 全目标构建成功，无 C++ 编译警告；完整 CTest 为 26 项通过、0 失败、
+1 项 probe_integration 因 ICMP 权限跳过，用时 157.52 秒。
+relay_paths 通过，用时 6.53 秒，包含新增来源与端口更新断言。
+构建与回归日志分别为 build/phase4-review-release-build.log、build/phase4-review-release-tests.log。
+git diff --check、41 个修改文本的尾部空白检查以及本次检查的 51 个本地文档链接均通过。

@@ -1,4 +1,5 @@
-#include "agent_routing.h"
+#include "relay_agent.h"
+#include <fstream>
 #include "link_quality.h"
 
 #include <cmath>
@@ -66,6 +67,55 @@ int main()
     try
     {
         asio::io_context io(1);
+        require(AgentConfig{}.routing_max_nodes == 4, "Default real Node budget changed");
+        const auto data = std::filesystem::path(__FILE__).parent_path() / "data";
+        const auto temporary = std::filesystem::temp_directory_path() /
+            ("relayweave-routing-config-" + std::to_string(AgentRouting::Clock::now().time_since_epoch().count()) + ".json");
+        ScopeGuard cleanup([temporary] { std::error_code ignored; std::filesystem::remove(temporary, ignored); });
+        Json settings{{"server", {{"host", "127.0.0.1"}, {"port", 18443}}},
+            {"certificate", {{"ca_file", (data / "tls_channel_test_ca.pem").string()},
+                             {"certificate_chain", (data / "tls_channel_test_client.pem").string()},
+                             {"private_key", (data / "tls_channel_test_client.key").string()}}}};
+        const auto write_settings = [&] { std::ofstream file(temporary); file << settings; };
+        write_settings();
+        require(load_agent_config(temporary).routing_max_nodes == 4, "Omitted routing did not default to four nodes");
+        for (unsigned maximum : {1u, 4u, 8u})
+        {
+            settings["routing"] = {{"max_nodes", maximum}};
+            write_settings();
+            require(load_agent_config(temporary).routing_max_nodes == maximum, "Explicit Node budget lost");
+        }
+        for (unsigned maximum : {0u, 9u, 16u})
+        {
+            settings["routing"] = {{"max_nodes", maximum}};
+            write_settings();
+            rejects([&] { load_agent_config(temporary); }, "Out of range Node budget accepted by parser");
+        }
+
+        rejects([&] { AgentRouting invalid(io, false, 9); }, "Nine-node Agent budget accepted");
+        rejects([&] { AgentRouting invalid(io, false, 0); }, "Zero-node Agent budget accepted");
+        AgentRouting eight(io, false, 8);
+        Json chain_nodes = Json::array();
+        Json chain_links = Json::array();
+        for (unsigned index = 0; index < 8; ++index)
+        {
+            chain_nodes.push_back(node(std::to_string(index), "192.0.2." + std::to_string(index + 1)));
+            if (index != 0)
+            {
+                chain_links.push_back(edge(std::to_string(index - 1), std::to_string(index), 1.0));
+            }
+        }
+        eight.begin_request(1, at(0));
+        eight.accept_snapshot(snapshot(1, chain_nodes, chain_links), at(0));
+        const std::vector<RouteGraph::Entry> ingress{{"0", 1.0}};
+        const auto whole = calculate_path(eight, "7", ingress, at(0));
+        require(whole && whole->nodes.size() == 8 && whole->nodes.front() == "0" && whole->nodes.back() == "7",
+                "Agent or endpoints incorrectly counted against eight-node budget");
+        AgentRouting four(io, false, 4);
+        four.begin_request(1, at(0));
+        four.accept_snapshot(snapshot(1, chain_nodes, chain_links), at(0));
+        require(calculate_path(four, "3", ingress, at(0)).has_value() && !calculate_path(four, "4", ingress, at(0)),
+                "Configured four-node limit omitted endpoints");
         AgentRouting routing(io, true, 4);
         const auto first = snapshot(1, Json::array({node("A", "192.0.2.1"), node("D", "192.0.2.2")}),
                                     Json::array({edge("A", "D", 5.0)}));
