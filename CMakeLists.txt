@@ -1,6 +1,32 @@
 cmake_minimum_required(VERSION 3.21)
 project(relayweave VERSION 1.0.4 LANGUAGES CXX)
 
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2/include/asio.hpp"
+    OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/CMakeLists.txt"
+    OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/include/nlohmann/json.hpp")
+    find_package(Git REQUIRED)
+    file(MAKE_DIRECTORY "${PROJECT_SOURCE_DIR}/vendor")
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2/include/asio.hpp")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" clone --depth 1 --branch asio-1-38-2
+            https://github.com/chriskohlhoff/asio.git
+            "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2"
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+endif()
+
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/CMakeLists.txt"
+    OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/include/nlohmann/json.hpp")
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" clone --depth 1 --branch v3.12.0
+            https://github.com/nlohmann/json.git
+            "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0"
+        COMMAND_ERROR_IS_FATAL ANY
+    )
+endif()
+
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

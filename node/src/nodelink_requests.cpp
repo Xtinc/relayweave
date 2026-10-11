@@ -1,11 +1,11 @@
-#include "nodelink_mgr.h"
 #include "app_common.h"
+#include "nodelink_mgr.h"
 
 // Remote callers use the same master FlowRequest as local callers. These messages contain no Relay/Agent state.
 asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> path, RelayProtocol transport)
 {
-    if (path.size() < 2 || path.front() != config_.node_id || transport == RelayProtocol::Tls ||
-        !topology_.epoch() || remote_flows_.size() >= 1000)
+    if (path.size() < 2 || path.front() != config_.node_id || transport == RelayProtocol::Tls || !topology_.epoch() ||
+        remote_flows_.size() >= 1000)
     {
         co_return FlowResult{0, 0, "open", "requires a current ingress and tcp/udp flow"};
     }
@@ -23,16 +23,18 @@ asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> p
         remote_flows_.erase(id);
         if (!accepted)
         {
-            cluster_.send(std::string(topology_.master_id()), CtrlMessage("flow.close.request",
-                njson{{"epoch", epoch}, {"flow_id", id}}));
+            cluster_.send(std::string(topology_.master_id()),
+                          CtrlMessage("flow.close.request", njson{{"epoch", epoch}, {"flow_id", id}}));
         }
     });
-    cluster_.send(std::string(topology_.master_id()), CtrlMessage("flow.open",
-        njson{{"epoch", epoch}, {"flow_id", id}, {"path", std::move(path)},
-              {"transport", relay_protocol_name(transport)}}));
+    cluster_.send(std::string(topology_.master_id()),
+                  CtrlMessage("flow.open", njson{{"epoch", epoch},
+                                                 {"flow_id", id},
+                                                 {"path", std::move(path)},
+                                                 {"transport", relay_protocol_name(transport)}}));
     // Bound the remote reply as well as the existing master link/flow deadlines.
     if (!co_await asio::co_spawn(control_, request->completed.wait(),
-                                asio::cancel_after(std::chrono::seconds(30), asio::use_awaitable)))
+                                 asio::cancel_after(std::chrono::seconds(30), asio::use_awaitable)))
     {
         throw asio::system_error(asio::error::operation_aborted);
     }
@@ -54,8 +56,10 @@ asio::awaitable<void> NodeLinkMgr::reply_flow(std::shared_ptr<FlowRequest> reque
         }
     }
     const auto &result = request->result;
-    cluster_.send(std::move(target), CtrlMessage("flow.opened",
-        njson{{"epoch", result.epoch}, {"flow_id", result.id}, {"stage", result.stage}, {"reason", result.reason}}));
+    cluster_.send(std::move(target), CtrlMessage("flow.opened", njson{{"epoch", result.epoch},
+                                                                      {"flow_id", result.id},
+                                                                      {"stage", result.stage},
+                                                                      {"reason", result.reason}}));
 }
 
 void NodeLinkMgr::handle_flow_request(CtrlMessage message)
@@ -120,9 +124,11 @@ void NodeLinkMgr::handle_flow_request(CtrlMessage message)
     {
         if (message.command == "flow.open")
         {
-            cluster_.send(p.at("source").get<std::string>(), CtrlMessage("flow.opened",
-                njson{{"epoch", p.at("epoch")}, {"flow_id", p.at("flow_id")},
-                      {"stage", "open"}, {"reason", error.what()}}));
+            cluster_.send(p.at("source").get<std::string>(),
+                          CtrlMessage("flow.opened", njson{{"epoch", p.at("epoch")},
+                                                           {"flow_id", p.at("flow_id")},
+                                                           {"stage", "open"},
+                                                           {"reason", error.what()}}));
         }
         else
         {
@@ -141,9 +147,8 @@ bool NodeLinkMgr::egress_ready(std::uint64_t epoch, std::uint64_t id, const std:
     }
     const auto &p = it->second;
     const auto &path = p.at("path");
-    return p.at("epoch") == epoch && p.value("committed", false) &&
-        path.back() == config_.node_id && path.front() == ingress &&
-        p.at("transport") == relay_protocol_name(transport);
+    return p.at("epoch") == epoch && p.value("committed", false) && path.back() == config_.node_id &&
+           path.front() == ingress && p.at("transport") == std::string(relay_protocol_name(transport));
 }
 
 void NodeLinkMgr::flow_closed(std::uint64_t id, std::string reason)
