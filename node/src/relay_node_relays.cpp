@@ -1,9 +1,9 @@
 #include "relay_node.h"
-#include "relay_session.h"
+#include "node_session.h"
 
 using Clock = std::chrono::steady_clock;
 
-void RelayNode::start_relay(std::shared_ptr<RelaySession> relay)
+void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
 {
     relay_sessions_.push_back(relay);
     try
@@ -45,11 +45,10 @@ void RelayNode::handle_relay(const ControlSessionPtr &session, const CtrlMessage
         {
             values["path"] = params.at("path");
             values["epoch"] = config::require_unsigned(params, "epoch", true);
-            values["budget_ms"] = config::optional_unsigned(params, "budget_ms", true).value_or(10000);
             const auto path = values.at("path").get<std::vector<std::string>>();
             if (!request || path.size() < 2 || path.front() != config_.cluster.node_id ||
-                values.at("epoch") != topology_->epoch() || values.at("budget_ms").get<std::uint64_t>() > config::max_duration_ms)
-                throw std::invalid_argument("invalid path, stale epoch or timeout");
+                values.at("epoch") != topology_->epoch())
+                throw std::invalid_argument("invalid path or stale epoch");
             for (const auto &relay : relay_sessions_)
             {
                 auto control = std::get_if<ControlRouterMulti>(&relay->control_);
@@ -58,7 +57,7 @@ void RelayNode::handle_relay(const ControlSessionPtr &session, const CtrlMessage
                 for (const auto *field : {"path", "epoch", "service", "protocol"})
                     if (control->params_.at(field) != values.at(field))
                         throw std::invalid_argument("relay request conflicts with existing request");
-                if (control->notified_)
+                if (control->progress_ >= ControlRouterMulti::Progress::AgentNotified)
                     control->notify_agent();
                 return;
             }
@@ -66,14 +65,14 @@ void RelayNode::handle_relay(const ControlSessionPtr &session, const CtrlMessage
                     return std::holds_alternative<ControlRouterMulti>(relay->control_);
                 }) >= static_cast<std::ptrdiff_t>(config_.control.max_connections))
                 throw std::runtime_error("relay path capacity reached");
-            start_relay(std::make_shared<RelaySession>(*this, session, std::move(values), true));
+            start_relay(std::make_shared<NodeSession>(*this, session, std::move(values), true));
         }
         else
         {
             const auto producer = registry_.find_service(service);
             if (!producer || producer->protocol != protocol)
                 throw std::runtime_error(!producer ? "service unavailable" : "service protocol mismatch");
-            start_relay(std::make_shared<RelaySession>(*this, session, producer->session, std::move(values), producer->traffic));
+            start_relay(std::make_shared<NodeSession>(*this, session, producer->session, std::move(values), producer->traffic));
         }
     }
     catch (const std::exception &error)
@@ -113,12 +112,11 @@ void RelayNode::handle_relay_peer(CtrlMessage message)
         const auto service = registry_.find_service(config::message_service(params));
         if (!service || service->protocol != protocol)
             throw std::runtime_error(!service ? "service unavailable" : "service protocol mismatch");
-        const auto budget = config::require_unsigned(params, "budget_ms", true);
-        if (budget > config::max_duration_ms || std::count_if(relay_sessions_.begin(), relay_sessions_.end(), [](const auto &relay) {
+        if (std::count_if(relay_sessions_.begin(), relay_sessions_.end(), [](const auto &relay) {
                     return std::holds_alternative<ControlRouterMulti>(relay->control_);
                 }) >= static_cast<std::ptrdiff_t>(config_.control.max_connections))
-            throw std::runtime_error("relay path capacity or timeout out of range");
-        start_relay(std::make_shared<RelaySession>(*this, service->session, params, false, service->traffic));
+            throw std::runtime_error("relay path capacity reached");
+        start_relay(std::make_shared<NodeSession>(*this, service->session, params, false, service->traffic));
     }
     catch (const std::exception &error)
     {
@@ -150,7 +148,6 @@ void RelayNode::invalidate_relays(std::string reason)
 
 asio::awaitable<void> RelayNode::stop_relays()
 {
-    co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     cancel_relays("node stopping");
     while (!relay_sessions_.empty())
     {

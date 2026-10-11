@@ -297,6 +297,15 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     const auto empty = co_await receive_datagram(consumer_socket);
     require(empty.size() == DatagramHeader::length, "Zero-length UDP payload was not forwarded");
 
+    // Single-node UDP retains its wire limit, independently of the routed Flow payload limit.
+    const BytesBuf large_payload(DatagramHeader::maximum_user_payload, 0xa5);
+    co_await send_datagram(producer_socket, server, udp_datagram(producer_id, large_payload));
+    require(co_await receive_datagram(consumer_socket) == udp_datagram(consumer_id, large_payload),
+            "Maximum single-node UDP datagram was changed or truncated");
+    co_await send_datagram(consumer_socket, server, udp_datagram(consumer_id, large_payload));
+    require(co_await receive_datagram(producer_socket) == udp_datagram(producer_id, large_payload),
+            "Maximum reverse single-node UDP datagram was changed or truncated");
+
     consumer->send(CtrlMessage{"server.traffic", njson{{"request_id", 30U}}});
     const auto traffic = co_await receive_command(consumer, "server.traffic.reported");
     const auto &services = params_of(traffic).at("services");
@@ -309,9 +318,10 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     const auto stats = find_service_stats("udp-session");
     require(stats != services.end(), "UDP service was missing from traffic response");
     require(stats->at("protocol") == "udp", "UDP traffic response reported the wrong protocol");
-    require(stats->at("rx_bytes") == attach_shaped_payload.size(),
+    require(stats->at("rx_bytes") == attach_shaped_payload.size() + large_payload.size(),
             "UDP RX traffic included headers, invalid datagrams, or dropped payloads");
-    require(stats->at("tx_bytes") == tx_payload.size(), "UDP TX payload bytes were counted incorrectly");
+    require(stats->at("tx_bytes") == tx_payload.size() + large_payload.size(),
+            "UDP TX payload bytes were counted incorrectly");
 
     asio::steady_timer sample_wait(co_await asio::this_coro::executor);
     sample_wait.expires_after(1100ms);

@@ -21,6 +21,7 @@ from dashboard import (
     _load_agent_config,
     _node_snapshot,
 )
+from history_store import HistoryStore
 from proxy_client import ProxyControlClient
 from proxy_protocol import CtrlMessage, HEADER_LENGTH, from_cbor, pack_frame
 
@@ -262,13 +263,15 @@ class DashboardConfigTest(unittest.TestCase):
 
 class ClusterPollingTest(unittest.TestCase):
     def make_client(self, directory: str) -> ProxyControlClient:
+        store = HistoryStore(Path(directory) / "history.sqlite3")
+        self.addCleanup(store.close)
         return ProxyControlClient(
             host="127.0.0.1",
             port=18443,
             ca_file="unused",
             cert_file="unused",
             key_file="unused",
-            history_db=str(Path(directory) / "history.sqlite3"),
+            history_store=store,
         )
 
     def test_identity_handshake_precedes_cluster_queries(self) -> None:

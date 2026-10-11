@@ -89,7 +89,7 @@ std::uint64_t RelayIdAllocator::allocate()
         {
             next_uuid_ = 1;
         }
-        if (uuid != 0 && active_ids_.insert(uuid).second)
+        if (active_ids_.insert(uuid).second)
         {
             return uuid;
         }

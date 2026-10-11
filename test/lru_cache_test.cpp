@@ -34,16 +34,14 @@ void verify_lru()
     const auto *one = cache.get(1, now + 1s);
     require(one && *one == "one", "Cache hit lost the value");
     cache.put(3, "three", now + 1s);
-    require(cache.size() == 2 && !cache.get(2, now + 1s), "Hit did not promote the LRU entry");
+    require(!cache.get(2, now + 1s), "Hit did not promote the LRU entry");
     require(cache.get(1, now + 1s) == one, "Splicing or insertion invalidated a live pointer");
     cache.put(1, "updated", now + 2s);
     cache.put(4, "four", now + 2s);
-    require(cache.size() == 2 && !cache.get(3, now + 2s), "Overwrite did not promote the entry");
+    require(!cache.get(3, now + 2s), "Overwrite did not promote the entry");
     require(*cache.get(1, now + 2s) == "updated", "Overwrite did not replace the value");
-    require(!cache.erase(9), "Missing erase reported success");
-    require(cache.erase(1) && !cache.get(1, now + 2s) && cache.size() == 1, "Erase left an indexed entry");
     cache.clear();
-    require(cache.size() == 0 && !cache.get(4, now + 2s), "Clear left an entry");
+    require(!cache.get(4, now + 2s), "Clear left an entry");
     cache.put(5, "five", now + 3s);
     require(*cache.get(5, now + 3s) == "five", "Cache cannot be reused after clear");
 }
@@ -54,7 +52,7 @@ void verify_ttl()
     LRUCache<int, int> cache(2, 5s);
     cache.put(1, 10, now);
     require(cache.get(1, now + 5s - 1ns), "Value expired before the TTL boundary");
-    require(!cache.get(1, now + 5s) && cache.size() == 0, "Read renewed TTL or boundary was not expired");
+    require(!cache.get(1, now + 5s), "Read renewed TTL or boundary was not expired");
 
     cache.put(1, 10, now);
     cache.put(1, 20, now + 4s);
@@ -63,14 +61,13 @@ void verify_ttl()
 
     cache.put(1, 10, now);
     cache.put(1, 30, now + 6s);
-    require(cache.size() == 1 && *cache.get(1, now + 6s) == 30, "Expired overwrite duplicated or lost the entry");
+    require(*cache.get(1, now + 6s) == 30, "Expired overwrite duplicated or lost the entry");
     require(!cache.get(1, now + 11s), "Expired overwrite did not start a new TTL");
 
     cache.put(1, 10, now);
     cache.put(2, 20, now);
-    require(cache.size() == 2, "Stored size is incorrect");
-    require(!cache.get(2, now + 10s) && cache.size() == 1, "Expiry did not lazily erase the requested entry");
-    require(!cache.get(1, now + 10s) && cache.size() == 0, "Expired entries remained accessible");
+    require(!cache.get(2, now + 10s), "Expiry did not lazily erase the requested entry");
+    require(!cache.get(1, now + 10s), "Expired entries remained accessible");
 }
 
 void verify_options_and_values()
@@ -78,7 +75,7 @@ void verify_options_and_values()
     const auto now = Clock::time_point{};
     LRUCache<int, int> disabled(0, 5s);
     disabled.put(1, 10, now);
-    require(disabled.size() == 0 && !disabled.get(1, now), "Zero capacity did not disable caching");
+    require(!disabled.get(1, now), "Zero capacity did not disable caching");
     for (auto ttl : {0s, -1s})
     {
         bool rejected = false;

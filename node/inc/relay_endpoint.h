@@ -15,8 +15,8 @@ struct RelayEndpoint
     void bind(LnkChannel &channel, std::uint64_t epoch, std::uint64_t flow_id,
               const TrafficLimitConfig &limits, SRVTrafficPtr traffic, std::string accessor);
     asio::awaitable<void> send(LnkFrType kind, BytesBuf payload = {}, std::string reason = {});
+    asio::awaitable<void> send_data(std::span<const std::uint8_t> payload);
     asio::awaitable<FlowFrame> receive();
-    asio::awaitable<void> limit(bool from_agent, std::size_t size);
     void count(bool from_agent, std::size_t size);
 
     std::uint64_t ticket = 0;

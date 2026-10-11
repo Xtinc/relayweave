@@ -3,10 +3,8 @@
 
 #include <cstddef>
 #include <map>
-#include <optional>
 #include <span>
 #include <string>
-#include <string_view>
 #include <vector>
 
 class RouteGraph
@@ -33,9 +31,6 @@ class RouteGraph
 
     explicit RouteGraph(std::span<const Link> links);
 
-    [[nodiscard]] std::optional<Path> shortest_path(
-        std::string_view source, std::string_view destination, std::size_t max_nodes) const;
-
     // Starts at real ingress Nodes. Every expansion charges the departing Node as a relay.
     [[nodiscard]] std::map<std::string, Path> shortest_paths(
         std::span<const Entry> entries, std::size_t max_nodes) const;
@@ -47,8 +42,6 @@ class RouteGraph
         double cost = 0.0;
     };
 
-    std::map<std::string, Path> search(std::span<const Entry> entries, std::size_t max_nodes,
-                                       bool charge_first_node) const;
     static constexpr double relay_penalty = 2.0;
 
     std::map<std::string, std::vector<Arc>> adjacency_;

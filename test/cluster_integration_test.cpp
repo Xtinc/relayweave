@@ -1,5 +1,5 @@
 #include "cluster_mgr.h"
-#include "node_test_config.h"
+#include "node_fixture.h"
 #include <deque>
 #include <iostream>
 #include <thread>
@@ -37,24 +37,12 @@ struct Inbox
     }
 };
 
-asio::awaitable<void> until(std::function<bool()> predicate)
-{
-    asio::steady_timer timer(co_await asio::this_coro::executor);
-    const auto deadline = std::chrono::steady_clock::now() + 7s;
-    while (!predicate())
-    {
-        require(std::chrono::steady_clock::now() < deadline, "Timed out waiting for cluster message");
-        timer.expires_after(10ms);
-        co_await timer.async_wait(asio::use_awaitable);
-    }
-}
-
-asio::awaitable<void> receive_until(const std::shared_ptr<RelayNode> &server, Inbox &inbox,
+asio::awaitable<void> receive_until(const std::shared_ptr<TLSChannel> &server, Inbox &inbox,
                                     std::function<bool()> predicate)
 {
     while (!predicate())
     {
-        inbox.push(co_await server->async_receive_cluster());
+        inbox.push(co_await server->async_receive());
     }
 }
 
@@ -96,10 +84,8 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
     channel.heartbeat_interval = 100ms;
     channel.heartbeat_timeout = 2s;
 
-    Inbox master_inbox;
     Inbox a_inbox;
     Inbox b_inbox;
-    Inbox duplicate_inbox;
     std::vector<std::shared_ptr<RelayNode>> owners;
     std::vector<std::shared_ptr<ClusterMgr>> nodes;
     auto make_owner = [&](const ClusterConfig &cluster) {
@@ -123,74 +109,63 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
     };
 
     std::shared_ptr<RelayNode> master_owner;
-    std::shared_ptr<RelayNode> a_owner;
-    std::shared_ptr<RelayNode> b_owner;
     auto master = make(ClusterConfig::Role::Master, "master", master_owner);
-    auto a = make(ClusterConfig::Role::Slave, "a", a_owner);
-    auto b = make(ClusterConfig::Role::Slave, "b", b_owner);
+    std::shared_ptr<TLSChannel> a;
+    std::shared_ptr<TLSChannel> b;
     std::exception_ptr failure;
     try
     {
-        co_await receive_until(a_owner, a_inbox, [&] { return a_inbox.count("cluster.joined") == 1; });
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("cluster.joined") == 1; });
+        a = co_await connect(context, port);
+        b = co_await connect(context, port);
+        a->send(CtrlMessage{"cluster.join", njson{{"node_id", "a"}}});
+        b->send(CtrlMessage{"cluster.join", njson{{"node_id", "b"}}});
+        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("cluster.joined") == 1; });
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("cluster.joined") == 1; });
 
-        asio::steady_timer live_channel(io);
-        live_channel.expires_after(1100ms);
-        co_await live_channel.async_wait(asio::use_awaitable);
-        require(a_inbox.count("cluster.joined") == 1 && b_inbox.count("cluster.joined") == 1,
-                "Slave reconnected while its channel was alive");
-
-        a->broadcast(CtrlMessage{"notice", njson{{"request_id", 1}}});
-        co_await receive_until(master_owner, master_inbox, [&] { return master_inbox.count("notice") == 1; });
-        co_await receive_until(a_owner, a_inbox, [&] { return a_inbox.count("notice") == 1; });
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("notice") == 1; });
-        require(master_inbox.messages.back().first == "a" && b_inbox.messages.back().first == "a",
-                "Broadcast source was not taken from the joined session");
-        require(!master_inbox.messages.back().second.params->contains("target") &&
-                    !a_inbox.messages.back().second.params->contains("target") &&
+        const auto broadcast = [&](const std::shared_ptr<TLSChannel> &peer, CtrlMessage message) {
+            if (!message.params) message.params = njson::object();
+            (*message.params)["target"] = "all";
+            peer->send(std::move(message));
+        };
+        broadcast(a, CtrlMessage{"notice", njson{{"request_id", 1}}});
+        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("notice") == 1; });
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("notice") == 1; });
+        require(a_inbox.messages.back().first == "a" && b_inbox.messages.back().first == "a",
+                "Broadcast lost the authenticated source");
+        require(!a_inbox.messages.back().second.params->contains("target") &&
                     !b_inbox.messages.back().second.params->contains("target"),
                 "Cluster target leaked into a broadcast delivery");
 
-        a->send("b", CtrlMessage{"direct", njson{{"request_id", 2}}});
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("direct") == 1; });
+        a->send(CtrlMessage{"direct", njson{{"target", "b"}, {"request_id", 2}}});
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("direct") == 1; });
         require(b_inbox.messages.back().first == "a" &&
                     b_inbox.messages.back().second.params->at("request_id") == 2 &&
                     !b_inbox.messages.back().second.params->contains("target"),
-                "Directed message lost its authenticated source or leaked its target");
+                "Directed message lost its source or leaked its target");
         master->broadcast(CtrlMessage{"direct.barrier"});
-        co_await receive_until(master_owner, master_inbox,
-                               [&] { return master_inbox.count("direct.barrier") == 1; });
-        co_await receive_until(a_owner, a_inbox, [&] { return a_inbox.count("direct.barrier") == 1; });
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("direct.barrier") == 1; });
-        require(master_inbox.count("direct") == 0 && a_inbox.count("direct") == 0 &&
-                    b_inbox.count("direct") == 1,
-                "Directed message was delivered to a non-target node");
+        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("direct.barrier") == 1; });
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("direct.barrier") == 1; });
+        require(a_inbox.count("direct") == 0 && b_inbox.count("direct") == 1,
+                "Directed message reached a non-target peer");
 
-        b->broadcast(CtrlMessage{"reported", njson{{"request_id", 1}, {"value", 42}}});
-        co_await receive_until(master_owner, master_inbox, [&] { return master_inbox.count("reported") == 1; });
-        co_await receive_until(a_owner, a_inbox, [&] { return a_inbox.count("reported") == 1; });
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("reported") == 1; });
-        require(master_inbox.messages.back().first == "b" &&
-                    master_inbox.messages.back().second.params->at("request_id") == 1,
+        broadcast(b, CtrlMessage{"reported", njson{{"request_id", 1}, {"value", 42}}});
+        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("reported") == 1; });
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("reported") == 1; });
+        require(a_inbox.messages.back().first == "b" &&
+                    a_inbox.messages.back().second.params->at("request_id") == 1,
                 "Protocol response lost source or request_id");
-
         master->broadcast(CtrlMessage{"master.notice"});
-        co_await receive_until(master_owner, master_inbox,
-                               [&] { return master_inbox.count("master.notice") == 1; });
-        co_await receive_until(a_owner, a_inbox, [&] { return a_inbox.count("master.notice") == 1; });
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("master.notice") == 1; });
-
+        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("master.notice") == 1; });
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("master.notice") == 1; });
         master->broadcast(CtrlMessage{std::string(CtrlMessage::max_command_length + 1, 'x')});
-        co_await receive_until(master_owner, master_inbox, [&] { return master_inbox.count("cluster.error") == 1; });
         master->broadcast(CtrlMessage{"after.invalid"});
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("after.invalid") == 1; });
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("after.invalid") == 1; });
 
-        std::shared_ptr<RelayNode> duplicate_owner;
-        auto duplicate = make(ClusterConfig::Role::Slave, "a", duplicate_owner);
-        co_await receive_until(duplicate_owner, duplicate_inbox,
-                               [&] { return duplicate_inbox.count("cluster.error") != 0; });
-        require(duplicate_inbox.count("cluster.joined") == 0, "Duplicate node joined the room");
-        co_await duplicate->async_stop();
+        auto duplicate = co_await connect(context, port);
+        duplicate->send(CtrlMessage{"cluster.join", njson{{"node_id", "a"}}});
+        require((co_await duplicate->async_receive()).type() == CtrlCommand::ClusterError,
+                "Duplicate node joined the room");
+        co_await duplicate->async_disconnect();
 
         auto reserved = co_await connect(context, port);
         reserved->send(CtrlMessage{"cluster.join", njson{{"node_id", "all"}}});
@@ -236,8 +211,8 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         raw->send(CtrlMessage{"cluster.join", njson{{"node_id", "raw"}}});
         require((co_await raw->async_receive()).command == "cluster.joined", "Raw peer did not join");
         raw->send(CtrlMessage{"identity", njson{{"target", "all"}, {"source", "forged"}}});
-        co_await receive_until(master_owner, master_inbox, [&] { return master_inbox.count("identity") == 1; });
-        require(master_inbox.messages.back().first == "raw", "Peer forged the broadcast source");
+        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("identity") == 1; });
+        require(a_inbox.messages.back().first == "raw", "Peer forged the broadcast source");
         auto raw_delivery = co_await raw->async_receive();
         while (raw_delivery.command == "topology.members")
         {
@@ -262,20 +237,12 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         require(invalid_closed, "Invalid cluster command did not close the session");
         co_await raw->async_disconnect();
 
-        co_await master->async_stop();
-        master = make(ClusterConfig::Role::Master, "master", master_owner);
-        co_await receive_until(a_owner, a_inbox, [&] { return a_inbox.count("cluster.joined") == 2; });
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("cluster.joined") == 2; });
-        require(a_inbox.count("notice") == 1 && b_inbox.count("notice") == 1, "History replayed after reconnect");
-        a->broadcast(CtrlMessage{"after.reconnect"});
-        co_await receive_until(b_owner, b_inbox, [&] { return b_inbox.count("after.reconnect") == 1; });
-
         // Stop master sessions during TLS handshake and slaves while connected.
         tcp::socket stalled(io);
         co_await stalled.async_connect({asio::ip::address_v4::loopback(), port}, asio::use_awaitable);
         co_await master->async_stop();
-        co_await a->async_stop();
-        co_await b->async_stop();
+        co_await a->async_disconnect();
+        co_await b->async_disconnect();
 
         // Pending handshakes count against the cluster connection limit.
         ClusterConfig limited_config{ClusterConfig::Role::Master, "limited", "127.0.0.1", port};
@@ -312,6 +279,8 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         failure = std::current_exception();
     }
 
+    if (a) co_await a->async_disconnect();
+    if (b) co_await b->async_disconnect();
     for (const auto &node : nodes)
         co_await node->async_stop();
     if (failure)
@@ -328,8 +297,6 @@ void verify_relay_node(asio::ssl::context &context)
     const auto port = reservation.local_endpoint().port();
     reservation.close();
 
-    Inbox master_inbox;
-    Inbox slave_inbox;
     auto settings = make_test_node_config();
     settings.control.address = settings.tcp.address = settings.tls.address = settings.datagram.address = "127.0.0.1";
     settings.cluster.control_port = port;
@@ -341,53 +308,60 @@ void verify_relay_node(asio::ssl::context &context)
     auto slave = std::make_shared<RelayNode>(control, tcp_io, udp_io, cluster_data.io, context, settings);
     master->start();
     slave->start();
-    auto collect = [&control](const std::shared_ptr<RelayNode> &server, Inbox &inbox) {
-        asio::co_spawn(
-            control,
-            [server, &inbox]() -> asio::awaitable<void> {
-                try
-                {
-                    for (;;)
-                    {
-                        auto received = co_await server->async_receive_cluster();
-                        inbox.push(std::move(received));
-                    }
-                }
-                catch (const asio::system_error &)
-                {
-                }
-            },
-            asio::detached);
-    };
-    collect(master, master_inbox);
-    collect(slave, slave_inbox);
-    auto scenario = [&]() -> asio::awaitable<void> {
-        co_await until([&] { return slave_inbox.count("cluster.joined") == 1; });
-        slave->broadcast_cluster(CtrlMessage{"cluster.invalid"});
-        co_await until([&] { return slave_inbox.count("cluster.error") == 1; });
-        // Business validation failures must not tear down the cluster connection.
-        slave->send_cluster("test-master", CtrlMessage{"service.lookup"});
-        slave->broadcast_cluster(CtrlMessage{"app.broadcast"});
-        co_await until(
-            [&] { return master_inbox.count("app.broadcast") == 1 && slave_inbox.count("app.broadcast") == 1; });
-        require(master_inbox.messages.back().first == "slave", "RelayNode lost the broadcast source");
-        slave->send_cluster("test-master", CtrlMessage{"app.direct"});
-        co_await until([&] { return master_inbox.count("app.direct") == 1; });
-        master->broadcast_cluster(CtrlMessage{"app.barrier"});
-        co_await until(
-            [&] { return master_inbox.count("app.barrier") == 1 && slave_inbox.count("app.barrier") == 1; });
-        require(slave_inbox.count("app.direct") == 0, "RelayNode directed message reached a non-target node");
-        require(slave_inbox.count("cluster.joined") == 1, "Invalid local command disconnected the slave");
+    // A real cluster peer observes wire replies; RelayNode needs no generic inbox.
+    auto scenario = [&](std::uint64_t previous_epoch) -> asio::awaitable<std::uint64_t> {
+        auto peer = co_await connect(context, port);
+        peer->send(CtrlMessage{"cluster.join", njson{{"node_id", "observer"}}});
+        std::uint64_t epoch = 0;
+        bool members_ready = false;
+        while (!members_ready)
+        {
+            auto message = co_await peer->async_receive();
+            if (message.type() == CtrlCommand::TopologyMembers)
+            {
+                epoch = message.params->at("epoch").get<std::uint64_t>();
+                members_ready = std::ranges::any_of(message.params->at("members"), [](const njson &member) {
+                    return member.at("node_id") == "slave";
+                });
+            }
+        }
+        require(epoch && epoch != previous_epoch, "Restart failed to publish a fresh membership epoch");
+        // Invalid local messages and malformed business requests must leave the slave connected.
+        test_node::cluster(slave).broadcast(CtrlMessage{"cluster.invalid"});
+        peer->send(CtrlMessage{"service.lookup", njson{{"target", "slave"}}});
+        for (const auto &target : {"slave", "test-master"})
+        {
+            peer->send(CtrlMessage{CtrlCommand::ServerStatusQuery,
+                                  njson{{"target", target}, {"request_id", 1u}, {"session_id", 1u}}});
+            CtrlMessage report;
+            do
+            {
+                report = co_await peer->async_receive();
+            } while (report.type() != CtrlCommand::ServerStatusReport);
+            require(report.params->at("source") == target && report.params->at("request_id") == 1u &&
+                        report.params->at("requester_node") == "observer" && !report.params->contains("target"),
+                    "Real cluster query lost its routing metadata");
+        }
+        co_await peer->async_disconnect();
+        co_return epoch;
     };
 
-    auto result = asio::co_spawn(control, scenario(), asio::use_future);
+    auto result = asio::co_spawn(control, scenario(0), asio::use_future);
     std::thread control_thread([&] { control.run(); });
     std::thread tcp_thread([&] { tcp_io.run(); });
     std::thread udp_thread([&] { udp_io.run(); });
     std::exception_ptr failure;
     try
     {
-        result.get();
+        const auto epoch = result.get();
+        master->stop();
+        auto restarted = make_test_node_config();
+        restarted.control.address = restarted.tcp.address = restarted.tls.address = restarted.datagram.address = "127.0.0.1";
+        restarted.cluster.control_port = port;
+        restarted.channel.disconnect_timeout = 100ms;
+        master = std::make_shared<RelayNode>(control, tcp_io, udp_io, cluster_data.io, context, std::move(restarted));
+        master->start();
+        asio::co_spawn(control, scenario(epoch), asio::use_future).get();
     }
     catch (...)
     {

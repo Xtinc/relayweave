@@ -78,7 +78,6 @@ static constexpr std::pair<CtrlCommand, std::string_view> ctrl_commands[] = {
     {CtrlCommand::LinkError, "link.error"},
     {CtrlCommand::LinkClose, "link.close"},
     {CtrlCommand::LinkClosed, "link.closed"},
-    {CtrlCommand::LinkStatus, "link.status"},
     {CtrlCommand::LinkAttach, "link.attach"},
     {CtrlCommand::LinkAttached, "link.attached"},
     {CtrlCommand::FlowPrepare, "flow.prepare"},

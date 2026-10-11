@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <map>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -65,7 +66,7 @@ std::vector<GraphCase> graph_cases()
         {
             "weighted-choice",
             "加权路径竞争",
-            "直连权重 30；A→B→D 与 A→F→D 的总代价都为 12，确定性规则选择字典序更小的 B。",
+            "直连权重 30；A→B→D 与 A→F→D 的总代价都为 14，确定性规则选择字典序更小的 B。",
             {
                 link("A", "D", 30.0),
                 link("A", "B", 5.0),
@@ -95,7 +96,7 @@ std::vector<GraphCase> graph_cases()
             "D",
             4,
             {"A", "B", "D"},
-            12.0,
+            14.0,
         },
         {
             "layered-state",
@@ -128,7 +129,7 @@ std::vector<GraphCase> graph_cases()
             "D",
             4,
             {"A", "X", "D"},
-            8.0,
+            10.0,
         },
         {
             "node-budget",
@@ -161,15 +162,24 @@ std::vector<GraphCase> graph_cases()
             "D",
             4,
             {"A", "D"},
-            10.0,
+            12.0,
         },
     };
+}
+
+std::optional<RouteGraph::Path> path_to(const RouteGraph &graph, std::string_view source,
+                                       std::string_view destination, std::size_t max_nodes)
+{
+    const RouteGraph::Entry entry{std::string(source), 0.0};
+    const auto paths = graph.shortest_paths(std::span(&entry, 1), max_nodes);
+    const auto found = paths.find(std::string(destination));
+    return found == paths.end() ? std::nullopt : std::optional(found->second);
 }
 
 void run_case(GraphCase &test)
 {
     const RouteGraph graph(test.links);
-    const auto result = graph.shortest_path(test.source, test.destination, test.max_nodes);
+    const auto result = path_to(graph, test.source, test.destination, test.max_nodes);
     require(result.has_value(), test.id + ": no route found");
     require(result->nodes == test.expected_nodes, test.id + ": wrong path");
     require_near(result->cost, test.expected_cost, test.id + ": wrong cost");
@@ -183,11 +193,11 @@ void test_directed_edges()
         link("B", "A", 20.0),
     };
     const RouteGraph graph(links);
-    const auto forward = graph.shortest_path("A", "B", 2);
-    const auto reverse = graph.shortest_path("B", "A", 2);
+    const auto forward = path_to(graph, "A", "B", 2);
+    const auto reverse = path_to(graph, "B", "A", 2);
     require(forward && reverse, "directed edges were not both reachable");
-    require_near(forward->cost, 1.0, "A to B used the reverse edge weight");
-    require_near(reverse->cost, 20.0, "B to A used the forward edge weight");
+    require_near(forward->cost, 3.0, "A to B used the reverse edge weight");
+    require_near(reverse->cost, 22.0, "B to A used the forward edge weight");
 }
 
 void test_invalid_links_are_filtered()
@@ -198,7 +208,7 @@ void test_invalid_links_are_filtered()
     const RouteGraph graph(links);
     for (const auto &target : {"B", "C", "D", "E"})
     {
-        require(!graph.shortest_path("A", target, 2), "invalid edge was accepted");
+        require(!path_to(graph, "A", target, 2), "invalid edge was accepted");
     }
 }
 
@@ -228,12 +238,12 @@ void test_caller_defined_node_limit()
         link("D", "E", 1.0),
     };
     const RouteGraph graph(links);
-    require(!graph.shortest_path("A", "E", 4), "four-node query exceeded its limit");
-    const auto result = graph.shortest_path("A", "E", 5);
+    require(!path_to(graph, "A", "E", 4), "four-node query exceeded its limit");
+    const auto result = path_to(graph, "A", "E", 5);
     require(result.has_value(), "five-node query did not reach its destination");
     require(result->nodes == std::vector<std::string>({"A", "B", "C", "D", "E"}),
             "five-node query returned the wrong path");
-    require_near(result->cost, 10.0, "five-node query returned the wrong cost");
+    require_near(result->cost, 12.0, "five-node query returned the wrong cost");
 }
 
 bool better(const RouteGraph::Path &candidate, const RouteGraph::Path &current)
@@ -247,7 +257,7 @@ bool better(const RouteGraph::Path &candidate, const RouteGraph::Path &current)
 
 void enumerate_paths(const std::vector<RouteGraph::Link> &links, std::string_view destination,
                      std::size_t max_nodes, RouteGraph::Path path,
-                     std::optional<RouteGraph::Path> &best, bool charge_first_node = false)
+                     std::optional<RouteGraph::Path> &best)
 {
     if (path.nodes.back() == destination)
     {
@@ -271,12 +281,9 @@ void enumerate_paths(const std::vector<RouteGraph::Link> &links, std::string_vie
         }
         auto next = path;
         next.cost += edge.cost;
-        if (charge_first_node || path.nodes.size() > 1)
-        {
-            next.cost += 2.0;
-        }
+        next.cost += 2.0;
         next.nodes.push_back(edge.to);
-        enumerate_paths(links, destination, max_nodes, std::move(next), best, charge_first_node);
+        enumerate_paths(links, destination, max_nodes, std::move(next), best);
     }
 }
 
@@ -310,7 +317,7 @@ void test_against_exhaustive_search()
                         RouteGraph::Path{{nodes[source_index]}, 0.0}, expected);
 
         const RouteGraph graph(links);
-        const auto actual = graph.shortest_path(nodes[source_index], nodes[destination_index], max_nodes);
+        const auto actual = path_to(graph, nodes[source_index], nodes[destination_index], max_nodes);
         const auto context = "exhaustive case " + std::to_string(case_index);
         require(actual.has_value() == expected.has_value(), context + ": reachability differs");
         if (actual)
@@ -327,7 +334,7 @@ void test_against_exhaustive_search()
             std::optional<RouteGraph::Path> batch_expected;
             for (const auto &entry : entries)
             {
-                enumerate_paths(links, destination, max_nodes, {{entry.node}, entry.access_cost}, batch_expected, true);
+                enumerate_paths(links, destination, max_nodes, {{entry.node}, entry.access_cost}, batch_expected);
             }
             const auto found = all_paths.find(destination);
             require((found != all_paths.end()) == batch_expected.has_value(), context + ": batch reachability differs");

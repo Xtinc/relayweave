@@ -29,9 +29,7 @@ class AgentRouting
     asio::awaitable<void> close();
     // One best path per usable ingress, ordered by total cost and node sequence.
     // The first candidate for each destination is its best path.
-    // Defaults to measured ingress entries; explicit entries allow calculation without raw sockets.
-    CandidatePaths candidate_paths(Clock::time_point now,
-                                   std::optional<std::span<const RouteGraph::Entry>> entries = std::nullopt) const;
+    CandidatePaths candidate_paths(Clock::time_point now) const;
 
   private:
     static constexpr auto REQUEST_TIMEOUT = std::chrono::seconds(10);

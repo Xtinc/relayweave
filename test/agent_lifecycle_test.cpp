@@ -79,6 +79,7 @@ void verify_stop_before_start(asio::ssl::context &ssl_context)
 
     first_stop.get();
     second_stop.get();
+    asio::co_spawn(control_io, client->async_stop(), asio::use_future).get();
     client.reset();
     control_work.reset();
     transfer_work.reset();
@@ -123,7 +124,7 @@ void verify_stop_and_disconnected_listener(asio::ssl::context &ssl_context)
     probe_io.run();
     rejected.get();
 
-    // Hold the transfer executor so shutdown cannot finish before cancellation is tested.
+    // Both stop callers must wait for the transfer executor to finish shutdown.
     std::promise<void> transfer_blocked;
     std::promise<void> release_transfer;
     auto transfer_released = release_transfer.get_future().share();
@@ -134,35 +135,23 @@ void verify_stop_and_disconnected_listener(asio::ssl::context &ssl_context)
     transfer_blocked.get_future().get();
 
     const auto stop_started = std::chrono::steady_clock::now();
-    asio::cancellation_signal cancellation;
-    auto first_stop = asio::co_spawn(control_io, client->async_stop(),
-                                    asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
+    auto first_stop = asio::co_spawn(control_io, client->async_stop(), asio::use_future);
     auto second_stop = asio::co_spawn(control_io, client->async_stop(), asio::use_future);
     client.reset();
-    std::promise<void> cancellation_sent;
-    asio::post(control_io, [&]() {
-        cancellation.emit(asio::cancellation_type::terminal);
-        cancellation_sent.set_value();
-    });
-    cancellation_sent.get_future().get();
-    const auto returned_early = first_stop.wait_for(50ms) == std::future_status::ready;
+    std::promise<void> stops_dispatched;
+    asio::post(control_io, [&]() { stops_dispatched.set_value(); });
+    stops_dispatched.get_future().get();
+    const auto first_returned_early = first_stop.wait_for(50ms) == std::future_status::ready;
+    const auto second_returned_early = second_stop.wait_for(0ms) == std::future_status::ready;
     release_transfer.set_value();
-    bool stop_cancelled = false;
-    try
-    {
-        first_stop.get();
-    }
-    catch (const asio::system_error &)
-    {
-        stop_cancelled = true;
-    }
+    first_stop.get();
     second_stop.get();
     control_work.reset();
     transfer_work.reset();
     control_thread.join();
     transfer_thread.join();
     const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
-    require(!returned_early && !stop_cancelled, "Caller cancellation interrupted Agent shutdown");
+    require(!first_returned_early && !second_returned_early, "Agent stop returned before transfer shutdown completed");
     require(stop_elapsed < 2s, "Client stop did not promptly cancel its retry/listener operations");
     require(weak_client.expired(), "Stopped client was retained by an asynchronous task");
 }

@@ -1,12 +1,15 @@
 #ifndef RELAYWEAVE_RELAY_AGENT_H
 #define RELAYWEAVE_RELAY_AGENT_H
 
+#include "agent_routing.h"
+#include "async_event.h"
 #include "dualindex_map.h"
 #include "lru_cache.h"
 #include "tls_channel.h"
-#include "agent_routing.h"
-#include <map>
+#include <exception>
 #include <functional>
+#include <map>
+#include <string_view>
 #include <type_traits>
 
 struct AgentServiceConfig
@@ -46,7 +49,7 @@ struct AgentConfig
 AgentConfig load_agent_config(const std::filesystem::path &path);
 
 class Forwarder;
-class AgentRelay;
+class AgentSession;
 class NodeConnection;
 
 struct ServiceKey
@@ -80,7 +83,7 @@ struct RelaySelection
     ServerRoute server;
     std::vector<std::string> path;
     std::uint64_t epoch = 0;
-    std::uint64_t lease = 0;
+    std::shared_ptr<NodeConnection> connection;
 };
 
 class RelayAgent : public std::enable_shared_from_this<RelayAgent>
@@ -95,11 +98,11 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
   private:
     friend class NodeConnection;
     friend class Forwarder;
-    friend class AgentRelay;
-    friend struct RelayAgentTestAccess;
+    friend class AgentSession;
     static constexpr std::size_t MAX_LOGGED_CANDIDATES = 3;
     static constexpr std::size_t PATH_CACHE_CAPACITY = 16;
     static constexpr auto PATH_CACHE_TTL = std::chrono::seconds(15);
+    static constexpr auto CONNECTION_IDLE_TIMEOUT = std::chrono::seconds(60);
 
     enum class State
     {
@@ -114,16 +117,15 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
     std::shared_ptr<NodeConnection> ensure_connection(std::string node_id, std::string host, std::uint16_t port);
     void connection_ready(NodeConnection &connection, const std::shared_ptr<TLSChannel> &channel);
     void connection_closed(const NodeConnection &connection);
-    void connection_finished(std::exception_ptr failure);
+    void connection_finished(NodeConnection &connection, std::exception_ptr failure);
+    void collect_idle_connections(std::chrono::steady_clock::time_point now);
+    void spawn_control_task(asio::awaitable<void> task, std::string_view context, NodeConnection *connection = nullptr);
     void query_services(bool refresh = false);
     void query_topology();
     void update_probe_targets();
-    // Synchronous path selection on control_executor_; no I/O or executor crossing here.
     std::vector<std::string> calculate_service_paths(const ServiceKey &service, const std::string &destination);
-    // All selection/lease operations require control_executor_.
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                               std::chrono::steady_clock::time_point deadline);
-    void release_entry(std::uint64_t lease);
+                                                 std::chrono::steady_clock::time_point deadline);
     void invalidate_entries(std::string reason, const std::optional<ServiceKey> &service = std::nullopt);
     struct EntryWait
     {
@@ -133,12 +135,16 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
         ServiceKey service;
         std::string node;
         std::chrono::steady_clock::time_point deadline;
-        njson location;
-        std::string connection;
+        struct Location
+        {
+            std::string address;
+            std::uint16_t port;
+        };
+        std::optional<Location> location;
+        std::shared_ptr<NodeConnection> connection;
         std::string reason;
     };
     std::map<std::uint64_t, std::shared_ptr<EntryWait>> entry_waits_;
-    void release_unused_connections();
     void locate_service(const njson &params);
     void forget_service(const ServiceKey &service, std::string reason);
     void handle_control_message(const NodeConnection &connection, CtrlMessage message);
@@ -168,7 +174,7 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
     DualIndexMap<ServiceKey, std::string, ServiceLocation> service_locations_;
     std::uint64_t next_request_id_ = 1;
     std::size_t active_tasks_ = 0;
-    asio::steady_timer stopped_waiter_;
+    AsyncEvent stopped_event_;
     State state_ = State::Created;
 };
 

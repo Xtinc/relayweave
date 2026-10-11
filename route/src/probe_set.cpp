@@ -29,12 +29,11 @@ void ProbeSet::set_targets(Targets targets)
 
 asio::awaitable<bool> ProbeSet::refresh()
 {
-    co_return co_await asio::co_spawn(io_, refresh_on_executor(), asio::use_awaitable);
+    return asio::co_spawn(io_, refresh_on_executor(), asio::use_awaitable);
 }
 
 asio::awaitable<bool> ProbeSet::refresh_on_executor()
 {
-    co_await asio::dispatch(io_, asio::use_awaitable);
     if (refreshing_)
     {
         throw std::logic_error("ProbeSet refresh must not overlap another refresh");
@@ -197,7 +196,6 @@ asio::awaitable<void> ProbeSet::close()
 
 asio::awaitable<void> ProbeSet::close_on_executor()
 {
-    co_await asio::dispatch(io_, asio::use_awaitable);
     if (state_ == State::Closed)
     {
         co_return;

@@ -179,7 +179,7 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
     void stop() override
     {
         stopping_ = true;
-        asio::co_spawn(channel_->executor(), channel_->async_disconnect(), asio::detached);
+        channel_->disconnect();
     }
 
   private:
@@ -335,7 +335,7 @@ class ClusterMgr::Connector
         }
         if (auto channel = channel_.lock())
         {
-            asio::co_spawn(executor_, channel->async_disconnect(), asio::detached);
+            channel->disconnect();
         }
     }
 
@@ -347,9 +347,8 @@ class ClusterMgr::Connector
         constexpr auto retry_interval = std::chrono::seconds(5);
         while (running_)
         {
-            if (channel_.expired())
+            // Release this attempt's channel before waiting to reconnect.
             {
-                joined_ = false;
                 std::shared_ptr<TLSChannel> channel;
                 try
                 {
@@ -363,7 +362,6 @@ class ClusterMgr::Connector
                         break;
                     }
 
-                    operations.socket = tcp::socket(executor_);
                     co_await asio::async_connect(operations.socket, endpoints,
                                                  asio::cancel_after(std::chrono::seconds(5), asio::use_awaitable));
                     if (!running_)
@@ -383,7 +381,6 @@ class ClusterMgr::Connector
                         joined_ = true;
                         PROXY_INFO_PRINT("Cluster [+] node=%s peer=%s:%u", config_.node_id.c_str(),
                                          config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
-                        manager_.receive(CtrlMessage{CtrlCommand::ClusterJoined});
                         while (running_)
                         {
                             manager_.receive(co_await channel->async_receive());
@@ -427,8 +424,8 @@ class ClusterMgr::Connector
                     joined_ = false;
                     if (running_)
                     {
-                        manager_.receive(CtrlMessage{CtrlCommand::ClusterError,
-                                                    njson{{"reason", "cluster control disconnected"}}});
+                        manager_.receive(
+                            CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster control disconnected"}}});
                     }
                 }
                 if (channel)
@@ -444,7 +441,7 @@ class ClusterMgr::Connector
 
             operations.retry.expires_after(retry_interval);
             auto [error] = co_await operations.retry.async_wait(use_nothrow_awaitable);
-            if (error || !running_)
+            if (error)
             {
                 break;
             }
@@ -473,14 +470,17 @@ ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::
     {
         throw std::invalid_argument("cluster node_id and address are required");
     }
+
     if (config_.node_id == cluster_broadcast_target)
     {
         throw std::invalid_argument("cluster node_id must not be all");
     }
+
     if (config_.advertise_address.empty())
     {
         config_.advertise_address = config_.address;
     }
+
     if (config_.role == ClusterConfig::Role::Master)
     {
         std::random_device random;
@@ -703,7 +703,7 @@ void ClusterMgr::receive(CtrlMessage message)
     try
     {
         const auto command = message.type();
-        if (command != CtrlCommand::ClusterJoined && command != CtrlCommand::ClusterError)
+        if (command != CtrlCommand::ClusterError)
         {
             static_cast<void>(config::required_string(config::message_params(message), "source", message.command));
         }

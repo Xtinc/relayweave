@@ -5,13 +5,13 @@
 #include "tls_channel.h"
 
 class RelayNode;
-class RelaySession;
+class NodeSession;
 
-// One multi-node Relay controller, owned by its RelaySession. All access requires control_io.
+// One multi-node Relay controller, owned by its NodeSession. All access requires control_io.
 class ControlRouterMulti
 {
   public:
-    ControlRouterMulti(RelaySession &relay, const ControlSessionPtr &session, njson params, bool ingress);
+    ControlRouterMulti(NodeSession &relay, const ControlSessionPtr &session, njson params, bool ingress);
     asio::awaitable<void> run();
     bool handle(const ControlSessionPtr &session, const CtrlMessage &message);
     void handle_peer(const CtrlMessage &message);
@@ -21,13 +21,21 @@ class ControlRouterMulti
 
   private:
     friend class RelayNode;
+    enum class Progress
+    {
+        OpeningFlow,
+        PeerOpened,
+        AgentNotified,
+        Ready
+    };
+
     asio::awaitable<void> establish_and_transfer();
     asio::awaitable<void> watch_flow();
     void notify_agent() const;
     void close_agent() const;
     void ready_agent();
     void send_peer(std::string command, njson params) const;
-    RelaySession &relay_;
+    NodeSession &relay_;
     std::weak_ptr<ControlSession> session_;
     njson params_;
     std::uint64_t epoch_ = 0;
@@ -37,13 +45,10 @@ class ControlRouterMulti
     asio::steady_timer changed_;
     std::string stage_ = "open_flow";
     std::string reason_;
+    Progress progress_ = Progress::OpeningFlow;
     bool ingress_;
-    bool notified_ = false;
-    bool peer_attached_ = false;
-    bool peer_ready_ = false;
+    bool peer_prepared_ = false;
     bool peer_finished_ = false;
-    bool ready_ = false;
-    bool peer_opened_ = false;
     bool closed_ = false;
     bool from_peer_ = false;
 };

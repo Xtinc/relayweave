@@ -200,7 +200,7 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
             co_return;
         }
 
-        if (limiter && !co_await wait_for_limit(*limiter, timer, nr))
+        if (limiter && !limiter->try_consume(nr) && !co_await wait_for_limit(*limiter, timer, nr))
         {
             co_return;
         }
@@ -223,7 +223,7 @@ asio::awaitable<void> relay_tcp(tcp::socket &left, tcp::socket &right, TokenBuck
                                 TokenBucket *right_to_left_limiter, TrafficCounter *left_to_right_traffic,
                                 TrafficCounter *right_to_left_traffic)
 {
-    co_await (transfer_tcp(left, right, left_to_right_limiter, left_to_right_traffic) &&
+    return (transfer_tcp(left, right, left_to_right_limiter, left_to_right_traffic) &&
               transfer_tcp(right, left, right_to_left_limiter, right_to_left_traffic));
 }
 
@@ -240,7 +240,7 @@ static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limit
             log_transfer_end(read_error, "tls", "read", from, to);
             co_return;
         }
-        if (limiter && !co_await wait_for_limit(*limiter, timer, read_size))
+        if (limiter && !limiter->try_consume(read_size) && !co_await wait_for_limit(*limiter, timer, read_size))
         {
             co_return;
         }
@@ -285,8 +285,7 @@ static asio::awaitable<void> send_udp_payloads(udp::socket &local_socket, udp::s
             {
                 continue;
             }
-            log_transfer_end(er, "udp", "receive", local_socket, transfer_socket);
-            co_return;
+            throw asio::system_error(er, "receive target datagram");
         }
 
         if (nr > DatagramHeader::maximum_user_payload)
@@ -298,8 +297,11 @@ static asio::awaitable<void> send_udp_payloads(udp::socket &local_socket, udp::s
         auto [wr, nw] = co_await transfer_socket.async_send(buffers, use_nothrow_awaitable);
         if (wr)
         {
-            log_transfer_end(wr, "udp", "send", local_socket, transfer_socket);
-            co_return;
+            throw asio::system_error(wr, "send relay datagram");
+        }
+        if (nw != session_header.size() + nr)
+        {
+            throw std::runtime_error("truncated relay datagram");
         }
     }
 }
@@ -317,8 +319,7 @@ static asio::awaitable<void> receive_udp_payloads(udp::socket &transfer_socket, 
             {
                 continue;
             }
-            log_transfer_end(er, "udp", "receive", transfer_socket, local_socket);
-            co_return;
+            throw asio::system_error(er, "receive relay datagram");
         }
 
         if (nr < DatagramHeader::length || nr > DatagramHeader::maximum_wire_payload)
@@ -335,8 +336,11 @@ static asio::awaitable<void> receive_udp_payloads(udp::socket &transfer_socket, 
             asio::buffer(datagram.data() + DatagramHeader::length, nr - DatagramHeader::length), use_nothrow_awaitable);
         if (ew)
         {
-            log_transfer_end(ew, "udp", "send", transfer_socket, local_socket);
-            co_return;
+            throw asio::system_error(ew, "send target datagram");
+        }
+        if (nw != nr - DatagramHeader::length)
+        {
+            throw std::runtime_error("truncated target datagram");
         }
     }
 }
@@ -344,8 +348,8 @@ static asio::awaitable<void> receive_udp_payloads(udp::socket &transfer_socket, 
 asio::awaitable<void> relay_udp_connected(udp::socket &local_socket, udp::socket &transfer_socket,
                                           DatagramHeader::Buffer session_header)
 {
-    co_await (send_udp_payloads(local_socket, transfer_socket, session_header) &&
-              receive_udp_payloads(transfer_socket, local_socket, session_header));
+    return await_transfers(send_udp_payloads(local_socket, transfer_socket, session_header),
+                           receive_udp_payloads(transfer_socket, local_socket, session_header));
 }
 
 // Same transfer executor. Transport EOF represents one business direction only.
@@ -393,10 +397,10 @@ asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awai
 
 asio::awaitable<void> relay_halfclose(tcp::socket &local, tcp::socket &transfer)
 {
-    co_await await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
+    return await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
 }
 
 asio::awaitable<void> relay_halfclose(tcp::socket &local, tls_stream &transfer)
 {
-    co_await await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
+    return await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
 }

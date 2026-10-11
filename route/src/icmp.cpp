@@ -92,8 +92,8 @@ ICMP::Session::Session(asio::io_context &io_context) : timer(io_context)
 {
 }
 
-ICMP::ICMP(asio::io_context &io_context, Duration interval, Duration timeout, std::optional<std::size_t> count)
-    : io_context_(io_context), interval_(interval), timeout_(timeout), count_(count), socket_(io_context),
+ICMP::ICMP(asio::io_context &io_context, Duration interval, Duration timeout)
+    : io_context_(io_context), interval_(interval), timeout_(timeout), socket_(io_context),
       finished_wait_(io_context)
 {
     if (interval_ <= Duration::zero())
@@ -104,11 +104,6 @@ ICMP::ICMP(asio::io_context &io_context, Duration interval, Duration timeout, st
     {
         throw std::invalid_argument("ICMP timeout must be positive and shorter than the interval");
     }
-    if (count_ && *count_ == 0)
-    {
-        throw std::invalid_argument("ICMP count must be positive or unset");
-    }
-
     std::random_device device;
     std::seed_seq seed{device(), device(), device(), device()};
     std::mt19937_64 random(seed);
@@ -214,8 +209,7 @@ asio::awaitable<void> ICMP::probe_loop(asio::ip::address_v4 destination)
     auto next_send_at = Clock::now();
     try
     {
-        std::size_t attempts = 0;
-        while (!stopping_ && (!count_ || attempts < *count_))
+        while (!stopping_)
         {
             const auto now = Clock::now();
             if (now < next_send_at)
@@ -238,7 +232,6 @@ asio::awaitable<void> ICMP::probe_loop(asio::ip::address_v4 destination)
                 next_send_at += interval_;
             } while (next_send_at <= sent_at);
 
-            ++attempts;
             ++session.state.transmitted;
             ++session.sequence;
             session.sent_at = sent_at;
@@ -300,7 +293,8 @@ asio::awaitable<void> ICMP::probe_loop(asio::ip::address_v4 destination)
         session.in_flight = false;
         stop();
     }
-    probe_finished();
+    --running_probes_;
+    notify_finished();
 }
 
 std::vector<ICMP::Metrics> ICMP::metrics() const
@@ -334,7 +328,6 @@ asio::awaitable<void> ICMP::close()
 
 asio::awaitable<void> ICMP::close_on_executor()
 {
-    co_await asio::dispatch(io_context_, asio::use_awaitable);
     stop();
 
     while (receiving_ || running_probes_ != 0)
@@ -358,10 +351,7 @@ asio::awaitable<void> ICMP::receive_loop()
             auto [error, size] = co_await socket_.async_receive_from(asio::buffer(buffer), sender, use_nothrow_awaitable);
             if (error)
             {
-                if (!stopping_ && running_probes_ != 0)
-                {
-                    stop();
-                }
+                stop();
                 break;
             }
 
@@ -444,17 +434,6 @@ std::optional<std::uint16_t> ICMP::parse_reply(std::span<const std::uint8_t> pac
         return std::nullopt;
     }
     return read_u16(message, 6);
-}
-
-void ICMP::probe_finished() noexcept
-{
-    --running_probes_;
-    if (running_probes_ == 0 && !stopping_)
-    {
-        asio::error_code ignored;
-        socket_.close(ignored);
-    }
-    notify_finished();
 }
 
 void ICMP::stop() noexcept

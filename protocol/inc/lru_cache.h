@@ -10,7 +10,7 @@
 #include <utility>
 
 // Caller must serialize access. Hits update recency, but never renew the TTL.
-// Expired entries are removed lazily on get(); size() counts stored entries.
+// Expired entries are removed lazily on get().
 template <class Key, class Value, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>>
 class LRUCache
 {
@@ -82,27 +82,10 @@ class LRUCache
         }
     }
 
-    bool erase(const Key &key)
-    {
-        const auto found = index_.find(key);
-        if (found == index_.end())
-        {
-            return false;
-        }
-        entries_.erase(found->second);
-        index_.erase(found);
-        return true;
-    }
-
     void clear() noexcept
     {
         index_.clear();
         entries_.clear();
-    }
-
-    std::size_t size() const noexcept
-    {
-        return index_.size();
     }
 
   private:

@@ -101,10 +101,7 @@ void channel_transfer()
         const auto unsent = rejected.data();
         require_buffer(!queue.try_send(asio::error_code{}, std::move(rejected)) && rejected.data() == unsent,
                        "full queue consumed an unsent buffer");
-        auto receive = [&]() -> asio::awaitable<PooledBuffer> {
-            co_return co_await queue.async_receive(asio::use_awaitable);
-        };
-        auto pending = asio::co_spawn(io, receive(), asio::use_future);
+        auto pending = asio::co_spawn(io, queue.async_receive(asio::use_awaitable), asio::use_future);
         io.run();
         auto packet = pending.get();
         require_buffer(packet.data() == storage && packet.size() == 1 && packet.bytes().front() == 42 &&

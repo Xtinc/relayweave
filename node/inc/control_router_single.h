@@ -3,14 +3,14 @@
 
 #include "tls_channel.h"
 
-class RelaySession;
+class NodeSession;
 
 // One single-node relay controller. All access requires control_io.
 class ControlRouterSingle
 {
   public:
-    ControlRouterSingle(RelaySession &relay, const ControlSessionPtr &consumer,
-                        const ControlSessionPtr &producer, njson params);
+    ControlRouterSingle(NodeSession &relay, const ControlSessionPtr &consumer, const ControlSessionPtr &producer,
+                        njson params);
     asio::awaitable<void> run();
     void cancel(std::string stage, std::string reason);
     bool handle(const ControlSessionPtr &session, const CtrlMessage &message);
@@ -21,7 +21,7 @@ class ControlRouterSingle
     void notify_agents() const;
     void ready_agents() const;
     void close_agents() const;
-    RelaySession &relay_;
+    NodeSession &relay_;
     std::weak_ptr<ControlSession> consumer_;
     std::weak_ptr<ControlSession> producer_;
     njson params_;

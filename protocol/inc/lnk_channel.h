@@ -2,7 +2,9 @@
 #define RELAYWEAVE_LNK_CHANNEL_H
 #include "async_event.h"
 #include "tls_channel.h"
+#include <asio/experimental/concurrent_channel.hpp>
 #include <array>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -203,12 +205,13 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
 {
   public:
     // Channel lifecycle and control-domain notifications.
-    LnkChannel(asio::any_io_executor executor, std::string node_id, std::string tcp_address, std::uint16_t tcp_port,
-               std::string udp_address, std::uint16_t udp_port);
+    LnkChannel(asio::any_io_executor executor, asio::any_io_executor event_executor, std::string node_id,
+               std::string tcp_address, std::uint16_t tcp_port, std::string udp_address, std::uint16_t udp_port);
     void start();
     void activate();
     void rollback() noexcept;
     asio::awaitable<void> stop();
+    // Thread-safe control notification receive; resumes on the caller's executor.
     asio::awaitable<CtrlMessage> receive_event();
     asio::any_io_executor executor() const
     {
@@ -226,6 +229,13 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     void close_flow(std::uint64_t id, std::string reason = {});
     void invalidate_flows(std::string reason);
     FlowSendStatus send_flow(FlowFrame frame);
+    // Cross-executor submission; the caller keeps the channel alive until completion.
+    asio::awaitable<FlowSendStatus> async_send_flow(FlowFrame frame);
+    // DATA submission borrows payload until completion; only the data executor allocates pool storage.
+    asio::awaitable<FlowSendStatus> async_send_flow_data(std::uint64_t epoch, std::uint64_t id, bool reverse,
+                                                       std::span<const std::uint8_t> payload);
+    // Cross-executor receive; pool storage stays on the data executor, completion returns to the caller.
+    // Cancellation wakes all pending receivers of this Flow; its owner still controls Flow closure.
     asio::awaitable<FlowFrame> receive_flow(std::uint64_t epoch, std::uint64_t id);
 
   private:
@@ -235,6 +245,7 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
 
     // Logical flow lifecycle and local delivery/forwarding.
     void link_flows_closed(std::uint64_t id);
+    FlowSendStatus send_flow(const FlowFrame &frame, std::span<const std::uint8_t> payload);
     bool deliver(const std::shared_ptr<lnk::NodeFlow> &flow, lnk::Frame &frame);
     void notify_flow(const std::shared_ptr<lnk::NodeFlow> &flow, CtrlCommand command, std::string stage,
                      std::string reason = {});
@@ -289,9 +300,11 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     std::map<std::uint64_t, Clock::time_point> retired_;
     std::size_t buffered_bytes_ = 0;
 
-    // Channel-wide control and lifecycle.
-    asio::experimental::channel<void(asio::error_code, CtrlMessage)> events_;
-    std::string event_error_;
+    // Control notifications cross executors.
+    asio::experimental::concurrent_channel<void(asio::error_code, CtrlMessage)> events_;
+    std::atomic<bool> event_overflow_ = false;
+
+    // Lifecycle state belongs to cluster_data_io.
     asio::steady_timer monitor_timer_;
     AsyncEvent tasks_done_;
     std::size_t tasks_ = 0;

@@ -27,6 +27,43 @@ void require(bool condition, const std::string &message)
     }
 }
 
+void verify_udp_error_drains_other_direction()
+{
+    for (const bool close_target : {false, true})
+    {
+        asio::io_context io(1);
+        const udp::endpoint loopback(asio::ip::address_v4::loopback(), 0);
+        udp::socket peer(io, loopback);
+        udp::socket target(io, loopback);
+        udp::socket transfer(io, loopback);
+        target.connect(peer.local_endpoint());
+        transfer.connect(peer.local_endpoint());
+        auto result = asio::co_spawn(io, relay_udp_connected(target, transfer, DatagramHeader::encode(1)),
+                                     asio::use_future);
+        io.poll(); // Both directions are now waiting for datagrams.
+        (close_target ? target : transfer).close();
+        io.restart();
+        io.poll();
+        const bool drained = result.wait_for(0ms) == std::future_status::ready;
+        // Also drain a failed implementation before reporting the assertion.
+        target.close();
+        transfer.close();
+        io.restart();
+        io.run();
+        require(drained, "UDP I/O failure left the opposite direction waiting");
+        bool failed = false;
+        try
+        {
+            result.get();
+        }
+        catch (const asio::system_error &error)
+        {
+            failed = error.code() == asio::error::operation_aborted;
+        }
+        require(failed, "UDP relay did not preserve the socket failure");
+    }
+}
+
 struct Certificates
 {
     std::filesystem::path server_ca;
@@ -227,6 +264,7 @@ int main(int argc, char *argv[])
 {
     try
     {
+        verify_udp_error_drains_other_direction();
         require(argc > 0, "Missing executable path");
         const auto files = certificates(argv[0]);
 

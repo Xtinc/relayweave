@@ -1,11 +1,27 @@
-#include "node_test_config.h"
+#include "node_fixture.h"
 #include "relay_agent.h"
 #include "forwarder.h"
+#include <asio/experimental/awaitable_operators.hpp>
 #include <array>
 #include <future>
 #include <iostream>
 
 // Compile-time fixture access only: seed the existing LRU so full Agent paths do not require raw ICMP.
+#include "member_access.h"
+TEST_MEMBER(RelayAgent, service_locations_)
+TEST_MEMBER(RelayAgent, routing_)
+TEST_MEMBER(RelayAgent, path_cache_)
+TEST_MEMBER(RelayAgent, calculate_service_paths)
+TEST_MEMBER(RelayAgent, transfer_executor_)
+TEST_MEMBER(RelayAgent, forwarder_)
+TEST_MEMBER(RelayAgent, connections_)
+TEST_MEMBER(RelayAgent, entry_waits_)
+TEST_MEMBER(RelayAgent, select_relay)
+TEST_MEMBER(RelayAgent, collect_idle_connections)
+TEST_MEMBER(RelayAgent, primary_connection_id_)
+
+namespace
+{
 struct RelayAgentTestAccess
 {
     static asio::awaitable<void> select_cached_path(RelayAgent &agent, ServiceKey service, std::uint64_t epoch,
@@ -13,25 +29,25 @@ struct RelayAgentTestAccess
     {
         for (unsigned attempt = 0; attempt < 200; ++attempt)
         {
-            const auto destination = agent.service_locations_.secondary_key(service);
-            if (agent.routing_.epoch() == epoch && destination)
+            const auto destination = test_access::RelayAgent_service_locations_(agent).secondary_key(service);
+            if (test_access::RelayAgent_routing_(agent).epoch() == epoch && destination)
             {
-                agent.path_cache_.put(path.back(), std::vector<RouteGraph::Path>{{path, 1.0}}, AgentRouting::Clock::now());
-                if (agent.calculate_service_paths(service, *destination) != path)
+                test_access::RelayAgent_path_cache_(agent).put(path.back(), std::vector<RouteGraph::Path>{{path, 1.0}}, AgentRouting::Clock::now());
+                if (test_access::RelayAgent_calculate_service_paths(agent, service, *destination) != path)
                 {
                     asio::steady_timer timer(co_await asio::this_coro::executor, std::chrono::milliseconds(20));
                     co_await timer.async_wait(asio::use_awaitable);
                     continue;
                 }
                 // Clear a UDP relay that may have opened before topology/cache availability.
-                co_await asio::co_spawn(agent.transfer_executor_,
-                    [forwarder = agent.forwarder_, service]() -> asio::awaitable<void> {
+                co_await asio::co_spawn(test_access::RelayAgent_transfer_executor_(agent),
+                    [forwarder = test_access::RelayAgent_forwarder_(agent), service]() -> asio::awaitable<void> {
                         forwarder->clear_service(service);
                         co_return;
                     }, asio::use_awaitable);
-                agent.path_cache_.put(path.back(), std::vector<RouteGraph::Path>{{path, 1.0}}, AgentRouting::Clock::now());
+                test_access::RelayAgent_path_cache_(agent).put(path.back(), std::vector<RouteGraph::Path>{{path, 1.0}}, AgentRouting::Clock::now());
                 // Refresh availability without connecting to the service Node.
-                asio::post(agent.transfer_executor_, [forwarder = agent.forwarder_, service, node = *destination] {
+                asio::post(test_access::RelayAgent_transfer_executor_(agent), [forwarder = test_access::RelayAgent_forwarder_(agent), service, node = *destination] {
                     forwarder->set_service(service, node);
                 });
                 co_return;
@@ -45,34 +61,110 @@ struct RelayAgentTestAccess
     {
         const ServiceKey service{"auto-tcp", RelayProtocol::Tcp};
         co_await select_cached_path(agent, service, epoch, {"a", "b", "master"});
-        if (agent.connections_.size() != 1 || agent.connections_.find_secondary("master"))
+        if (test_access::RelayAgent_connections_(agent).size() != 1 || test_access::RelayAgent_connections_(agent).find_secondary("master"))
         {
             throw std::runtime_error("Service discovery connected to the tail Node before route selection");
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        const auto first = co_await agent.select_relay(service, "master", deadline);
-        const auto second = co_await agent.select_relay(service, "master", deadline);
-        if (first.server.id != second.server.id || agent.connections_.size() != 2 ||
-            !agent.connections_.find_secondary("a") || agent.connections_.find_secondary("master"))
+        auto first = co_await test_access::RelayAgent_select_relay(agent, service, "master", deadline);
+        auto second = co_await test_access::RelayAgent_select_relay(agent, service, "master", deadline);
+        if (!first.connection || first.connection != second.connection ||
+            first.server.id != second.server.id || test_access::RelayAgent_connections_(agent).size() != 2 ||
+            !test_access::RelayAgent_connections_(agent).find_secondary("a") || test_access::RelayAgent_connections_(agent).find_secondary("master"))
         {
             throw std::runtime_error("Multi relay did not reuse the head control without connecting the tail");
         }
-        agent.release_entry(first.lease);
-        if (!agent.connections_.find_secondary("a"))
+        if (!test_access::RelayAgent_entry_waits_(agent).empty())
         {
-            throw std::runtime_error("Releasing one relay dropped the shared entry control");
+            throw std::runtime_error("Completed entry selections retained their waiting state");
         }
-        agent.release_entry(second.lease);
-        if (agent.connections_.size() != 1 || !agent.entry_waits_.empty())
+        bool timed_out = false;
+        try
         {
-            throw std::runtime_error("The last relay did not release the entry control");
+            co_await test_access::RelayAgent_select_relay(agent, service, "master", std::chrono::steady_clock::now());
         }
+        catch (const std::runtime_error &)
+        {
+            timed_out = true;
+        }
+        const auto shared = test_access::RelayAgent_connections_(agent).find_secondary("a");
+        if (!timed_out || !test_access::RelayAgent_entry_waits_(agent).empty() || !shared || *shared != second.connection)
+        {
+            throw std::runtime_error("A failed entry selection retained its wait or dropped another session's handle");
+        }
+        using Clock = std::chrono::steady_clock;
+        const auto start = Clock::now();
+        std::weak_ptr<NodeConnection> old = first.connection;
+        first.connection.reset();
+        test_access::RelayAgent_collect_idle_connections(agent, start);
+        test_access::RelayAgent_collect_idle_connections(agent, start + std::chrono::seconds(120));
+        auto active = co_await test_access::RelayAgent_select_relay(agent, service, "master", Clock::now() + std::chrono::seconds(2));
+        if (old.expired() || active.connection != second.connection)
+            throw std::runtime_error("Idle collection stopped an entry still used by another relay");
+        active.connection.reset();
+
+        // Real session cleanup runs on transfer_io. The ordinary shared_ptr
+        // release leaves the Agent's pool as the sole owner.
+        co_await asio::co_spawn(test_access::RelayAgent_transfer_executor_(agent),
+            [](std::shared_ptr<NodeConnection> connection) -> asio::awaitable<void> {
+                connection.reset();
+                co_return;
+            }(std::move(second.connection)), asio::use_awaitable);
+        if (old.expired())
+            throw std::runtime_error("Releasing the last session removed the connection before idle collection");
+
+        const auto idle = Clock::now();
+        test_access::RelayAgent_collect_idle_connections(agent, idle);
+        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(59));
+        auto brief = co_await test_access::RelayAgent_select_relay(agent, service, "master", Clock::now() + std::chrono::seconds(2));
+        if (brief.connection != old.lock())
+            throw std::runtime_error("An entry was retired before the idle timeout");
+        brief.connection.reset();
+        // A brief use between maintenance scans must restart the idle period.
+        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(60));
+        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(119));
+        if (test_access::RelayAgent_connections_(agent).size() != 2 || old.expired())
+            throw std::runtime_error("Brief reuse did not restart the entry's idle period");
+        auto reused = co_await test_access::RelayAgent_select_relay(agent, service, "master", Clock::now() + std::chrono::seconds(2));
+        if (reused.connection != old.lock())
+            throw std::runtime_error("Brief reuse allowed the original idle deadline to stop the entry");
+        reused.connection.reset();
+        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(120));
+        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(180));
+        if (test_access::RelayAgent_connections_(agent).size() != 2 || old.expired())
+            throw std::runtime_error("A stopping entry was removed before its task completed");
+
+        // Both requests arrive while the old entry is stopping. They must wait
+        // for completion and share one replacement, with their original deadline.
+        using namespace asio::experimental::awaitable_operators;
+        const auto replacement_deadline = Clock::now() + std::chrono::seconds(2);
+        auto [third, fourth] = co_await (
+            test_access::RelayAgent_select_relay(agent, service, "master", replacement_deadline) &&
+            test_access::RelayAgent_select_relay(agent, service, "master", replacement_deadline));
+        const auto replacement = test_access::RelayAgent_connections_(agent).find_secondary("a");
+        if (!old.expired() || !replacement || *replacement != third.connection ||
+            third.connection != fourth.connection || !test_access::RelayAgent_entry_waits_(agent).empty() || test_access::RelayAgent_connections_(agent).size() != 2)
+            throw std::runtime_error("Requests during shutdown failed to share a replacement entry");
+
+        std::weak_ptr<NodeConnection> retired = third.connection;
+        third.connection.reset();
+        fourth.connection.reset();
+        const auto last_idle = Clock::now();
+        test_access::RelayAgent_collect_idle_connections(agent, last_idle);
+        test_access::RelayAgent_collect_idle_connections(agent, last_idle + std::chrono::seconds(60));
+        const auto exit_deadline = Clock::now() + std::chrono::seconds(2);
+        while (!retired.expired() && Clock::now() < exit_deadline)
+        {
+            asio::steady_timer timer(co_await asio::this_coro::executor, std::chrono::milliseconds(5));
+            co_await timer.async_wait(asio::use_awaitable);
+        }
+        if (!retired.expired() || test_access::RelayAgent_connections_(agent).size() != 1 || !test_access::RelayAgent_entry_waits_(agent).empty() ||
+            !test_access::RelayAgent_connections_(agent).find_primary(test_access::RelayAgent_primary_connection_id_(agent)))
+            throw std::runtime_error("Idle entry tasks leaked or collection removed the primary connection");
     }
 
 };
 
-namespace
-{
 using namespace std::chrono_literals;
 using tcp = asio::ip::tcp;
 using udp = asio::ip::udp;
@@ -115,10 +207,17 @@ asio::awaitable<std::shared_ptr<TLSChannel>> connect_control(asio::ssl::context 
 
 asio::awaitable<CtrlMessage> receive(const std::shared_ptr<TLSChannel> &channel, CtrlCommand command)
 {
-    auto message = co_await channel->async_receive(4s);
-    require(message.type() == command, "Expected " + std::string(ctrl_command_name(command)) + ", got " + message.command +
-            " " + config::message_params(message).dump());
-    co_return message;
+    try
+    {
+        auto message = co_await channel->async_receive(4s);
+        require(message.type() == command, "Expected " + std::string(ctrl_command_name(command)) + ", got " + message.command +
+                " " + config::message_params(message).dump());
+        co_return message;
+    }
+    catch (const std::exception &error)
+    {
+        throw std::runtime_error("Receive " + std::string(ctrl_command_name(command)) + ": " + error.what());
+    }
 }
 
 asio::awaitable<tcp::socket> attach_tcp(const njson &endpoint, const NodeConfig &node, int role)
@@ -132,6 +231,39 @@ asio::awaitable<tcp::socket> attach_tcp(const njson &endpoint, const NodeConfig 
     co_return socket;
 }
 
+// Exhaust the configured service-side bucket through real sockets, then cancel during its next wait.
+asio::awaitable<void> cancel_during_stream_limit(const std::shared_ptr<TLSChannel> &consumer,
+                                                const std::shared_ptr<TLSChannel> &producer,
+                                                const NodeConfig &entry, const NodeConfig &exit, std::uint64_t epoch)
+{
+    consumer->send(CtrlMessage(CtrlCommand::RelayOpen,
+        njson{{"request_id", 144}, {"service", "manual-tcp"}, {"protocol", "tcp"},
+              {"epoch", epoch}, {"path", {"a", "b", "c"}}}));
+    const auto opened = co_await receive(consumer, CtrlCommand::RelayOpened);
+    const auto offer = co_await receive(producer, CtrlCommand::RelayOffer);
+    auto from = co_await attach_tcp(*opened.params, entry, RelayAttach::Consumer);
+    auto to = co_await attach_tcp(*offer.params, exit, RelayAttach::Producer);
+    co_await receive(consumer, CtrlCommand::RelayReady);
+    co_await receive(producer, CtrlCommand::RelayReady);
+    BytesBuf payload(exit.tcp.traffic.tx_burst_bytes, 0xa5), received(payload.size());
+    co_await asio::async_write(from, asio::buffer(payload), asio::use_awaitable);
+    co_await asio::async_read(to, asio::buffer(received), asio::cancel_after(1s, asio::use_awaitable));
+    require(received == payload, "Initial rate-limit burst changed");
+    co_await asio::async_write(from, asio::buffer(payload), asio::use_awaitable);
+    const auto [waiting, bytes] = co_await to.async_read_some(asio::buffer(received),
+        asio::cancel_after(50ms, use_nothrow_awaitable));
+    require(waiting == asio::error::operation_aborted && bytes == 0, "Second burst did not wait for rate limit");
+    consumer->send(CtrlMessage(CtrlCommand::RelayCancel,
+        njson{{"request_id", 144}, {"reason", "cancel during stream limit"}}));
+    const auto closed = co_await receive(consumer, CtrlCommand::RelayClosed);
+    require(closed.params->at("reason") == "cancel during stream limit", "Rate-wait cancellation reason lost");
+    co_await receive(producer, CtrlCommand::RelayClosed);
+    const auto [error, size] = co_await to.async_read_some(asio::buffer(received),
+        asio::cancel_after(1s, use_nothrow_awaitable));
+    require((error == asio::error::eof || error == asio::error::connection_reset) && size == 0,
+            "Rate-wait cancellation retained a socket or sent queued data");
+}
+
 // A real Agent/Node data handshake. Ownership of all data sockets remains in this coroutine.
 asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, const std::shared_ptr<TLSChannel> &producer,
                                asio::ssl::context &ssl, const NodeConfig &entry, const NodeConfig &exit,
@@ -141,7 +273,7 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
     const auto service = service_name.empty() ? "manual-" + std::string(relay_protocol_name(protocol)) : std::string(service_name);
     consumer->send(CtrlMessage(CtrlCommand::RelayOpen,
         njson{{"request_id", request}, {"service", service}, {"protocol", relay_protocol_name(protocol)},
-              {"epoch", epoch}, {"path", path}, {"budget_ms", 1200}}));
+              {"epoch", epoch}, {"path", path}}));
     const auto opened = co_await receive(consumer, CtrlCommand::RelayOpened);
     const auto offer = co_await receive(producer, CtrlCommand::RelayOffer);
     const auto &first = *opened.params;
@@ -150,6 +282,7 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
             "Flow identity lost across endpoint notifications");
     require(!first.contains("data_address") && !last.contains("data_address") &&
             !first.contains("consumer_session_id") && !last.contains("consumer_session_id") &&
+            !first.contains("budget_ms") && !last.contains("budget_ms") &&
             !first.contains("path") && !last.contains("path") && !last.contains("request_id"),
             "Internal route fields leaked to Agent");
     const auto expected_entry_port = protocol == RelayProtocol::Tcp ? entry.tcp.port :
@@ -224,7 +357,9 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
     if (bad_ticket)
     {
         const auto error = co_await receive(consumer, CtrlCommand::RelayError);
-        require(error.params->at("request_id") == request && error.params->at("stage") == "attach",
+        require(error.params->at("request_id") == request &&
+                (error.params->at("stage") == "attach" || error.params->at("stage") == "bridge") &&
+                error.params->at("reason") == "relay establishment timed out",
                 "Wrong ticket passed the readiness barrier: " + error.params->dump());
         co_await receive(producer, CtrlCommand::RelayClosed);
         if (protocol == RelayProtocol::Udp)
@@ -294,7 +429,7 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
             }
             if (protocol == RelayProtocol::Tcp && request == 10 + static_cast<unsigned>(RelayProtocol::Tcp))
             {
-                co_await pause(1300ms);
+                co_await pause(std::chrono::duration_cast<std::chrono::milliseconds>(entry.tcp.setup_timeout) + 100ms);
             }
             const auto started = std::chrono::steady_clock::now();
             co_await asio::async_write(left, asio::buffer(payload), asio::use_awaitable);
@@ -385,8 +520,17 @@ void integration()
         config.tls.port = tcp_port(transfer);
         config.datagram.address = host;
         config.datagram.port = udp_port(udp_io);
+        if (names[index] == "a")
+        {
+            config.tcp.setup_timeout = 3s;
+            config.tls.setup_timeout = 8s;
+            config.datagram.setup_timeout = 8s;
+        }
         if (names[index] == "c")
         {
+            config.tcp.setup_timeout = 8s;
+            config.tls.setup_timeout = 3s;
+            config.datagram.setup_timeout = 3s;
             config.tcp.traffic.tx_bytes_per_second = 8192;
             config.tcp.traffic.tx_burst_bytes = 4096;
             config.tls.traffic.tx_bytes_per_second = 8192;
@@ -434,7 +578,7 @@ void integration()
             FlowResult warm;
             for (unsigned attempt = 0; attempt < 100; ++attempt)
             {
-                warm = co_await nodes[0]->async_open_flow({"a", "b", "c"}, RelayProtocol::Tcp);
+                warm = co_await test_node::open_flow(nodes[0], {"a", "b", "c"}, RelayProtocol::Tcp);
                 if (warm)
                 {
                     break;
@@ -443,7 +587,7 @@ void integration()
             }
             require(bool(warm), "Cluster membership did not converge");
             const auto epoch = warm.epoch;
-            co_await nodes[0]->async_close_flow(warm.epoch, warm.id);
+            co_await test_node::close_flow(nodes[0], warm.epoch, warm.id);
             for (const auto &config : configs)
             {
                 channels.push_back(co_await connect_control(client_ssl, config));
@@ -477,7 +621,7 @@ void integration()
             {
                 channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                     njson{{"request_id", 7}, {"service", service}, {"protocol", "tls"},
-                          {"path", {"a", "b", "c"}}, {"epoch", epoch}, {"budget_ms", 2000}}));
+                          {"path", {"a", "b", "c"}}, {"epoch", epoch}}));
                 auto reply = co_await channels[1]->async_receive(3s);
                 if (reply.type() == CtrlCommand::RelayOpened)
                 {
@@ -504,7 +648,7 @@ void integration()
             co_await receive(local_producer, CtrlCommand::ServiceOk);
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 39}, {"service", "manual-tcp"}, {"protocol", "tcp"},
-                      {"path", {"a", "b", "c"}}, {"epoch", epoch}, {"budget_ms", 5000}}));
+                      {"path", {"a", "b", "c"}}, {"epoch", epoch}}));
             const auto multi = co_await receive(channels[1], CtrlCommand::RelayOpened);
             co_await receive(channels[3], CtrlCommand::RelayOffer);
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
@@ -543,7 +687,7 @@ void integration()
             {
                 for (int attempt = 0; attempt < 3; ++attempt)
                 {
-                    const auto link = co_await nodes[0]->async_ensure_link("b", peer, RelayProtocol::Udp);
+                    const auto link = co_await test_node::ensure_link(nodes[0], "b", peer, RelayProtocol::Udp);
                     if (link)
                     {
                         break;
@@ -553,7 +697,7 @@ void integration()
             }
             for (int attempt = 0; attempt < 3; ++attempt)
             {
-                const auto link = co_await nodes[0]->async_ensure_link("a", "b", RelayProtocol::Udp);
+                const auto link = co_await test_node::ensure_link(nodes[0], "a", "b", RelayProtocol::Udp);
                 if (link)
                 {
                     break;
@@ -591,9 +735,27 @@ void integration()
                               RelayProtocol::Tcp, {"a", "b", "c"}, true);
             co_await exercise(channels[1], channels[3], client_ssl, configs[1], configs[3], epoch, 21,
                               RelayProtocol::Udp, {"a", "b", "c"}, true);
+            // Unattached endpoints expire using each Node's own protocol setup timeout.
+            // TCP expires at the ingress; TLS and UDP expire at the egress and close the ingress.
+            for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
+            {
+                const auto request = 60 + static_cast<unsigned>(protocol);
+                const auto started = std::chrono::steady_clock::now();
+                channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
+                    njson{{"request_id", request}, {"service", "manual-" + std::string(relay_protocol_name(protocol))},
+                          {"protocol", relay_protocol_name(protocol)}, {"epoch", epoch}, {"path", {"a", "b", "c"}}}));
+                co_await receive(channels[1], CtrlCommand::RelayOpened);
+                co_await receive(channels[3], CtrlCommand::RelayOffer);
+                const auto expired = co_await receive(channels[1], CtrlCommand::RelayError);
+                require(expired.params->at("request_id") == request && expired.params->at("stage") == "attach" &&
+                        expired.params->at("reason") == "relay establishment timed out" &&
+                        std::chrono::steady_clock::now() - started >= 2s,
+                        "Node did not expire its local establishment timeout or propagate peer closure");
+                co_await receive(channels[3], CtrlCommand::RelayClosed);
+            }
             // Consistent duplicates reuse the endpoint; conflicting parameters do not create another flow.
             auto duplicate = njson{{"request_id", 40}, {"service", "manual-tcp"}, {"protocol", "tcp"},
-                {"path", {"a", "b", "c"}}, {"epoch", epoch}, {"budget_ms", 5000}};
+                {"path", {"a", "b", "c"}}, {"epoch", epoch}};
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen, duplicate));
             const auto original = co_await receive(channels[1], CtrlCommand::RelayOpened);
             co_await receive(channels[3], CtrlCommand::RelayOffer);
@@ -615,6 +777,7 @@ void integration()
                               RelayProtocol::Tcp, {"master", "b", "c"});
             co_await exercise(channels[1], channels[3], client_ssl, configs[1], configs[3], epoch, 42,
                               RelayProtocol::Tcp, {"a", "master", "c"});
+            co_await cancel_during_stream_limit(channels[1], channels[3], configs[1], configs[3], epoch);
             // Forked flows retain their shared link when one consumer disconnects.
             channels[4]->send(CtrlMessage(CtrlCommand::ServiceRegister,
                 njson{{"request_id", 1}, {"service", "fork-tcp"}, {"protocol", "tcp"}}));
@@ -623,17 +786,17 @@ void integration()
             channels.push_back(other_consumer);
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 43}, {"service", "manual-tcp"}, {"protocol", "tcp"},
-                      {"path", {"a", "b", "c"}}, {"epoch", epoch}, {"budget_ms", 5000}}));
+                      {"path", {"a", "b", "c"}}, {"epoch", epoch}}));
             const auto fork1 = co_await receive(channels[1], CtrlCommand::RelayOpened);
             const auto fork1_offer = co_await receive(channels[3], CtrlCommand::RelayOffer);
             other_consumer->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 43}, {"service", "fork-tcp"}, {"protocol", "tcp"},
-                      {"path", {"a", "b", "d"}}, {"epoch", epoch}, {"budget_ms", 5000}}));
+                      {"path", {"a", "b", "d"}}, {"epoch", epoch}}));
             const auto fork2 = co_await receive(other_consumer, CtrlCommand::RelayOpened);
             const auto fork2_offer = co_await receive(channels[4], CtrlCommand::RelayOffer);
             require(fork1.params->at("flow_id") != fork2.params->at("flow_id") &&
                     fork1.params->at("uuid") != fork2.params->at("uuid"), "Sessions or forked flows share identity");
-            const auto shared = co_await nodes[0]->async_ensure_link("a", "b", RelayProtocol::Tcp);
+            const auto shared = co_await test_node::ensure_link(nodes[0], "a", "b", RelayProtocol::Tcp);
             require(bool(shared), "Shared link not found");
             auto first_consumer = co_await attach_tcp(*fork1.params, configs[1], RelayAttach::Consumer);
             auto first_producer = co_await attach_tcp(*fork1_offer.params, configs[3], RelayAttach::Producer);
@@ -649,13 +812,13 @@ void integration()
             co_await other_consumer->async_disconnect();
             const auto lost_consumer = co_await receive(channels[4], CtrlCommand::RelayClosed);
             require(lost_consumer.params->at("reason") == "consumer control disconnected", "Control loss did not close endpoint");
-            const auto still_shared = co_await nodes[0]->async_ensure_link("a", "b", RelayProtocol::Tcp);
+            const auto still_shared = co_await test_node::ensure_link(nodes[0], "a", "b", RelayProtocol::Tcp);
             require(still_shared.id == shared.id, "Closing a flow destroyed a shared NodeLink");
             co_await asio::async_write(first_consumer, asio::buffer(bytes), asio::use_awaitable);
             co_await asio::async_read(first_producer, asio::buffer(echoed), asio::cancel_after(1s, asio::use_awaitable));
             require(echoed == bytes, "Consumer disconnect closed a different session's active flow");
             // A NodeLink failure terminates active socket pumps immediately.
-            co_await nodes[0]->async_close_link(shared.id);
+            co_await test_node::close_link(nodes[0], shared.id);
             const auto broken = co_await receive(channels[1], CtrlCommand::RelayClosed);
             require(broken.params->at("request_id") == 43 && broken.params->at("reason") != "relay establishment timed out",
                     "Broken NodeLink left the business transaction waiting");
@@ -664,7 +827,7 @@ void integration()
             {
                 channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                     njson{{"request_id", producer_failure ? 55 : 54}, {"service", "manual-tcp"}, {"protocol", "tcp"},
-                          {"epoch", epoch}, {"path", {"a", "b", "c"}}, {"budget_ms", 3000}}));
+                          {"epoch", epoch}, {"path", {"a", "b", "c"}}}));
                 const auto reset_opened = co_await receive(channels[1], CtrlCommand::RelayOpened);
                 const auto reset_offer = co_await receive(channels[3], CtrlCommand::RelayOffer);
                 auto reset_consumer = co_await attach_tcp(*reset_opened.params, configs[1], RelayAttach::Consumer);
@@ -684,8 +847,7 @@ void integration()
             {
                 channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                     njson{{"request_id", 30}, {"service", "auto-" + std::string(relay_protocol_name(protocol))},
-                          {"protocol", relay_protocol_name(protocol)}, {"epoch", epoch}, {"path", {"a", "b", "master"}},
-                          {"budget_ms", 700}}));
+                          {"protocol", relay_protocol_name(protocol)}, {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
                 const auto opened = co_await receive(channels[1], CtrlCommand::RelayOpened);
                 const auto &p = *opened.params;
                 const auto frame = WireMessage::pack(RelayAttach::to_msg({RelayAttach::Consumer,
@@ -752,6 +914,20 @@ void integration()
                 channels[1]->send(CtrlMessage(CtrlCommand::RelayCancel, njson{{"request_id", 30}}));
                 co_await receive(channels[1], CtrlCommand::RelayClosed);
             }
+            // The producer Agent's two-second timeout expires before either Node's setup timeout.
+            // Leave the consumer unattached so readiness cannot complete.
+            const auto producer_started = std::chrono::steady_clock::now();
+            channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
+                njson{{"request_id", 31}, {"service", "auto-tls"}, {"protocol", "tls"},
+                      {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
+            co_await receive(channels[1], CtrlCommand::RelayOpened);
+            auto pending_target = co_await target.async_accept(asio::cancel_after(1s, asio::use_awaitable));
+            const auto producer_expired = co_await receive(channels[1], CtrlCommand::RelayError);
+            require(producer_expired.params->at("request_id") == 31 && producer_expired.params->at("stage") == "attach" &&
+                    producer_expired.params->at("reason").get<std::string>().find("timed out") != std::string::npos &&
+                    std::chrono::steady_clock::now() - producer_started >= 1s,
+                    "Producer Agent did not enforce its own establishment timeout");
+            pending_target.close();
             // Full application -> consumer Agent -> three Nodes -> producer Agent -> service.
             // The consumer's primary d is outside a -> b -> master.
             AgentConfig consumer_config;
@@ -783,7 +959,8 @@ void integration()
             }
             discovery_agent = std::make_shared<RelayAgent>(agent_control, agent_transfer, client_ssl, discovery_config);
             discovery_agent->start();
-            co_await asio::co_spawn(agent_control, RelayAgentTestAccess::verify_entry_lifetime(*discovery_agent, epoch), asio::use_awaitable);
+            co_await asio::co_spawn(agent_control, RelayAgentTestAccess::verify_entry_lifetime(
+                *discovery_agent, epoch), asio::use_awaitable);
             // Both Single roles share the same Agent control and Node UUID.
             for (const auto port : self_ports)
             {
@@ -854,6 +1031,38 @@ void integration()
                         asio::cancel_after(1s, asio::use_awaitable));
                     require(returned == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
                             "Consumer Agent did not update the local return endpoint");
+
+                    const BytesBuf maximum(LnkFrameHeader::maximum_payload, 0xa5);
+                    BytesBuf large_data(maximum.size() + 1);
+                    co_await replacement.async_send(asio::buffer(maximum), asio::use_awaitable);
+                    const auto maximum_received = co_await udp_target.async_receive_from(
+                        asio::buffer(large_data), sender, asio::cancel_after(1s, asio::use_awaitable));
+                    require(maximum_received == maximum.size() &&
+                                std::equal(maximum.begin(), maximum.end(), large_data.begin()),
+                            "Consumer Agent rejected or changed the maximum routed UDP payload");
+                    co_await udp_target.async_send_to(asio::buffer(maximum), sender, asio::use_awaitable);
+                    const auto maximum_returned = co_await replacement.async_receive(
+                        asio::buffer(large_data), asio::cancel_after(1s, asio::use_awaitable));
+                    require(maximum_returned == maximum.size() &&
+                                std::equal(maximum.begin(), maximum.end(), large_data.begin()),
+                            "Consumer Agent maximum routed UDP return path failed");
+
+                    const BytesBuf oversized(maximum.size() + 1, 0x5a);
+                    co_await replacement.async_send(asio::buffer(oversized), asio::use_awaitable);
+                    const auto [oversize_error, oversize_size] = co_await udp_target.async_receive_from(
+                        asio::buffer(large_data), sender, asio::cancel_after(150ms, use_nothrow_awaitable));
+                    require(oversize_error == asio::error::operation_aborted && oversize_size == 0,
+                            "Consumer Agent forwarded an oversized routed UDP payload");
+
+                    const BytesBuf empty;
+                    co_await replacement.async_send(asio::buffer(empty), asio::use_awaitable);
+                    const auto empty_received = co_await udp_target.async_receive_from(
+                        asio::buffer(data), sender, asio::cancel_after(1s, asio::use_awaitable));
+                    require(empty_received == 0, "Consumer Agent lost an empty routed UDP payload");
+                    co_await udp_target.async_send_to(asio::buffer(empty), sender, asio::use_awaitable);
+                    const auto empty_returned = co_await replacement.async_receive(
+                        asio::buffer(data), asio::cancel_after(1s, asio::use_awaitable));
+                    require(empty_returned == 0, "Consumer Agent empty routed UDP return path failed");
                 }
                 else
                 {
@@ -883,7 +1092,7 @@ void integration()
             co_await consumer_agent->async_stop();
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 50}, {"service", "auto-bad"}, {"protocol", "tcp"},
-                      {"epoch", epoch}, {"path", {"a", "b", "master"}}, {"budget_ms", 3000}}));
+                      {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             const auto rejected = co_await receive(channels[1], CtrlCommand::RelayError);
             require(rejected.params->at("stage") == "attach" &&
@@ -891,7 +1100,7 @@ void integration()
                     "Producer target failure did not preserve the original error");
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 51}, {"service", "auto-tcp"}, {"protocol", "tcp"},
-                      {"epoch", epoch}, {"path", {"a", "b", "master"}}, {"budget_ms", 5000}}));
+                      {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             co_await agent->async_stop();
             const auto producer_lost = co_await receive(channels[1], CtrlCommand::RelayError);
@@ -900,12 +1109,12 @@ void integration()
             // Leave a real pending transaction for Node::stop() to cancel and drain.
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 52}, {"service", "manual-tcp"}, {"protocol", "tcp"},
-                      {"epoch", epoch}, {"path", {"a", "b", "c"}}, {"budget_ms", 5000}}));
+                      {"epoch", epoch}, {"path", {"a", "b", "c"}}}));
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             co_await receive(channels[3], CtrlCommand::RelayOffer);
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 53}, {"service", "manual-tcp"}, {"protocol", "tcp"},
-                      {"epoch", epoch}, {"path", {"a", "b", "c"}}, {"budget_ms", 5000}}));
+                      {"epoch", epoch}, {"path", {"a", "b", "c"}}}));
             const auto live = co_await receive(channels[1], CtrlCommand::RelayOpened);
             const auto live_offer = co_await receive(channels[3], CtrlCommand::RelayOffer);
             live_sockets.push_back(co_await attach_tcp(*live.params, configs[1], RelayAttach::Consumer));

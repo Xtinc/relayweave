@@ -1,4 +1,5 @@
 #include "relay_agent.h"
+#include "routing_fixture.h"
 #include <fstream>
 #include "link_quality.h"
 
@@ -39,10 +40,10 @@ Json node(std::string id, std::string address)
 {
     return {{"node_id", std::move(id)}, {"address", std::move(address)}, {"report_age_ms", 0u}};
 }
-std::optional<RouteGraph::Path> calculate_path(const AgentRouting &routing, std::string_view destination,
+std::optional<RouteGraph::Path> calculate_path(test_routing::Fixture &routing, std::string_view destination,
                                      std::span<const RouteGraph::Entry> access, AgentRouting::Clock::time_point now)
 {
-    const auto paths = routing.candidate_paths(now, access);
+    const auto paths = test_routing::candidates(routing, now, access);
     const auto found = paths.find(std::string(destination));
     return found == paths.end() ? std::nullopt : std::optional(found->second.front());
 }
@@ -94,7 +95,7 @@ int main()
 
         rejects([&] { AgentRouting invalid(io, false, 9); }, "Nine-node Agent budget accepted");
         rejects([&] { AgentRouting invalid(io, false, 0); }, "Zero-node Agent budget accepted");
-        AgentRouting eight(io, false, 8);
+        test_routing::Fixture eight(io, false, 8);
         Json chain_nodes = Json::array();
         Json chain_links = Json::array();
         for (unsigned index = 0; index < 8; ++index)
@@ -111,48 +112,42 @@ int main()
         const auto whole = calculate_path(eight, "7", ingress, at(0));
         require(whole && whole->nodes.size() == 8 && whole->nodes.front() == "0" && whole->nodes.back() == "7",
                 "Agent or endpoints incorrectly counted against eight-node budget");
-        AgentRouting four(io, false, 4);
+        test_routing::Fixture four(io, false, 4);
         four.begin_request(1, at(0));
         four.accept_snapshot(snapshot(1, chain_nodes, chain_links), at(0));
         require(calculate_path(four, "3", ingress, at(0)).has_value() && !calculate_path(four, "4", ingress, at(0)),
                 "Configured four-node limit omitted endpoints");
-        AgentRouting routing(io, true, 4);
+        test_routing::Fixture routing(io, true, 4);
         const auto first = snapshot(1, Json::array({node("A", "192.0.2.1"), node("D", "192.0.2.2")}),
                                     Json::array({edge("A", "D", 5.0)}));
         routing.begin_request(1, at(0));
         require(routing.accept_snapshot(first, at(0)), "Complete snapshot was not applied");
         require(!routing.accept_snapshot(first, at(0)), "Duplicate snapshot was applied");
         const std::vector<RouteGraph::Entry> access{{"A", 3.0}, {"D", 50.0}};
+        require(routing.candidate_paths(at(0)).empty(), "Unmeasured ingress invented candidate routes");
         auto path = calculate_path(routing, "D", access, at(0));
         require(path && path->nodes == std::vector<std::string>({"A", "D"}), "Best entry was not selected");
         require(std::abs(path->cost - 10.0) < 1e-9, "Access edge/hop penalty was omitted");
-        require(routing.candidate_paths(at(0)).empty(), "Unmeasured ingress invented candidate routes");
-        require(routing.candidate_paths(at(0), std::span<const RouteGraph::Entry>{}).empty(),
-                "Explicit empty ingress invented candidate routes");
-        const auto candidates = routing.candidate_paths(at(0), access);
+        require(test_routing::candidates(routing, at(0), std::span<const RouteGraph::Entry>{}).empty(),
+                "Empty measurement set invented candidate routes");
+        const auto candidates = test_routing::candidates(routing, at(0), access);
         const auto &to_d = candidates.at("D");
         require(to_d.size() == 2 && to_d[0].cost < to_d[1].cost &&
                     to_d[1].nodes == std::vector<std::string>({"D"}) && to_d[1].cost == 50.0,
                 "Per-ingress candidates lost an alternative or are not ordered by cost");
         const std::vector<RouteGraph::Entry> repeated{{"A", 50.0}, {"D", 10.0}, {"A", 3.0}};
-        const auto tied = routing.candidate_paths(at(0), repeated).at("D");
+        const auto tied = test_routing::candidates(routing, at(0), repeated).at("D");
         require(tied.size() == 2 && tied[0].nodes == path->nodes && tied[1].nodes.front() == "D" &&
                     tied[0].cost == tied[1].cost,
                 "Repeated ingress or equal-cost candidates are not deterministic");
-        rejects([&] { routing.candidate_paths(at(0), std::vector<RouteGraph::Entry>{{"A", -1.0}}); },
-                "Invalid diagnostic entry was accepted");
-        rejects([&] {
-            routing.candidate_paths(at(0), std::vector<RouteGraph::Entry>{
-                {"A", 3.0}, {"A", std::numeric_limits<double>::quiet_NaN()}});
-        }, "Duplicate ingress masked an invalid access cost");
         const std::vector<RouteGraph::Entry> only_a{access.front()};
         require(!calculate_path(routing, "D", only_a, at(15)), "Expired snapshot remained routable");
         require(!calculate_path(routing, "A", std::span(access).subspan(1), at(0)), "Reverse edge was invented");
         const auto direct = calculate_path(routing, "D", access, at(15));
         require(direct && direct->nodes == std::vector<std::string>({"D"}), "Local direct path needs stale topology");
-        const auto expired_candidates = routing.candidate_paths(at(15), access);
+        const auto expired_candidates = test_routing::candidates(routing, at(15), access);
         require(expired_candidates.at("D").size() == 1 && expired_candidates.at("D")[0].cost == 50.0,
-                "Diagnostic candidates reused stale remote edges");
+                "Measured candidates reused stale remote edges");
 
         routing.begin_request(2, at(1));
         const auto invalid_nodes = snapshot(2, Json::array({node("A", "192.0.2.1"), node("A", "192.0.2.3")}),
@@ -170,13 +165,13 @@ int main()
         invalid["links"][0]["quality"]["confidence"] = 2.0;
         rejects([&] { routing.accept_snapshot(invalid, at(1)); }, "Invalid quality was accepted");
 
-        AgentRouting one_hop(io, true, 1);
+        test_routing::Fixture one_hop(io, true, 1);
         one_hop.begin_request(1, at(0));
         one_hop.accept_snapshot(first, at(0));
         require(!calculate_path(one_hop, "D", only_a, at(0)), "Virtual Agent consumed or bypassed Node budget");
-        require(!one_hop.candidate_paths(at(0), only_a).contains("D"),
-                "Diagnostic candidates bypassed the real Node budget");
-        AgentRouting producer(io, false, 4);
+        require(!test_routing::candidates(one_hop, at(0), only_a).contains("D"),
+                "Measured candidates bypassed the real Node budget");
+        test_routing::Fixture producer(io, false, 4);
         require(producer.set_required_targets({{"entry", "127.0.0.1"}}), "New required targets were not detected");
         require(!producer.set_required_targets({{"entry", "127.0.0.1"}}), "Identical targets appeared changed");
         require(producer.set_required_targets({{"entry", "127.0.0.2"}}), "Changed target host was not detected");
@@ -200,7 +195,7 @@ int main()
         require(calculate_path(routing, "D", only_a, at(0)).has_value(), "Fresh source report was rejected");
         require(!calculate_path(routing, "D", only_a, at(1)), "Source report remained usable at exactly 15 seconds");
         require(!calculate_path(routing, "D", only_a, at(2)), "16-second source report was masked by a fresh snapshot");
-        const auto aged_candidates = routing.candidate_paths(at(2), access).at("D");
+        const auto aged_candidates = test_routing::candidates(routing, at(2), access).at("D");
         require(aged_candidates.size() == 1 && aged_candidates[0].nodes == std::vector<std::string>({"D"}),
                 "Candidate logging accepted a 16-second source report");
         require(calculate_path(routing, "D", access, at(2))->nodes == std::vector<std::string>({"D"}),
@@ -247,7 +242,7 @@ int main()
         require(routing.accept_snapshot(first, at(0)), "Active request did not survive an unrelated malformed response");
 
         // Limiting diagnostic logs must not truncate the routing result.
-        AgentRouting many_ingresses(io, false, 4);
+        test_routing::Fixture many_ingresses(io, false, 4);
         many_ingresses.begin_request(1, at(0));
         many_ingresses.accept_snapshot(snapshot(1,
             Json::array({node("A", "127.0.0.1"), node("B", "127.0.0.2"), node("C", "127.0.0.3"),
@@ -255,7 +250,7 @@ int main()
             Json::array({edge("A", "D", 5.0), edge("B", "D", 5.0), edge("C", "D", 5.0), edge("E", "D", 5.0)})),
             at(0));
         const std::vector<RouteGraph::Entry> all_ingresses{{"A", 1.0}, {"B", 2.0}, {"C", 3.0}, {"E", 4.0}, {"D", 50.0}};
-        const auto all_candidates = many_ingresses.candidate_paths(at(0), all_ingresses).at("D");
+        const auto all_candidates = test_routing::candidates(many_ingresses, at(0), all_ingresses).at("D");
         require(all_candidates.size() == 5 && all_candidates.front().nodes == std::vector<std::string>({"A", "D"}) &&
                     all_candidates.front().cost == 8.0 && all_candidates.back().cost == 50.0,
                 "Candidate routing dropped alternatives or failed to select the lowest cost path");

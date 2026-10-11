@@ -154,17 +154,20 @@ class DashboardServiceTest(unittest.TestCase):
 
 class CollectorStopTest(unittest.TestCase):
     def test_stop_waits_for_pending_tls_handshake_before_releasing_history(self):
+        from history_store import HistoryStore
         from proxy_client import ProxyControlClient
         with tempfile.TemporaryDirectory() as directory, socket.socket() as listener:
             listener.bind(('127.0.0.1', 0))
             listener.listen()
             listener.settimeout(3)
+            store = HistoryStore(Path(directory) / "history.sqlite3")
+            self.addCleanup(store.close)
             client = ProxyControlClient(
                 host='127.0.0.1', port=listener.getsockname()[1],
                 ca_file=str(DATA / 'tls_channel_test_ca.pem'),
                 cert_file=str(DATA / 'tls_channel_test_client.pem'),
                 key_file=str(DATA / 'tls_channel_test_client.key'),
-                history_db=str(Path(directory) / 'history.sqlite3'), handshake_timeout=3,
+                history_store=store, handshake_timeout=3,
             )
             client.start()
             peer, _ = listener.accept()

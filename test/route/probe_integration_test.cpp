@@ -2,6 +2,7 @@
 #include "link_quality.h"
 #include <asio/experimental/awaitable_operators.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <stdexcept>
@@ -34,44 +35,56 @@ asio::awaitable<void> verify(asio::io_context &io)
 {
     const auto loopback = asio::ip::make_address_v4("127.0.0.1");
     const auto other = asio::ip::make_address_v4("127.0.0.2");
-    ICMP probes(io, 100ms, 80ms, 3);
-    ICMP concurrent(io, 100ms, 80ms, 3);
+    ICMP probes(io, 100ms, 80ms);
+    ICMP concurrent(io, 100ms, 80ms);
     probes.run({loopback, other});
     concurrent.run({loopback});
-    co_await wait(400ms);
+    while (!std::ranges::all_of(probes.metrics(), [](const auto &metric) { return metric.assessment.total_received >= 3; }) ||
+           concurrent.metrics().front().assessment.total_received < 3)
+        co_await wait(1ms);
     co_await probes.close();
     co_await concurrent.close();
-    require(concurrent.metrics().front().assessment.total_received == 3,
+    require(concurrent.metrics().front().assessment.total_received >= 3,
             "Concurrent ICMP instances interfered with one another");
     for (const auto &metric : probes.metrics())
     {
-        require(metric.transmitted == 3 && metric.assessment.total_completed == 3 && metric.assessment.total_received == 3,
+        require(metric.transmitted >= 3 && metric.assessment.total_received >= 3 &&
+                    metric.assessment.total_completed == metric.assessment.total_received,
                 "Concurrent loopback probes did not complete successfully");
         require(metric.assessment.quality.usable && metric.assessment.quality.cost && *metric.assessment.quality.cost < 10.0,
                 "Real replies did not produce usable quality");
     }
 
-    ICMP resumed(io, 100ms, 80ms, 2);
+    const auto previous = probes.history().at(loopback);
+    const auto previous_metrics = probes.metrics().front();
+    ICMP resumed(io, 100ms, 80ms);
     resumed.run({loopback}, probes.history());
-    co_await wait(300ms);
+    while (resumed.metrics().front().assessment.total_received < previous_metrics.assessment.total_received + 2)
+        co_await wait(1ms);
     co_await resumed.close();
     const auto restored = resumed.metrics().front();
-    require(restored.transmitted == 5 && restored.assessment.total_completed == 5 && restored.assessment.total_received == 5,
-            "Rebuilding probes lost EMA history or counted old sends against the new limit");
+    require(restored.transmitted >= previous.transmitted + 2 &&
+                restored.assessment.total_completed >= previous_metrics.assessment.total_completed + 2 &&
+                restored.assessment.total_received == restored.assessment.total_completed,
+            "Rebuilding probes lost EMA history or reset completed measurements");
 
     // Preserve a send that was cancelled before completion: transmitted and
     // completed are independent counters when a probe engine is rebuilt.
     auto cancelled_send_history = probes.history();
     ++cancelled_send_history.at(loopback).transmitted;
-    ICMP retained_sends(io, 100ms, 80ms, 1);
+    ICMP retained_sends(io, 100ms, 80ms);
     retained_sends.run({loopback}, cancelled_send_history);
     auto retained = retained_sends.metrics().front();
-    require(retained.transmitted == 4 && retained.assessment.total_completed == 3,
+    require(retained.transmitted == previous.transmitted + 1 &&
+                retained.assessment.total_completed == previous_metrics.assessment.total_completed,
             "Rebuilding probes replaced the actual send count with completed samples");
-    co_await wait(200ms);
+    while (retained_sends.metrics().front().assessment.total_received < previous_metrics.assessment.total_received + 1)
+        co_await wait(1ms);
     co_await retained_sends.close();
     retained = retained_sends.metrics().front();
-    require(retained.transmitted == 5 && retained.assessment.total_completed == 4,
+    require(retained.transmitted >= previous.transmitted + 2 &&
+                retained.assessment.total_completed >= previous_metrics.assessment.total_completed + 1 &&
+                retained.transmitted > retained.assessment.total_completed,
             "Resumed probes lost a cancelled send or counted it as a completed sample");
 
     ProbeSet shared(io);

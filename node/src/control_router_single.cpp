@@ -1,17 +1,18 @@
 #include "control_router_single.h"
-#include "relay_session.h"
+#include "node_session.h"
 #include "relay_node.h"
 
 using Clock = std::chrono::steady_clock;
 
-ControlRouterSingle::ControlRouterSingle(RelaySession &relay, const ControlSessionPtr &consumer,
+ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const ControlSessionPtr &consumer,
                                          const ControlSessionPtr &producer, njson params)
     : relay_(relay), consumer_(consumer), producer_(producer), params_(std::move(params))
 {
     const auto protocol = config::message_protocol(params_);
     const auto &config = relay.node_.config_;
-    const auto timeout = protocol == RelayProtocol::Udp ? config.datagram.setup_timeout :
-                         protocol == RelayProtocol::Tls ? config.tls.setup_timeout : config.tcp.setup_timeout;
+    const auto timeout = protocol == RelayProtocol::Udp   ? config.datagram.setup_timeout
+                         : protocol == RelayProtocol::Tls ? config.tls.setup_timeout
+                                                          : config.tcp.setup_timeout;
     deadline_ = Clock::now() + timeout;
 }
 
@@ -37,7 +38,8 @@ bool ControlRouterSingle::handle(const ControlSessionPtr &session, const CtrlMes
     if (message.type() == CtrlCommand::RelayReject && (ready_ || producer_.lock() != session))
         return true;
     cancel("control", config::optional_string(config::message_params(message), "reason",
-        message.type() == CtrlCommand::RelayReject ? "producer rejected relay" : "relay cancelled"));
+                                              message.type() == CtrlCommand::RelayReject ? "producer rejected relay"
+                                                                                         : "relay cancelled"));
     return true;
 }
 
@@ -61,7 +63,8 @@ void ControlRouterSingle::notify_agents() const
             values["protocol"] = params_.at("protocol");
             if (!producer)
                 values["request_id"] = params_.at("request_id");
-            session->send(CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
+            session->send(
+                CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
         }
     }
 }
@@ -87,12 +90,15 @@ void ControlRouterSingle::close_agents() const
     // Stream EOF is carried by data sockets; UDP requires an explicit lifetime notification.
     if (ready_ && protocol != RelayProtocol::Udp)
         return;
-    njson values{{"request_id", params_.at("request_id")}, {"service", params_.at("service")},
-                 {"protocol", params_.at("protocol")}, {"reason", reason_}};
-    if (const auto id = relay_.uuid())
+    njson values{{"request_id", params_.at("request_id")},
+                 {"service", params_.at("service")},
+                 {"protocol", params_.at("protocol")},
+                 {"reason", reason_}};
+    const auto id = relay_.uuid();
+    if (id)
         values["uuid"] = id;
     const auto consumer = consumer_.lock();
-    if (auto producer = producer_.lock(); producer && producer != consumer && relay_.uuid())
+    if (auto producer = producer_.lock(); producer && producer != consumer && id)
         producer->send(CtrlMessage(CtrlCommand::RelayClosed, values));
     if (consumer)
         consumer->send(CtrlMessage(ready_ ? CtrlCommand::RelayClosed : CtrlCommand::RelayError, std::move(values)));
@@ -104,34 +110,29 @@ asio::awaitable<void> ControlRouterSingle::run()
     {
         if (closed_)
             throw asio::system_error(asio::error::operation_aborted);
-        // Complete allocation before allowing cancellation to enter cleanup.
-        co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
         co_await relay_.install();
         if (closed_ || consumer_.expired() || producer_.expired())
             throw asio::system_error(asio::error::operation_aborted);
-        co_await asio::this_coro::reset_cancellation_state(asio::enable_total_cancellation());
         notify_agents();
-        if (Clock::now() >= deadline_ || !co_await asio::co_spawn(relay_.node_.control_executor_, relay_.wait_attach(),
-                asio::cancel_after(deadline_ - Clock::now(), asio::use_awaitable)))
+        if (Clock::now() >= deadline_ ||
+            !co_await relay_.wait_attach(deadline_))
             throw std::runtime_error("relay setup timed out");
-        // Binding and activation only finish once; no data resource can be released midway.
         {
             const auto consumer = consumer_.lock();
             if (closed_ || !consumer || producer_.expired())
             {
                 throw asio::system_error(asio::error::operation_aborted);
             }
-            co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
             co_await relay_.bind(std::string(consumer->peer()));
         }
         co_await relay_.activate();
         if (closed_ || Clock::now() >= deadline_)
             throw asio::system_error(asio::error::operation_aborted);
-        co_await asio::this_coro::reset_cancellation_state(asio::enable_total_cancellation());
         ready_ = true;
         ready_agents();
         PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", params_.at("protocol").get<std::string>().c_str(),
-            params_.at("service").get<std::string>().c_str(), static_cast<unsigned long long>(relay_.uuid()));
+                         params_.at("service").get<std::string>().c_str(),
+                         static_cast<unsigned long long>(relay_.uuid()));
         co_await relay_.bridge();
         if (reason_.empty())
         {
@@ -141,13 +142,17 @@ asio::awaitable<void> ControlRouterSingle::run()
     catch (const std::exception &)
     {
         if (reason_.empty())
-            reason_ = !ready_ && Clock::now() >= deadline_ ? "relay setup timed out" : exception_description(std::current_exception());
+            reason_ = !ready_ && Clock::now() >= deadline_ ? "relay setup timed out"
+                                                           : exception_description(std::current_exception());
     }
+    // Cancellation can end the business task, but resource cleanup must still finish.
     co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     closed_ = true;
     if (ready_)
-        PROXY_INFO_PRINT("Relay [x] %s service=%s uuid=%llu reason=%s", params_.at("protocol").get<std::string>().c_str(),
-            params_.at("service").get<std::string>().c_str(), static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
+        PROXY_INFO_PRINT("Relay [x] %s service=%s uuid=%llu reason=%s",
+                         params_.at("protocol").get<std::string>().c_str(),
+                         params_.at("service").get<std::string>().c_str(),
+                         static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     // Release capacity and attached sockets before telling the requester it can retry.
     co_await relay_.close();
     close_agents();

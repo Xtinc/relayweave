@@ -26,7 +26,7 @@ asio::awaitable<TcpTransport::Stream> TcpTransport::prepare(Stream socket,
 asio::awaitable<void> TcpTransport::relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
                                           TokenBucket &tx_limiter, ServiceTraffic &traffic)
 {
-    co_await relay_tcp(producer, consumer, &rx_limiter, &tx_limiter, &traffic.rx, &traffic.tx);
+    return relay_tcp(producer, consumer, &rx_limiter, &tx_limiter, &traffic.rx, &traffic.tx);
 }
 
 TlsTransport::TlsTransport(asio::ssl::context &context) noexcept : context_(context)
@@ -46,7 +46,7 @@ asio::awaitable<TlsTransport::Stream> TlsTransport::prepare(asio::ip::tcp::socke
 asio::awaitable<void> TlsTransport::relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
                                           TokenBucket &tx_limiter, ServiceTraffic &traffic)
 {
-    co_await relay_tls(producer, consumer, &rx_limiter, &tx_limiter, &traffic.rx, &traffic.tx);
+    return relay_tls(producer, consumer, &rx_limiter, &tx_limiter, &traffic.rx, &traffic.tx);
 }
 
 template <typename Transport>
@@ -81,7 +81,7 @@ void StreamPipeline<Transport>::start()
     close_acceptor.dismiss();
 
     asio::co_spawn(executor_,
-                   [self = this->shared_from_this()]() -> asio::awaitable<void> { co_await self->accept_loop(); },
+                   [self = this->shared_from_this()] { return self->accept_loop(); },
                    asio::detached);
 }
 
@@ -101,16 +101,12 @@ asio::awaitable<void> StreamPipeline<Transport>::accept_loop()
         }
         if (stopped_)
         {
-            asio::error_code ignored;
-            socket.close(ignored);
             co_return;
         }
 
         const auto pending = pending_sockets_.load();
         if (pending >= max_setup_connections_)
         {
-            asio::error_code ignored;
-            socket.close(ignored);
             PROXY_ERROR_PRINT("Transfer rejected %s setting_up=%zu limit=%zu", Transport::name.data(),
                               pending, max_setup_connections_);
             continue;
@@ -119,8 +115,8 @@ asio::awaitable<void> StreamPipeline<Transport>::accept_loop()
         pending_sockets_.fetch_add(1);
         asio::co_spawn(
             executor_,
-            [self = this->shared_from_this(), socket = std::move(socket)]() mutable -> asio::awaitable<void> {
-                co_await self->run_transfer_session(std::move(socket));
+            [self = this->shared_from_this(), socket = std::move(socket)]() mutable {
+                return self->run_transfer_session(std::move(socket));
             },
             asio::detached);
     }
@@ -154,9 +150,9 @@ asio::awaitable<void> StreamPipeline<Transport>::run_transfer_session(tcp::socke
 }
 
 template <typename Transport>
-njson StreamPipeline<Transport>::install_pair()
+njson StreamPipeline<Transport>::install_local_pair()
 {
-    if (stopped_ || local_pairs_.size() + path_endpoints_.size() >= capacity_)
+    if (stopped_ || local_pairs_.size() + remote_pairs_.size() >= capacity_)
     {
         throw std::runtime_error(stopped_ ? "server stopping" : "relay capacity reached");
     }
@@ -173,17 +169,18 @@ njson StreamPipeline<Transport>::install_pair()
 }
 
 template <typename Transport>
-asio::awaitable<bool> StreamPipeline<Transport>::wait_pair(std::uint64_t uuid)
+asio::awaitable<bool> StreamPipeline<Transport>::wait_local_pair(std::uint64_t uuid)
 {
     auto pair = local_pairs_.at(uuid);
-    co_return co_await pair->attached.wait() && !pair->closed && pair->producer_stream && pair->consumer_stream;
+    // The event signals either both roles attached or close.
+    co_return co_await pair->attached.wait() && !pair->closed;
 }
 
 template <typename Transport>
-void StreamPipeline<Transport>::bind_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor)
+void StreamPipeline<Transport>::bind_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor)
 {
     auto pair = local_pairs_.at(uuid);
-    if (pair->closed || !pair->producer_stream || !pair->consumer_stream || pair->traffic || !traffic)
+    if (!pair->producer_stream || !pair->consumer_stream || pair->traffic || !traffic)
         throw std::runtime_error("local pair cannot bind service");
     pair->traffic = std::move(traffic);
     pair->accessor = std::move(accessor);
@@ -192,20 +189,20 @@ void StreamPipeline<Transport>::bind_pair(std::uint64_t uuid, SRVTrafficPtr traf
 }
 
 template <typename Transport>
-void StreamPipeline<Transport>::activate_pair(std::uint64_t uuid)
+void StreamPipeline<Transport>::activate_local_pair(std::uint64_t uuid)
 {
     auto pair = local_pairs_.at(uuid);
-    if (pair->closed || !pair->traffic || pair->active)
+    if (!pair->traffic || pair->active)
         throw std::runtime_error("local pair unavailable");
     pair->active = true;
     pair->traffic->add_accessor(pair->accessor);
 }
 
 template <typename Transport>
-asio::awaitable<void> StreamPipeline<Transport>::run_pair(std::uint64_t uuid)
+asio::awaitable<void> StreamPipeline<Transport>::run_local_pair(std::uint64_t uuid)
 {
     auto pair = local_pairs_.at(uuid);
-    if (pair->closed || !pair->active)
+    if (!pair->active)
         throw std::runtime_error("local pair unavailable");
     // The controller owns and drains this data-domain copy task.
     co_await Transport::relay(*pair->producer_stream, *pair->consumer_stream, pair->rx_limiter,
@@ -213,7 +210,7 @@ asio::awaitable<void> StreamPipeline<Transport>::run_pair(std::uint64_t uuid)
 }
 
 template <typename Transport>
-void StreamPipeline<Transport>::close_pair(std::uint64_t uuid)
+void StreamPipeline<Transport>::close_local_pair(std::uint64_t uuid)
 {
     const auto it = local_pairs_.find(uuid);
     if (it == local_pairs_.end())
@@ -233,48 +230,51 @@ void StreamPipeline<Transport>::close_pair(std::uint64_t uuid)
 }
 
 template <typename Transport>
-njson StreamPipeline<Transport>::install_endpoint(int role)
+njson StreamPipeline<Transport>::install_remote_pair(int role)
 {
     if (role != RelayAttach::Consumer && role != RelayAttach::Producer)
     {
         throw std::invalid_argument("invalid relay endpoint role");
     }
-    if (stopped_ || local_pairs_.size() + path_endpoints_.size() >= capacity_)
+    if (stopped_ || local_pairs_.size() + remote_pairs_.size() >= capacity_)
     {
         throw std::runtime_error("relay endpoint capacity reached or pipeline stopped");
     }
     const auto uuid = id_allocator_->allocate();
     ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
-    auto endpoint = std::make_shared<PathEndpoint>(executor_, role);
+    auto endpoint = std::make_shared<RemotePair>(executor_, role);
     endpoint->ticket = generate_random_id();
-    path_endpoints_.emplace(uuid, endpoint);
+    remote_pairs_.emplace(uuid, endpoint);
     rollback.dismiss();
     return {{"uuid", uuid}, {"ticket", endpoint->ticket}, {"data_port", data_port_}};
 }
 
 template <typename Transport>
-asio::awaitable<bool> StreamPipeline<Transport>::wait_endpoint(std::uint64_t uuid)
+asio::awaitable<bool> StreamPipeline<Transport>::wait_remote_pair(std::uint64_t uuid)
 {
-    const auto it = path_endpoints_.find(uuid);
-    if (it == path_endpoints_.end())
+    const auto it = remote_pairs_.find(uuid);
+    if (it == remote_pairs_.end())
     {
         co_return false;
     }
     auto endpoint = it->second;
-    co_return co_await endpoint->attached.wait() && endpoint->stream && !endpoint->closed;
+    // The event signals either a completed attach or close.
+    co_return co_await endpoint->attached.wait() && !endpoint->closed;
 }
 
 template <typename Transport>
-void StreamPipeline<Transport>::bind_endpoint(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch,
+void StreamPipeline<Transport>::bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch,
                                                std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor)
 {
-    path_endpoints_.at(uuid)->bind(channel, epoch, flow_id, config_, std::move(traffic), std::move(accessor));
+    remote_pairs_.at(uuid)->bind(channel, epoch, flow_id, config_, std::move(traffic), std::move(accessor));
 }
 
 template <typename Transport>
-asio::awaitable<void> StreamPipeline<Transport>::read_endpoint(std::shared_ptr<PathEndpoint> endpoint)
+asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
     std::array<std::uint8_t, LnkFrameHeader::maximum_payload> buffer;
+    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
+    asio::steady_timer timer(executor_);
     for (;;)
     {
         const auto [error, size] = co_await endpoint->stream->async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
@@ -287,15 +287,27 @@ asio::awaitable<void> StreamPipeline<Transport>::read_endpoint(std::shared_ptr<P
         {
             throw asio::system_error(error);
         }
-        co_await endpoint->limit(true, size);
-        co_await endpoint->send(LnkFrType::Data, BytesBuf(buffer.begin(), buffer.begin() + size));
+        if (!limiter.try_consume(size))
+        {
+            const auto now = TokenBucket::Clock::now();
+            const auto until = limiter.reserve(size, now);
+            if (until > now)
+            {
+                timer.expires_at(until);
+                co_await timer.async_wait(asio::use_awaitable);
+            }
+        }
+        // Enqueue completion guarantees that the data executor no longer borrows this buffer.
+        co_await endpoint->send_data(std::span<const std::uint8_t>(buffer.data(), size));
         endpoint->count(true, size);
     }
 }
 
 template <typename Transport>
-asio::awaitable<void> StreamPipeline<Transport>::write_endpoint(std::shared_ptr<PathEndpoint> endpoint)
+asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
+    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
+    asio::steady_timer timer(executor_);
     for (;;)
     {
         auto frame = co_await endpoint->receive();
@@ -309,21 +321,27 @@ asio::awaitable<void> StreamPipeline<Transport>::write_endpoint(std::shared_ptr<
             }
             co_return;
         }
-        if (frame.kind != LnkFrType::Data)
+        // LnkChannel reports RESET as a flow failure; the remaining frames are DATA.
+        if (!limiter.try_consume(frame.payload.size()))
         {
-            throw std::runtime_error("unexpected stream flow frame");
+            const auto now = TokenBucket::Clock::now();
+            const auto until = limiter.reserve(frame.payload.size(), now);
+            if (until > now)
+            {
+                timer.expires_at(until);
+                co_await timer.async_wait(asio::use_awaitable);
+            }
         }
-        co_await endpoint->limit(false, frame.payload.size());
         const auto written = co_await asio::async_write(*endpoint->stream, asio::buffer(frame.payload), asio::use_awaitable);
         endpoint->count(false, written);
     }
 }
 
 template <typename Transport>
-void StreamPipeline<Transport>::activate_endpoint(std::uint64_t uuid)
+void StreamPipeline<Transport>::activate_remote_pair(std::uint64_t uuid)
 {
-    auto endpoint = path_endpoints_.at(uuid);
-    if (endpoint->closed || !endpoint->stream || !endpoint->channel || endpoint->active)
+    auto endpoint = remote_pairs_.at(uuid);
+    if (!endpoint->stream || !endpoint->channel || endpoint->active)
     {
         throw std::runtime_error("relay bridge unavailable");
     }
@@ -331,10 +349,10 @@ void StreamPipeline<Transport>::activate_endpoint(std::uint64_t uuid)
 }
 
 template <typename Transport>
-asio::awaitable<void> StreamPipeline<Transport>::run_endpoint(std::uint64_t uuid)
+asio::awaitable<void> StreamPipeline<Transport>::run_remote_pair(std::uint64_t uuid)
 {
-    auto endpoint = path_endpoints_.at(uuid);
-    if (endpoint->closed || !endpoint->stream || !endpoint->channel || !endpoint->active)
+    auto endpoint = remote_pairs_.at(uuid);
+    if (!endpoint->active)
     {
         throw std::runtime_error("relay bridge unavailable");
     }
@@ -352,7 +370,7 @@ asio::awaitable<void> StreamPipeline<Transport>::run_endpoint(std::uint64_t uuid
     try
     {
         // Both directions share this transfer executor; EOF ends only its own direction.
-        co_await await_transfers(read_endpoint(endpoint), write_endpoint(endpoint));
+        co_await await_transfers(read_remote_pair(endpoint), write_remote_pair(endpoint));
     }
     catch (...)
     {
@@ -361,7 +379,6 @@ asio::awaitable<void> StreamPipeline<Transport>::run_endpoint(std::uint64_t uuid
     const auto cancellation = co_await asio::this_coro::cancellation_state;
     if (failure && !endpoint->closed && cancellation.cancelled() == asio::cancellation_type::none)
     {
-        co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
         try
         {
             auto reason = exception_description(failure);
@@ -380,15 +397,15 @@ asio::awaitable<void> StreamPipeline<Transport>::run_endpoint(std::uint64_t uuid
 }
 
 template <typename Transport>
-void StreamPipeline<Transport>::close_endpoint(std::uint64_t uuid)
+void StreamPipeline<Transport>::close_remote_pair(std::uint64_t uuid)
 {
-    const auto it = path_endpoints_.find(uuid);
-    if (it == path_endpoints_.end())
+    const auto it = remote_pairs_.find(uuid);
+    if (it == remote_pairs_.end())
     {
         return;
     }
     auto endpoint = it->second;
-    path_endpoints_.erase(it);
+    remote_pairs_.erase(it);
     endpoint->closed = true;
     if (endpoint->stream)
     {
@@ -400,15 +417,15 @@ void StreamPipeline<Transport>::close_endpoint(std::uint64_t uuid)
 }
 
 template <typename Transport>
-bool StreamPipeline<Transport>::attach_endpoint(int role, std::uint64_t uuid, std::uint64_t ticket, Stream &stream)
+bool StreamPipeline<Transport>::attach_remote_pair(int role, std::uint64_t uuid, std::uint64_t ticket, Stream &stream)
 {
-    const auto it = path_endpoints_.find(uuid);
-    if (it == path_endpoints_.end())
+    const auto it = remote_pairs_.find(uuid);
+    if (it == remote_pairs_.end())
     {
         return false;
     }
     auto &endpoint = *it->second;
-    if (endpoint.closed || endpoint.stream || role != endpoint.role || ticket != endpoint.ticket)
+    if (endpoint.stream || role != endpoint.role || ticket != endpoint.ticket)
     {
         throw std::invalid_argument("relay.attach invalid or duplicate path endpoint");
     }
@@ -422,7 +439,7 @@ void StreamPipeline<Transport>::attach(int role, std::uint64_t uuid, std::uint64
 {
     if (stopped_)
         return;
-    if (attach_endpoint(role, uuid, ticket, stream))
+    if (attach_remote_pair(role, uuid, ticket, stream))
     {
         return;
     }
@@ -430,10 +447,7 @@ void StreamPipeline<Transport>::attach(int role, std::uint64_t uuid, std::uint64
     if (iterator == local_pairs_.end())
         throw std::invalid_argument("relay.attach uuid is unknown or expired");
     const auto &pair = iterator->second;
-    if (pair->active || pair->closed)
-        throw std::invalid_argument("relay.attach is only valid before transfer starts");
-    if (role != RelayAttach::Producer && role != RelayAttach::Consumer)
-        throw std::invalid_argument("relay.attach contains an invalid role");
+    // RelayAttach::from_msg has already validated the role.
     auto &slot = role == RelayAttach::Producer ? pair->producer_stream : pair->consumer_stream;
     const auto expected = role == RelayAttach::Producer ? pair->producer_ticket : pair->consumer_ticket;
     if (ticket != expected || slot)
@@ -451,12 +465,12 @@ void StreamPipeline<Transport>::stop()
     stopped_ = true;
     asio::error_code ignored;
     acceptor_.close(ignored);
-    while (!path_endpoints_.empty())
+    while (!remote_pairs_.empty())
     {
-        close_endpoint(path_endpoints_.begin()->first);
+        close_remote_pair(remote_pairs_.begin()->first);
     }
     while (!local_pairs_.empty())
-        close_pair(local_pairs_.begin()->first);
+        close_local_pair(local_pairs_.begin()->first);
 }
 
 template <typename Transport>

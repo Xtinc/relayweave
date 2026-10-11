@@ -68,7 +68,6 @@ enum class CtrlCommand
     LinkError,
     LinkClose,
     LinkClosed,
-    LinkStatus,
     LinkAttach,
     LinkAttached,
     FlowPrepare,

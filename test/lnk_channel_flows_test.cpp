@@ -15,20 +15,49 @@ asio::awaitable<void> pause_channel(std::chrono::milliseconds duration)
     timer.expires_after(duration);
     co_await timer.async_wait(asio::use_awaitable);
 }
+
+void check_cancelled_submission(bool borrowed)
+{
+    asio::io_context caller(1), data(1);
+    auto channel = std::make_shared<LnkChannel>(data.get_executor(), caller.get_executor(), "a", "127.0.0.1", 0,
+                                               "127.0.0.1", 0);
+    asio::cancellation_signal cancellation;
+    auto submit = [&]() -> asio::awaitable<FlowSendStatus> {
+        FlowFrame frame{7, 999, false, LnkFrType::Data, {1, 2, 3}};
+        const auto status = borrowed ? co_await channel->async_send_flow_data(7, 999, false, frame.payload)
+                                     : co_await channel->async_send_flow(std::move(frame));
+        const auto state = co_await asio::this_coro::cancellation_state;
+        check_channel(state.cancelled() != asio::cancellation_type::none, "submission lost caller cancellation");
+        co_return status;
+    };
+    auto result = asio::co_spawn(caller, submit(),
+                                 asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
+    caller.poll(); // Dispatch submission while the data executor is still paused.
+    cancellation.emit(asio::cancellation_type::all);
+    data.run();
+    caller.run();
+    check_channel(result.get() == FlowSendStatus::Closed, "cancelled submission lost its enqueue result");
+    check_channel(caller.stopped() && data.stopped(), "submission retained executor work");
+}
+
 int main()
 {
     try
     {
+        check_cancelled_submission(false);
+        check_cancelled_submission(true);
         asio::io_context io(1);
         auto guard = asio::make_work_guard(io);
+        asio::io_context submit_io(1);
+        auto submit_guard = asio::make_work_guard(submit_io);
         asio::ip::tcp::acceptor probe(io, {asio::ip::address_v4::loopback(), 0});
         auto tp = probe.local_endpoint().port();
         probe.close();
         asio::ip::udp::socket udp_probe(io, {asio::ip::address_v4::loopback(), 0});
         auto up = udp_probe.local_endpoint().port();
         udp_probe.close();
-        auto a = std::make_shared<LnkChannel>(io.get_executor(), "a", "127.0.0.1", tp, "127.0.0.1", up);
-        auto b = std::make_shared<LnkChannel>(io.get_executor(), "b", "127.0.0.2", tp, "127.0.0.2", up);
+        auto a = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "a", "127.0.0.1", tp, "127.0.0.1", up);
+        auto b = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "b", "127.0.0.2", tp, "127.0.0.2", up);
         std::vector<CtrlMessage> events;
         std::future<FlowFrame> stopped_receiver;
         FlowFrame retained_frame;
@@ -64,6 +93,19 @@ int main()
             b->prepare_flow(p);
             a->commit_flow(id);
             b->commit_flow(id);
+        };
+        auto submit = [&](FlowFrame frame) -> asio::awaitable<FlowSendStatus> {
+            check_channel(submit_io.get_executor().running_in_this_thread(), "wrong submission executor");
+            const auto status = co_await a->async_send_flow(std::move(frame));
+            check_channel(submit_io.get_executor().running_in_this_thread(), "send resumed on the data executor");
+            co_return status;
+        };
+        auto submit_data = [&](std::uint64_t epoch, std::uint64_t id, bool reverse,
+                               std::span<const std::uint8_t> payload) -> asio::awaitable<FlowSendStatus> {
+            check_channel(submit_io.get_executor().running_in_this_thread(), "wrong borrowed submission executor");
+            const auto status = co_await a->async_send_flow_data(epoch, id, reverse, payload);
+            check_channel(submit_io.get_executor().running_in_this_thread(), "borrowed send resumed on the data executor");
+            co_return status;
         };
         auto scenario = [&]() -> asio::awaitable<void> {
             njson link{{"epoch", std::uint64_t(7)},
@@ -118,13 +160,44 @@ int main()
                                FlowFrame{7, 202, false, LnkFrType::Reset, {}, std::string(513, 'x')},
                                FlowFrame{7, 202, false, LnkFrType::Ping, {}, {}}})
             {
-                auto result = a->send_flow(std::move(frame));
+                auto result = co_await a->async_send_flow(std::move(frame));
                 check_channel(result == FlowSendStatus::Invalid, "local format validation admitted invalid data");
             }
-            check_channel(a->send_flow({7, 202, false, LnkFrType::Data, {2}, {}}) == FlowSendStatus::Queued,
+            const BytesBuf oversized(LnkFrameHeader::maximum_payload + 1, 0xff);
+            check_channel(co_await a->async_send_flow_data(7, 202, false, oversized) == FlowSendStatus::Invalid,
+                          "borrowed submission admitted oversized data");
+            check_channel(co_await a->async_send_flow_data(7, 202, true, {}) == FlowSendStatus::Invalid,
+                          "borrowed submission admitted wrong direction");
+            check_channel(co_await a->async_send_flow_data(8, 202, false, {}) == FlowSendStatus::Closed,
+                          "borrowed submission admitted stale epoch");
+            check_channel(co_await a->async_send_flow_data(7, 999, false, {}) == FlowSendStatus::Closed,
+                          "borrowed submission admitted unknown flow");
+            FlowFrame valid{7, 202, false, LnkFrType::Data, {2}, {}};
+            check_channel(co_await a->async_send_flow(std::move(valid)) == FlowSendStatus::Queued,
                           "valid frame not queued");
+            check_channel(io.get_executor().running_in_this_thread(), "same-executor send changed executor");
             auto f = co_await b->receive_flow(7, 202);
             check_channel(f.payload == BytesBuf{2}, "wrong incoming identity delivered");
+            for (auto size : {std::size_t{}, std::size_t(LnkFrameHeader::maximum_payload)})
+            {
+                const BytesBuf payload(size, 0xa5);
+                FlowFrame frame{7, 202, false, LnkFrType::Data, payload, {}};
+                const auto status = co_await asio::co_spawn(submit_io, submit(std::move(frame)), asio::use_awaitable);
+                check_channel(status == FlowSendStatus::Queued, "cross-executor frame not queued");
+                f = co_await b->receive_flow(7, 202);
+                check_channel(f.payload == payload, "cross-executor payload changed");
+                BytesBuf borrowed = payload;
+                check_channel(co_await asio::co_spawn(submit_io, submit_data(7, 202, false, borrowed),
+                                                      asio::use_awaitable) == FlowSendStatus::Queued,
+                              "borrowed cross-executor frame not queued");
+                std::ranges::fill(borrowed, 0x5a); // Reuse immediately after submission completes.
+                f = co_await b->receive_flow(7, 202);
+                check_channel(f.payload == payload, "queued frame retained the caller's borrowed buffer");
+            }
+            FlowFrame stale{8, 202, false, LnkFrType::Data};
+            check_channel(co_await asio::co_spawn(submit_io, submit(std::move(stale)), asio::use_awaitable) ==
+                              FlowSendStatus::Closed,
+                          "cross-executor stale epoch accepted");
             a->close_flow(202);
             b->close_flow(202);
             b->prepare_flow(params(202, 10000));
@@ -136,6 +209,8 @@ int main()
                           "FIN rejected");
             f = co_await b->receive_flow(7, 203);
             check_channel(f.kind == LnkFrType::Fin, "FIN lost");
+            check_channel(co_await a->async_send_flow_data(7, 203, false, {}) == FlowSendStatus::Invalid,
+                          "borrowed DATA accepted after FIN");
             auto reset_receiver = asio::co_spawn(io, b->receive_flow(7, 203), asio::use_future);
             co_await asio::post(asio::use_awaitable); // Start the receiver before RESET closes the flow.
             check_channel(a->send_flow({7, 203, false, LnkFrType::Reset, {}, "reset after FIN"}) == FlowSendStatus::Queued,
@@ -256,6 +331,7 @@ int main()
         auto observed_a = asio::co_spawn(io, observe(a), asio::use_future);
         auto observed_b = asio::co_spawn(io, observe(b), asio::use_future);
         std::thread thread([&] { io.run(); });
+        std::thread submit_thread([&] { submit_io.run(); });
         std::exception_ptr failure;
         try
         {
@@ -272,6 +348,8 @@ int main()
         asio::co_spawn(io, stop(), asio::use_future).get();
         guard.reset();
         thread.join();
+        submit_guard.reset();
+        submit_thread.join();
         observed_a.get();
         observed_b.get();
         bool stopped = false;

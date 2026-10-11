@@ -29,16 +29,6 @@ RegistryMgr::RegistryMgr(std::size_t max_sessions, std::size_t max_services, std
 
 bool RegistryMgr::full() noexcept
 {
-    for (auto entry = sessions_.begin(); entry != sessions_.end();)
-    {
-        if (!entry->second.expired())
-        {
-            ++entry;
-            continue;
-        }
-        services_.erase_secondary(entry->first);
-        entry = sessions_.erase(entry);
-    }
     return stopped_ || sessions_.size() >= max_sessions_;
 }
 
@@ -64,25 +54,16 @@ void RegistryMgr::add(SessionId id, const ControlSessionPtr &session)
         throw std::invalid_argument("Control session ID and session must be valid");
     }
 
-    if (contains(id))
+    if (!sessions_.emplace(id, session).second)
     {
         throw std::logic_error("Control session ID is already registered");
     }
-    sessions_.emplace(id, session);
 }
 
 void RegistryMgr::remove(SessionId id) noexcept
 {
-    for (auto entry = sessions_.begin(); entry != sessions_.end();)
-    {
-        if (entry->first != id && !entry->second.expired())
-        {
-            ++entry;
-            continue;
-        }
-        services_.erase_secondary(entry->first);
-        entry = sessions_.erase(entry);
-    }
+    services_.erase_secondary(id);
+    sessions_.erase(id);
 }
 
 ControlSessionPtr RegistryMgr::find_session(SessionId id) const
@@ -91,10 +72,8 @@ ControlSessionPtr RegistryMgr::find_session(SessionId id) const
     return entry == sessions_.end() ? ControlSessionPtr{} : entry->second.lock();
 }
 
-RegistryMgr::Result RegistryMgr::register_service(SessionId id, const std::string &service, RelayProtocol protocol,
-                                                  SRVTrafficPtr &traffic)
+RegistryMgr::Result RegistryMgr::register_service(SessionId id, const std::string &service, RelayProtocol protocol)
 {
-    traffic.reset();
     const auto session = sessions_.find(id);
     if (stopped_ || session == sessions_.end())
     {
@@ -106,7 +85,6 @@ RegistryMgr::Result RegistryMgr::register_service(SessionId id, const std::strin
         const auto owner = services_.secondary_key(service);
         if (owner && *owner == id && existing->protocol == protocol)
         {
-            traffic = existing->traffic;
             return Result::Registered;
         }
         return Result::NameConflict;
@@ -121,12 +99,7 @@ RegistryMgr::Result RegistryMgr::register_service(SessionId id, const std::strin
         return Result::SessionLimitReached;
     }
 
-    traffic = std::make_shared<ServiceTraffic>();
-    if (!services_.insert(service, id, ServiceEntry{protocol, traffic}).second)
-    {
-        traffic.reset();
-        return Result::NameConflict;
-    }
+    services_.insert(service, id, ServiceEntry{protocol, std::make_shared<ServiceTraffic>()});
     return Result::Registered;
 }
 
@@ -157,10 +130,6 @@ njson RegistryMgr::traffic_report()
     for (const auto &name : service_names())
     {
         const auto service = services_.find_primary(name);
-        const auto owner = services_.secondary_key(name);
-        const auto session = owner ? sessions_.find(*owner) : sessions_.end();
-        if (!service || session == sessions_.end() || session->second.expired())
-            continue;
         report.push_back(njson{{"service", name},
                                {"protocol", relay_protocol_name(service->protocol)},
                                {"rx_bytes", service->traffic->rx.total()},
@@ -177,10 +146,7 @@ std::vector<std::string> RegistryMgr::service_names()
     std::vector<std::string> names;
     names.reserve(services_.size());
     services_.for_each([&](const std::string &name, ServiceEntry &) {
-        const auto owner = services_.secondary_key(name);
-        const auto session = owner ? sessions_.find(*owner) : sessions_.end();
-        if (session != sessions_.end() && !session->second.expired())
-            names.push_back(name);
+        names.push_back(name);
     });
     std::ranges::sort(names);
     return names;
@@ -198,9 +164,7 @@ void RegistryMgr::stop()
     {
         if (auto session = session_entry.lock())
         {
-            asio::co_spawn(
-                session->executor(), [session]() -> asio::awaitable<void> { co_await session->async_disconnect(); },
-                asio::detached);
+            session->disconnect();
         }
     }
     services_.clear();

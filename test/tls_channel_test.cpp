@@ -207,8 +207,12 @@ void test_success_and_start_contract(const DataFiles &files)
     auto repeated_start = asio::co_spawn(io, client->start("localhost"), asio::use_future);
     require(failed_with_logic_error(repeated_start), "A second start() call did not throw std::logic_error");
 
-    disconnect_pair(io, client, server);
+    auto server_closed = asio::co_spawn(io, server->async_wait_closed(), asio::use_future);
+    client->disconnect();
+    client->disconnect();
+    server->disconnect();
     closed.get();
+    server_closed.get();
 }
 
 void test_missing_client_certificate(const DataFiles &files)
@@ -267,7 +271,8 @@ void test_disconnect_during_handshake(const DataFiles &files)
     auto client =
         std::make_shared<TLSChannel>(std::move(sockets.client), client_context, TLSChannelRole::C, channel_config());
     auto start_result = asio::co_spawn(io, client->start("localhost"), asio::use_future);
-    auto disconnect_result = asio::co_spawn(io, client->async_disconnect(), asio::use_future);
+    auto disconnect_result = asio::co_spawn(io, client->async_wait_closed(), asio::use_future);
+    asio::post(io, [client] { client->disconnect(); });
     IoRunner runner(io);
 
     require(failed(start_result), "Disconnecting during the TLS handshake did not cancel start()");

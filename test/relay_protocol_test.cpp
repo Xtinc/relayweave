@@ -422,6 +422,25 @@ void test_protocol_and_udp_limit()
     traffic.add(1);
     require(traffic.total() == std::numeric_limits<std::uint64_t>::max(), "Traffic total did not saturate");
 }
+
+void test_stream_limit_accounting()
+{
+    TokenBucket burst(1, 10);
+    require(burst.try_consume(6), "Initial stream burst was rejected");
+    const auto now = TokenBucket::Clock::now();
+    require(burst.reserve(4, now) == now, "Stream fast path did not leave the remaining burst available");
+
+    // Keep refill time in the future so accounting assertions need no sleeps.
+    TokenBucket waiting(1, 10);
+    const auto future = now + std::chrono::hours(1);
+    require(waiting.reserve(6, future) == future, "Initial stream reservation unexpectedly waited");
+    require(!waiting.try_consume(5), "Insufficient stream tokens were accepted");
+    require(waiting.reserve(5, future) == future + std::chrono::seconds(1),
+            "Failed stream fast path consumed tokens or charged the reservation twice");
+    require(!waiting.try_consume(1), "Stream fast path bypassed an outstanding reservation");
+    require(waiting.reserve(11, future) == future + std::chrono::seconds(12),
+            "Stream reservation lost outstanding debt or mishandled a write larger than the burst");
+}
 } // namespace
 
 int main()
@@ -437,6 +456,7 @@ int main()
         test_message_fragmentation();
         test_udp_session_header();
         test_protocol_and_udp_limit();
+        test_stream_limit_accounting();
         std::cout << "[PASS] relay framing, UDP session header, and validation\n";
         return 0;
     }

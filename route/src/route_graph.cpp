@@ -47,32 +47,8 @@ RouteGraph::RouteGraph(std::span<const Link> links)
     }
 }
 
-std::optional<RouteGraph::Path> RouteGraph::shortest_path(std::string_view source, std::string_view destination,
-                                                         std::size_t max_nodes) const
-{
-    if (source.empty() || destination.empty())
-    {
-        throw std::invalid_argument("Route endpoints must not be empty");
-    }
-    if (max_nodes == 0)
-    {
-        throw std::invalid_argument("Route node limit must be positive");
-    }
-
-    const std::vector<Entry> entries{{std::string(source), 0.0}};
-    const auto paths = search(entries, max_nodes, false);
-    const auto found = paths.find(std::string(destination));
-    return found == paths.end() ? std::nullopt : std::optional(found->second);
-}
-
 std::map<std::string, RouteGraph::Path> RouteGraph::shortest_paths(
     std::span<const Entry> entries, std::size_t max_nodes) const
-{
-    return search(entries, max_nodes, true);
-}
-
-std::map<std::string, RouteGraph::Path> RouteGraph::search(
-    std::span<const Entry> entries, std::size_t max_nodes, bool charge_first_node) const
 {
     if (max_nodes == 0)
     {
@@ -117,10 +93,7 @@ std::map<std::string, RouteGraph::Path> RouteGraph::search(
             for (const auto &edge : outgoing->second)
             {
                 Path candidate{path.nodes, path.cost + edge.cost};
-                if (charge_first_node || node_count > 1)
-                {
-                    candidate.cost += relay_penalty;
-                }
+                candidate.cost += relay_penalty;
                 if (!std::isfinite(candidate.cost))
                 {
                     continue;

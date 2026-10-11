@@ -35,6 +35,11 @@ target_link_libraries(test_lnk_channel_flows PRIVATE relayweave_protocol)
 add_test(NAME lnk_channel_flows COMMAND test_lnk_channel_flows)
 set_tests_properties(lnk_channel_flows PROPERTIES TIMEOUT 45 LABELS "protocol;unit")
 
+add_executable(test_lnk_flow_receive lnk_flow_receive_test.cpp)
+target_link_libraries(test_lnk_flow_receive PRIVATE relayweave_protocol)
+add_test(NAME lnk_flow_receive COMMAND test_lnk_flow_receive)
+set_tests_properties(lnk_flow_receive PROPERTIES TIMEOUT 10 LABELS "protocol;unit")
+
 add_subdirectory(route)
 
 add_executable(test_agent_routing agent_routing_test.cpp)
@@ -97,6 +102,16 @@ add_executable(test_agent_lifecycle agent_lifecycle_test.cpp)
 target_link_libraries(test_agent_lifecycle PRIVATE relayweave_agent_lib)
 add_test(NAME agent_lifecycle COMMAND test_agent_lifecycle)
 set_tests_properties(agent_lifecycle PROPERTIES TIMEOUT 10)
+
+add_executable(test_agent_session agent_session_test.cpp)
+target_link_libraries(test_agent_session PRIVATE relayweave_agent_lib)
+add_test(NAME agent_session COMMAND test_agent_session)
+set_tests_properties(agent_session PROPERTIES TIMEOUT 10)
+
+add_executable(test_forwarder forwarder_test.cpp)
+target_link_libraries(test_forwarder PRIVATE relayweave_agent_lib)
+add_test(NAME forwarder COMMAND test_forwarder)
+set_tests_properties(forwarder PROPERTIES TIMEOUT 10)
 
 add_executable(test_agent_reconnect agent_reconnect_test.cpp)
 target_link_libraries(test_agent_reconnect PRIVATE relayweave_agent_lib relayweave_node_lib)

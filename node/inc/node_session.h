@@ -1,5 +1,5 @@
-#ifndef RELAYWEAVE_RELAY_SESSION_H
-#define RELAYWEAVE_RELAY_SESSION_H
+#ifndef RELAYWEAVE_NODE_SESSION_H
+#define RELAYWEAVE_NODE_SESSION_H
 
 #include "control_router_single.h"
 #include "control_router_multi.h"
@@ -8,12 +8,12 @@
 #include <variant>
 
 // One Node business instance; control state stays on control_io, data stays with its manager.
-class RelaySession
+class NodeSession
 {
   public:
-    RelaySession(RelayNode &node, const ControlSessionPtr &session, njson params, bool ingress, SRVTrafficPtr traffic = {});
-    RelaySession(RelayNode &node, const ControlSessionPtr &consumer, const ControlSessionPtr &producer,
-                 njson params, SRVTrafficPtr traffic);
+    NodeSession(RelayNode &node, const ControlSessionPtr &session, njson params, bool ingress, SRVTrafficPtr traffic = {});
+    NodeSession(RelayNode &node, const ControlSessionPtr &consumer, const ControlSessionPtr &producer,
+                njson params, SRVTrafficPtr traffic);
     asio::awaitable<void> run();
     void cancel(std::string stage, std::string reason);
     bool belongs_to(const ControlSessionPtr &session) const;
@@ -25,7 +25,7 @@ class RelaySession
     friend class ControlRouterMulti;
     // Called on control_io; data operations cross to the selected manager's executor.
     asio::awaitable<void> install(int role = RelayAttach::Consumer);
-    asio::awaitable<bool> wait_attach();
+    asio::awaitable<bool> wait_attach(std::chrono::steady_clock::time_point deadline);
     asio::awaitable<void> bind(std::string accessor, std::uint64_t epoch = 0, std::uint64_t flow_id = 0);
     asio::awaitable<void> activate();
     asio::awaitable<void> bridge();

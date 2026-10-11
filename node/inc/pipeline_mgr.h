@@ -12,7 +12,6 @@ struct TcpTransport
 
     explicit TcpTransport(asio::ssl::context &) noexcept;
 
-    static constexpr RelayProtocol protocol = RelayProtocol::Tcp;
     static constexpr std::string_view name = "TCP";
 
     asio::awaitable<Stream> prepare(Stream socket, std::chrono::steady_clock::time_point deadline) const;
@@ -26,7 +25,6 @@ struct TlsTransport
 
     explicit TlsTransport(asio::ssl::context &context) noexcept;
 
-    static constexpr RelayProtocol protocol = RelayProtocol::Tls;
     static constexpr std::string_view name = "TLS";
 
     asio::awaitable<Stream> prepare(asio::ip::tcp::socket socket,
@@ -44,12 +42,14 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     using tcp = asio::ip::tcp;
     using Stream = typename Transport::Stream;
 
-    struct PathEndpoint : RelayEndpoint
+    // Forwarding between an attached Agent and a NodeFlow.
+    struct RemotePair : RelayEndpoint
     {
         using RelayEndpoint::RelayEndpoint;
         std::optional<Stream> stream;
     };
 
+    // Single-node forwarding between two attached Agents.
     struct LocalPair
     {
         explicit LocalPair(asio::any_io_executor executor) : attached(executor)
@@ -76,29 +76,29 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
 
     void start();
     // These entry points require the owning transfer executor.
-    njson install_endpoint(int role);
-    asio::awaitable<bool> wait_endpoint(std::uint64_t uuid);
-    void bind_endpoint(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch, std::uint64_t flow_id,
+    njson install_remote_pair(int role);
+    asio::awaitable<bool> wait_remote_pair(std::uint64_t uuid);
+    void bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch, std::uint64_t flow_id,
                        SRVTrafficPtr traffic, std::string accessor);
-    void activate_endpoint(std::uint64_t uuid);
-    asio::awaitable<void> run_endpoint(std::uint64_t uuid);
-    void close_endpoint(std::uint64_t uuid);
-    njson install_pair();
-    asio::awaitable<bool> wait_pair(std::uint64_t uuid);
-    void bind_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor);
-    void activate_pair(std::uint64_t uuid);
-    asio::awaitable<void> run_pair(std::uint64_t uuid);
-    void close_pair(std::uint64_t uuid);
+    void activate_remote_pair(std::uint64_t uuid);
+    asio::awaitable<void> run_remote_pair(std::uint64_t uuid);
+    void close_remote_pair(std::uint64_t uuid);
+    njson install_local_pair();
+    asio::awaitable<bool> wait_local_pair(std::uint64_t uuid);
+    void bind_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor);
+    void activate_local_pair(std::uint64_t uuid);
+    asio::awaitable<void> run_local_pair(std::uint64_t uuid);
+    void close_local_pair(std::uint64_t uuid);
     void stop();
     void wait_for_pending();
 
   private:
     asio::awaitable<void> accept_loop();
     asio::awaitable<void> run_transfer_session(tcp::socket socket);
-    bool attach_endpoint(int role, std::uint64_t uuid, std::uint64_t ticket, Stream &stream);
+    bool attach_remote_pair(int role, std::uint64_t uuid, std::uint64_t ticket, Stream &stream);
     void attach(int role, std::uint64_t uuid, std::uint64_t ticket, Stream stream);
-    asio::awaitable<void> read_endpoint(std::shared_ptr<PathEndpoint> endpoint);
-    asio::awaitable<void> write_endpoint(std::shared_ptr<PathEndpoint> endpoint);
+    asio::awaitable<void> read_remote_pair(std::shared_ptr<RemotePair> endpoint);
+    asio::awaitable<void> write_remote_pair(std::shared_ptr<RemotePair> endpoint);
 
     asio::any_io_executor executor_;
     Transport transport_;
@@ -110,8 +110,9 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     std::chrono::steady_clock::duration setup_timeout_;
     TrafficLimitConfig config_;
     tcp::acceptor acceptor_;
+    // Close erases resources before notifying tasks that still hold them.
     std::unordered_map<std::uint64_t, std::shared_ptr<LocalPair>> local_pairs_;
-    std::unordered_map<std::uint64_t, std::shared_ptr<PathEndpoint>> path_endpoints_;
+    std::unordered_map<std::uint64_t, std::shared_ptr<RemotePair>> remote_pairs_;
     std::atomic_size_t pending_sockets_{0};
     bool started_ = false;
     bool stopped_ = false;

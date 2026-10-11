@@ -19,19 +19,6 @@ struct LinkResult
     }
 };
 
-struct LinkStatus
-{
-    LinkResult result;
-    std::string llink;
-    std::string rlink;
-    bool lready = false;
-    bool rready = false;
-    bool complete() const noexcept
-    {
-        return !llink.empty() && !rlink.empty();
-    }
-};
-
 struct FlowResult
 {
     std::uint64_t epoch = 0;
@@ -58,10 +45,8 @@ class NodeLinkMgr
     void handle(CtrlMessage message);
     void members_changed();
     void control_failed(std::string reason);
-    // Coroutine entry points require control_io; RelayNode binds external callers.
+    // Coroutine entry points require control_io.
     asio::awaitable<LinkResult> ensure_link(std::string left, std::string right, RelayProtocol transport);
-    asio::awaitable<LinkStatus> link_status(std::uint64_t id);
-    asio::awaitable<void> close_link(std::uint64_t id);
     asio::awaitable<FlowResult> open_flow(std::vector<std::string> path, RelayProtocol transport);
     asio::awaitable<void> close_flow(std::uint64_t epoch, std::uint64_t id);
     bool egress_ready(std::uint64_t epoch, std::uint64_t id, const std::string &ingress,
@@ -75,14 +60,6 @@ class NodeLinkMgr
 
   private:
     using Clock = std::chrono::steady_clock;
-    struct StatusQuery
-    {
-        StatusQuery(asio::any_io_executor executor, std::uint64_t link_id);
-        std::uint64_t id;
-        LinkStatus result;
-        asio::steady_timer timeout;
-        AsyncEvent completed_event;
-    };
     struct LinkRequest
     {
         LinkRequest(asio::any_io_executor executor, njson params);
@@ -93,11 +70,9 @@ class NodeLinkMgr
         // Bit 0: left, bit 1: right.
         std::uint8_t prepared = 0;
         std::uint8_t ready = 0;
-        std::shared_ptr<StatusQuery> status;
         bool completed = false;
     };
     void send_both(const LinkRequest &request, CtrlCommand command);
-    void finish_status(LinkRequest &request, std::string reason = {});
     void finish_link(std::shared_ptr<LinkRequest> request, std::string stage, std::string reason);
     using LinkKey = std::tuple<std::string, std::string, RelayProtocol>;
     static LinkKey link_key(const njson &params);

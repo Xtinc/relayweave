@@ -6,6 +6,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from history_store import HistoryStore
 from ip_location import (
@@ -40,7 +41,11 @@ class IpLocationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = HistoryStore(Path(directory) / "history.sqlite3")
             downloads: list[str] = []
-            index = UnLocodeIndex(store, lambda country: downloads.append(country) or csv_data)
+            download = patch("ip_location.download_unlocode_country",
+                             side_effect=lambda country: downloads.append(country) or csv_data)
+            download.start()
+            self.addCleanup(download.stop)
+            index = UnLocodeIndex(store)
             geo = GeoLocation("CN", "Huangshi", "Hubei", "HB")
             try:
                 self.assertEqual(index.location_code(geo), "HIS")
@@ -54,10 +59,11 @@ class IpLocationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = HistoryStore(Path(directory) / "history.sqlite3")
             calls: list[str] = []
-            cache = IpLocationCache(
-                store,
-                lambda ip: calls.append(ip) or GeoLocation("US", "Nowhere", "", ""),
-            )
+            lookup = patch("ip_location.query_ip_location",
+                           side_effect=lambda ip: calls.append(ip) or GeoLocation("US", "Nowhere", "", ""))
+            lookup.start()
+            self.addCleanup(lookup.stop)
+            cache = IpLocationCache(store)
             try:
                 self.assertEqual(cache.location_for_endpoint("192.168.1.2:5000"), LOCAL_LOCATION)
                 self.assertEqual(calls, [])
@@ -73,11 +79,14 @@ class IpLocationTest(unittest.TestCase):
             lookup = lambda ip: calls.append(ip) or GeoLocation(
                 "US", "Mountain View", "California", "CA"
             )
-            unlocode = UnLocodeIndex(
-                store,
-                lambda country: ",US,MTV,Mountain View,Mountain View,CA,---4----,AS,2107,,,\n",
-            )
-            cache = IpLocationCache(store, lookup, unlocode)
+            query = patch("ip_location.query_ip_location", side_effect=lookup)
+            download = patch("ip_location.download_unlocode_country",
+                             return_value=",US,MTV,Mountain View,Mountain View,CA,---4----,AS,2107,,,\n")
+            query.start()
+            download.start()
+            self.addCleanup(query.stop)
+            self.addCleanup(download.stop)
+            cache = IpLocationCache(store)
             try:
                 self.assertEqual(cache.location_for_endpoint("8.8.8.8:53"), PENDING_LOCATION)
                 deadline = time.monotonic() + 1.0
@@ -97,11 +106,12 @@ class IpLocationTest(unittest.TestCase):
 
             reopened_store = HistoryStore(database)
             reopened_calls: list[str] = []
-            reopened_cache = IpLocationCache(
-                reopened_store,
-                lambda ip: reopened_calls.append(ip)
-                or GeoLocation("US", "Unexpected", "", ""),
-            )
+            query.stop()
+            unexpected = patch("ip_location.query_ip_location",
+                               side_effect=lambda ip: reopened_calls.append(ip) or GeoLocation("US", "Unexpected", "", ""))
+            unexpected.start()
+            self.addCleanup(unexpected.stop)
+            reopened_cache = IpLocationCache(reopened_store)
             try:
                 self.assertEqual(
                     reopened_cache.location_for_endpoint("8.8.8.8:53"),

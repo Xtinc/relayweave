@@ -115,7 +115,7 @@ asio::awaitable<void> TLSChannel::start(std::string verify_host, std::optional<s
                           self->peer().data(), SSL_get_version(self->stream_.native_handle()),
                           SSL_get_cipher_name(self->stream_.native_handle()));
         self->state_ = State::Connected;
-        asio::co_spawn(self->executor(), [self]() -> asio::awaitable<void> { co_await self->run(); }, asio::detached);
+        asio::co_spawn(self->executor(), [self] { return self->run(); }, asio::detached);
     }
     catch (...)
     {
@@ -125,25 +125,24 @@ asio::awaitable<void> TLSChannel::start(std::string verify_host, std::optional<s
     }
 }
 
+void TLSChannel::disconnect()
+{
+    asio::dispatch(executor(), [self = shared_from_this()] {
+        if (self->state_ == State::Created || self->state_ == State::Handshaking)
+        {
+            self->finalize_close();
+        }
+        else
+        {
+            self->request_close();
+        }
+    });
+}
+
 asio::awaitable<void> TLSChannel::async_disconnect()
 {
     auto self = shared_from_this();
-    co_await asio::dispatch(self->executor(), asio::use_awaitable);
-
-    switch (self->state_)
-    {
-    case State::Created:
-    case State::Handshaking:
-        self->finalize_close();
-        co_return;
-    case State::Connected:
-        self->request_close();
-        break;
-    case State::Closing:
-        break;
-    case State::Closed:
-        co_return;
-    }
+    self->disconnect();
 
     co_await self->async_wait_closed();
 }
@@ -214,19 +213,23 @@ asio::awaitable<void> TLSChannel::run()
     {
         time_point deadline = std::chrono::steady_clock::now() + config_.heartbeat_timeout;
         {
-            auto [completion_order, read_exception, write_exception, keepalive_exception, close_exception] =
+            auto [completion_order, read_exception, write_exception, keepalive_exception, close_error] =
                 co_await asio::experimental::make_parallel_group(
                     asio::co_spawn(executor(), rloop(deadline), asio::deferred),
                     asio::co_spawn(executor(), wloop(), asio::deferred),
                     asio::co_spawn(executor(), keepalive(deadline), asio::deferred),
-                    asio::co_spawn(executor(), wait_close_request(), asio::deferred))
+                    close_channel_.async_receive(asio::deferred))
                     .async_wait(asio::experimental::wait_for_one(), asio::use_awaitable);
 
-            const std::array<std::exception_ptr, 4> exceptions{read_exception, write_exception, keepalive_exception,
-                                                               close_exception};
-            if (exceptions[completion_order[0]])
+            const std::array<std::exception_ptr, 3> exceptions{read_exception, write_exception, keepalive_exception};
+            const auto first = completion_order[0];
+            if (first < exceptions.size() && exceptions[first])
             {
-                std::rethrow_exception(exceptions[completion_order[0]]);
+                std::rethrow_exception(exceptions[first]);
+            }
+            if (first == 3 && close_error)
+            {
+                throw asio::system_error(close_error);
             }
         }
 
@@ -343,11 +346,6 @@ asio::awaitable<void> TLSChannel::keepalive(time_point &deadline)
             next_ping = now + config_.heartbeat_interval;
         }
     }
-}
-
-asio::awaitable<void> TLSChannel::wait_close_request()
-{
-    co_await close_channel_.async_receive(asio::use_awaitable);
 }
 
 void TLSChannel::configure_tls(const std::string &verify_host, const std::optional<std::string> &sni_name)

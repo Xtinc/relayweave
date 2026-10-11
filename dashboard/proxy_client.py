@@ -143,13 +143,11 @@ class ProxyControlClient:
         ca_file: str,
         cert_file: str,
         key_file: str,
+        history_store: HistoryStore,
         server_name: str | None = None,
         poll_interval: float = 2.0,
         connect_timeout: float = 5.0,
         handshake_timeout: float = 5.0,
-        history_db: str = "dashboard.sqlite3",
-        max_history_bytes: int = 50 * 1024 * 1024,
-        history_store: HistoryStore | None = None,
     ):
         self.host = host
         self.port = port
@@ -166,8 +164,7 @@ class ProxyControlClient:
         self._lock = threading.Lock()
         self._snapshot = Snapshot()
         self._nodes: dict[str, NodeSnapshot] = {}
-        self._owns_history_store = history_store is None
-        self._history_store = history_store or HistoryStore(history_db, max_bytes=max_history_bytes)
+        self._history_store = history_store
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._socket: ssl.SSLSocket | None = None
@@ -195,8 +192,6 @@ class ProxyControlClient:
         self._close_socket()
         if self._thread:
             self._thread.join()
-        if self._owns_history_store:
-            self._history_store.close()
 
     def snapshot(self, queue_since: float | None, traffic_since: float | None) -> Snapshot:
         """Return a copy of the current cluster snapshot for the UI."""

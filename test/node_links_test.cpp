@@ -1,5 +1,5 @@
 #include "frame_io.h"
-#include "node_test_config.h"
+#include "node_fixture.h"
 #include <future>
 #include <iostream>
 using namespace std::chrono_literals;
@@ -82,7 +82,7 @@ void integration()
             LinkResult warm;
             for (int tries = 0; tries < 100; ++tries)
             {
-                warm = co_await nodes[0]->async_ensure_link("a", "b", RelayProtocol::Tcp);
+                warm = co_await test_node::ensure_link(nodes[0], "a", "b", RelayProtocol::Tcp);
                 if (warm)
                 {
                     break;
@@ -91,25 +91,19 @@ void integration()
             }
             require(bool(warm), "TCP slave pair did not become Ready");
             live_id = warm.id;
-            auto slave_pair_status = co_await nodes[0]->async_link_status(warm.id);
-            require(bool(slave_pair_status.result) && slave_pair_status.llink == "a" && slave_pair_status.rlink == "b" &&
-                        slave_pair_status.lready && slave_pair_status.rready,
-                    "slave status replies did not reach master");
-            auto denied_status = co_await nodes[1]->async_link_status(warm.id);
-            require(!denied_status.result, "slave was allowed to query node link status");
             // Business transfer executors may be busy; node data has its own domain.
             asio::post(transfer, [] { std::this_thread::sleep_for(1s); });
             asio::post(datagram, [] { std::this_thread::sleep_for(1s); });
-            auto reversed = co_await nodes[0]->async_ensure_link("b", "a", RelayProtocol::Tcp);
+            auto reversed = co_await test_node::ensure_link(nodes[0], "b", "a", RelayProtocol::Tcp);
             require(reversed.id == warm.id, "Ready normalized node pair was not reused");
-            auto denied = co_await nodes[1]->async_ensure_link("a", "b", RelayProtocol::Tcp);
+            auto denied = co_await test_node::ensure_link(nodes[1], "a", "b", RelayProtocol::Tcp);
             require(!denied && denied.stage == "ensure", "slave was allowed to coordinate");
             for (auto transport : {RelayProtocol::Tcp, RelayProtocol::Udp})
             {
                 // Concurrent calls must share a single attempt and NodeLink ID.
                 asio::experimental::channel<void(asio::error_code, LinkResult)> results(control, 2);
                 auto call = [&]() -> asio::awaitable<void> {
-                    auto link = co_await nodes[0]->async_ensure_link("master", "a", transport);
+                    auto link = co_await test_node::ensure_link(nodes[0], "master", "a", transport);
                     results.try_send(asio::error_code{}, std::move(link));
                 };
                 asio::co_spawn(control, call(), asio::detached);
@@ -117,55 +111,18 @@ void integration()
                 auto first = co_await results.async_receive(asio::use_awaitable);
                 auto second = co_await results.async_receive(asio::use_awaitable);
                 require(bool(first) && first.id == second.id, "concurrent ensure did not coalesce");
-                asio::experimental::channel<void(asio::error_code, LinkStatus)> statuses(control, 2);
-                auto query = [&]() -> asio::awaitable<void> {
-                    auto status = co_await nodes[0]->async_link_status(first.id);
-                    statuses.try_send(asio::error_code{}, std::move(status));
-                };
-                asio::co_spawn(control, query(), asio::detached);
-                asio::co_spawn(control, query(), asio::detached);
-                for (int i = 0; i < 2; ++i)
-                {
-                    auto status = co_await statuses.async_receive(asio::use_awaitable);
-                    require(bool(status.result) && status.result.id == first.id && status.llink == "a" &&
-                                status.rlink == "master" && status.lready && status.rready,
-                            "concurrent TCP/UDP status queries failed for master endpoint");
-                }
-                // Cancelling one caller must leave the shared status operation alive for the other.
-                asio::cancellation_signal cancellation;
-                const auto completed_status = [&](std::exception_ptr error, LinkStatus status) {
-                    if (error)
-                    {
-                        status.result = {first.id, "status", exception_description(error)};
-                    }
-                    statuses.try_send(asio::error_code{}, std::move(status));
-                };
-                asio::co_spawn(control, nodes[0]->async_link_status(first.id),
-                               asio::bind_cancellation_slot(cancellation.slot(), completed_status));
-                asio::co_spawn(control, nodes[0]->async_link_status(first.id), completed_status);
-                co_await asio::post(control, asio::use_awaitable);
-                cancellation.emit(asio::cancellation_type::all);
-                auto cancelled_status = co_await statuses.async_receive(asio::use_awaitable);
-                auto surviving_status = co_await statuses.async_receive(asio::use_awaitable);
-                if (cancelled_status.result.reason.empty())
-                {
-                    std::swap(cancelled_status, surviving_status);
-                }
-                require(!cancelled_status.result.reason.empty() && bool(surviving_status.result) &&
-                            surviving_status.complete() && surviving_status.lready && surviving_status.rready,
-                        "status cancellation affected another caller");
                 std::array<FlowResult, 2> flows;
                 for (auto &flow : flows)
                 {
-                    flow = co_await nodes[0]->async_open_flow({"master", "a"}, transport);
+                    flow = co_await test_node::open_flow(nodes[0], {"master", "a"}, transport);
                     require(bool(flow), "business flow did not become Ready");
                 }
                 for (std::uint64_t i = 1; i <= 12; ++i)
                 {
                     const auto &flow = flows[i % flows.size()];
-                    auto forward = co_await nodes[0]->async_send_flow(
+                    auto forward = co_await test_node::send_flow(nodes[0],
                         {flow.epoch, flow.id, false, LnkFrType::Data, {0, 255, std::uint8_t(i)}, {}});
-                    auto reverse = co_await nodes[1]->async_send_flow(
+                    auto reverse = co_await test_node::send_flow(nodes[1],
                         {flow.epoch, flow.id, true, LnkFrType::Data, {std::uint8_t(i), 0}, {}});
                     require(forward == FlowSendStatus::Queued && reverse == FlowSendStatus::Queued,
                             "business flow send failed");
@@ -173,8 +130,8 @@ void integration()
                 for (std::uint64_t i = 1; i <= 12; ++i)
                 {
                     const auto &flow = flows[i % flows.size()];
-                    auto from_master = co_await nodes[1]->async_receive_flow(flow.epoch, flow.id);
-                    auto from_slave = co_await nodes[0]->async_receive_flow(flow.epoch, flow.id);
+                    auto from_master = co_await test_node::receive_flow(nodes[1], flow.epoch, flow.id);
+                    auto from_slave = co_await test_node::receive_flow(nodes[0], flow.epoch, flow.id);
                     require(from_master.flow_id == flow.id && !from_master.reverse &&
                                 from_master.payload == BytesBuf({0, 255, std::uint8_t(i)}),
                             "business flow data mixed on shared channel");
@@ -184,21 +141,15 @@ void integration()
                 }
                 for (const auto &flow : flows)
                 {
-                    co_await nodes[0]->async_close_flow(flow.epoch, flow.id);
+                    co_await test_node::close_flow(nodes[0], flow.epoch, flow.id);
                 }
-                asio::co_spawn(control, query(), asio::detached);
-                co_await nodes[0]->async_close_link(first.id);
-                auto closing_status = co_await statuses.async_receive(asio::use_awaitable);
-                require(!closing_status.result, "close left an in-flight status unresolved");
-                auto closed_status = co_await nodes[0]->async_link_status(first.id);
-                require(!closed_status.result && closed_status.llink.empty() && closed_status.rlink.empty(),
-                        "closed link returned cached status");
-                auto fresh = co_await nodes[0]->async_ensure_link("master", "a", transport);
+                co_await test_node::close_link(nodes[0], first.id);
+                auto fresh = co_await test_node::ensure_link(nodes[0], "master", "a", transport);
                 require(bool(fresh) && fresh.id != first.id, "outer ensure failed to create fresh link after close");
             }
             // Hold links past one keepalive interval and verify they still reuse.
             co_await pause(5300ms);
-            auto alive = co_await nodes[0]->async_ensure_link("a", "b", RelayProtocol::Tcp);
+            auto alive = co_await test_node::ensure_link(nodes[0], "a", "b", RelayProtocol::Tcp);
             require(bool(alive) && alive.id == live_id, "TCP keepalive lost a healthy channel");
         };
         asio::co_spawn(control, scenario(), asio::use_future).get();
@@ -206,7 +157,7 @@ void integration()
         auto offline = [&]() -> asio::awaitable<void> {
             for (int tries = 0; tries < 100; ++tries)
             {
-                auto result = co_await nodes[0]->async_ensure_link("a", "b", RelayProtocol::Tcp);
+                auto result = co_await test_node::ensure_link(nodes[0], "a", "b", RelayProtocol::Tcp);
                 if (!result)
                 {
                     co_return;
@@ -223,7 +174,7 @@ void integration()
             LinkResult result;
             for (int tries = 0; tries < 350; ++tries)
             {
-                result = co_await nodes[0]->async_ensure_link("master", "a", RelayProtocol::Tcp);
+                result = co_await test_node::ensure_link(nodes[0], "master", "a", RelayProtocol::Tcp);
                 if (result)
                 {
                     break;
@@ -239,7 +190,7 @@ void integration()
             LinkResult mismatch;
             for (int tries = 0; tries < 100; ++tries)
             {
-                mismatch = co_await nodes[0]->async_ensure_link("master", "b", RelayProtocol::Tcp);
+                mismatch = co_await test_node::ensure_link(nodes[0], "master", "b", RelayProtocol::Tcp);
                 if (mismatch.stage == "prepare")
                 {
                     break;
@@ -247,12 +198,12 @@ void integration()
                 co_await pause(20ms);
             }
             require(!mismatch && mismatch.stage == "prepare", "different data ports were accepted");
-            auto retry = co_await nodes[0]->async_ensure_link("master", "b", RelayProtocol::Tcp);
+            auto retry = co_await test_node::ensure_link(nodes[0], "master", "b", RelayProtocol::Tcp);
             require(!retry && retry.id != mismatch.id, "failed ensure was retained instead of permitting outer retry");
         };
         asio::co_spawn(control, new_epoch(), asio::use_future).get();
         auto in_flight =
-            asio::co_spawn(control, nodes[0]->async_ensure_link("master", "a", RelayProtocol::Udp), asio::use_future);
+            asio::co_spawn(control, test_node::ensure_link(nodes[0], "master", "a", RelayProtocol::Udp), asio::use_future);
         nodes[0]->stop();
         const auto stopped_result = in_flight.get();
         require(bool(stopped_result) || stopped_result.stage == "stop" || stopped_result.stage == "ensure",
@@ -290,7 +241,7 @@ void data_failures()
     std::vector<CtrlMessage> events;
     const auto tp = tcp_port(io);
     const auto up = udp_port(io);
-    auto module = std::make_shared<LnkChannel>(io.get_executor(), "a", "127.0.0.1", tp, "127.0.0.1", up);
+    auto module = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "a", "127.0.0.1", tp, "127.0.0.1", up);
     module->start();
     module->activate();
     auto observe = [&]() -> asio::awaitable<void> {
@@ -712,7 +663,8 @@ void data_failures()
     // UDP bind failure must roll back the TCP listener opened immediately before it.
     const auto rollback_port = tcp_port(io);
     auto failed =
-        std::make_shared<LnkChannel>(io.get_executor(), "rollback", "127.0.0.1", rollback_port, "127.0.0.1", up);
+        std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "rollback", "127.0.0.1", rollback_port,
+                                     "127.0.0.1", up);
     bool rejected = false;
     try
     {
@@ -732,7 +684,8 @@ void delayed_activation()
     asio::io_context io(1);
     const auto tp = tcp_port(io);
     const auto up = udp_port(io);
-    auto module = std::make_shared<LnkChannel>(io.get_executor(), "delayed", "127.0.0.1", tp, "127.0.0.1", up);
+    auto module = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "delayed", "127.0.0.1", tp,
+                                             "127.0.0.1", up);
     module->start();
     auto stopped = asio::co_spawn(io, module->stop(), asio::use_future);
     io.run();
@@ -750,7 +703,8 @@ void concurrent_stop()
     asio::io_context io(1);
     const auto tp = tcp_port(io);
     const auto up = udp_port(io);
-    auto module = std::make_shared<LnkChannel>(io.get_executor(), "stopping", "127.0.0.1", tp, "127.0.0.1", up);
+    auto module = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "stopping", "127.0.0.1", tp,
+                                             "127.0.0.1", up);
     module->start();
     module->activate();
     module->activate();
@@ -779,7 +733,7 @@ void concurrent_stop()
 void notification_overflow()
 {
     asio::io_context io(1);
-    auto module = std::make_shared<LnkChannel>(io.get_executor(), "a", "127.0.0.1", 1, "127.0.0.1", 1);
+    auto module = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "a", "127.0.0.1", 1, "127.0.0.1", 1);
     // Every rejected prepare emits one control notification without allocating a live flow.
     for (std::uint64_t id = 1; id <= 4097; ++id)
     {

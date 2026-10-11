@@ -14,7 +14,6 @@ import time
 import unicodedata
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
 from dataclasses import dataclass
 
 from history_store import HistoryStore
@@ -126,13 +125,8 @@ def download_unlocode_country(country_code: str) -> str:
 class UnLocodeIndex:
     """Load and cache the official UNECE CSV for each country on demand."""
 
-    def __init__(
-        self,
-        store: HistoryStore,
-        download: Callable[[str], str] = download_unlocode_country,
-    ) -> None:
+    def __init__(self, store: HistoryStore) -> None:
         self._store = store
-        self._download = download
         self._countries: dict[str, dict[str, list[tuple[str, str]]]] = {}
 
     def location_code(self, geo: GeoLocation) -> str | None:
@@ -141,7 +135,7 @@ class UnLocodeIndex:
         if entries is None:
             csv_data = self._store.load_unlocode_country(country)
             if csv_data is None:
-                csv_data = self._download(country)
+                csv_data = download_unlocode_country(country)
                 self._store.save_unlocode_country(country, csv_data)
             entries = self._parse_country(country, csv_data)
             self._countries[country] = entries
@@ -184,15 +178,9 @@ class UnLocodeIndex:
 class IpLocationCache:
     """Return cached locations immediately and resolve cache misses in one worker."""
 
-    def __init__(
-        self,
-        store: HistoryStore,
-        lookup: Callable[[str], GeoLocation] = query_ip_location,
-        unlocode: UnLocodeIndex | None = None,
-    ) -> None:
+    def __init__(self, store: HistoryStore) -> None:
         self._store = store
-        self._lookup = lookup
-        self._unlocode = unlocode or UnLocodeIndex(store)
+        self._unlocode = UnLocodeIndex(store)
         self._locations = {
             ip: CachedLocation(*location)
             for ip, location in store.load_ip_locations().items()
@@ -242,7 +230,7 @@ class IpLocationCache:
             if ip is None or self._stopping.is_set():
                 return
             try:
-                geo = self._lookup(ip)
+                geo = query_ip_location(ip)
                 location = CachedLocation(
                     country_code=geo.country_code,
                     location_code=self._unlocode.location_code(geo) or "---",

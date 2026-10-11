@@ -61,18 +61,8 @@ template <class Map> void test_unique_secondary()
     auto [duplicate_secondary, secondary_inserted] = values.insert("second", 1, "two");
     require(!secondary_inserted && duplicate_secondary == first, "Duplicate unique secondary key was not rejected");
     require(values.find_secondary(1) == first, "Unique secondary lookup failed");
-    const auto first_entry = values.find_secondary_entry(1);
-    require(first_entry && *first_entry.primary == "first" && first_entry.value == first,
-            "Unique secondary entry lookup did not return its primary key");
-    const auto missing_entry = values.find_secondary_entry(99);
-    require(!missing_entry && !missing_entry.primary && !missing_entry.value,
-            "Missing secondary entry lookup returned a partial result");
-
-    const auto &const_values = std::as_const(values);
-    const auto const_entry = const_values.find_secondary_entry(1);
-    require(const_entry && *const_entry.primary == "first" && *const_entry.value == "one",
-            "Const secondary entry lookup failed");
-
+    require(!values.find_secondary(99), "Missing secondary lookup returned a value");
+    require(std::as_const(values).find_secondary(1) == first, "Const secondary lookup failed");
     auto [unindexed, unindexed_inserted] = values.insert("second", std::nullopt, "two");
     require(unindexed_inserted && unindexed && values.secondary_key("second") == nullptr,
             "Failed to insert unindexed entry");
@@ -96,7 +86,9 @@ template <class Map> void test_non_unique_secondary()
     require(values.count_secondary(7) == 2, "Incorrect non-unique secondary count");
 
     int sum = 0;
-    values.for_each_secondary(7, [&](const std::string &, int &value) { sum += value; });
+    values.for_each([&](const std::string &primary, int &value) {
+        if (*values.secondary_key(primary) == 7) sum += value;
+    });
     require(sum == 3, "Non-unique secondary traversal failed");
 
     require(values.set_secondary("third", 7), "Failed to replace secondary key");
@@ -127,10 +119,14 @@ template <SecondaryKeyMode Mode, class Left, class Right> void compare_maps(Left
                 "Differential secondary count mismatch");
         std::map<int, int> left_values;
         std::map<int, int> right_values;
-        left.for_each_secondary(secondary,
-                                [&](const int &primary, int &value) { left_values.emplace(primary, value); });
-        right.for_each_secondary(secondary,
-                                 [&](const int &primary, int &value) { right_values.emplace(primary, value); });
+        const auto collect = [secondary](auto &map, auto &result) {
+            map.for_each([&](const int &primary, int &value) {
+                const auto key = map.secondary_key(primary);
+                if (key && *key == secondary) result.emplace(primary, value);
+            });
+        };
+        collect(left, left_values);
+        collect(right, right_values);
         require(left_values == right_values, "Differential secondary traversal mismatch");
 
         if constexpr (Mode == SecondaryKeyMode::Unique)

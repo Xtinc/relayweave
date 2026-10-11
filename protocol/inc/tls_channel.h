@@ -81,6 +81,8 @@ class TLSChannel : public std::enable_shared_from_this<TLSChannel>
     ~TLSChannel();
 
     asio::awaitable<void> start(std::string verify_host, std::optional<std::string> sni_name = std::nullopt);
+    // Request closure without starting a waiter; the connection owner drains it.
+    void disconnect();
     asio::awaitable<void> async_disconnect();
     asio::awaitable<void> async_wait_closed();
     asio::awaitable<CtrlMessage> async_receive(
@@ -94,7 +96,6 @@ class TLSChannel : public std::enable_shared_from_this<TLSChannel>
     asio::awaitable<void> rloop(time_point &deadline);
     asio::awaitable<void> wloop();
     asio::awaitable<void> keepalive(time_point &deadline);
-    asio::awaitable<void> wait_close_request();
 
     void configure_tls(const std::string &verify_host, const std::optional<std::string> &sni_name);
     void enqueue_message(BytesBuf message);

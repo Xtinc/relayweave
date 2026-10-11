@@ -58,13 +58,13 @@ std::string_view link_stage(LinkState state)
 
 void LnkChannel::emit(CtrlMessage message)
 {
-    if (stopping_ || !event_error_.empty())
+    if (stopping_ || event_overflow_.load())
     {
         return;
     }
     if (!events_.try_send(asio::error_code{}, std::move(message)))
     {
-        event_error_ = "Node control event queue capacity exceeded";
+        event_overflow_.store(true);
         events_.cancel();
         events_.close();
     }
@@ -72,10 +72,11 @@ void LnkChannel::emit(CtrlMessage message)
 
 asio::awaitable<CtrlMessage> LnkChannel::receive_event()
 {
-    auto [error, message] = co_await events_.async_receive(use_nothrow_awaitable);
-    if (!event_error_.empty())
+    auto self = shared_from_this();
+    auto [error, message] = co_await self->events_.async_receive(use_nothrow_awaitable);
+    if (self->event_overflow_.load())
     {
-        throw std::runtime_error(event_error_);
+        throw std::runtime_error("Node control event queue capacity exceeded");
     }
     if (error)
     {
@@ -97,13 +98,13 @@ lnk::NodeLink::NodeLink(asio::any_io_executor executor, njson values)
     }
 }
 
-LnkChannel::LnkChannel(asio::any_io_executor executor, std::string node_id, std::string tcp_address,
-                       std::uint16_t tcp_port, std::string udp_address, std::uint16_t udp_port)
+LnkChannel::LnkChannel(asio::any_io_executor executor, asio::any_io_executor event_executor, std::string node_id,
+                       std::string tcp_address, std::uint16_t tcp_port, std::string udp_address, std::uint16_t udp_port)
     : executor_(executor), node_id_(std::move(node_id)), acceptor_(executor), udp_socket_(executor),
       tcp_address_(std::move(tcp_address)), udp_address_(std::move(udp_address)), tcp_port_(tcp_port),
       udp_port_(udp_port), payload_pool_({pool_blocks_per_chunk, datagram_receive_size}),
-      udp_writes_(executor, send_queue_capacity), events_(executor, event_queue_capacity), monitor_timer_(executor),
-      tasks_done_(executor)
+      udp_writes_(executor, send_queue_capacity), events_(event_executor, event_queue_capacity),
+      monitor_timer_(executor), tasks_done_(executor)
 {
     monitor_timer_.expires_at(Clock::time_point::max());
 }

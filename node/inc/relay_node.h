@@ -11,7 +11,7 @@
 #include <limits>
 
 class ControlRouterMulti;
-class RelaySession;
+class NodeSession;
 
 struct ControlNodeConfig
 {
@@ -65,7 +65,6 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 {
     using tcp = asio::ip::tcp;
     using SessionId = RegistryMgr::SessionId;
-    using cluster_message_channel = asio::experimental::channel<void(asio::error_code, CtrlMessage)>;
 
   public:
     RelayNode(asio::io_context &control_io, asio::io_context &transfer_tcp_io, asio::io_context &transfer_udp_io,
@@ -74,22 +73,12 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 
     void start();
     void stop();
-    void send_cluster(std::string target, CtrlMessage message);
-    void broadcast_cluster(CtrlMessage message);
-    asio::awaitable<CtrlMessage> async_receive_cluster();
-    asio::awaitable<LinkResult> async_ensure_link(std::string left, std::string right, RelayProtocol transport);
-    asio::awaitable<LinkStatus> async_link_status(std::uint64_t id);
-    asio::awaitable<void> async_close_link(std::uint64_t id);
-    asio::awaitable<FlowResult> async_open_flow(std::vector<std::string> path, RelayProtocol transport);
-    asio::awaitable<FlowSendStatus> async_send_flow(FlowFrame frame);
-    asio::awaitable<FlowFrame> async_receive_flow(std::uint64_t epoch, std::uint64_t id);
-    asio::awaitable<void> async_close_flow(std::uint64_t epoch, std::uint64_t id);
 
   private:
     friend class ClusterMgr;
     friend class ControlRouterSingle;
     friend class ControlRouterMulti;
-    friend class RelaySession;
+    friend class NodeSession;
 
     asio::awaitable<void> control_accept_loop();
     asio::awaitable<void> run_control_session(SessionId id, ControlSessionPtr session);
@@ -123,7 +112,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 
     void handle_relay(const ControlSessionPtr &session, const CtrlMessage &message);
     void handle_relay_peer(CtrlMessage message);
-    void start_relay(std::shared_ptr<RelaySession> relay);
+    void start_relay(std::shared_ptr<NodeSession> relay);
     void cancel_relays(std::string reason, const ControlSessionPtr &session = {});
     void invalidate_relays(std::string reason = {});
     asio::awaitable<void> stop_relays();
@@ -144,7 +133,6 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     asio::ssl::context &ssl_context_;
     NodeConfig config_;
     asio::ssl::context cluster_context_{asio::ssl::context::tls};
-    cluster_message_channel cluster_messages_;
     std::shared_ptr<ClusterMgr> cluster_mgr_;
     std::shared_ptr<RelayIdAllocator> relay_id_allocator_;
     std::shared_ptr<TcpPipeline> tcp_pipeline_;
@@ -155,7 +143,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     RegistryMgr registry_;
     std::chrono::steady_clock::time_point started_at_{};
     SessionId next_session_id_ = 1;
-    std::vector<std::shared_ptr<RelaySession>> relay_sessions_;
+    std::vector<std::shared_ptr<NodeSession>> relay_sessions_;
     asio::steady_timer relays_done_;
     std::once_flag stop_once_;
     std::exception_ptr stop_error_;

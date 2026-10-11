@@ -2,7 +2,6 @@
 #include "link_quality.h"
 #include "message.h"
 #include <algorithm>
-#include <cmath>
 #include <set>
 
 static std::chrono::milliseconds age(std::uint64_t value)
@@ -42,9 +41,7 @@ void AgentRouting::update_targets()
 
 void AgentRouting::begin_request(std::uint64_t request_id, Clock::time_point now)
 {
-    pending_ = Pending{};
-    pending_.request_id = request_id;
-    pending_.started = now;
+    pending_ = Pending{request_id, now};
 }
 
 bool AgentRouting::request_pending(Clock::time_point now) const noexcept
@@ -148,7 +145,7 @@ void AgentRouting::invalidate_snapshot()
 
 asio::awaitable<bool> AgentRouting::refresh_probes()
 {
-    co_return co_await probes_.refresh();
+    return probes_.refresh();
 }
 
 void AgentRouting::stop()
@@ -159,8 +156,7 @@ void AgentRouting::stop()
 
 asio::awaitable<void> AgentRouting::close()
 {
-    co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
-    stop();
+    invalidate_snapshot();
     co_await probes_.close();
 }
 
@@ -212,29 +208,18 @@ std::vector<RouteGraph::Entry> AgentRouting::measured_entries() const
     return entries;
 }
 
-AgentRouting::CandidatePaths AgentRouting::candidate_paths(
-    Clock::time_point now, std::optional<std::span<const RouteGraph::Entry>> entries) const
+AgentRouting::CandidatePaths AgentRouting::candidate_paths(Clock::time_point now) const
 {
-    std::vector<RouteGraph::Entry> measured;
-    if (!entries)
-    {
-        measured = measured_entries();
-        entries = measured;
-    }
-
-    if (entries->empty())
+    const auto entries = measured_entries();
+    if (entries.empty())
     {
         return {};
     }
 
-    // Keep the lowest access cost for each ingress, validating before merging duplicates.
+    // Keep the lowest access cost for each measured ingress.
     std::map<std::string, double> ingress_costs;
-    for (const auto &entry : *entries)
+    for (const auto &entry : entries)
     {
-        if (entry.node.empty() || !std::isfinite(entry.access_cost) || entry.access_cost < 0.0)
-        {
-            throw std::invalid_argument("Route entries require a node and finite nonnegative cost");
-        }
         auto &cost = ingress_costs.try_emplace(entry.node, entry.access_cost).first->second;
         cost = std::min(cost, entry.access_cost);
     }

@@ -124,17 +124,12 @@ void RelayNode::handle_control_cluster_message(CtrlMessage message)
         handle_topology_snapshot(std::move(message));
         break;
     default:
-        if (!cluster_messages_.try_send(asio::error_code{}, std::move(message)))
-        {
-            PROXY_ERROR_PRINT("Cluster receive rejected reason=queue full");
-        }
         break;
     }
 }
 
 void RelayNode::broadcast_client_query(SessionId id, CtrlMessage message)
 {
-    static_cast<void>(config::message_params(message));
     (*message.params)["session_id"] = id;
     cluster_mgr_->broadcast(std::move(message));
 }
@@ -172,8 +167,7 @@ void RelayNode::register_service(SessionId id, const ControlSessionPtr &session,
     const auto request_id = config::require_unsigned(params, "request_id");
     const auto service = config::message_service(params);
     const auto protocol = config::message_protocol(params);
-    SRVTrafficPtr traffic;
-    const auto result = registry_.register_service(id, service, protocol, traffic);
+    const auto result = registry_.register_service(id, service, protocol);
     if (result != RegistryMgr::Result::Registered)
     {
         PROXY_ERROR_PRINT("Service rejected service=%s/%s session_id=%llu reason=%.*s",

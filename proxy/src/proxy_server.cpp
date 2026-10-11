@@ -386,14 +386,7 @@ class ProxySession
 
     asio::awaitable<void> run()
     {
-        if (protocol_ == SessionProtocol::Http)
-        {
-            co_await run_http();
-        }
-        else
-        {
-            co_await run_socks5();
-        }
+        return protocol_ == SessionProtocol::Http ? run_http() : run_socks5();
     }
 
     const std::string &peer() const noexcept

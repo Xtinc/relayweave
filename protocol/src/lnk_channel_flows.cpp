@@ -1,6 +1,7 @@
 #include "lnk_channel.h"
 #include <chrono>
 #include <cstddef>
+#include <exception>
 
 using lnk::Frame;
 using lnk::NodeFlow;
@@ -82,8 +83,7 @@ void LnkChannel::prepare_flow(njson p)
         s->next = links[index];
     }
     // Link state can change between the control-domain validation and this data-domain operation.
-    if ((s->previous && !check(s->previous, path[index - 1])) ||
-        (s->next && !check(s->next, path[index + 1])))
+    if ((s->previous && !check(s->previous, path[index - 1])) || (s->next && !check(s->next, path[index + 1])))
     {
         notify_flow(s, CtrlCommand::FlowError, "prepare", "flow adjacent link is not Ready or identity differs");
         return;
@@ -190,7 +190,54 @@ bool LnkChannel::deliver(const std::shared_ptr<NodeFlow> &s, Frame &f)
     return true;
 }
 
+namespace
+{
+template <typename Submit> asio::awaitable<FlowSendStatus> submit_on(asio::any_io_executor executor, Submit submit)
+{
+    // Submission is synchronous once dispatched; cancellation cannot interrupt it halfway.
+    return asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr, FlowSendStatus)>(
+        [executor, submit = std::move(submit)](auto handler) mutable {
+            auto reply_executor = asio::get_associated_executor(handler);
+            auto work = asio::make_work_guard(reply_executor);
+            asio::dispatch(executor, [submit = std::move(submit), handler = std::move(handler), reply_executor,
+                                      work = std::move(work)]() mutable {
+                std::exception_ptr error;
+                auto status = FlowSendStatus::Invalid;
+                try
+                {
+                    status = submit();
+                }
+                catch (...)
+                {
+                    error = std::current_exception();
+                }
+                asio::post(reply_executor, [handler = std::move(handler), error, status,
+                                            work = std::move(work)]() mutable { std::move(handler)(error, status); });
+            });
+        },
+        asio::use_awaitable);
+}
+} // namespace
+
+asio::awaitable<FlowSendStatus> LnkChannel::async_send_flow(FlowFrame frame)
+{
+    return submit_on(executor_, [this, frame = std::move(frame)]() mutable { return send_flow(std::move(frame)); });
+}
+
+asio::awaitable<FlowSendStatus> LnkChannel::async_send_flow_data(std::uint64_t epoch, std::uint64_t id, bool reverse,
+                                                                 std::span<const std::uint8_t> payload)
+{
+    return submit_on(executor_, [this, epoch, id, reverse, payload] {
+        return send_flow(FlowFrame{epoch, id, reverse, LnkFrType::Data}, payload);
+    });
+}
+
 FlowSendStatus LnkChannel::send_flow(FlowFrame f)
+{
+    return send_flow(f, f.payload);
+}
+
+FlowSendStatus LnkChannel::send_flow(const FlowFrame &f, std::span<const std::uint8_t> payload)
 {
     auto it = flows_.find(f.flow_id);
     if (it == flows_.end() || it->second->state != NodeFlow::State::Active || it->second->epoch != f.epoch)
@@ -199,7 +246,8 @@ FlowSendStatus LnkChannel::send_flow(FlowFrame f)
     }
 
     auto s = it->second;
-    if ((f.reverse ? s->next : s->previous) != 0 || !f.validate() || !accepts(*s, f.kind, f.reverse))
+    if ((f.reverse ? s->next : s->previous) != 0 || !f.validate() || payload.size() > LnkFrameHeader::maximum_payload ||
+        (f.kind != LnkFrType::Data && !payload.empty()) || !accepts(*s, f.kind, f.reverse))
     {
         return FlowSendStatus::Invalid;
     }
@@ -207,7 +255,7 @@ FlowSendStatus LnkChannel::send_flow(FlowFrame f)
     // Public buffers may belong to another executor. Only internal Frames borrow the single-thread pool.
     const std::span<const std::uint8_t> bytes =
         f.kind == LnkFrType::Reset ? std::span(reinterpret_cast<const std::uint8_t *>(f.reason.data()), f.reason.size())
-                                   : std::span<const std::uint8_t>(f.payload);
+                                   : payload;
     Frame packet{{f.kind, f.reverse, static_cast<std::uint32_t>(bytes.size()), f.epoch, f.flow_id},
                  PooledBuffer(payload_pool_, bytes)};
     if (!deliver(s, packet))
@@ -217,7 +265,7 @@ FlowSendStatus LnkChannel::send_flow(FlowFrame f)
     }
     if (f.kind == LnkFrType::Reset)
     {
-        fail_flow(s, "reset", f.reason.empty() ? "flow reset" : std::move(f.reason));
+        fail_flow(s, "reset", f.reason.empty() ? "flow reset" : f.reason);
     }
 
     return FlowSendStatus::Queued;
@@ -258,32 +306,81 @@ void LnkChannel::incoming_flow(const NodeLink &link, Frame f)
 
 asio::awaitable<FlowFrame> LnkChannel::receive_flow(std::uint64_t epoch, std::uint64_t id)
 {
-    // cluster_data_io: retain the pool until the pending receive and its internal Frame are destroyed.
-    auto self = shared_from_this();
-    auto it = flows_.find(id);
-    if (it == flows_.end() || it->second->epoch != epoch || it->second->state != NodeFlow::State::Active)
-    {
-        throw std::runtime_error("flow is not active");
-    }
-
-    auto s = it->second;
-    auto [error, frame] = co_await s->received.async_receive(use_nothrow_awaitable);
-    if (s->state == NodeFlow::State::Closed || error)
-    {
-        throw std::runtime_error(s->reason.empty() ? "flow closed" : s->reason);
-    }
-
-    const auto used = charge(frame);
-    s->bytes -= used;
-    buffered_bytes_ -= used;
-    FlowFrame result{frame.header.epoch, frame.header.id, frame.header.reverse, frame.header.kind};
-    if (frame.payload.size())
-    {
-        const auto bytes = frame.payload.bytes();
-        result.payload.assign(bytes.begin(), bytes.end());
-    }
-
-    co_return result;
+    return asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr, FlowFrame)>(
+        [this, epoch, id](auto handler) {
+            auto self = shared_from_this();
+            const auto executor = self->executor_;
+            const auto reply_executor = asio::get_associated_executor(handler);
+            auto slot = asio::get_associated_cancellation_slot(handler);
+            if (slot.is_connected())
+            {
+                // Wake pending receivers; the owning business handles RESET and Flow closure.
+                slot.assign([executor, weak = weak_from_this(), epoch, id](asio::cancellation_type_t type) {
+                    if (type == asio::cancellation_type::none)
+                    {
+                        return;
+                    }
+                    asio::post(executor, [weak, epoch, id] {
+                        if (auto channel = weak.lock())
+                        {
+                            const auto it = channel->flows_.find(id);
+                            if (it != channel->flows_.end() && it->second->epoch == epoch)
+                            {
+                                it->second->received.cancel();
+                            }
+                        }
+                    });
+                });
+            }
+            auto finish = [handler = std::move(handler), reply_executor, work = asio::make_work_guard(reply_executor)]
+                          (std::exception_ptr error, FlowFrame frame) mutable {
+                asio::post(reply_executor, [handler = std::move(handler), error, frame = std::move(frame),
+                                            work = std::move(work)]() mutable {
+                    std::move(handler)(error, std::move(frame));
+                });
+            };
+            asio::dispatch(executor, [self = std::move(self), epoch, id, executor,
+                                      finish = std::move(finish)]() mutable {
+                const auto it = self->flows_.find(id);
+                if (it == self->flows_.end() || it->second->epoch != epoch ||
+                    it->second->state != NodeFlow::State::Active)
+                {
+                    finish(std::make_exception_ptr(std::runtime_error("flow is not active")), {});
+                    return;
+                }
+                auto flow = it->second;
+                auto &received = flow->received;
+                auto complete = [self = std::move(self), flow = std::move(flow),
+                                 finish = std::move(finish)](asio::error_code error, Frame frame) mutable {
+                    std::exception_ptr failure;
+                    FlowFrame result;
+                    try
+                    {
+                        if (flow->state == NodeFlow::State::Closed || error)
+                        {
+                            throw std::runtime_error(flow->reason.empty() ? "flow closed" : flow->reason);
+                        }
+                        const auto used = charge(frame);
+                        flow->bytes -= used;
+                        self->buffered_bytes_ -= used;
+                        result = {frame.header.epoch, frame.header.id, frame.header.reverse, frame.header.kind};
+                        const auto bytes = frame.payload.bytes();
+                        if (!bytes.empty())
+                        {
+                            result.payload.assign(bytes.begin(), bytes.end());
+                        }
+                    }
+                    catch (...)
+                    {
+                        failure = std::current_exception();
+                    }
+                    // Release pool storage here, before another executor can complete the caller.
+                    frame = {};
+                    finish(failure, std::move(result));
+                };
+                received.async_receive(asio::bind_executor(executor, std::move(complete)));
+            });
+        }, asio::use_awaitable);
 }
 
 void LnkChannel::link_flows_closed(std::uint64_t id)

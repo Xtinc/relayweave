@@ -150,7 +150,6 @@ LinkQuality::Assessment LinkQuality::assess(Clock::time_point now) const noexcep
         const auto deviation = std::sqrt(std::max(0.0, ema.rtt_square_sum / ema.received_weight - mean * mean));
         metrics.rtt_ms = mean;
         metrics.jitter_ms = jitter;
-        metrics.rtt_stddev_ms = deviation;
         const auto cost = mean + 0.5 * jitter + 0.25 * deviation - LOSS_PENALTY * std::log1p(-metrics.loss_rate);
         weighted_cost += weights[index] * cost;
         weight_sum += weights[index];

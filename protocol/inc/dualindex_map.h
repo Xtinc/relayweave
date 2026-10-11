@@ -42,28 +42,6 @@ class DualIndexMap
     static constexpr std::size_t initial_bucket_count = 16;
 
   public:
-    struct SecondaryEntry
-    {
-        const PrimaryKey *primary = nullptr;
-        Value *value = nullptr;
-
-        explicit operator bool() const noexcept
-        {
-            return value != nullptr;
-        }
-    };
-
-    struct ConstSecondaryEntry
-    {
-        const PrimaryKey *primary = nullptr;
-        const Value *value = nullptr;
-
-        explicit operator bool() const noexcept
-        {
-            return value != nullptr;
-        }
-    };
-
     DualIndexMap() = default;
     DualIndexMap(const DualIndexMap &) = delete;
     DualIndexMap &operator=(const DualIndexMap &) = delete;
@@ -123,29 +101,15 @@ class DualIndexMap
     Value *find_secondary(const SecondaryKey &secondary)
         requires(Mode == SecondaryKeyMode::Unique)
     {
-        return find_secondary_entry(secondary).value;
+        const auto node = find_secondary_node(secondary, hash_secondary(secondary));
+        return node ? &node->value : nullptr;
     }
 
     const Value *find_secondary(const SecondaryKey &secondary) const
         requires(Mode == SecondaryKeyMode::Unique)
     {
-        return find_secondary_entry(secondary).value;
-    }
-
-    SecondaryEntry find_secondary_entry(const SecondaryKey &secondary)
-        requires(Mode == SecondaryKeyMode::Unique)
-    {
-        const auto hash = hash_secondary(secondary);
-        const auto node = find_secondary_node(secondary, hash);
-        return node ? SecondaryEntry{&node->primary, &node->value} : SecondaryEntry{};
-    }
-
-    ConstSecondaryEntry find_secondary_entry(const SecondaryKey &secondary) const
-        requires(Mode == SecondaryKeyMode::Unique)
-    {
-        const auto hash = hash_secondary(secondary);
-        const auto node = find_secondary_node(secondary, hash);
-        return node ? ConstSecondaryEntry{&node->primary, &node->value} : ConstSecondaryEntry{};
+        const auto node = find_secondary_node(secondary, hash_secondary(secondary));
+        return node ? &node->value : nullptr;
     }
 
     const SecondaryKey *secondary_key(const PrimaryKey &primary) const
@@ -236,22 +200,6 @@ class DualIndexMap
         for (std::size_t bucket = 0; bucket < bucket_count_; ++bucket)
         {
             for (auto *node = primary_buckets_[bucket]; node; node = node->primary_next)
-            {
-                function(node->primary, node->value);
-            }
-        }
-    }
-
-    template <class Function> void for_each_secondary(const SecondaryKey &secondary, Function &&function)
-    {
-        if (!bucket_count_)
-        {
-            return;
-        }
-        const auto hash = hash_secondary(secondary);
-        for (auto *node = secondary_buckets_[bucket_index(hash)]; node; node = node->secondary_next)
-        {
-            if (node->secondary_hash == hash && secondary_equal(*node->secondary, secondary))
             {
                 function(node->primary, node->value);
             }

@@ -108,7 +108,11 @@ int main()
         fast.record(false, 0.0, at(2));
         result = fast.assess(at(2));
         near(*result.scales.back().jitter_ms, 20.0, "Jitter is incorrect");
-        require(*result.scales.back().rtt_stddev_ms > 9.9, "RTT spread is incorrect");
+        LinkQuality spread;
+        spread.record(true, 10.0, at(0));
+        spread.record(true, 30.0, at(0));
+        // Equal timestamps give mean 20, jitter 20 and deviation 10 at every scale.
+        near(*spread.assess(at(0)).quality.cost, 32.5, "Routing cost omitted RTT spread");
         require(result.scales.back().loss_rate > 0.333 && result.scales.back().loss_rate < 0.334,
                 "Failed sample did not enter loss EMA");
         require(!fast.record(true, -1.0, at(3)), "Negative RTT was accepted");

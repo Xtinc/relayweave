@@ -34,11 +34,12 @@ class RegistryMgr
     bool full() noexcept;
     std::size_t session_count() noexcept;
     bool contains(SessionId id) noexcept;
+    // The control task retains the session until remove(id); the registry only borrows it.
     void add(SessionId id, const ControlSessionPtr &session);
     void remove(SessionId id) noexcept;
     ControlSessionPtr find_session(SessionId id) const;
 
-    Result register_service(SessionId id, const std::string &service, RelayProtocol protocol, SRVTrafficPtr &traffic);
+    Result register_service(SessionId id, const std::string &service, RelayProtocol protocol);
     std::optional<Service> find_service(const std::string &service);
     std::vector<std::string> service_names();
     void sample_traffic();

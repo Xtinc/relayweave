@@ -20,7 +20,6 @@ class LinkQuality
         double sample_weight = 0.0;
         std::optional<double> rtt_ms;
         std::optional<double> jitter_ms;
-        std::optional<double> rtt_stddev_ms;
         double loss_rate = 1.0;
     };
 

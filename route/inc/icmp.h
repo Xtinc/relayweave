@@ -25,8 +25,7 @@ class ICMP
         LinkQuality::Assessment assessment;
     };
 
-    ICMP(asio::io_context &io_context, Duration interval, Duration timeout,
-         std::optional<std::size_t> count = std::nullopt);
+    ICMP(asio::io_context &io_context, Duration interval, Duration timeout);
     ~ICMP() = default;
 
     ICMP(const ICMP &) = delete;
@@ -75,14 +74,12 @@ class ICMP
     asio::awaitable<void> close_on_executor();
     void handle_packet(std::span<const std::uint8_t> packet, asio::ip::address_v4 source) noexcept;
     std::optional<std::uint16_t> parse_reply(std::span<const std::uint8_t> packet) const noexcept;
-    void probe_finished() noexcept;
     void stop() noexcept;
     void notify_finished() noexcept;
 
     asio::io_context &io_context_;
     const Duration interval_;
     const Duration timeout_;
-    const std::optional<std::size_t> count_;
     asio::ip::icmp::socket socket_;
     std::uint64_t instance_ = 0;
     asio::steady_timer finished_wait_;

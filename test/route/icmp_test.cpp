@@ -65,13 +65,20 @@ void print_metrics(std::string_view target, const ICMP::Metrics &metrics)
 }
 
 asio::awaitable<void> start(std::string target, asio::io_context &io_context,
-                            std::optional<std::size_t> count, std::optional<ICMP> &icmp)
+                            std::size_t count, std::optional<ICMP> &icmp)
 {
     const auto destination = co_await resolve_target(target);
     std::cout << "PING " << target << " (" << destination.to_string() << ")" << std::endl;
-    icmp.emplace(io_context, std::chrono::seconds(1), std::chrono::milliseconds(800), count);
+    icmp.emplace(io_context, std::chrono::seconds(1), std::chrono::milliseconds(800));
 
     icmp->run({destination});
+    asio::steady_timer wait(io_context);
+    while (icmp->metrics().front().assessment.total_completed < count)
+    {
+        wait.expires_after(std::chrono::milliseconds(10));
+        co_await wait.async_wait(asio::use_awaitable);
+    }
+    co_await icmp->close();
 }
 } // namespace
 
