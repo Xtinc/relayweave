@@ -724,11 +724,13 @@ void integration()
                     RelayProtocol::Udp, {"a", "b", "c"}, false, "parallel-udp"));
             channels[3]->send(CtrlMessage(CtrlCommand::ServerTraffic, njson{{"request_id", 90}}));
             const auto accounting = co_await receive(channels[3], CtrlCommand::ServerTrafficReported);
+            // Each UDP direction forwards one three-byte payload and one maximum payload.
+            const auto udp_bytes = 3 + LnkFrameHeader::maximum_payload;
             for (const auto &service : accounting.params->at("services"))
             {
                 const auto protocol = service.at("protocol").get<std::string>();
-                const auto tx = protocol == "udp" ? 4099u : protocol == "tcp" ? 8196u : 8193u;
-                const auto rx = protocol == "udp" ? 4099u : protocol == "tcp" ? 6u : 3u;
+                const auto tx = protocol == "udp" ? udp_bytes : protocol == "tcp" ? 8196u : 8193u;
+                const auto rx = protocol == "udp" ? udp_bytes : protocol == "tcp" ? 6u : 3u;
                 require(service.at("tx_bytes") == tx && service.at("rx_bytes") == rx && service.at("accessors").empty(),
                         "Multi-hop service accounting duplicated bytes or retained a closed accessor: " + service.dump());
             }
@@ -1080,10 +1082,16 @@ void integration()
                     const auto [eof, n] = co_await service_socket.async_read_some(asio::buffer(byte),
                         asio::cancel_after(1s, use_nothrow_awaitable));
                     require(eof == asio::error::eof, "Application FIN did not reach the service");
-                    co_await asio::async_write(service_socket, asio::buffer(bytes), asio::use_awaitable);
+                    BytesBuf reply(2 * LnkFrameHeader::maximum_payload + 17);
+                    for (std::size_t i = 0; i < reply.size(); ++i)
+                    {
+                        reply[i] = static_cast<std::uint8_t>(i);
+                    }
+                    co_await asio::async_write(service_socket, asio::buffer(reply), asio::use_awaitable);
                     service_socket.shutdown(tcp::socket::shutdown_send);
+                    data.resize(reply.size());
                     co_await asio::async_read(app, asio::buffer(data), asio::cancel_after(2s, asio::use_awaitable));
-                    require(data == bytes, "Consumer Agent stream reverse payload changed after FIN");
+                    require(data == reply, "Consumer Agent large stream reverse payload changed after FIN");
                     const auto [final_eof, final_size] = co_await app.async_read_some(asio::buffer(byte),
                         asio::cancel_after(1s, use_nothrow_awaitable));
                     require(final_eof == asio::error::eof, "Service FIN did not reach the application");

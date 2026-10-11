@@ -161,12 +161,25 @@ enum class LnkFrType : std::uint8_t
     Attached = 8
 };
 
+struct DatagramHeader
+{
+    static constexpr std::size_t length = 8;
+    static constexpr std::size_t maximum_wire_payload = 65507;
+    static constexpr std::size_t maximum_user_payload = maximum_wire_payload - length;
+    using Buffer = std::array<std::uint8_t, length>;
+
+    static Buffer encode(std::uint64_t session_id);
+    static std::optional<std::uint64_t> decode(std::span<const std::uint8_t> header) noexcept;
+};
+
 struct LnkFrameHeader
 {
     static constexpr std::uint8_t magic = 0x4e;
     static constexpr std::uint8_t version = 1;
     static constexpr std::size_t length = 32;
-    static constexpr std::size_t maximum_payload = 4096;
+    // UDP carries both the NodeLink ID and this frame header before the user payload.
+    static constexpr std::size_t maximum_payload =
+        DatagramHeader::maximum_wire_payload - DatagramHeader::length - length;
     static constexpr std::size_t maximum_reason = 512;
     using Buffer = std::array<std::uint8_t, length>;
 
@@ -194,17 +207,6 @@ struct FlowFrame
     BytesBuf payload;
     std::string reason;
     [[nodiscard]] bool validate() const noexcept;
-};
-
-struct DatagramHeader
-{
-    static constexpr std::size_t length = 8;
-    static constexpr std::size_t maximum_wire_payload = 65507;
-    static constexpr std::size_t maximum_user_payload = maximum_wire_payload - length;
-    using Buffer = std::array<std::uint8_t, length>;
-
-    static Buffer encode(std::uint64_t session_id);
-    static std::optional<std::uint64_t> decode(std::span<const std::uint8_t> header) noexcept;
 };
 
 struct RelayAttach

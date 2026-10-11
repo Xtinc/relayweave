@@ -154,7 +154,8 @@ int main()
                           "unknown flow accepted");
             check_channel(a->send_flow({8, 202, false, LnkFrType::Data, {97}, {}}) == FlowSendStatus::Closed,
                           "stale epoch accepted");
-            for (auto frame : {FlowFrame{7, 202, false, LnkFrType::Data, BytesBuf(4097), {}},
+            for (auto frame : {FlowFrame{7, 202, false, LnkFrType::Data,
+                                         BytesBuf(LnkFrameHeader::maximum_payload + 1), {}},
                                FlowFrame{7, 202, false, LnkFrType::Data, {1}, "invalid reason"},
                                FlowFrame{7, 202, false, LnkFrType::Fin, {1}, {}},
                                FlowFrame{7, 202, false, LnkFrType::Reset, {}, std::string(513, 'x')},
@@ -178,7 +179,7 @@ int main()
             check_channel(io.get_executor().running_in_this_thread(), "same-executor send changed executor");
             auto f = co_await b->receive_flow(7, 202);
             check_channel(f.payload == BytesBuf{2}, "wrong incoming identity delivered");
-            for (auto size : {std::size_t{}, std::size_t(LnkFrameHeader::maximum_payload)})
+            for (auto size : {std::size_t{}, std::size_t{4097}, LnkFrameHeader::maximum_payload})
             {
                 const BytesBuf payload(size, 0xa5);
                 FlowFrame frame{7, 202, false, LnkFrType::Data, payload, {}};

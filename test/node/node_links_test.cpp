@@ -398,14 +398,16 @@ void data_failures()
             module->prepare_flow(udp_flow);
             module->commit_flow(24);
             const auto udp_link_header = DatagramHeader::encode(4);
-            const auto large_header =
-                LnkFrameHeader{LnkFrType::Data, false, LnkFrameHeader::maximum_payload, 7, 24}.encode();
-            BytesBuf oversized(LnkFrameHeader::maximum_payload + 1, 0xee);
-            for (int padding : {1, 1024})
+            // A physically oversized packet cannot be sent: a maximum frame already fills UDP.
+            // Exercise both an invalid declared body length and a mismatched wire length instead.
+            BytesBuf malformed_payload(LnkFrameHeader::maximum_payload, 0xee);
+            for (const auto declared_size : {LnkFrameHeader::maximum_payload + 1,
+                                            LnkFrameHeader::maximum_payload - 1})
             {
-                oversized.resize(LnkFrameHeader::maximum_payload + padding, 0xee);
+                const auto large_header =
+                    LnkFrameHeader{LnkFrType::Data, false, static_cast<std::uint32_t>(declared_size), 7, 24}.encode();
                 const std::array<asio::const_buffer, 3> buffers{
-                    asio::buffer(udp_link_header), asio::buffer(large_header), asio::buffer(oversized)};
+                    asio::buffer(udp_link_header), asio::buffer(large_header), asio::buffer(malformed_payload)};
                 co_await peer.async_send_to(buffers, source, asio::use_awaitable);
             }
             const auto valid_header = LnkFrameHeader{LnkFrType::Data, false, 1, 7, 24}.encode();
@@ -414,7 +416,7 @@ void data_failures()
                 asio::buffer(udp_link_header), asio::buffer(valid_header), asio::buffer(valid_payload)};
             co_await peer.async_send_to(valid_buffers, source, asio::use_awaitable);
             auto udp_received = co_await module->receive_flow(7, 24);
-            require(udp_received.payload == BytesBuf{42}, "truncated oversized UDP frame entered the flow");
+            require(udp_received.payload == BytesBuf{42}, "malformed maximum-size UDP frame entered the flow");
             module->close_flow(24);
             // Delay Pong 1 until Ping 2 has been sent. An older, unacknowledged Ping
             // still proves liveness; duplicate and unsent sequences must not renew it.

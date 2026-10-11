@@ -1185,7 +1185,7 @@ relay.open_timeout_ms 是 Agent 本端 TCP/TLS/UDP 共同的建立超时，默�
 失败后的 retry_timer 只控制新实例的退避：从 500 毫秒增加到最多 10 秒，ready 后恢复初始退避。
 每次新实例重新执行选路与入口连接；已知服务位置仍有效时不重复发现。
 
-UDP payload 沿用 session 头：单节点保留原最大载荷，多节点为 0..4096 字节，无分片。
+UDP payload 沿用 session 头：单节点保留原最大载荷，多节点为 0..65467 字节，无应用层分片。
 本地首次报文固定来源 IP，同一 IP 更换端口会更新返回地址；其他 IP 报文丢弃。
 来源地址属于长期 forward，业务结束不重置；返回 payload 在尚无本地来源时丢弃。
 
@@ -1695,7 +1695,8 @@ UDP attach 完成后，公网数据报格式为：
 DatagramMgr 的 bindings_ 将 session_id 关联到 uuid 和方向，再查本地配对或端点并验证已固定的来源。
 ready 前 payload、未知 session、短报文、错来源和超长报文丢弃；不缓存，也不替换已绑定来源。
 单节点改写对端 session 头并转发，多节点剥离本地头送入 NodeFlow，返回时写回本地头。
-单节点保留原载荷范围，多节点上限 4096 字节，无分片。
+单节点保留原载荷范围，多节点上限为 65467 字节，由 UDP 最大线载荷 65507 减去 8 字节 NodeLink 标识和
+32 字节帧头得到，无应用层分片。
 
 服务离线时只有 Agent 本地 forward。Node 收到无服务的 open 立即返回 unavailable，
 不创建 waiting Relay、timer、binding 或 Flow。注册服务不接管旧请求；新的业务必须重新选路及申请。
@@ -1778,9 +1779,13 @@ NodeLink 接入完成后，业务 DATA/FIN/RESET 与 PING/PONG 都使用固定 3
 | 16 | 8 | 非零 flow_id；接入与保活帧为零 |
 | 24 | 8 | PING/PONG 非零 sequence；其他帧为零 |
 
-DATA 为 0..4096 字节原始载荷，FIN 无帧体，RESET 为最多 512 字节原因。PING/PONG 无帧体。
-这是当前 Node 协议上限，由 LnkFrameHeader::maximum_payload 定义；Agent 与本地 UDP 的大接收缓冲仍保留，
-后续提高 Node 协议上限需要同步修改编解码、队列预算、接入校验和协议测试。
+DATA 为 0..65467 字节原始载荷，FIN 无帧体，RESET 为最多 512 字节原因。PING/PONG 无帧体。
+LnkFrameHeader::maximum_payload 按 `65507 - DatagramHeader::length - LnkFrameHeader::length` 推导，
+最大 Node UDP 数据报为 65507 字节；每跳重新封装，帧头不随路径长度累加。TCP/TLS 多节点接入的读取缓冲
+也采用最大 DATA 载荷 65467 字节，按实际读取长度立即提交，不等待填满。Agent 与本地 UDP 的大接收缓冲保留。
+Node UDP 接收池每块为 65508 字节（包含一个检测字节），切出载荷后保留原分配大小；末端 8 MiB 接收预算
+按分配大小计费，队列容量与字节预算不变。启用 UDP 限速时，burst 必须至少容纳希望转发的报文。
+此上限不保证实际路径 MTU 允许直接发送；部署须同步更新相关 Agent 和 Node，旧节点仍拒绝超过 4096 的帧。
 
 TCP 的首帧 attach/attached 继续采用 WireMessage/CBOR 并校验 data_version=1，之后只接受 Node 二进制帧。
 TCP socket 已绑定相邻 Link 身份，后续帧不重复发送 Node 字符串和凭据。
@@ -1879,7 +1884,7 @@ Consumer 向服务发字节时 reverse=false，Producer 回传时 reverse=true�
 | H/T StreamPipeline RemotePair | Agent TCP ↔ NodeFlow | 两个持续协程：read_remote_pair 将字节切成 DATA；write_remote_pair 写回 DATA 或处理 FIN |
 | H/I/T LnkChannel | FlowFrame ↔ 相邻 TCP NodeLink | 查 Flow 身份、方向和入边，按固定路径入队；中间节点直接移动载荷，不经过业务控制协程 |
 
-RemotePair 每次从 Agent stream 读取最多 4096 字节，按对应方向限速，借用读缓冲提交 DATA。
+RemotePair 使用 65467 字节的读取缓冲，从 Agent stream 读到多少就转发多少，按对应方向限速，借用读缓冲提交 DATA。
 LnkChannel 在 cluster_data_io 中复制进拥有的池化缓冲并完成入队后，提交才返回；随后该方向才复用
 读缓冲。NodeLink 的单写循环按队列写二进制头和载荷，一条 Link 可交错承载多个 Flow，但每个 Flow
 同方向 DATA/FIN 的提交与交付顺序保持一致。应用的原始 TCP 写入边界不保留，终点把收到的块顺序写回 stream。
@@ -1967,7 +1972,7 @@ Producer → 目标：原始 datagram payload
 发给当前本地应用 endpoint。业务 session_id 不穿过 NodeFlow，Link ID 也不暴露给 Agent。
 一次 DATA 对应一个完整 UDP payload，不合并、拆分、重排或重传；零字节用户报文仍是合法 DATA。
 
-H 的共享 UDP 接收循环验证 session、固定来源、RemotePair active 和 payload ≤4096，剥离 8 字节
+H 的共享 UDP 接收循环验证 session、固定来源、RemotePair active 和 payload ≤65467，剥离 8 字节
 头，复制 payload 到该 RemotePair 的 received 队列，容量为 16 个报文；队列满只丢当前包。
 read_remote_pair 是本业务的持续协程，从队列取包，令牌足够才提交 Flow DATA，不足则丢包。
 I 验证 epoch、flow_id、方向、物理来源和预期入边，再将帧移动到另一相邻 Link 的发送队列。
@@ -1978,7 +1983,7 @@ T 的 write_remote_pair 持续从 Flow 接收完整 datagram，令牌不足丢�
 Flow 或 Link 队列拒绝入队、接收 Flow 失败、RemotePair 真实发送失败会结束相关桥接并走 Multi 清理，
 不能将这些失败与 UDP 本地队列满、超限时的单包丢弃混为一谈。
 
-Single 最大用户 payload 为 65499 字节，Multi 当前为 4096；超出 Multi 上限由接入检查丢弃，
+Single 最大用户 payload 为 65499 字节，Multi 为 65467；超出 Multi 上限由接入检查丢弃，
 没有应用层分片。Agent 和共享 UDP listener 的大接收缓冲仍保留，Node 帧上限不是缩小这些缓冲的理由。
 UDP Flow 只接受 DATA，没有 FIN 或对端正常 EOF；控制器的桥接通常持续到取消/失效，不通过
 peer.finished 判定正常完成。首末控制失效、服务离线、Link/Flow 失败或 stop 后，关闭本地队列、删除

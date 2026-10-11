@@ -18,6 +18,11 @@ int main()
         check(f.encode() == expected);
         auto parsed = LnkFrameHeader::decode(expected);
         check(parsed.epoch == f.epoch && parsed.id == f.id && parsed.reverse && parsed.body_length == 4096);
+        for (const auto size : {std::size_t{4097}, LnkFrameHeader::maximum_payload})
+        {
+            f.body_length = static_cast<std::uint32_t>(size);
+            check(LnkFrameHeader::decode(f.encode()).body_length == size);
+        }
         for (auto kind : {LnkFrType::Data, LnkFrType::Fin, LnkFrType::Reset, LnkFrType::Ping, LnkFrType::Pong,
                           LnkFrType::Attach, LnkFrType::Attached})
         {
@@ -91,7 +96,8 @@ int main()
         }
         for (const auto bad :
              {LnkFrameHeader{LnkFrType::Ping, false, 0, 7}, LnkFrameHeader{LnkFrType::Pong, true, 0, 7, 0, 1},
-              LnkFrameHeader{LnkFrType::Attach, false, 0, 7}, LnkFrameHeader{LnkFrType::Reset, false, 513, 7, 9}})
+              LnkFrameHeader{LnkFrType::Attach, false, 0, 7}, LnkFrameHeader{LnkFrType::Reset, false, 513, 7, 9},
+              LnkFrameHeader{LnkFrType::Data, false, LnkFrameHeader::maximum_payload + 1, 7, 9}})
         {
             bool rejected = false;
             try
@@ -107,6 +113,8 @@ int main()
         static_assert(noexcept(FlowFrame{}.validate()));
         for (const auto &frame : {FlowFrame{7, 9, false, LnkFrType::Data, {}, {}},
                                   FlowFrame{7, 9, true, LnkFrType::Data, BytesBuf(4096), {}},
+                                  FlowFrame{7, 9, true, LnkFrType::Data, BytesBuf(4097), {}},
+                                  FlowFrame{7, 9, true, LnkFrType::Data, BytesBuf(LnkFrameHeader::maximum_payload), {}},
                                   FlowFrame{7, 9, false, LnkFrType::Fin, {}, {}},
                                   FlowFrame{7, 9, true, LnkFrType::Reset, {}, std::string(512, 'x')}})
         {
@@ -117,7 +125,7 @@ int main()
             FlowFrame frame{7, 9, false, LnkFrType::Data, {0, 255, 3}, {}};
             if (invalid == 0)
             {
-                frame.payload.resize(4097);
+                frame.payload.resize(LnkFrameHeader::maximum_payload + 1);
             }
             if (invalid == 1)
             {
