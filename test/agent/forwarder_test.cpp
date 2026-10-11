@@ -61,8 +61,11 @@ struct ForwarderTestAccess
         }
         if (recover)
         {
-            co_await asio::post(asio::use_awaitable);
-            co_await asio::post(asio::use_awaitable);
+            // Queued posts do not guarantee that the retry timer has completed.
+            while (forward.retry_scheduled)
+            {
+                co_await asio::post(asio::use_awaitable);
+            }
             if (!forward.relay || test_access::Forwarder_relays_(owner).size() != 1 || test_access::Forwarder_relays_(owner).begin()->second != forward.relay)
             {
                 throw std::runtime_error("Cancelled retry did not establish one current UDP session on recovery");
@@ -93,6 +96,7 @@ int main()
         {
             for (const bool recover : {false, true})
             {
+                std::cerr << "[CASE] wait_started=" << wait_started << " recover=" << recover << '\n';
                 asio::io_context control(1);
                 asio::io_context transfer(1);
                 auto agent = std::make_shared<RelayAgent>(control, transfer, ssl, AgentConfig{});
