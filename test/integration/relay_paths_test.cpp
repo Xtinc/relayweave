@@ -671,6 +671,24 @@ void integration()
                 njson{{"request_id", 5}, {"service", "manual-tcp"}, {"protocol", "tcp"}}));
             location = co_await receive(channels[0], CtrlCommand::ServiceLocated);
             require(location.params->at("node_id") == "c", "Entry lookup changed service ownership");
+            // Flow rejection happens before install(): the requester must still receive the original error.
+            for (const auto ingress : {0U, 1U})
+            {
+                for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
+                {
+                    const std::vector<std::string> path{configs[ingress].cluster.node_id, "missing"};
+                    channels[ingress]->send(CtrlMessage(CtrlCommand::RelayOpen,
+                        njson{{"request_id", 8}, {"service", "manual-" + std::string(relay_protocol_name(protocol))},
+                              {"protocol", relay_protocol_name(protocol)}, {"path", path}, {"epoch", epoch}}));
+                    const auto error = co_await receive(channels[ingress], CtrlCommand::RelayError);
+                    require(error.params->at("request_id") == 8 && error.params->at("epoch") == epoch &&
+                            error.params->at("path") == path && error.params->at("protocol") == relay_protocol_name(protocol) &&
+                            error.params->at("stage") == "open" && error.params->at("reason") == "path node offline" &&
+                            !error.params->contains("uuid") && !error.params->contains("flow_id") &&
+                            !error.params->contains("ticket") && !error.params->contains("data_port"),
+                            "Flow rejection without an endpoint lost its failure reply: " + error.params->dump());
+                }
+            }
             // Egress rejection can race the ingress notification; either order must close the same request.
             for (const auto &service : {"missing-service", "manual-tcp"})
             {

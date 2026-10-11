@@ -98,7 +98,11 @@ void ControlRouterMulti::close_agent() const
         {
             values["flow_id"] = flow_id_;
         }
-        values.update(relay_.endpoint_);
+        // Flow establishment can fail before install() creates an endpoint.
+        if (!relay_.endpoint_.empty())
+        {
+            values.update(relay_.endpoint_);
+        }
         if (ingress_)
         {
             values["request_id"] = params_.at("request_id");

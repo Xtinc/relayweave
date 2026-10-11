@@ -265,7 +265,8 @@ void flow_integration()
                 co_await test_node::close_flow(nodes[0], reversed.epoch, reversed.id);
                 // A slow endpoint reaches its bounded queue; only that flow fails.
                 auto crowded = co_await test_node::open_flow(nodes[0], path1, transport);
-                for (int i = 0; i < 24; ++i)
+                const auto congested_frames = transport == RelayProtocol::Tcp ? 136 : 24;
+                for (int i = 0; i < congested_frames; ++i)
                 {
                     auto result = co_await test_node::send_flow(nodes[1],
                         {crowded.epoch, crowded.id, false, LnkFrType::Data, {12}, {}});

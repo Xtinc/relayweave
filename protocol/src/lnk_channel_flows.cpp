@@ -7,9 +7,11 @@ using lnk::Frame;
 using lnk::NodeFlow;
 using lnk::NodeLink;
 
-static constexpr std::size_t receive_queue_capacity = 16;
+// Absorb bursts across concurrent TCP/TLS responses while retaining bounded admission.
+static constexpr std::size_t tcp_receive_queue_capacity = 128;
+static constexpr std::size_t udp_receive_queue_capacity = 16;
 static constexpr std::size_t max_flows = 1000;
-static constexpr std::size_t max_buffered_bytes = 8 * 1024 * 1024;
+static constexpr std::size_t max_buffered_bytes = 64 * 1024 * 1024;
 static constexpr std::size_t frame_overhead = 128;
 static constexpr auto retired_flow_ttl = std::chrono::seconds(10);
 
@@ -28,7 +30,7 @@ lnk::NodeFlow::NodeFlow(asio::any_io_executor executor, njson values)
     : params(std::move(values)), epoch(params.at("epoch").get<std::uint64_t>()),
       transport(parse_relay_protocol(params.at("transport").get_ref<const std::string &>())),
       prepare_deadline(Clock::now() + std::chrono::milliseconds(params.at("ttl_ms").get<int>())),
-      received(executor, receive_queue_capacity)
+      received(executor, transport == RelayProtocol::Tcp ? tcp_receive_queue_capacity : udp_receive_queue_capacity)
 {
 }
 

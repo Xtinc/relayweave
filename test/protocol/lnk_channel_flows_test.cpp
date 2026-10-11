@@ -231,9 +231,53 @@ int main()
             check_channel(b->send_flow({7, 203, true, LnkFrType::Data, {4}, {}}) == FlowSendStatus::Closed,
                           "RESET left reverse direction alive");
 
+            // Keep many short responses buffered together, as with a browser opening parallel connections.
+            install(300);
+            for (std::uint64_t id = 400; id < 448; ++id)
+            {
+                install(id);
+                for (int index = 0; index < 48; ++index)
+                {
+                    BytesBuf payload(8192, static_cast<std::uint8_t>(id));
+                    payload.front() = static_cast<std::uint8_t>(index);
+                    check_channel(a->send_flow({7, id, false, LnkFrType::Data, std::move(payload), {}}) ==
+                                      FlowSendStatus::Queued, "parallel response burst was rejected at sender");
+                }
+                check_channel(a->send_flow({7, id, false, LnkFrType::Fin, {}, {}}) == FlowSendStatus::Queued,
+                              "parallel response FIN was rejected");
+                // The shared FIFO marker proves this response is buffered before submitting the next one.
+                check_channel(a->send_flow({7, 300, false, LnkFrType::Data, {1}, {}}) == FlowSendStatus::Queued,
+                              "parallel response marker was rejected");
+                static_cast<void>(co_await b->receive_flow(7, 300));
+            }
+            for (std::uint64_t id = 400; id < 448; ++id)
+            {
+                for (int index = 0; index < 48; ++index)
+                {
+                    auto frame = co_await b->receive_flow(7, id);
+                    BytesBuf expected(8192, static_cast<std::uint8_t>(id));
+                    expected.front() = static_cast<std::uint8_t>(index);
+                    check_channel(frame.kind == LnkFrType::Data && frame.payload == expected,
+                                  "parallel response burst lost or reordered bytes");
+                }
+                check_channel((co_await b->receive_flow(7, id)).kind == LnkFrType::Fin,
+                              "parallel response burst lost FIN");
+                check_channel(b->send_flow({7, id, true, LnkFrType::Data, {2}, {}}) == FlowSendStatus::Queued &&
+                              b->send_flow({7, id, true, LnkFrType::Fin, {}, {}}) == FlowSendStatus::Queued,
+                              "parallel response burst closed the reverse direction");
+                check_channel((co_await a->receive_flow(7, id)).payload == BytesBuf{2} &&
+                              (co_await a->receive_flow(7, id)).kind == LnkFrType::Fin,
+                              "parallel response burst lost reverse data or FIN");
+                a->close_flow(id);
+                b->close_flow(id);
+            }
+            a->close_flow(300);
+            b->close_flow(300);
+            check_channel(link_ready(), "parallel response bursts closed the shared NodeLink");
+
             install(207);
             install(208);
-            for (int i = 0; i < 16; ++i)
+            for (int i = 0; i < 128; ++i)
             {
                 check_channel(a->send_flow({7, 207, false, LnkFrType::Data, {9}, {}}) == FlowSendStatus::Queued,
                               "could not fill endpoint receive queue");
@@ -262,7 +306,7 @@ int main()
             install(204);
             FlowSendStatus full = FlowSendStatus::Queued;
             // No executor yield: fill exactly the transport admission queue before its writer runs.
-            for (int i = 0; i < 110; ++i)
+            for (int i = 0; i < 260; ++i)
             {
                 full = a->send_flow({7, 204, false, LnkFrType::Data, {5}, {}});
                 if (full != FlowSendStatus::Queued)

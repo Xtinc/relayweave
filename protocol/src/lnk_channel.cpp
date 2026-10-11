@@ -12,10 +12,10 @@ using lnk::NodeFlow;
 using lnk::NodeLink;
 using LinkState = NodeLink::State;
 
-constexpr std::size_t send_queue_capacity = 100;
-constexpr std::size_t reserved_control_frames = 4;
+constexpr std::size_t tcp_send_queue_capacity = 256;
+constexpr std::size_t udp_send_queue_capacity = 100;
 // Reserve admission capacity for control frames; the shared FIFO preserves DATA/FIN order.
-constexpr std::size_t business_queue_limit = send_queue_capacity - reserved_control_frames;
+constexpr std::size_t reserved_control_frames = 4;
 constexpr std::size_t event_queue_capacity = 4096;
 constexpr std::size_t max_pending_accepts = 100;
 constexpr std::size_t max_datagram_size =
@@ -94,7 +94,7 @@ lnk::NodeLink::NodeLink(asio::any_io_executor executor, njson values)
     if (transport == RelayProtocol::Tcp)
     {
         socket.emplace(executor);
-        writes.emplace(executor, send_queue_capacity);
+        writes.emplace(executor, tcp_send_queue_capacity);
     }
 }
 
@@ -103,7 +103,7 @@ LnkChannel::LnkChannel(asio::any_io_executor executor, asio::any_io_executor eve
     : executor_(executor), node_id_(std::move(node_id)), acceptor_(executor), udp_socket_(executor),
       tcp_address_(std::move(tcp_address)), udp_address_(std::move(udp_address)), tcp_port_(tcp_port),
       udp_port_(udp_port), payload_pool_({pool_blocks_per_chunk, datagram_receive_size}),
-      udp_writes_(executor, send_queue_capacity), events_(event_executor, event_queue_capacity),
+      udp_writes_(executor, udp_send_queue_capacity), events_(event_executor, event_queue_capacity),
       monitor_timer_(executor), tasks_done_(executor)
 {
     monitor_timer_.expires_at(Clock::time_point::max());
@@ -486,6 +486,8 @@ bool LnkChannel::enqueue(const std::shared_ptr<NodeLink> &link, const LnkFrameHe
     assert(link->state != LinkState::Closed && !stopping_);
     const bool business = is_business(header.kind);
     const bool tcp = link->transport == RelayProtocol::Tcp;
+    const auto business_queue_limit =
+        (tcp ? tcp_send_queue_capacity : udp_send_queue_capacity) - reserved_control_frames;
     auto &pending = tcp ? link->pending_data : udp_pending_data_;
     if (business && pending >= business_queue_limit)
     {
