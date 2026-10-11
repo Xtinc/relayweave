@@ -230,8 +230,8 @@ Dashboard 打包时仅复制 Python 源码，不探测或绑定构建机的 Pyth
 
 ```bash
 python -m unittest discover -s dashboard -p 'test_*.py'
-python test/dashboard_service_smoke.py --build-dir build
-python test/dashboard_service_smoke.py --build-dir build --two-nodes
+python test/tools/dashboard_service_smoke.py --build-dir build
+python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 ```
 
 冒烟脚本启动真实 Node、发布端 Agent、消费端 Agent 和 Dashboard，验证 TCP/TLS 转发的页面、快照接口、SIGTERM 与重启后的历史保留；配置、端口和数据库均位于临时目录。`--two-nodes` 通过 Slave 入口采集 Master 汇总，并验证入口停止与恢复；具备 CAP_NET_RAW 时还验证两条有向质量链路和 Agent 推荐路径日志，否则明确记录 ICMP 验证跳过。

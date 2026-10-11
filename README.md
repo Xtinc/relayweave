@@ -3,7 +3,7 @@
 本文是项目的编码风格约束，适用于贡献者和 AI 编码工具。新增与修改代码应遵循本文，异步代码参考
 `protocol/src/xfr_channel.cpp` 和 `protocol/src/tls_channel.cpp` 的既有风格。
 
-设计、配置、链路质量与推荐路径、测试入口见 [RelayWeave 设计](docs/RelayWeave设计.md)。
+设计、配置、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)，测试分组与运行入口见 [测试目录](test/README.md)。
 RelayNode 直接持有 node/nodelink_mgr，统一协调 NodeLink 建连与 NodeFlow 路径事务，层次与 Pipeline/DatagramMgr 一致。
 NodeLink 共享 TCP/UDP 通道与 NodeFlow 分派由管理器直接持有的 protocol/lnk_channel 管理；protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBOR。
 控制通知使用有界协程收发接口，数据域直接逐跳分派，不通过模块回调注册。

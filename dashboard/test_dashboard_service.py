@@ -5,6 +5,7 @@ import gzip
 import json
 from http.client import RemoteDisconnected
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 import os
 from pathlib import Path
 import signal
@@ -106,12 +107,12 @@ class DashboardServiceTest(unittest.TestCase):
         self.start()
         self.stop()
         self.assertEqual(self.process.returncode, 0)
-        with sqlite3.connect(self.database) as database:
+        with closing(sqlite3.connect(self.database)) as database, database:
             database.execute("INSERT INTO node_queue_history VALUES ('saved-node', 100, 1, 2, 3)")
         self.start()
         self.stop()
         self.assertEqual(self.process.returncode, 0)
-        with sqlite3.connect(self.database) as database:
+        with closing(sqlite3.connect(self.database)) as database, database:
             self.assertEqual(database.execute('PRAGMA quick_check').fetchone()[0], 'ok')
             self.assertEqual(database.execute('SELECT COUNT(*) FROM node_queue_history').fetchone()[0], 1)
 
@@ -147,7 +148,7 @@ class DashboardServiceTest(unittest.TestCase):
                 # using the database before it is closed (verified below).
                 pass
         self.assertEqual(self.process.returncode, 0)
-        with sqlite3.connect(self.database) as database:
+        with closing(sqlite3.connect(self.database)) as database, database:
             self.assertEqual(database.execute(
                 "SELECT COUNT(*) FROM node_queue_history WHERE node_key='slow-request'").fetchone()[0], 1)
 

@@ -2413,8 +2413,13 @@ cmake --build build --config Debug --parallel 1
 ctest --test-dir build -C Debug --output-on-failure
 ```
 
-路由模块测试集中在 `test/route/`；Agent 路由组装与 Node 拓扑测试分别保留在
-`test/agent_routing_test.cpp` 和 `test/topology_test.cpp`。所有相关 CTest 使用 routing 标签，
+测试目录按 `common/`、`protocol/`、`route/`、`agent/`、`node/`、`proxy/`、
+`integration/`、`deployment/` 分组；夹具与资源位于 `support/`、`data/`，
+性能基准和手动诊断分别位于 `benchmark/`、`tools/`。分组、覆盖边界及运行方法见
+[`test/README.md`](../test/README.md)。所有自动用例有超时和组件/运行类型标签。
+
+路由模块测试集中在 `test/route/`；Agent 路由组装与 Node 拓扑测试分别位于
+`test/agent/agent_routing_test.cpp` 和 `test/node/topology_test.cpp`。所有相关 CTest 使用 routing 标签，
 普通权限和 ICMP 集成可以分别运行：
 
 ```console
@@ -2433,7 +2438,7 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 
 `probe_integration` 仅在原始 socket 权限不足时返回 77，由 CTest 标为跳过；其他初始化或网络错误必须失败。
 人工质量用例验证推荐路径随成本变化；真实测量需在具备上述权限的环境验证，跳过不能替代这部分验收。
-`test_icmp` 是手动诊断程序，不注册为 CTest，构建后可运行 `build/test/route/test_icmp 127.0.0.1 4`。
+`test_icmp` 是手动诊断程序，不注册为 CTest，构建后可运行 `build/test/tools/test_icmp 127.0.0.1 4`。
 `routing` 生成的图示报告位于 `build/test/route/routing_test_report.html`，测试产物不进入源码或安装包。
 
 主要测试覆盖：
@@ -2445,39 +2450,48 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 - `lnk_frame`、`pooled_buffer`：固定二进制头和非抛异常的本地帧校验；独占缓冲移动、偏移归还、队列转移及池预热后的上游分配复用；
 - `agent_cluster`：两个节点上的服务同时转发、主控在线时从节点恢复、服务迁移、首次目标失败、过期发现响应；
 - `relay_protocol`：控制命令枚举映射、自定义命令、三种协议 attach、帧校验、UDP session header
-  和限速基础逻辑；
+  和协议选择；
 - `relay_integration`：TCP/TLS Relay、ticket/role、半关闭、RelayAgent/RelayNode 完整往返；
 - `tcp_relay`：真实 TCP socket 的读写失败、限速等待退出、原始异常保留、半关闭回传与计数；
-- `udp_relay_integration`、`udp_session_routing`：UDP 单侧 I/O 失败排空、attach、路由、endpoint 固定、丢包边界、重建和统计，
+- `udp_relay`：零长度、超过 4096 和最大合法 UDP 载荷、session/短头丢弃后的继续转发、超限丢弃及两侧 I/O 失败排空；
+- `token_bucket`、`traffic_counter`：足额快路径、不足时预留、债务累积、补充与 burst 上限、无限速/空包，以及并发计数/采样和饱和；
+- `node_config`、`node_status`、`node_lifecycle`：配置校验、旧配置拒绝、服务统计及超长报告、监听回滚和停止后的对象释放；
+- `udp_relay_integration`、`udp_session_routing`：attach、路由、endpoint 固定、丢包边界、重建和统计，
   以及离线不分配资源、注册不复活旧请求、半接入超时、过期票据丢弃、ready 后无运行超时和容量恢复；
 - `agent_lifecycle`、`agent_reconnect`：重复启动/停止、可等待停止、断线重连取消以及停止后的对象释放。
 
-`benchmark_udp_node` 是独立容量基准，不注册为 CTest。它建立真实 mTLS 控制会话和 UDP Relay，再以原始 UDP socket 测量服务器数据路径。
+`benchmark_udp_node` 与 `benchmark_dual_index_map` 位于 `test/benchmark/`，不注册为 CTest。旧 UDP 集成测试内的环境变量压测分支已删除。前者是独立容量基准，它建立真实 mTLS 控制会话和 UDP Relay，再以原始 UDP socket 测量服务器数据路径。
 
-Dashboard 与部署验证使用 Python 环境中的 Flask、cbor2、Waitress；部署测试仅使用临时目录和 dry-run，
+Dashboard 验证使用 Python 环境中的 Flask、cbor2、Waitress；部署测试仅使用标准库、临时目录、模拟 systemctl 和 dry-run，Linux 检测到 Python3 时自动注册到 CTest，
 不会修改主机配置或服务。双 Node smoke 启动真实 Node、发布/消费 Agent 与 Dashboard，验证 TCP/TLS、
 Slave 入口重启恢复及历史保留；具备 CAP_NET_RAW 时也验证有向质量和推荐路径，否则明确跳过相关断言。
 
 ```console
 python -m unittest discover -s dashboard -p 'test_*.py'
-python -m unittest discover -s test -p 'provision_*_test.py'
-python -m unittest discover -s test -p 'packaging_test.py'
-python test/dashboard_service_smoke.py --build-dir build --two-nodes
+python -m unittest discover -s test/deployment -p '*_test.py'
+python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 ```
 
 ### 16.1 当前整理的验证范围
 
-2026-10-11 最终整理及 TCP 异常退出修复验证：
+2026-10-11 测试分组整理与回归补充验证：
 
 | 检查 | 结果 | 证据 |
 |---|---|---|
-| Debug 全目标构建 | 通过，无编译警告 | build/tcp-relay-fix-build.log |
-| 完整 CTest | 30 项通过，1 项原始 ICMP 权限跳过，0 失败；178.99 秒 | build/tcp-relay-fix-tests.log |
-| Dashboard 单元与集成测试 | 46 项通过 | build/final-audit-dashboard-tests.log |
-| 文档本地链接与章节锚点 | 72 个目标有效，54 个枚举命令及 Flow/peer 扩展命令均已描述 | 对 README、设计、部署及 Dashboard 文档逐项检查，并对照 message.cpp 与业务分派 |
+| Debug 全目标构建 | 通过，无编译警告 | build/test-layout-final-build.log |
+| 完整 CTest | 37 项通过，1 项原始 ICMP 权限跳过，0 失败；176.79 秒 | build/test-layout-final-tests.log |
+| Dashboard 单元与集成测试 | 46 项通过，无未关闭资源警告 | build/test-layout-dashboard-tests.log |
+| 双 Node Dashboard smoke | TCP/TLS 服务、Slave 入口恢复、SIGTERM 与历史保留通过；原始 ICMP 断言跳过 | build/test-layout-dashboard-smoke.log |
+| 部署脚本测试 | 10 项通过，也包含在 CTest deployment 组 | build/test-layout-deployment.log |
+| 自动测试清单 | 原有 31 项全部保留，共 38 项；均有标签、超时，命令对应已构建程序 | build/test-layout-test-list.json |
+| 文档本地链接与章节锚点 | 63 个目标有效 | 对根 README、测试 README、设计及 Dashboard 文档逐项检查 |
 | 修改格式 | git diff --check 通过 | 无空白错误 |
 
-新增 UDP 回归使用真实 socket 分别关闭目标侧与 Node 接入侧，确认对向仍在等待时也能排空，原始错误仍向调用方传播。
+UDP 复制回归移入 protocol 组，使用真实 socket 分别关闭目标侧与 Node 接入侧，确认对向仍在等待时也能排空，原始错误仍向调用方传播；
+新增空包、4097 字节、最大合法载荷和非法报文后的继续转发检查。限速和计数从编解码测试拆到 common 组，
+补充无睡眠的令牌补充/债务边界、burst 上限、空包，以及并发计数/采样、interval 饱和后的恢复。
+Node 配置、服务统计和启动生命周期从完整 Relay 集成中拆为独立用例；生成的非法配置位于临时目录，
+证书路径规范化后先验证有效基线，避免资源缺失造成负面测试假通过。
 TCP 回归同样使用真实 socket，分别验证两侧 RST、发送失败、限速等待中的对向失败，以及正常 EOF 后的反向回传和流量计数。
 已有测试覆盖 NodeConnection 停止、重复停止、建立失败、对象释放，以及单/多节点 TCP/TLS/UDP、FIN 排空、
 共享 Flow 隔离、服务恢复和路由失效。生产测试接口已删除；集群测试使用真实协议对端，路由测量夹具及私有访问仅在 test/。
