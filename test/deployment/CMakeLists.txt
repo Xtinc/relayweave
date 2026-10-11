@@ -1,5 +1,5 @@
-# Standard library, temporary directories, mocked systemctl and provisioning
-# dry-run only; these tests need no Dashboard dependencies.
+# Temporary packages, mocked systemctl and provisioning dry-run only; these
+# tests need no Dashboard dependencies. Package checks skip without CPack/dpkg.
 find_package(Python3 QUIET COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME deployment COMMAND "${Python3_EXECUTABLE}" -m unittest discover

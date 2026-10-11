@@ -33,7 +33,7 @@ relayweave-proxy_1.0.0-1_arm64.deb
 版本来源只有两处：
 
 - upstream version 在顶层 [`CMakeLists.txt`](../CMakeLists.txt) 的 `project(relayweave VERSION ...)` 中维护；
-- Debian revision 使用 CMake cache 变量 `RELAYWEAVE_PACKAGE_RELEASE`，默认值为 `1`。
+- Debian revision 使用 CMake cache 变量 `RELAYWEAVE_PACKAGE_RELEASE`，默认值为 `2`。
 
 应用输出的版本、CMake project version 和包的 upstream version 来自同一 `PROJECT_VERSION`。只修改 Debian 构建或维护脚本而应用版本不变时，可以递增 revision，例如从 `1.0.0-1` 变为 `1.0.0-2`。
 
@@ -90,7 +90,7 @@ RELAYWEAVE_BUILD_JOBS=2 scripts/build_deb.sh
 cmake -S . -B build-package \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF \
-  -DRELAYWEAVE_PACKAGE_RELEASE=1
+  -DRELAYWEAVE_PACKAGE_RELEASE=2
 cmake --build build-package --parallel 1
 cpack --config build-package/CPackConfig.cmake -G DEB
 ```
@@ -105,6 +105,12 @@ dpkg-deb --contents build-package/packages/relayweave-node_*.deb
 dpkg-deb --info build-package/packages/relayweave-proxy_*.deb
 dpkg-deb --contents build-package/packages/relayweave-proxy_*.deb
 ```
+
+Git 对 `packaging/` 文件统一要求 LF 换行；CMake 还会把 `conffiles`、`postinst`、
+`prerm`、`postrm` 和 Dashboard 启动脚本生成到构建目录并统一为 LF，CPack 使用这些副本。
+这样即使源码来自 CRLF 检出或压缩包，维护脚本的解释器路径仍是有效的 `/bin/sh`。
+`1.0.4-2` 是包含该修复的包修订号；复用旧构建目录时需显式指定
+`-DRELAYWEAVE_PACKAGE_RELEASE=2`，以覆盖缓存中的旧值。
 
 ## 4. 安装内容
 
@@ -281,6 +287,45 @@ sudo apt purge relayweave-agent relayweave-node relayweave-proxy
 ### 安装时报告依赖缺失
 
 优先使用 `apt install ./package.deb`，不要只使用 `dpkg -i`。如果构建机没有 `dpkg-shlibdeps`，重新安装 `dpkg-dev` 后清理或重新配置打包目录。
+
+### dpkg 无法执行 postinst，报告 No such file or directory
+
+这个错误也可能表示脚本首行指定的解释器不存在。先检查脚本和 `/bin/sh`：
+
+```console
+ls -l /var/lib/dpkg/info/relayweave-node.postinst /bin/sh
+head -n 1 /var/lib/dpkg/info/relayweave-node.postinst | cat -v
+head -n 1 /var/lib/dpkg/info/relayweave-agent.postinst | cat -v
+```
+
+如果首行显示 `#!/bin/sh^M`，说明包内脚本是 CRLF；内核会尝试执行不存在的 `/bin/sh\r`。
+确认后可修正已安装角色的维护脚本，再完成挂起的配置：
+
+```bash
+for package in relayweave-node relayweave-agent relayweave-proxy relayweave-dashboard; do
+    for hook in postinst prerm postrm; do
+        script=/var/lib/dpkg/info/$package.$hook
+        [ -f "$script" ] || continue
+        sudo sed -i 's/\r$//' "$script"
+        sudo chmod 755 "$script"
+    done
+done
+sudo dpkg --configure -a
+```
+
+修正 `prerm` 和 `postrm` 是为了让后续升级和卸载也能执行。此操作不会替换 JSON 配置；
+配置阶段会按原有规则重启当前 active 的服务。如果脚本确实缺失或 `/bin/sh` 损坏，
+应分别重新解包修复版软件包或修复系统解释器。
+
+随后使用修复版包，例如：
+
+```console
+sudo apt install ./relayweave-node_1.0.4-2_amd64.deb ./relayweave-agent_1.0.4-2_amd64.deb
+```
+
+再次 `apt install` 同版本的 `1.0.4-1` 会跳过解包，仅重试原来的 `postinst`，所以不会
+自动修复。若重新生成的包仍沿用同一版本号，需要 `apt install --reinstall ./package.deb`。
+`_apt` 无法访问 `/root` 包文件的 Notice 与维护脚本执行失败无关。
 
 ### 首次安装后服务没有运行
 

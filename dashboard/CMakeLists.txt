@@ -3,7 +3,10 @@ install(FILES dashboard.py proxy_client.py proxy_protocol.py history_store.py ip
     DESTINATION usr/lib/relayweave/dashboard COMPONENT dashboard)
 install(FILES templates/dashboard.html
     DESTINATION usr/lib/relayweave/dashboard/templates COMPONENT dashboard)
-install(PROGRAMS "${PROJECT_SOURCE_DIR}/packaging/dashboard/relayweave-dashboard"
+configure_file("${PROJECT_SOURCE_DIR}/packaging/dashboard/relayweave-dashboard"
+    "${PROJECT_BINARY_DIR}/packaging/dashboard/relayweave-dashboard"
+    @ONLY NEWLINE_STYLE UNIX)
+install(PROGRAMS "${PROJECT_BINARY_DIR}/packaging/dashboard/relayweave-dashboard"
     DESTINATION usr/bin COMPONENT dashboard)
 install(FILES "${PROJECT_SOURCE_DIR}/packaging/dashboard/relayweave-dashboard.service"
     DESTINATION lib/systemd/system COMPONENT dashboard)

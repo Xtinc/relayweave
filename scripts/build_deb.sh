@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source_dir=$(cd -- "$script_dir/.." && pwd -P)
 build_dir=${1:-"$source_dir/build-package"}
-package_release=${RELAYWEAVE_PACKAGE_RELEASE:-1}
+package_release=${RELAYWEAVE_PACKAGE_RELEASE:-2}
 build_jobs=${RELAYWEAVE_BUILD_JOBS:-1}
 
 if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then

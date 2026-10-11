@@ -1,12 +1,87 @@
-"""Check Node/Agent maintainer scripts with temporary units and a fake systemctl."""
+"""Check Debian package contents and maintainer scripts without installing them."""
 import os
 from pathlib import Path
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@unittest.skipUnless(all(shutil.which(tool) for tool in ('cmake', 'cpack', 'dpkg-deb')),
+                     'Debian packaging tools are required')
+class DebianControlFilesTest(unittest.TestCase):
+    def test_crlf_checkout_produces_executable_lf_maintainer_scripts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            source = work / 'source'
+            build = work / 'build'
+            shutil.copytree(ROOT / 'packaging', source / 'packaging')
+            shutil.copytree(ROOT / 'docs', source / 'docs')
+            shutil.copytree(ROOT / 'cmake', source / 'cmake')
+            shutil.copytree(ROOT / 'dashboard', source / 'dashboard',
+                            ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+            (source / 'scripts').mkdir()
+            shutil.copyfile(ROOT / 'scripts' / 'provision_relayweave.sh',
+                            source / 'scripts' / 'provision_relayweave.sh')
+            components = ('agent', 'node', 'proxy', 'dashboard')
+            controls = ('conffiles', 'postinst', 'prerm', 'postrm')
+            for component in components:
+                for name in controls:
+                    path = source / 'packaging' / component / name
+                    path.write_bytes(path.read_bytes().replace(b'\r\n', b'\n')
+                                     .replace(b'\n', b'\r\n'))
+            launcher = source / 'packaging' / 'dashboard' / 'relayweave-dashboard'
+            launcher.write_bytes(launcher.read_bytes().replace(b'\r\n', b'\n')
+                                 .replace(b'\n', b'\r\n'))
+            # Exercise the real packaging rules with a tiny payload instead of
+            # compiling C++. No packages or services are installed on the host.
+            (source / 'payload').write_text('test payload\n')
+            (source / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.21)
+project(relayweave VERSION 1.0.4 LANGUAGES NONE)
+foreach(component IN ITEMS agent node proxy dashboard)
+    install(FILES payload DESTINATION usr/share/relayweave COMPONENT ${component})
+endforeach()
+add_subdirectory(dashboard)
+include(cmake/Packaging.cmake)
+''')
+            for command in (
+                ['cmake', '-S', str(source), '-B', str(build)],
+                ['cpack', '--config', str(build / 'CPackConfig.cmake'), '-G', 'DEB'],
+            ):
+                result = subprocess.run(command, cwd=work, capture_output=True, text=True,
+                                        timeout=20)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            packages = list((build / 'packages').glob('*.deb'))
+            self.assertEqual(len(packages), len(components))
+            for component in components:
+                with self.subTest(component=component):
+                    package, = (build / 'packages').glob(f'relayweave-{component}_*.deb')
+                    extracted = work / component
+                    subprocess.run(['dpkg-deb', '--control', str(package), str(extracted)],
+                                   check=True, capture_output=True, timeout=10)
+                    for name in controls:
+                        with self.subTest(control=name):
+                            path = extracted / name
+                            expected = (ROOT / 'packaging' / component / name).read_bytes()
+                            self.assertEqual(path.read_bytes(), expected.replace(b'\r\n', b'\n'))
+                            if name != 'conffiles':
+                                self.assertEqual(path.stat().st_mode & 0o777, 0o755)
+                                # An unused action skips service operations and
+                                # lets the kernel resolve the packaged shebang.
+                                result = subprocess.run([str(path), 'test-noop'],
+                                                        capture_output=True, timeout=5)
+                                self.assertEqual(result.returncode, 0, result.stderr)
+            dashboard_package, = (build / 'packages').glob('relayweave-dashboard_*.deb')
+            payload = work / 'dashboard-payload'
+            subprocess.run(['dpkg-deb', '--extract', str(dashboard_package), str(payload)],
+                           check=True, capture_output=True, timeout=10)
+            installed_launcher = payload / 'usr' / 'bin' / 'relayweave-dashboard'
+            expected = (ROOT / 'packaging' / 'dashboard' / 'relayweave-dashboard').read_bytes()
+            self.assertEqual(installed_launcher.read_bytes(), expected.replace(b'\r\n', b'\n'))
+            self.assertEqual(installed_launcher.stat().st_mode & 0o777, 0o755)
 
 
 class IcmpPackagingTest(unittest.TestCase):

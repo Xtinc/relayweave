@@ -12,7 +12,7 @@
 | `node/` | 配置/统计、启动停止、集群控制、共享 NodeLink、Flow、UDP session 路由、拓扑 | `node`，集群相关另标 `cluster` |
 | `proxy/` | HTTP、CONNECT、SOCKS5、容量、超时和监听回滚 | `proxy`、`integration` |
 | `integration/` | 单/多节点 TCP/TLS/UDP、恢复、迁移及 Proxy 完整链路 | `end_to_end`、`integration` |
-| `deployment/` | 安装脚本、能力校验、证书校验与配置 dry-run | `deployment`、`integration` |
+| `deployment/` | Deb 控制脚本换行与执行、能力校验、证书校验与配置 dry-run | `deployment`、`integration` |
 | `benchmark/` | UDP Node 吞吐、双索引容器性能比较 | 手动运行，不注册 CTest |
 | `tools/` | ICMP/TLS 手动诊断、真实 Dashboard 服务 smoke | 手动运行，不注册 CTest |
 | `support/` | 公共夹具、资源定位和容器对拍参考实现 | 不单独运行 |
