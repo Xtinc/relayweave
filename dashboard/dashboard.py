@@ -28,12 +28,14 @@ DASHBOARD_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(DASHBOARD_DIR))
 
 from history_store import HistoryStore  # noqa: E402
+from flow_map import FlowMapRenderer  # noqa: E402
 from ip_location import IpLocationCache  # noqa: E402
 from proxy_client import ProxyControlClient  # noqa: E402
 from service_runtime import RequestDrain  # noqa: E402
 
 app = Flask(__name__, template_folder="templates", static_folder=None)
 _client: ProxyControlClient | None = None
+_flow_renderer = FlowMapRenderer()
 _location_cache: IpLocationCache | None = None
 MAX_HISTORY_RANGE_SECONDS = 7 * 24 * 60 * 60
 GZIP_MINIMUM_SIZE = 512
@@ -82,6 +84,10 @@ def index():
 @app.route("/api/snapshot")
 def api_snapshot():
     assert _client
+    flow_service = request.args.get("flow_service", "")
+    flow_protocol = request.args.get("flow_protocol", "")
+    if len(flow_service) > 64 or flow_protocol not in {"", "tcp", "tls", "udp"}:
+        abort(400, description="Invalid Flow map filter")
     now = time.time()
     history_after = _history_after()
     queue_since = _history_since("queue_range", now)
@@ -102,6 +108,7 @@ def api_snapshot():
             else incremental_since
         )
     snap = _client.snapshot(queue_since, traffic_since)
+    flow_map = _flow_renderer.render(snap.flow_map, flow_service, flow_protocol)
     nodes = [_node_snapshot(node, now) for node in snap.nodes.values()]
     nodes.sort(key=lambda node: node["node_id"])
     connected_nodes, total_nodes = _cluster_counts(snap)
@@ -119,6 +126,7 @@ def api_snapshot():
             "entry_peer": snap.peer,
             "entry_error": snap.last_error,
             "topology": _topology_snapshot(snap.topology, time.monotonic(), snap.connected),
+            "flow_map": flow_map,
         }
     )
     response.headers["Cache-Control"] = "no-store"

@@ -86,6 +86,15 @@ void verify_status_fragmentation()
                {"node_id", "master-1"},
                {"uptime_ms", maximum}};
     base["services"] = services;
+    base["relays"] = njson::array();
+    for (std::size_t index = 0; index < 1000; ++index)
+    {
+        base["relays"].push_back(njson{{"mode", "multi"}, {"role", "ingress"},
+                                     {"service", "ssh"}, {"protocol", "tcp"},
+                                     {"epoch", maximum}, {"flow_id", maximum - index},
+                                     {"agent_peer", "[2001:db8::1]:49152"},
+                                     {"path", {"master-1", "node-b", "node-c"}}});
+    }
     const CtrlMessage message{CtrlCommand::ServerStatusReported, std::move(base)};
     const auto frames = WireMessage::pack(message);
     require(frames.size() > WireMessage::max_payload_length + WireMessage::header_length,

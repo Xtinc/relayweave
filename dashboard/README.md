@@ -13,6 +13,7 @@ browser dashboard.
 |------|---------|
 | `proxy_protocol.py` | Wire protocol: 4-byte big-endian length header + CBOR payload (`cbor2`). Mirrors `protocol/inc/message.h` (max frame payload 64 KiB, max logical message 16 MiB, max command length 32). |
 | `proxy_client.py`   | One background-thread mTLS client: handshake, heartbeat, periodic service-status and topology queries, history capture, and auto-reconnect. |
+| `flow_map.py` | In-memory collection rounds, Ready business pairing, route grouping, deterministic metro layout and SVG generation. |
 | `history_store.py`  | SQLite persistence and time-range/downsampled chart queries. |
 | `ip_location.py`    | Background public-IP geolocation, UNECE UN/LOCODE matching, and persistent caches. |
 | `dashboard.py`      | Single-process Waitress/Flask service: serves the page and `/api/snapshot`. |
@@ -42,7 +43,7 @@ range resets the cursor and performs a new full-window request.
   - `server.identify {}` → `server.identified {node_id}`. This handshake is
     completed before cluster polling starts.
   - `server.cluster {request_id}` → one complete `server.status.reported` message per node with
-    `{request_id, node_id, uptime_ms, services:[...]}`. `proxy_protocol.MessageReceiver`
+    `{request_id, node_id, uptime_ms, services:[...], relays:[...]}`. `proxy_protocol.MessageReceiver`
     transparently assembles large messages before they reach the client. Single services
     and accessor maps can span frames. Node membership, advertised addresses, and queue
     delays are supplied only by `topology.snapshot`.
@@ -80,14 +81,51 @@ complete versioned snapshot after membership or report changes; raw ICMP
 samples are not centralized.
 
 The page starts with cluster status, followed by the selected Node's five
-health metrics and responsive queue/bandwidth charts, then registered services. It does not display Agent
-routes, service routes, the Node-to-Node graph, or the directed-link table. Agent
-route calculations, per-ingress candidate costs, and connection establishment
-are recorded in Agent logs. Topology collection still supplies
+health metrics and responsive queue/bandwidth charts, the cluster-wide Current Flows
+metro map, then registered services. The map shows established TCP/TLS/UDP
+businesses, independently of the selected health Node. Agent route calculations,
+per-ingress candidate costs, and connection establishment are recorded in Agent logs. Topology collection still supplies
 current membership and queue values; the API retains link quality data. The score
 in that data is derived from cost as `100 * exp(-cost / 100)` and is not transmitted by Nodes.
 Snapshot and source-report ages must remain below 15 seconds, and link age below
 45 seconds; disconnects invalidate current availability while preserving historical scores.
+
+## Current Flows
+
+Every status report must include `relays`, including an empty array when no
+business is Ready. Upgrade all cluster Nodes and the Dashboard together;
+this addition requires no Agent changes and has no old-status compatibility branch.
+Controllers snapshot existing control-executor metadata, without reading data-plane queues.
+
+| Kind | Fields in addition to `mode`, `service`, `protocol` |
+|------|----------------------------------------------------|
+| `single` | `uuid`, `consumer_peer`, `producer_peer` |
+| `multi`, `role=ingress` | `epoch`, `flow_id`, `agent_peer` (Consumer), ordered `path` |
+| `multi`, `role=egress` | `epoch`, `flow_id`, `agent_peer` (Producer) |
+
+Python groups reports by the `server.cluster` request ID and the known member
+set. A complete round replaces the displayed businesses; after three polling
+cycles an incomplete round is published with its missing Nodes listed. Multi
+endpoints must match within that round on epoch, Flow ID, service, protocol and
+path endpoints. Missing or conflicting endpoints count as unmatched and produce
+no inferred route. Disconnects clear current availability; membership or epoch
+changes invalidate old rounds. Empty reports remove closed businesses.
+
+`/api/snapshot` includes `flow_map`: collection state, missing Nodes, unmatched
+count, business/route counts, route details and escaped SVG. Optional
+`flow_service` and `flow_protocol` query parameters filter the map in Python.
+Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
+Agents, service, protocol and ordered Node path merge and list every business ID.
+Agent stations are identified by attachment Node plus control IP:port; Nodes
+share stations. Geometry and colors are deterministic, and count-only refreshes
+retain coordinates. The browser preserves pan, zoom and valid route selection.
+Click a route or legend entry for details; use the filters, wheel/zoom buttons,
+dragging, and **Fit all** to explore the map. Flow data is only held in memory
+and is not added to SQLite history.
+
+Run the live three-Node tests with `RELAYWEAVE_NODE_BINARY` set to the built
+`relayweave-node` executable:
+`python -m unittest discover -s dashboard -p 'test_flow_integration.py' -v`.
 Age includes query and page-assembly time and uses a monotonic clock. This topology is observational only and is
 not used to route Relay traffic.
 

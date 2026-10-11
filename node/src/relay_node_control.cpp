@@ -1,14 +1,79 @@
+#include "node_session.h"
 #include "relay_node.h"
+#include <set>
 
 namespace
 {
 void validate_server_status(const njson &params, std::string_view location)
 {
     using namespace config;
-    reject_unknown_fields(params, {"request_id", "node_id", "uptime_ms", "services"}, location);
+    reject_unknown_fields(params, {"request_id", "node_id", "uptime_ms", "services", "relays"}, location);
     require_unsigned(params, "request_id", true);
     required_string(params, "node_id", location);
     require_unsigned(params, "uptime_ms");
+
+    {
+        const auto relays = params.find("relays");
+        if (relays == params.end() || !relays->is_array())
+        {
+            throw std::invalid_argument(std::string(location) + ".relays must be an array");
+        }
+        for (const auto &relay : *relays)
+        {
+            const auto mode = required_string(relay, "mode", location);
+            message_service(relay);
+            message_protocol(relay);
+            if (mode == "single")
+            {
+                reject_unknown_fields(relay, {"mode", "service", "protocol", "uuid", "consumer_peer", "producer_peer"},
+                                      location);
+                require_unsigned(relay, "uuid", true);
+                required_string(relay, "consumer_peer", location);
+                required_string(relay, "producer_peer", location);
+            }
+            else if (mode == "multi")
+            {
+                require_unsigned(relay, "epoch", true);
+                require_unsigned(relay, "flow_id", true);
+                required_string(relay, "agent_peer", location);
+                const auto role = required_string(relay, "role", location);
+                if (role == "ingress")
+                {
+                    reject_unknown_fields(
+                        relay, {"mode", "role", "service", "protocol", "epoch", "flow_id", "agent_peer", "path"},
+                        location);
+                    const auto &path = relay.at("path");
+                    if (!path.is_array() || path.size() < 2 || path.size() > 8 || path.front() != params.at("node_id"))
+                    {
+                        throw std::invalid_argument(std::string(location) + ".relays contains an invalid path");
+                    }
+                    std::set<std::string> nodes;
+                    for (const auto &node : path)
+                    {
+                        if (!node.is_string() || node.get_ref<const std::string &>().empty() ||
+                            !nodes.insert(node.get<std::string>()).second)
+                        {
+                            throw std::invalid_argument(std::string(location) +
+                                                        ".relays contains an invalid path node");
+                        }
+                    }
+                }
+                else if (role == "egress")
+                {
+                    reject_unknown_fields(
+                        relay, {"mode", "role", "service", "protocol", "epoch", "flow_id", "agent_peer"}, location);
+                }
+                else
+                {
+                    throw std::invalid_argument(std::string(location) + ".relays contains an invalid role");
+                }
+            }
+            else
+            {
+                throw std::invalid_argument(std::string(location) + ".relays contains an invalid mode");
+            }
+        }
+    }
 
     const auto services = params.find("services");
     if (services == params.end() || !services->is_array())
@@ -170,9 +235,10 @@ void RelayNode::register_service(SessionId id, const ControlSessionPtr &session,
     const auto result = registry_.register_service(id, service, protocol);
     if (result != RegistryMgr::Result::Registered)
     {
-        PROXY_ERROR_PRINT("Service rejected service=%s/%s session_id=%llu reason=%.*s",
-                          service.c_str(), relay_protocol_name(protocol).data(), static_cast<unsigned long long>(id),
-                          static_cast<int>(RegistryMgr::result2string(result).size()), RegistryMgr::result2string(result).data());
+        PROXY_ERROR_PRINT("Service rejected service=%s/%s session_id=%llu reason=%.*s", service.c_str(),
+                          relay_protocol_name(protocol).data(), static_cast<unsigned long long>(id),
+                          static_cast<int>(RegistryMgr::result2string(result).size()),
+                          RegistryMgr::result2string(result).data());
         session->send(CtrlMessage{CtrlCommand::ServiceError, njson{{"request_id", request_id},
                                                                    {"service", service},
                                                                    {"protocol", relay_protocol_name(protocol)},
@@ -186,7 +252,6 @@ void RelayNode::register_service(SessionId id, const ControlSessionPtr &session,
     session->send(CtrlMessage{
         CtrlCommand::ServiceOk,
         njson{{"request_id", request_id}, {"service", service}, {"protocol", relay_protocol_name(protocol)}}});
-
 }
 
 void RelayNode::locate_service(SessionId id, const ControlSessionPtr &session, const njson &params)
@@ -331,8 +396,17 @@ CtrlMessage RelayNode::server_status_message(std::uint64_t request_id)
 {
     const auto uptime =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_at_).count();
-    njson params{{"request_id", request_id}, {"node_id", config_.cluster.node_id}, {"uptime_ms", uptime < 0 ? 0 : uptime}};
+    njson params{
+        {"request_id", request_id}, {"node_id", config_.cluster.node_id}, {"uptime_ms", uptime < 0 ? 0 : uptime}};
     params["services"] = registry_.traffic_report();
+    params["relays"] = njson::array();
+    for (const auto &relay : relay_sessions_)
+    {
+        if (auto report = relay->status_report())
+        {
+            params["relays"].push_back(std::move(*report));
+        }
+    }
     return CtrlMessage{CtrlCommand::ServerStatusReported, std::move(params)};
 }
 
@@ -387,18 +461,19 @@ void RelayNode::locate_node(SessionId id, const ControlSessionPtr &session, cons
     if (!topology_->members().contains(node))
     {
         session->send(CtrlMessage(CtrlCommand::NodeError,
-            njson{{"request_id", request}, {"node_id", node}, {"reason", "node unavailable"}}));
+                                  njson{{"request_id", request}, {"node_id", node}, {"reason", "node unavailable"}}));
         return;
     }
     if (node == config_.cluster.node_id)
     {
-        session->send(CtrlMessage(CtrlCommand::NodeLocated,
-            njson{{"request_id", request}, {"node_id", node},
-                  {"address", config_.control.advertise_address}, {"port", config_.control.port}}));
+        session->send(CtrlMessage(CtrlCommand::NodeLocated, njson{{"request_id", request},
+                                                                  {"node_id", node},
+                                                                  {"address", config_.control.advertise_address},
+                                                                  {"port", config_.control.port}}));
         return;
     }
     cluster_mgr_->send(node, CtrlMessage(CtrlCommand::NodeLookup,
-        njson{{"request_id", request}, {"node_id", node}, {"session_id", id}}));
+                                         njson{{"request_id", request}, {"node_id", node}, {"session_id", id}}));
 }
 
 void RelayNode::handle_node_lookup(const njson &params)
@@ -410,7 +485,7 @@ void RelayNode::handle_node_lookup(const njson &params)
         return;
     }
     CtrlMessage reply(CtrlCommand::NodeLocated,
-        njson{{"address", config_.control.advertise_address}, {"port", config_.control.port}});
+                      njson{{"address", config_.control.advertise_address}, {"port", config_.control.port}});
     attach_cluster_reply_route(reply, params);
     cluster_mgr_->send(source, std::move(reply));
 }

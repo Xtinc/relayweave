@@ -15,6 +15,7 @@ class ControlRouterSingle
     void cancel(std::string stage, std::string reason);
     bool handle(const ControlSessionPtr &session, const CtrlMessage &message);
     bool belongs_to(const ControlSessionPtr &session) const;
+    std::optional<njson> status_report() const;
 
   private:
     bool matches(const ControlSessionPtr &session, const njson &params) const;

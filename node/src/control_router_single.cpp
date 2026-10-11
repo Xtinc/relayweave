@@ -21,6 +21,20 @@ bool ControlRouterSingle::belongs_to(const ControlSessionPtr &session) const
     return consumer_.lock() == session || producer_.lock() == session;
 }
 
+std::optional<njson> ControlRouterSingle::status_report() const
+{
+    const auto consumer = consumer_.lock();
+    const auto producer = producer_.lock();
+    if (!ready_ || closed_ || !consumer || !producer)
+    {
+        return std::nullopt;
+    }
+    return njson{{"mode", "single"}, {"service", params_.at("service")},
+                 {"protocol", params_.at("protocol")}, {"uuid", relay_.uuid()},
+                 {"consumer_peer", std::string(consumer->peer())},
+                 {"producer_peer", std::string(producer->peer())}};
+}
+
 bool ControlRouterSingle::matches(const ControlSessionPtr &session, const njson &params) const
 {
     if (closed_ || !belongs_to(session))

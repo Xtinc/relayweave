@@ -6,6 +6,7 @@
 #include <array>
 #include <future>
 #include <iostream>
+#include <set>
 
 // Compile-time fixture access only: seed the existing LRU so full Agent paths do not require raw ICMP.
 #include "member_access.h"
@@ -232,6 +233,50 @@ asio::awaitable<tcp::socket> attach_tcp(const njson &endpoint, const NodeConfig 
     co_return socket;
 }
 
+// Query through one entry Node so endpoint reports also exercise cluster forwarding.
+asio::awaitable<void> verify_flow_reports(const std::shared_ptr<TLSChannel> &monitor,
+                                         const std::string &entry, const std::string &exit,
+                                         std::uint64_t epoch, std::uint64_t flow_id,
+                                         std::uint64_t request, RelayProtocol protocol,
+                                         const std::vector<std::string> &path, bool active)
+{
+    monitor->send(CtrlMessage(CtrlCommand::ServerCluster, njson{{"request_id", request}}));
+    std::set<std::string> received;
+    while (received.size() < 2)
+    {
+        const auto message = co_await monitor->async_receive(4s);
+        const auto &params = config::message_params(message);
+        if (message.type() != CtrlCommand::ServerStatusReported || params.at("request_id") != request)
+        {
+            continue;
+        }
+        const auto node = params.at("node_id").get<std::string>();
+        if (node != entry && node != exit)
+        {
+            continue;
+        }
+        received.insert(node);
+        std::size_t found = 0;
+        for (const auto &relay : params.at("relays"))
+        {
+            if (relay.at("mode") != "multi" || relay.at("epoch") != epoch || relay.at("flow_id") != flow_id)
+            {
+                continue;
+            }
+            ++found;
+            require(relay.at("protocol") == std::string(relay_protocol_name(protocol)) &&
+                    relay.at("role") == (node == entry ? "ingress" : "egress") &&
+                    !relay.at("agent_peer").get<std::string>().empty() && !relay.contains("ticket"),
+                    "Invalid public Flow endpoint metadata");
+            if (node == entry)
+            {
+                require(relay.at("path") == path, "Flow report changed its committed Node path");
+            }
+        }
+        require(found == (active ? 1U : 0U), active ? "Ready Flow missing from report" : "Inactive Flow leaked into report");
+    }
+}
+
 // Exhaust the configured service-side bucket through real sockets, then cancel during its next wait.
 asio::awaitable<void> cancel_during_stream_limit(const std::shared_ptr<TLSChannel> &consumer,
                                                 const std::shared_ptr<TLSChannel> &producer,
@@ -279,6 +324,9 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
     const auto offer = co_await receive(producer, CtrlCommand::RelayOffer);
     const auto &first = *opened.params;
     const auto &last = *offer.params;
+    auto monitor = co_await connect_control(ssl, entry);
+    co_await verify_flow_reports(monitor, path.front(), path.back(), epoch,
+                                first.at("flow_id").get<std::uint64_t>(), 1, protocol, path, false);
     require(first.at("flow_id") == last.at("flow_id") && first.at("epoch") == epoch,
             "Flow identity lost across endpoint notifications");
     require(!first.contains("data_address") && !last.contains("data_address") &&
@@ -367,10 +415,13 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
         {
             require(datagrams.back().available() == 0, "UDP business data passed an incomplete readiness barrier");
         }
+        co_await monitor->async_disconnect();
         co_return;
     }
     co_await receive(consumer, CtrlCommand::RelayReady);
     co_await receive(producer, CtrlCommand::RelayReady);
+    co_await verify_flow_reports(monitor, path.front(), path.back(), epoch,
+                                first.at("flow_id").get<std::uint64_t>(), 2, protocol, path, true);
     const std::array<std::uint8_t, 3> expected{1, 2, 3};
     if (protocol == RelayProtocol::Udp)
     {
@@ -464,6 +515,9 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
     }
     const auto consumer_closed = co_await receive(consumer, CtrlCommand::RelayClosed);
     const auto producer_closed = co_await receive(producer, CtrlCommand::RelayClosed);
+    co_await verify_flow_reports(monitor, path.front(), path.back(), epoch,
+                                first.at("flow_id").get<std::uint64_t>(), 3, protocol, path, false);
+    co_await monitor->async_disconnect();
     if (protocol != RelayProtocol::Udp)
     {
         require(consumer_closed.params->at("reason") == "stream complete" &&

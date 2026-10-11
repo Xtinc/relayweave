@@ -35,6 +35,23 @@ void ControlRouterMulti::send_peer(std::string command, njson params) const
     relay_.node_.cluster_mgr_->send(peer_, CtrlMessage(std::move(command), std::move(params)));
 }
 
+std::optional<njson> ControlRouterMulti::status_report() const
+{
+    const auto session = session_.lock();
+    if (progress_ != Progress::Ready || closed_ || !session)
+    {
+        return std::nullopt;
+    }
+    njson report{{"mode", "multi"}, {"role", ingress_ ? "ingress" : "egress"},
+                 {"service", params_.at("service")}, {"protocol", params_.at("protocol")},
+                 {"epoch", epoch_}, {"flow_id", flow_id_}, {"agent_peer", std::string(session->peer())}};
+    if (ingress_)
+    {
+        report["path"] = params_.at("path");
+    }
+    return report;
+}
+
 void ControlRouterMulti::notify_agent() const
 {
     if (auto session = session_.lock())

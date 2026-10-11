@@ -287,6 +287,30 @@
   }
   .footer-note { color: var(--text-muted); font-size: 12px; margin-top: 24px; }
   .stale { opacity: 0.5; transition: opacity 0.3s; }
+  .flow-controls { display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }
+  .flow-controls button, .flow-legend button {
+    background:var(--surface-1); border:1px solid var(--border); border-radius:7px;
+    padding:6px 10px; color:var(--text-primary); cursor:pointer; font:inherit; font-size:12px;
+  }
+  .flow-viewport { height:420px; overflow:hidden; touch-action:none; cursor:grab; border:1px solid var(--border); border-radius:8px; }
+  .flow-viewport:active { cursor:grabbing; }
+  .flow-svg { width:100%; height:100%; display:block; }
+  .flow-track { fill:none; stroke-width:4; stroke-linejoin:round; stroke-linecap:round; }
+  .flow-hit { fill:none; stroke:transparent; stroke-width:18; cursor:pointer; }
+  .flow-line { cursor:pointer; }
+  .flow-line.dimmed { opacity:.18; }
+  .flow-line.selected .flow-track, .flow-line:focus .flow-track { stroke-width:7; }
+  .flow-line:focus { outline:none; }
+  .flow-node, .flow-agent { fill:var(--surface-1); stroke:var(--text-primary); stroke-width:2; }
+  .flow-station text { fill:var(--text-secondary); font-size:12px; paint-order:stroke; stroke:var(--surface-2); stroke-width:4; stroke-linejoin:round; }
+  .flow-status { color:var(--text-secondary); font-size:12px; margin:8px 0 12px; }
+  .flow-legend { display:flex; flex-wrap:wrap; gap:7px; margin:12px 0; max-height:140px; overflow:auto; }
+  .flow-legend button { border-left:5px solid; }
+  .flow-legend button[aria-pressed="true"] { background:var(--surface-2); outline:2px solid var(--baseline); }
+  .flow-details { font-size:12px; color:var(--text-secondary); line-height:1.7; overflow-wrap:anywhere; max-height:220px; overflow:auto; }
+  .flow-details strong { color:var(--text-primary); }
+  .flow-empty { display:grid; place-items:center; height:100%; padding:24px; text-align:center; box-sizing:border-box; color:var(--text-muted); }
+  @media (max-width:700px) { .flow-card .card-head { align-items:flex-start; flex-direction:column; } .flow-controls { margin-left:0; } .flow-viewport { height:340px; } }
 </style>
 </head>
 <body class="viz-root">
@@ -378,6 +402,26 @@
           <div class="tooltip" id="tip-bandwidth"></div>
         </div>
       </div>
+    </div>
+    <div class="card flow-card">
+      <div class="card-head">
+        <h2>Current Flows</h2>
+        <div class="flow-controls">
+          <select class="svc-select" id="flow-service" aria-label="Flow service filter"><option value="">All services</option></select>
+          <select class="svc-select" id="flow-protocol" aria-label="Flow protocol filter">
+            <option value="">All protocols</option><option value="tcp">TCP</option><option value="tls">TLS</option><option value="udp">UDP</option>
+          </select>
+          <button type="button" id="flow-zoom-out" aria-label="Zoom out">−</button>
+          <button type="button" id="flow-zoom-in" aria-label="Zoom in">+</button>
+          <button type="button" id="flow-fit">Fit all</button>
+        </div>
+      </div>
+      <div class="flow-status" id="flow-status" role="status">Waiting for current business reports</div>
+      <div class="flow-viewport" id="flow-viewport" aria-label="Interactive Flow map">
+        <div class="flow-empty">Waiting for reports</div>
+      </div>
+      <div class="flow-legend" id="flow-legend" aria-label="Active routes"></div>
+      <div class="flow-details" id="flow-details">Select a route to inspect its connections.</div>
     </div>
     <div class="card table-card">
       <div class="card-head">
@@ -486,6 +530,141 @@ const chartRanges = { "chart-queue": 300, "chart-bandwidth": 300 };
 // The compound key keeps same-named services on different nodes distinct.
 let bandwidthSelection = null;
 let selectedNodeKey = null;
+let flowServiceFilter = "";
+let flowProtocolFilter = "";
+let flowSelected = null;
+let flowMapData = null;
+let flowSvgText = null;
+let flowPan = {scale:1, x:0, y:0};
+let flowDragging = null;
+let flowDidDrag = false;
+
+function applyFlowPan(){
+  const scene = $("flow-viewport").querySelector(".flow-scene");
+  if(scene) scene.setAttribute("transform", `translate(${flowPan.x} ${flowPan.y}) scale(${flowPan.scale})`);
+}
+function flowPoint(event){
+  const svg = $("flow-viewport").querySelector("svg");
+  const matrix = svg?.getScreenCTM();
+  if(!matrix) return null;
+  return new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix.inverse());
+}
+function zoomFlow(factor, point=null){
+  const svg = $("flow-viewport").querySelector("svg");
+  if(!svg) return;
+  point ||= {x:svg.viewBox.baseVal.width/2, y:svg.viewBox.baseVal.height/2};
+  const scale = Math.max(.25, Math.min(8, flowPan.scale*factor));
+  const ratio = scale/flowPan.scale;
+  flowPan = {scale, x:point.x-(point.x-flowPan.x)*ratio, y:point.y-(point.y-flowPan.y)*ratio};
+  applyFlowPan();
+}
+function selectFlow(id){
+  flowSelected = flowSelected === id ? null : id;
+  renderFlowSelection();
+}
+function renderFlowSelection(){
+  const route = flowMapData?.routes.find(item => item.id === flowSelected);
+  if(!route) flowSelected = null;
+  $("flow-viewport").querySelectorAll(".flow-line").forEach(line => {
+    line.classList.toggle("selected", line.dataset.route === flowSelected);
+    line.classList.toggle("dimmed", !!flowSelected && line.dataset.route !== flowSelected);
+  });
+  $("flow-legend").querySelectorAll("button").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.route === flowSelected)));
+  const details = $("flow-details");
+  details.replaceChildren();
+  if(!route){ details.textContent = "Select a route to inspect its connections. Circles: Nodes · squares: Agents. Traffic is bidirectional."; return; }
+  const heading = document.createElement("strong");
+  heading.textContent = `${route.service} / ${route.protocol.toUpperCase()} · ${route.count} connections`;
+  details.append(heading);
+  const rows = [
+    `Consumer Agent: ${route.consumer.peer} @ ${route.consumer.node}`,
+    `Node path: ${route.path.join(" → ")}`,
+    `Producer Agent: ${route.producer.peer} @ ${route.producer.node}`,
+    ...route.businesses.map(business => business.mode === "single"
+      ? `Single · ${business.node} · UUID ${business.uuid}`
+      : `Multi · epoch ${business.epoch} · Flow ${business.flow_id}`),
+  ];
+  rows.forEach(text => { const row=document.createElement("div"); row.textContent=text; details.append(row); });
+}
+function renderFlowMap(map){
+  flowMapData = map;
+  const select = $("flow-service");
+  const services = [...map.services];
+  if(flowServiceFilter && !services.includes(flowServiceFilter)) services.push(flowServiceFilter);
+  select.replaceChildren(new Option("All services", ""), ...services.sort().map(name => new Option(name, name)));
+  select.value = flowServiceFilter;
+  const messages = [`${map.flow_count} current connections · ${map.route_count} routes`,
+                    `${map.visible_route_count} routes shown`];
+  if(map.state === "disconnected") messages.push("Collection disconnected — current Flow data unavailable");
+  if(map.state === "pending") messages.push("Waiting for a complete collection round");
+  if(map.missing_nodes.length) messages.push(`Incomplete collection — missing: ${map.missing_nodes.join(", ")}`);
+  if(map.unmatched_count) messages.push(`${map.unmatched_count} multi-node businesses awaiting matching endpoints`);
+  $("flow-status").textContent = messages.join(" · ");
+  const viewport = $("flow-viewport");
+  if(map.routes.length){
+    if(flowSvgText !== map.svg){ viewport.innerHTML = map.svg; flowSvgText = map.svg; }
+    applyFlowPan();
+  }else{
+    flowSvgText = null;
+    const empty = document.createElement("div"); empty.className = "flow-empty";
+    empty.textContent = map.state === "disconnected" ? "Collection disconnected"
+      : map.state === "pending" ? "Waiting for current Flow reports"
+      : map.route_count ? "No routes match the selected filters"
+      : map.partial ? "Collection incomplete; no complete routes available"
+      : "No active Flows";
+    viewport.replaceChildren(empty);
+  }
+  const legend = $("flow-legend"); legend.replaceChildren();
+  map.routes.forEach(route => {
+    const button = document.createElement("button"); button.type="button"; button.dataset.route=route.id;
+    button.style.borderLeftColor=route.color;
+    button.textContent=`${route.service} / ${route.protocol.toUpperCase()} · ${route.count}`;
+    button.title=`${route.consumer.peer} → ${route.path.join(" → ")} → ${route.producer.peer}`;
+    button.addEventListener("click", ()=>selectFlow(route.id)); legend.append(button);
+  });
+  renderFlowSelection();
+}
+function requestFlowPoll(){
+  pollGeneration++; pollPending=true;
+  if(pollTimer !== null){ clearTimeout(pollTimer); pollTimer=null; }
+  poll();
+}
+$("flow-service").addEventListener("change", event=>{ flowServiceFilter=event.target.value; requestFlowPoll(); });
+$("flow-protocol").addEventListener("change", event=>{ flowProtocolFilter=event.target.value; requestFlowPoll(); });
+$("flow-fit").addEventListener("click", ()=>{ flowPan={scale:1,x:0,y:0}; applyFlowPan(); });
+$("flow-zoom-in").addEventListener("click", ()=>zoomFlow(1.25));
+$("flow-zoom-out").addEventListener("click", ()=>zoomFlow(.8));
+$("flow-viewport").addEventListener("wheel", event=>{
+  const point=flowPoint(event); if(!point) return;
+  event.preventDefault(); zoomFlow(event.deltaY < 0 ? 1.15 : 1/1.15, point);
+}, {passive:false});
+$("flow-viewport").addEventListener("pointerdown", event=>{
+  if(event.button !== 0) return;
+  const point=flowPoint(event); if(!point) return;
+  flowDragging={point, x:flowPan.x, y:flowPan.y}; flowDidDrag=false;
+  event.currentTarget.setPointerCapture(event.pointerId);
+});
+$("flow-viewport").addEventListener("pointermove", event=>{
+  if(!flowDragging) return;
+  const point=flowPoint(event); if(!point) return;
+  const dx=point.x-flowDragging.point.x, dy=point.y-flowDragging.point.y;
+  if(Math.abs(dx)+Math.abs(dy)>3) flowDidDrag=true;
+  flowPan.x=flowDragging.x+dx; flowPan.y=flowDragging.y+dy; applyFlowPan();
+});
+$("flow-viewport").addEventListener("pointerup", event=>{
+  if(!flowDragging) return;
+  // Pointer capture retargets clicks; pick the route underneath the released pointer.
+  if(!flowDidDrag){
+    const line=document.elementFromPoint(event.clientX,event.clientY)?.closest("[data-route]");
+    if(line && event.currentTarget.contains(line)) selectFlow(line.dataset.route);
+  }
+  flowDragging=null;
+});
+$("flow-viewport").addEventListener("pointercancel", ()=>{ flowDragging=null; });
+$("flow-viewport").addEventListener("keydown", event=>{
+  const line=event.target.closest("[data-route]");
+  if(line && (event.key === "Enter" || event.key === " ")){ event.preventDefault(); selectFlow(line.dataset.route); }
+});
 
 function windowHistory(hist, secs, now){
   if(secs == null || !hist.length) return hist;
@@ -963,6 +1142,7 @@ function resetHistoryAndPoll(){
 
 function render(data){
   currentData = data;
+  renderFlowMap(data.flow_map);
   const nodes = data.nodes || [];
   const renderNow = Number(data.now) || Date.now()/1000;
   populateNodeSelect(nodes);
@@ -1088,6 +1268,8 @@ async function poll(){
     const query = new URLSearchParams({
       queue_range: chartRanges["chart-queue"] === null ? "all" : chartRanges["chart-queue"],
       bandwidth_range: chartRanges["chart-bandwidth"] === null ? "all" : chartRanges["chart-bandwidth"],
+      flow_service: flowServiceFilter,
+      flow_protocol: flowProtocolFilter,
     });
     if(historyCursor !== null) query.set("history_after", String(historyCursor));
     const r = await fetch("/api/snapshot?" + query, {cache:"no-store"});

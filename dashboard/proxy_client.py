@@ -20,6 +20,7 @@ import time
 from dataclasses import dataclass, field, replace
 
 from history_store import HistoryStore
+from flow_map import FlowCollection, validate_relays
 from proxy_protocol import (
     CtrlMessage,
     HEADER_LENGTH,
@@ -131,6 +132,7 @@ class Snapshot:
     peer: str = ""
     nodes: dict[str, NodeSnapshot] = field(default_factory=dict)
     topology: TopologySnapshot | None = None
+    flow_map: dict = field(default_factory=lambda: FlowCollection().snapshot(False))
 
 
 class ProxyControlClient:
@@ -172,6 +174,7 @@ class ProxyControlClient:
         self._round_number = 0
         self._rounds: dict[int, tuple[int, float]] = {}
         self._discarded_topology: set[int] = set()
+        self._flows = FlowCollection()
         self._receiver = MessageReceiver()
         self._member_ids: set[str] | None = None
         # Serializes writes: the reader thread answers pings while the poller
@@ -229,6 +232,7 @@ class ProxyControlClient:
                 peer=self._snapshot.peer,
                 nodes=nodes,
                 topology=topology,
+                flow_map=self._flows.snapshot(self._snapshot.connected),
             )
         for node in snap.nodes.values():
             node.queue_history = [
@@ -274,6 +278,7 @@ class ProxyControlClient:
             self._discarded_topology.clear()
             self._receiver = MessageReceiver()
             self._member_ids = None
+            self._flows = FlowCollection()
             self._snapshot.topology = None
             self._snapshot.entry_node_id = node_id
             self._snapshot.connected = True
@@ -495,6 +500,7 @@ class ProxyControlClient:
         with self._lock:
             self._round_number += 1
             round_number = self._round_number
+            self._flows.begin(request_id, round_number)
             self._rounds[request_id] = (round_number, time.monotonic())
             self._rounds = {
                 rid: value for rid, value in self._rounds.items() if round_number - value[0] < 3
@@ -519,6 +525,7 @@ class ProxyControlClient:
         if not isinstance(node_id, str) or not node_id:
             raise ValueError("server.status.reported.node_id must be a non-empty string")
         uptime_ms = self._unsigned(params, "uptime_ms")
+        relays = validate_relays(node_id, params.get("relays"))
 
         raw_services = params.get("services")
         if not isinstance(raw_services, list):
@@ -564,6 +571,8 @@ class ProxyControlClient:
         with self._lock:
             round_info = self._rounds.get(request_id)
             current = self._nodes.get(node_id)
+            if round_info is not None and (self._member_ids is None or node_id in self._member_ids):
+                self._flows.record(request_id, node_id, relays)
             if (
                 round_info is None
                 or (self._member_ids is not None and node_id not in self._member_ids)
@@ -739,6 +748,7 @@ class ProxyControlClient:
                 node_id: node for node_id, node in self._nodes.items() if node_id in member_ids
             }
             self._member_ids = member_ids
+            self._flows.topology(member_ids, epoch)
             origin = self._rounds[request_id][1] - created_age_ms / 1000.0
             self._snapshot.topology = TopologySnapshot(
                 epoch=epoch,

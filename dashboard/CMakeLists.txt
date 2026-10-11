@@ -1,5 +1,5 @@
 # Python sources are architecture independent; building the package does not run Python.
-install(FILES dashboard.py proxy_client.py proxy_protocol.py history_store.py ip_location.py service_runtime.py
+install(FILES dashboard.py proxy_client.py proxy_protocol.py history_store.py ip_location.py service_runtime.py flow_map.py
     DESTINATION usr/lib/relayweave/dashboard COMPONENT dashboard)
 install(FILES templates/dashboard.html
     DESTINATION usr/lib/relayweave/dashboard/templates COMPONENT dashboard)

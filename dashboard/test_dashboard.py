@@ -22,6 +22,7 @@ from dashboard import (
     _node_snapshot,
 )
 from history_store import HistoryStore
+from flow_map import FlowCollection
 from proxy_client import ProxyControlClient
 from proxy_protocol import CtrlMessage, HEADER_LENGTH, from_cbor, pack_frame
 
@@ -55,6 +56,7 @@ def _status(
             "request_id": request_id,
             "node_id": node_id,
             "uptime_ms": uptime_ms,
+            "relays": [],
             "services": [
                 {
                     "service": "ssh",
@@ -205,6 +207,7 @@ class DashboardConfigTest(unittest.TestCase):
             peer="127.0.0.1:18443",
             last_error="",
             topology=None,
+            flow_map=FlowCollection().snapshot(True),
         )
         client = SimpleNamespace(snapshot=lambda load, traffic: calls.append((load, traffic)) or snap)
         with patch.object(dashboard_module, "_client", client):
@@ -228,6 +231,14 @@ class DashboardConfigTest(unittest.TestCase):
         self.assertLess(len(compressed.data), len(plain.data))
         disabled = client.get("/", headers={"Accept-Encoding": "gzip;q=0"})
         self.assertNotIn("Content-Encoding", disabled.headers)
+
+    def test_invalid_flow_filters_are_rejected_before_snapshot(self) -> None:
+        with patch.object(dashboard_module, "_client") as collector:
+            http = dashboard_module.app.test_client()
+            for query in ("flow_protocol=http", "flow_service=" + "a" * 65):
+                with self.subTest(query=query):
+                    self.assertEqual(http.get("/api/snapshot?" + query).status_code, 400)
+            collector.snapshot.assert_not_called()
 
     def test_snapshot_includes_accessor_locations(self) -> None:
         traffic = SimpleNamespace(
@@ -286,6 +297,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertIsNone(sock.timeout)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_one_round_accepts_multiple_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -308,6 +320,58 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(len(snapshot.nodes["node-a"].queue_history), 0)
             finally:
                 client.stop()
+                client._history_store.close()
+
+    def test_flow_round_can_complete_after_newer_node_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(directory)
+            sock = _Socket()
+            try:
+                client._set(connected=True)
+                client._poll_once(sock)
+                first = _request_id(sock.outgoing)
+                client._handle_message(sock, _topology(first))
+                head = _status(first, "node-a")
+                head.params["relays"] = [dict(mode="multi", role="ingress", epoch=11,
+                    flow_id=2**64-1, service="ssh", protocol="tcp", agent_peer="192.0.2.1:99",
+                    path=["node-a", "node-b"])]
+                client._handle_message(sock, head)
+                sock.outgoing.clear()
+                client._poll_once(sock)
+                newer = _request_id(sock.outgoing)
+                client._handle_message(sock, _status(newer, "node-b", 999))
+                tail = _status(first, "node-b", 123)
+                tail.params["relays"] = [dict(mode="multi", role="egress", epoch=11,
+                    flow_id=2**64-1, service="ssh", protocol="tcp", agent_peer="[2001:db8::1]:55")]
+                client._handle_message(sock, tail)
+                snap = client.snapshot(None, None)
+                self.assertEqual(snap.nodes["node-b"].uptime_ms, 999)
+                self.assertEqual(snap.flow_map["flow_count"], 1)
+                self.assertEqual(snap.flow_map["routes"][0]["businesses"][0]["flow_id"], str(2**64-1))
+                client._handle_message(sock, tail)
+                self.assertEqual(client.snapshot(None, None).flow_map["flow_count"], 1)
+                client._handle_message(sock, _status(newer, "node-a"))
+                self.assertEqual(client.snapshot(None, None).flow_map["flow_count"], 0)
+                client._set(connected=False)
+                self.assertEqual(client.snapshot(None, None).flow_map["state"], "disconnected")
+            finally:
+                client.stop()
+                client._history_store.close()
+
+    def test_status_requires_relays_without_committing_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(directory)
+            sock = _Socket()
+            try:
+                client._poll_once(sock)
+                message = _status(_request_id(sock.outgoing), "node-a")
+                del message.params["relays"]
+                with self.assertRaises(ValueError):
+                    client._handle_message(sock, message)
+                self.assertEqual(client.snapshot(None, None).nodes, {})
+            finally:
+                client.stop()
+                client._history_store.close()
 
     def test_poll_collects_a_complete_topology_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -342,6 +406,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertIsNone(client.snapshot(None, None).topology)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_topology_age_includes_request_and_assembly_time(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -369,6 +434,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertTrue(dashboard_module._topology_snapshot(topology, 115.0, True)["stale"])
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_expired_topology_request_or_snapshot_is_not_published(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -387,6 +453,7 @@ class ClusterPollingTest(unittest.TestCase):
                     self.assertIsNone(client.snapshot(None, None).topology)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_topology_delayed_old_epoch_cannot_replace_new_epoch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -406,6 +473,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(client.snapshot(None, None).topology.last_request_id, newer)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_same_version_reply_advances_epoch_watermark(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -427,6 +495,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(topology.last_request_id, requests[2])
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_quality_validation_aborts_request(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -449,6 +518,7 @@ class ClusterPollingTest(unittest.TestCase):
                     self.assertIsNone(client.snapshot(None, None).topology)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_topology_rejects_links_to_unknown_nodes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -464,6 +534,7 @@ class ClusterPollingTest(unittest.TestCase):
                     client._record_topology(message.params)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_topology_member_history_is_available_before_service_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -520,6 +591,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(set(client.snapshot(None, None).nodes), {"node-a"})
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_snapshot_reads_persisted_samples_before_client_start(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -540,6 +612,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(snapshot.traffic_history["ssh"][0].timestamp, 100.0)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_status_requires_service_accessors(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -556,6 +629,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertNotIn("node-a", client.snapshot(None, None).nodes)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_fragmented_status_is_published_only_after_assembly(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -581,6 +655,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(len(snapshot.nodes["node-a"].traffic_history["ssh"]), 1)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_duplicate_and_older_reports_are_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -601,6 +676,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(snapshot.nodes["node-a"].uptime_ms, 2)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_recent_late_report_is_accepted_until_a_newer_report_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -619,6 +695,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertEqual(snapshot.nodes["node-a"].uptime_ms, 7)
             finally:
                 client.stop()
+                client._history_store.close()
 
     def test_three_missed_rounds_mark_node_offline_until_next_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -648,6 +725,7 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertTrue(client.snapshot(None, None).nodes["node-a"].connected)
             finally:
                 client.stop()
+                client._history_store.close()
 
 
 if __name__ == "__main__":

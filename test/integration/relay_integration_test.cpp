@@ -129,6 +129,14 @@ asio::awaitable<tcp::socket> connect_relay_half(std::uint16_t transfer_port, int
     co_return std::move(socket);
 }
 
+asio::awaitable<njson> relay_status(const std::shared_ptr<TLSChannel> &channel, std::uint64_t request)
+{
+    channel->send(CtrlMessage{"server.cluster", njson{{"request_id", request}}});
+    const auto response = co_await receive_command(channel, "server.status.reported");
+    require(params_of(response).at("request_id") == request, "Status request correlation lost");
+    co_return params_of(response).at("relays");
+}
+
 asio::awaitable<tcp::socket> connect_transfer_socket(std::uint16_t transfer_port)
 {
     const auto executor = co_await asio::this_coro::executor;
@@ -226,6 +234,7 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     const auto first_opened = co_await receive_command(consumer, "relay.opened");
     const auto first_offer = co_await receive_command(producer, "relay.offer");
     const auto first_uuid = params_of(first_opened).at("uuid").get<uint64_t>();
+    require((co_await relay_status(consumer, 1001)).empty(), "Establishing Single relay appeared in status");
     require(params_of(first_offer).at("uuid").get<uint64_t>() == first_uuid,
             "Producer and Consumer received different relay UUIDs");
     require(params_of(first_opened).at("ticket").get<uint64_t>() != params_of(first_offer).at("ticket").get<uint64_t>(),
@@ -322,6 +331,14 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     co_await receive_command(producer, "relay.ready");
     co_await receive_command(consumer, "relay.ready");
 
+    const auto active_relays = co_await relay_status(consumer, 1002);
+    require(active_relays.size() == 1 && active_relays.at(0).at("mode") == "single" &&
+            active_relays.at(0).at("uuid") == active_uuid &&
+            active_relays.at(0).at("service") == "lifecycle" && active_relays.at(0).at("protocol") == "tcp" &&
+            !active_relays.at(0).at("consumer_peer").get<std::string>().empty() &&
+            !active_relays.at(0).at("producer_peer").get<std::string>().empty() && !active_relays.at(0).contains("ticket"),
+            "Ready Single relay endpoint metadata missing or invalid");
+
     const BytesBuf rx_payload{'s', 'e', 'r', 'v', 'i', 'c', 'e', '-', 'r', 'x'};
     const BytesBuf tx_payload{'s', 'e', 'r', 'v', 'i', 'c', 'e', '-', 't', 'x', '-', 'd', 'a', 't', 'a'};
     co_await asio::async_write(active_producer_half, asio::buffer(rx_payload), asio::use_awaitable);
@@ -361,6 +378,7 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
 
     probe_wait.expires_after(100ms);
     co_await probe_wait.async_wait(asio::use_awaitable);
+    require((co_await relay_status(consumer, 1003)).empty(), "Closed Single relay remained in status");
     auto replacement = co_await connect_control(producer_context, control_port);
     replacement->send(CtrlMessage{
         "service.register", njson{{"request_id", 34U}, {"service", "lifecycle"}, {"protocol", "tcp"}}});
@@ -415,7 +433,8 @@ asio::awaitable<void> echo_accept_loop(tcp::acceptor &acceptor)
     }
 }
 
-asio::awaitable<void> relay_round_trip(std::uint16_t port, bool half_close)
+asio::awaitable<void> relay_round_trip(std::uint16_t port, bool half_close, asio::ssl::context &context,
+                                     std::uint16_t control_port)
 {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
@@ -439,6 +458,12 @@ asio::awaitable<void> relay_round_trip(std::uint16_t port, bool half_close)
         co_await asio::async_read(socket, asio::buffer(received),
                                   asio::cancel_after(2s, asio::use_awaitable));
         require(received == payload, "TLS relay round trip payload mismatch");
+        auto monitor = co_await connect_control(context, control_port);
+        const auto relays = co_await relay_status(monitor, 1004);
+        require(relays.size() == 1 && relays.at(0).at("mode") == "single" &&
+                relays.at(0).at("protocol") == "tls" && relays.at(0).at("service") == "echo",
+                "Ready TLS Single relay missing from public status");
+        co_await monitor->async_disconnect();
         co_return;
     }
 
@@ -582,7 +607,7 @@ int main()
             bool succeeded = false;
             for (int attempt = 0; attempt < 20 && !succeeded; ++attempt)
             {
-                auto result = asio::co_spawn(control_io, relay_round_trip(forward_port, false), asio::use_future);
+                auto result = asio::co_spawn(control_io, relay_round_trip(forward_port, false, consumer_context, control_port), asio::use_future);
                 try
                 {
                     result.get();

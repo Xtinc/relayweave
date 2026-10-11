@@ -178,6 +178,7 @@ class CollectorStopTest(unittest.TestCase):
             finally:
                 peer.close()
                 client.stop()
+                store.close()
 
 
 if __name__ == '__main__':

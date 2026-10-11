@@ -18,6 +18,7 @@ class ControlRouterMulti
     bool belongs_to(const ControlSessionPtr &session) const;
     void cancel(std::string stage, std::string reason, bool from_peer = false);
     bool matches(const ControlSessionPtr &session, const njson &params) const;
+    std::optional<njson> status_report() const;
 
   private:
     friend class RelayNode;

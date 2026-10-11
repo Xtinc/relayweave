@@ -1069,8 +1069,8 @@ Agent 和 Dashboard 使用相同规则，以单调时钟的“请求开始时间
 没有匹配请求身份的非法回复不终止当前请求。Dashboard 还保存最高已接受请求编号，同版本的
 完整回复也推进水位，防止迟到回复恢复旧 epoch。断线使当前结果失效，历史记录与 HTTP 游标继续使用墙钟。
 
-Dashboard 页面先展示集群状态，再展示所选 Node 的五项健康指标和自适应排队/带宽图表，最后展示集群服务；移除 Node 间
-拓扑图和链路列表，不展示 Agent 或服务路径。拓扑采集仍提供成员、当前排队值和 API 链路质量；API 根据成本生成展示分数
+Dashboard 页面先展示集群状态，再展示所选 Node 的五项健康指标和自适应排队/带宽图表、集群当前 Flow 交通图，最后展示集群服务。
+交通图展示已 Ready 的 Single 和 Multi 业务，独立于健康指标选择；拓扑采集提供成员、当前排队值和 API 链路质量；API 根据成本生成展示分数
 `100 × exp(−cost / 100)`，线协议不发送 score，Python 不重新计算质量模型。
 
 ## 8. Agent 本地转发与业务接入
@@ -1349,7 +1349,7 @@ Multi 正常 `reason="stream complete"` 的 closed 只表示 Node 已排空；Ag
 ### 9.3 RelayNode 与 Dashboard：运行状态查询
 
 客户端请求均带 request_id。server.loaded 返回原 request_id 和三类队列延迟，server.traffic.reported
-返回原 request_id 和 services 数组；server.status.reported 还带 node_id、uptime_ms，每个在线 Node
+返回原 request_id 和 services 数组；server.status.reported 还带 node_id、uptime_ms、必填 relays 数组，每个在线 Node
 独立回复一条。内部 status.query/report 增加 9.5 中的入口会话路由字段。
 
 | 命令 | 响应 | 说明 |
@@ -1370,6 +1370,13 @@ Flow→Producer 在 socket 写入后累计 TX，首 Node 和中间 Node 不重�
 带宽按实际采样间隔换算，并以系数 0.5 做 EMA。
 
 `server.load` 和 `server.traffic` 只报告当前节点；`server.cluster` 广播查询，各在线节点把独立完整报告定向发回入口，入口只转发、不聚合或缓存结果。当前所有普通客户端共用客户端证书，因此任意通过 mTLS 的客户端都能请求这些信息，它们不是独立管理员接口。
+
+`relays` 只包含已 Ready 且尚未关闭的业务，由 Single/Multi 控制器只读现有元数据，NodeSession 分派，RelayNode 在 control_io 汇总，不访问数据域队列。
+Single 报告 mode、service、protocol、uuid、consumer_peer、producer_peer。Multi 首节点报告 mode、role=ingress、service、protocol、epoch、flow_id、agent_peer 和完整有序 path；末节点报告 role=egress 和 Producer 的 agent_peer，不报告 path。
+Python 按同一 server.cluster 请求轮次收集；已知成员全部回复后发布，三个周期仍缺报则发布部分结果并列出缺报节点。Multi 按 epoch + flow_id 拼接，并验证服务、协议和路径端点；未拼齐的业务不生成路线。
+每轮替换业务集合，空数组清理旧业务，断线使当前业务失效，成员或 epoch 变化清理旧轮次。同端点、服务、协议和有序路径合并成一条线路，业务 ID 转为字符串。
+`dashboard/flow_map.py` 集中实现拼接、合并、确定性 BFS 网格布局和转义 SVG；页面处理筛选、选择、缩放、拖动与恢复全图。Flow 数据只存在内存，不写入历史 SQLite。
+Node 与 Dashboard 统一升级，不支持缺失 relays 的旧报告；Agent 无需为本功能修改。完整字段和接口见 [Dashboard 说明](../dashboard/README.md#current-flows)。
 
 ### 9.4 Topology 与 AgentRouting：成员、质量与快照
 

@@ -101,6 +101,11 @@ asio::awaitable<void> NodeSession::run()
     return std::visit([](auto &controller) { return controller.run(); }, control_);
 }
 
+std::optional<njson> NodeSession::status_report() const
+{
+    return std::visit([](const auto &controller) { return controller.status_report(); }, control_);
+}
+
 void NodeSession::cancel(std::string stage, std::string reason)
 {
     std::visit([&](auto &controller) { controller.cancel(std::move(stage), std::move(reason)); }, control_);

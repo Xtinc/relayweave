@@ -18,6 +18,8 @@ class NodeSession
     void cancel(std::string stage, std::string reason);
     bool belongs_to(const ControlSessionPtr &session) const;
     bool handle(const ControlSessionPtr &session, const CtrlMessage &message);
+    // Read-only business metadata; called on control_io, without inspecting data-domain state.
+    std::optional<njson> status_report() const;
 
   private:
     friend class RelayNode;
