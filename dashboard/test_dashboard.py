@@ -11,6 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from werkzeug.exceptions import BadRequest
+
 import dashboard as dashboard_module
 from dashboard import (
     MAX_HISTORY_RANGE_SECONDS,
@@ -18,6 +20,7 @@ from dashboard import (
     _history_after,
     _history_cursor,
     _history_since,
+    _history_until,
     _load_agent_config,
     _node_snapshot,
 )
@@ -140,6 +143,11 @@ def _without_accessors(message: CtrlMessage) -> CtrlMessage:
 
 
 class DashboardConfigTest(unittest.TestCase):
+    def setUp(self) -> None:
+        clock = patch("history_store._wall_time", return_value=6000.0)
+        clock.start()
+        self.addCleanup(clock.stop)
+
     def test_only_entry_server_is_loaded(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "client.json"
@@ -167,7 +175,7 @@ class DashboardConfigTest(unittest.TestCase):
 
     def test_history_range_rejects_invalid_boundaries(self) -> None:
         with patch.object(dashboard_module, "request", SimpleNamespace(args={"queue_range": "all"})):
-            self.assertIsNone(_history_since("queue_range", 1000.0))
+            self.assertEqual(_history_since("queue_range", 1000.0), 1000.0 - MAX_HISTORY_RANGE_SECONDS)
         with patch.object(dashboard_module, "request", SimpleNamespace(args={"queue_range": "300"})):
             self.assertEqual(_history_since("queue_range", 1000.0), 700.0)
 
@@ -183,6 +191,28 @@ class DashboardConfigTest(unittest.TestCase):
                 self.assertRaisesRegex(ValueError, "finite number"),
             ):
                 _history_since("queue_range", 1000.0)
+
+    def test_zoom_end_rejects_invalid_boundaries(self) -> None:
+        now = MAX_HISTORY_RANGE_SECONDS + 1000
+        for value in ("nan", "inf", "0", str(now + 1)):
+            with self.subTest(value=value), dashboard_module.app.test_request_context(f"/?queue_until={value}"):
+                with self.assertRaises(BadRequest) as error:
+                    _history_until("queue_until", now)
+                self.assertEqual(error.exception.code, 400)
+        with dashboard_module.app.test_request_context("/?queue_until=1000"):
+            self.assertEqual(_history_until("queue_until", now), 1000)
+
+    def test_zoom_snapshot_queries_selected_interval(self) -> None:
+        calls = []
+        snap = SimpleNamespace(nodes={}, connected=True, connecting=False, entry_node_id="entry",
+                               peer="entry:443", last_error="", topology=None,
+                               flow_map=FlowCollection().snapshot(True))
+        client = SimpleNamespace(snapshot=lambda *args, **kwargs: calls.append((args, kwargs)) or snap)
+        with patch.object(dashboard_module, "_client", client), patch("dashboard.time.time", return_value=1000):
+            response = dashboard_module.app.test_client().get(
+                "/api/snapshot?queue_range=60&queue_until=900&bandwidth_range=3600")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(calls, [((840, -2600), {"queue_until": 900})])
 
     def test_incremental_cursor_is_strict_and_tracks_latest_sample(self) -> None:
         node = SimpleNamespace(
@@ -210,7 +240,7 @@ class DashboardConfigTest(unittest.TestCase):
             flow_map=FlowCollection().snapshot(True),
         )
         client = SimpleNamespace(snapshot=lambda load, traffic: calls.append((load, traffic)) or snap)
-        with patch.object(dashboard_module, "_client", client):
+        with patch.object(dashboard_module, "_client", client), patch("dashboard.time.time", return_value=200.0):
             response = dashboard_module.app.test_client().get(
                 "/api/snapshot?queue_range=300&bandwidth_range=300&history_after=100"
             )
@@ -273,6 +303,11 @@ class DashboardConfigTest(unittest.TestCase):
 
 
 class ClusterPollingTest(unittest.TestCase):
+    def setUp(self) -> None:
+        clock = patch("history_store._wall_time", return_value=6000.0)
+        clock.start()
+        self.addCleanup(clock.stop)
+
     def make_client(self, directory: str) -> ProxyControlClient:
         store = HistoryStore(Path(directory) / "history.sqlite3")
         self.addCleanup(store.close)

@@ -187,8 +187,9 @@
   svg.chart .marker, svg.spark .marker { stroke: var(--surface-2); stroke-width: 2; }
   svg.chart .crosshair{ stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0; }
   svg.chart .hover-hit{ fill: transparent; cursor: crosshair; }
-  svg.chart .gap-line   { stroke: var(--gridline); stroke-width: 1; stroke-dasharray: 2 3; opacity: 0.75; }
-  svg.chart .axis-break { stroke: var(--baseline); stroke-width: 1.3; shape-rendering: crispEdges; }
+  svg.chart { touch-action: none; user-select: none; }
+  svg.chart .zoom-selection { fill: var(--series-1); opacity: .15; pointer-events: none; }
+  .chart-help { color: var(--text-muted); font-size: 12px; margin-top: 6px; }
   .table-wrap { overflow-x: auto; }
 
   .tooltip {
@@ -287,13 +288,7 @@
   }
   .footer-note { color: var(--text-muted); font-size: 12px; margin-top: 24px; }
   .stale { opacity: 0.5; transition: opacity 0.3s; }
-  .flow-controls { display:flex; gap:8px; flex-wrap:wrap; margin-left:auto; }
-  .flow-controls button, .flow-legend button {
-    background:var(--surface-1); border:1px solid var(--border); border-radius:7px;
-    padding:6px 10px; color:var(--text-primary); cursor:pointer; font:inherit; font-size:12px;
-  }
-  .flow-viewport { height:420px; overflow:hidden; touch-action:none; cursor:grab; border:1px solid var(--border); border-radius:8px; }
-  .flow-viewport:active { cursor:grabbing; }
+  .flow-viewport { height:420px; overflow:hidden; border:1px solid var(--border); border-radius:8px; }
   .flow-svg { width:100%; height:100%; display:block; }
   .flow-track { fill:none; stroke-width:4; stroke-linejoin:round; stroke-linecap:round; }
   .flow-hit { fill:none; stroke:transparent; stroke-width:18; cursor:pointer; }
@@ -305,12 +300,16 @@
   .flow-station text { fill:var(--text-secondary); font-size:12px; paint-order:stroke; stroke:var(--surface-2); stroke-width:4; stroke-linejoin:round; }
   .flow-status { color:var(--text-secondary); font-size:12px; margin:8px 0 12px; }
   .flow-legend { display:flex; flex-wrap:wrap; gap:7px; margin:12px 0; max-height:140px; overflow:auto; }
-  .flow-legend button { border-left:5px solid; }
+  .flow-legend button {
+    background:var(--surface-1); border:1px solid var(--border); border-left:5px solid;
+    border-radius:7px; padding:6px 10px; color:var(--text-primary);
+    cursor:pointer; font:inherit; font-size:12px;
+  }
   .flow-legend button[aria-pressed="true"] { background:var(--surface-2); outline:2px solid var(--baseline); }
   .flow-details { font-size:12px; color:var(--text-secondary); line-height:1.7; overflow-wrap:anywhere; max-height:220px; overflow:auto; }
   .flow-details strong { color:var(--text-primary); }
   .flow-empty { display:grid; place-items:center; height:100%; padding:24px; text-align:center; box-sizing:border-box; color:var(--text-muted); }
-  @media (max-width:700px) { .flow-card .card-head { align-items:flex-start; flex-direction:column; } .flow-controls { margin-left:0; } .flow-viewport { height:340px; } }
+  @media (max-width:700px) { .flow-card .card-head { align-items:flex-start; flex-direction:column; } .flow-viewport { height:340px; } }
 </style>
 </head>
 <body class="viz-root">
@@ -382,6 +381,7 @@
         <div style="position:relative">
           <svg class="chart" id="chart-queue"></svg>
           <div class="tooltip" id="tip-queue"></div>
+          <div class="chart-help">Drag to zoom · scroll to zoom · double-click to reset</div>
         </div>
       </div>
       <div class="card">
@@ -400,24 +400,16 @@
         <div style="position:relative">
           <svg class="chart" id="chart-bandwidth"></svg>
           <div class="tooltip" id="tip-bandwidth"></div>
+          <div class="chart-help">Drag to zoom · scroll to zoom · double-click to reset</div>
         </div>
       </div>
     </div>
     <div class="card flow-card">
       <div class="card-head">
         <h2>Current Flows</h2>
-        <div class="flow-controls">
-          <select class="svc-select" id="flow-service" aria-label="Flow service filter"><option value="">All services</option></select>
-          <select class="svc-select" id="flow-protocol" aria-label="Flow protocol filter">
-            <option value="">All protocols</option><option value="tcp">TCP</option><option value="tls">TLS</option><option value="udp">UDP</option>
-          </select>
-          <button type="button" id="flow-zoom-out" aria-label="Zoom out">−</button>
-          <button type="button" id="flow-zoom-in" aria-label="Zoom in">+</button>
-          <button type="button" id="flow-fit">Fit all</button>
-        </div>
       </div>
       <div class="flow-status" id="flow-status" role="status">Waiting for current business reports</div>
-      <div class="flow-viewport" id="flow-viewport" aria-label="Interactive Flow map">
+      <div class="flow-viewport" id="flow-viewport" aria-label="Current Flow map">
         <div class="flow-empty">Waiting for reports</div>
       </div>
       <div class="flow-legend" id="flow-legend" aria-label="Active routes"></div>
@@ -516,48 +508,35 @@ function fmtChartTime(timestamp){ const d=new Date(timestamp*1000);
 function escapeText(s){ const d=document.createElement("div"); d.textContent=String(s); return d.innerHTML; }
 function escapeAttribute(s){ return escapeText(s).replaceAll('"', "&quot;").replaceAll("'", "&#39;"); }
 
-// Each big chart remembers its selected window in seconds; "All" = null.
-// Presets are time-based so they stay correct regardless of poll interval.
+// Presets and mouse selections share one continuous time axis.
+const MAX_HISTORY_SECONDS = 7 * 24 * 60 * 60;
 const RANGE_PRESETS = [
-  {label:"1m",  secs: 60},
-  {label:"5m",  secs: 300},
-  {label:"15m", secs: 900},
-  {label:"60m", secs: 3600},
-  {label:"All", secs: null},
+  {label:"1m", secs:60},
+  {label:"1h", secs:3600},
+  {label:"1d", secs:86400},
+  {label:"7d", secs:MAX_HISTORY_SECONDS},
 ];
-const chartRanges = { "chart-queue": 300, "chart-bandwidth": 300 };
+const chartRanges = {"chart-queue":60, "chart-bandwidth":60};
+const chartViews = {"chart-queue":null, "chart-bandwidth":null};
+let chartDragging = null;
+function chartDomain(cid, now){
+  return chartViews[cid] || {start:now-chartRanges[cid], end:now};
+}
+function setChartView(cid, start, end){
+  const now = Number(currentData?.now) || Date.now()/1000;
+  start = Math.max(now-MAX_HISTORY_SECONDS, start);
+  end = Math.min(now, end);
+  if(end-start < 1) return;
+  chartViews[cid] = {start, end};
+  resetHistoryAndPoll();
+}
 // Bandwidth chart selection is independent from the node overview selection.
 // The compound key keeps same-named services on different nodes distinct.
 let bandwidthSelection = null;
 let selectedNodeKey = null;
-let flowServiceFilter = "";
-let flowProtocolFilter = "";
 let flowSelected = null;
 let flowMapData = null;
 let flowSvgText = null;
-let flowPan = {scale:1, x:0, y:0};
-let flowDragging = null;
-let flowDidDrag = false;
-
-function applyFlowPan(){
-  const scene = $("flow-viewport").querySelector(".flow-scene");
-  if(scene) scene.setAttribute("transform", `translate(${flowPan.x} ${flowPan.y}) scale(${flowPan.scale})`);
-}
-function flowPoint(event){
-  const svg = $("flow-viewport").querySelector("svg");
-  const matrix = svg?.getScreenCTM();
-  if(!matrix) return null;
-  return new DOMPoint(event.clientX, event.clientY).matrixTransform(matrix.inverse());
-}
-function zoomFlow(factor, point=null){
-  const svg = $("flow-viewport").querySelector("svg");
-  if(!svg) return;
-  point ||= {x:svg.viewBox.baseVal.width/2, y:svg.viewBox.baseVal.height/2};
-  const scale = Math.max(.25, Math.min(8, flowPan.scale*factor));
-  const ratio = scale/flowPan.scale;
-  flowPan = {scale, x:point.x-(point.x-flowPan.x)*ratio, y:point.y-(point.y-flowPan.y)*ratio};
-  applyFlowPan();
-}
 function selectFlow(id){
   flowSelected = flowSelected === id ? null : id;
   renderFlowSelection();
@@ -588,13 +567,7 @@ function renderFlowSelection(){
 }
 function renderFlowMap(map){
   flowMapData = map;
-  const select = $("flow-service");
-  const services = [...map.services];
-  if(flowServiceFilter && !services.includes(flowServiceFilter)) services.push(flowServiceFilter);
-  select.replaceChildren(new Option("All services", ""), ...services.sort().map(name => new Option(name, name)));
-  select.value = flowServiceFilter;
-  const messages = [`${map.flow_count} current connections · ${map.route_count} routes`,
-                    `${map.visible_route_count} routes shown`];
+  const messages = [`${map.flow_count} current connections · ${map.route_count} routes`];
   if(map.state === "disconnected") messages.push("Collection disconnected — current Flow data unavailable");
   if(map.state === "pending") messages.push("Waiting for a complete collection round");
   if(map.missing_nodes.length) messages.push(`Incomplete collection — missing: ${map.missing_nodes.join(", ")}`);
@@ -603,13 +576,11 @@ function renderFlowMap(map){
   const viewport = $("flow-viewport");
   if(map.routes.length){
     if(flowSvgText !== map.svg){ viewport.innerHTML = map.svg; flowSvgText = map.svg; }
-    applyFlowPan();
   }else{
     flowSvgText = null;
     const empty = document.createElement("div"); empty.className = "flow-empty";
     empty.textContent = map.state === "disconnected" ? "Collection disconnected"
       : map.state === "pending" ? "Waiting for current Flow reports"
-      : map.route_count ? "No routes match the selected filters"
       : map.partial ? "Collection incomplete; no complete routes available"
       : "No active Flows";
     viewport.replaceChildren(empty);
@@ -624,59 +595,24 @@ function renderFlowMap(map){
   });
   renderFlowSelection();
 }
-function requestFlowPoll(){
-  pollGeneration++; pollPending=true;
-  if(pollTimer !== null){ clearTimeout(pollTimer); pollTimer=null; }
-  poll();
-}
-$("flow-service").addEventListener("change", event=>{ flowServiceFilter=event.target.value; requestFlowPoll(); });
-$("flow-protocol").addEventListener("change", event=>{ flowProtocolFilter=event.target.value; requestFlowPoll(); });
-$("flow-fit").addEventListener("click", ()=>{ flowPan={scale:1,x:0,y:0}; applyFlowPan(); });
-$("flow-zoom-in").addEventListener("click", ()=>zoomFlow(1.25));
-$("flow-zoom-out").addEventListener("click", ()=>zoomFlow(.8));
-$("flow-viewport").addEventListener("wheel", event=>{
-  const point=flowPoint(event); if(!point) return;
-  event.preventDefault(); zoomFlow(event.deltaY < 0 ? 1.15 : 1/1.15, point);
-}, {passive:false});
-$("flow-viewport").addEventListener("pointerdown", event=>{
-  if(event.button !== 0) return;
-  const point=flowPoint(event); if(!point) return;
-  flowDragging={point, x:flowPan.x, y:flowPan.y}; flowDidDrag=false;
-  event.currentTarget.setPointerCapture(event.pointerId);
+$("flow-viewport").addEventListener("click", event=>{
+  const line=event.target.closest("[data-route]");
+  if(line) selectFlow(line.dataset.route);
 });
-$("flow-viewport").addEventListener("pointermove", event=>{
-  if(!flowDragging) return;
-  const point=flowPoint(event); if(!point) return;
-  const dx=point.x-flowDragging.point.x, dy=point.y-flowDragging.point.y;
-  if(Math.abs(dx)+Math.abs(dy)>3) flowDidDrag=true;
-  flowPan.x=flowDragging.x+dx; flowPan.y=flowDragging.y+dy; applyFlowPan();
-});
-$("flow-viewport").addEventListener("pointerup", event=>{
-  if(!flowDragging) return;
-  // Pointer capture retargets clicks; pick the route underneath the released pointer.
-  if(!flowDidDrag){
-    const line=document.elementFromPoint(event.clientX,event.clientY)?.closest("[data-route]");
-    if(line && event.currentTarget.contains(line)) selectFlow(line.dataset.route);
-  }
-  flowDragging=null;
-});
-$("flow-viewport").addEventListener("pointercancel", ()=>{ flowDragging=null; });
 $("flow-viewport").addEventListener("keydown", event=>{
   const line=event.target.closest("[data-route]");
   if(line && (event.key === "Enter" || event.key === " ")){ event.preventDefault(); selectFlow(line.dataset.route); }
 });
 
-function windowHistory(hist, secs, now){
-  if(secs == null || !hist.length) return hist;
-  const cutoff = now - secs;
-  return hist.filter(point => point.t >= cutoff && point.t <= now);
+function windowHistory(hist, domain){
+  return hist.filter(point => point.t >= domain.start && point.t <= domain.end);
 }
 
 function populateRangeSelect(sel){
   const cid = sel.getAttribute("data-chart");
   const current = chartRanges[cid];
   sel.innerHTML = RANGE_PRESETS.map(p => {
-    const val = p.secs == null ? "all" : String(p.secs);
+    const val = String(p.secs);
     const selected = (p.secs === current) ? " selected" : "";
     return `<option value="${val}"${selected}>${p.label}</option>`;
   }).join("");
@@ -688,7 +624,8 @@ function wireRangeSelects(){
       sel.addEventListener("change", () => {
         const cid = sel.getAttribute("data-chart");
         const v = sel.value;
-        chartRanges[cid] = (v === "all") ? null : Number(v);
+        chartRanges[cid] = Number(v);
+        chartViews[cid] = null;
         resetHistoryAndPoll();
       });
       sel.dataset.wired = "1";
@@ -719,7 +656,8 @@ function populateServiceSelect(services){
   if(!sel.dataset.wired){
     sel.addEventListener("change", () => {
       bandwidthSelection = sel.value || null;
-      if(currentData) render(currentData);
+      chartViews["chart-bandwidth"] = null;
+      resetHistoryAndPoll();
     });
     sel.dataset.wired = "1";
   }
@@ -752,7 +690,8 @@ function populateNodeSelect(nodes){
   if(!sel.dataset.wired){
     sel.addEventListener("change", () => {
       selectedNodeKey = sel.value;
-      if(currentData) render(currentData);
+      chartViews["chart-queue"] = null;
+      resetHistoryAndPoll();
     });
     sel.dataset.wired = "1";
   }
@@ -765,105 +704,11 @@ function makeScale(domainMin, domainMax, rangeMin, rangeMax){
   return (v) => rangeMin + ((v - domainMin) / span) * (rangeMax - rangeMin);
 }
 
-// A gap-aware x scale for the time axis.
-//
-// Problem: the proxy client samples live data every ~2s, but a reconnect or a
-// dashboard gap leaves multi-minute holes. A plain linear scale over [tMin,tMax]
-// collapses each live cluster into a hairline at one edge and draws a single
-// long straight line across the gap — the "everything jammed to the right, with
-// a big straight line joining the ends" artifact on the 60m / All views.
-//
-// Fix: detect gaps longer than GAP_FACTOR * medianStep, collapse each to a
-// fixed small width, and redistribute the freed space to the real runs. The
-// axis keeps a linear time scale *within* each run, but is discontinuous across
-// gaps — marked with "//" break ticks so the reader knows the axis is not one
-// continuous timeline. Falls back to a plain linear scale when there are no
-// gaps (the common 5m/15m case), so those charts are byte-for-byte unchanged.
-const GAP_FACTOR = 8;          // a gap > 8x the median step counts as a break
-const GAP_COLLAPSE_WIDTH = 24; // px allotted to each collapsed gap on screen
-
-function buildGapScale(history, rangeMin, rangeMax, timeDomain=null){
-  const n = history.length;
-  const tMin = timeDomain ? timeDomain.start : history[0].t;
-  const tMax = timeDomain ? timeDomain.end : history[n-1].t;
-  const linearSpan = tMax - tMin;
-  const sxLin = makeScale(tMin, tMax, rangeMin, rangeMax);
-  const txLin = makeScale(rangeMin, rangeMax, tMin, tMax);
-
-  if(n < 3 || linearSpan <= 0){
-    return { map: sxLin, invert: txLin, gaps: [] };
-  }
-
-  const steps = [];
-  for(let i=1;i<n;i++){
-    const step = history[i].t - history[i-1].t;
-    if(step > 0) steps.push(step);
-  }
-  if(!steps.length) return { map: sxLin, invert: txLin, gaps: [] };
-  steps.sort((a,b)=>a-b);
-  const medianStep = steps[Math.floor(steps.length/2)] || linearSpan / (n-1);
-
-  const gaps = [];
-  for(let i=0;i<n-1;i++){
-    const dt = history[i+1].t - history[i].t;
-    if(dt > GAP_FACTOR * medianStep && dt > linearSpan * 0.02){
-      gaps.push({ i, t0: history[i].t, t1: history[i+1].t });
-    }
-  }
-  if(!gaps.length){
-    return { map: sxLin, invert: txLin, gaps: [] };
-  }
-
-  // Keep at least half of the plot for measured runs when there are many gaps.
-  const skipped = gaps.reduce((sum, gap) => sum + gap.t1-gap.t0, 0);
-  const measured = Math.max(0, linearSpan-skipped);
-  const pxTotal = rangeMax - rangeMin;
-  const gapPxTotal = measured > 0
-    ? Math.min(gaps.length*GAP_COLLAPSE_WIDTH, pxTotal/2)
-    : pxTotal;
-  const gapWidth = gapPxTotal/gaps.length;
-  const pxPerSec = measured > 0 ? (pxTotal-gapPxTotal)/measured : 0;
-
-  // Lay measured time and fixed-width gap slots out from left to right. Gap
-  // boundary samples stay on opposite sides of the slot; neither is collapsed
-  // onto the other.
-  function map(t){
-    if(t <= tMin) return rangeMin;
-    if(t >= tMax) return rangeMax;
-    let x = rangeMin;
-    let cursor = tMin;
-    for(const gap of gaps){
-      if(t <= gap.t0) return x + (t-cursor)*pxPerSec;
-      x += (gap.t0-cursor)*pxPerSec;
-      if(t < gap.t1){
-        return x + (t-gap.t0)/(gap.t1-gap.t0)*gapWidth;
-      }
-      x += gapWidth;
-      cursor = gap.t1;
-    }
-    return x + (t-cursor)*pxPerSec;
-  }
-
-  function invert(x){
-    if(x <= rangeMin) return tMin;
-    if(x >= rangeMax) return tMax;
-    let cursorX = rangeMin;
-    let cursorT = tMin;
-    for(const gap of gaps){
-      const runWidth = (gap.t0-cursorT)*pxPerSec;
-      if(x <= cursorX+runWidth){
-        return cursorT + (x-cursorX)/pxPerSec;
-      }
-      cursorX += runWidth;
-      if(x < cursorX+gapWidth){
-        return gap.t0 + (x-cursorX)/gapWidth*(gap.t1-gap.t0);
-      }
-      cursorX += gapWidth;
-      cursorT = gap.t1;
-    }
-    return cursorT + (x-cursorX)/pxPerSec;
-  }
-  return { map, invert, gaps };
+// Detect missing sample runs without changing their width on the time axis.
+function historyGaps(history){
+  const steps = history.slice(1).map((point,i)=>point.t-history[i].t).filter(step=>step>0).sort((a,b)=>a-b);
+  const threshold = Math.max(15, (steps[Math.floor(steps.length/2)] || 2)*8);
+  return history.slice(1).flatMap((point,i)=>point.t-history[i].t>threshold ? [{i}] : []);
 }
 
 function linePath(pts){
@@ -872,17 +717,16 @@ function linePath(pts){
   for(let i=1;i<pts.length;i++) d += " L" + pts[i].x.toFixed(2) + " " + pts[i].y.toFixed(2);
   return d;
 }
-// Same as linePath but splits the path across gap indices, so the line does not
-// bridge a collapsed disconnect gap with a misleading straight segment. `gaps`
-// is the array returned by buildGapScale (each carries .i, the left index).
+// Leave disconnect intervals blank instead of inventing values between runs.
 function linePathGapped(pts, gaps){
-  if(!pts.length) return "";
   const gapIdx = new Set((gaps||[]).map(g => g.i));
-  let d = "M" + pts[0].x.toFixed(2) + " " + pts[0].y.toFixed(2);
-  for(let i=1;i<pts.length;i++){
-    d += (gapIdx.has(i-1) ? " M" : " L") + pts[i].x.toFixed(2) + " " + pts[i].y.toFixed(2);
-  }
-  return d;
+  let d = "", connected = false;
+  pts.forEach((point,i)=>{
+    if(!point){ connected=false; return; }
+    d += (connected && !gapIdx.has(i-1) ? " L" : " M") + point.x.toFixed(2) + " " + point.y.toFixed(2);
+    connected=true;
+  });
+  return d.trim();
 }
 function areaPath(pts, baseY){
   if(!pts.length) return "";
@@ -959,11 +803,6 @@ function drawChart(svg, tipEl, history, series, fmtY, timeDomain=null){
   svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
   const m = {l:48, r:14, t:10, b:38};  // b: two-line x-axis (date + time)
   const pw = W - m.l - m.r, ph = H - m.t - m.b;
-  if(history.length < 2){
-    svg.innerHTML = `<text x="${W/2}" y="${H/2}" text-anchor="middle" class="tick">waiting for data…</text>`;
-    tipEl.style.display = "none";
-    return;
-  }
   // Latency/queue-delay metrics start at 0. Pin the baseline to 0 so the line
   // doesn't get visually "lifted" when the window's minimum drifts upward; a
   // floating baseline exaggerates noise and makes the whole graph jump. The top
@@ -973,18 +812,10 @@ function drawChart(svg, tipEl, history, series, fmtY, timeDomain=null){
   if(dataMax <= 0){ dataMax = 1; }
   const yMin = 0;
   const yMax = niceCeil(dataMax);
-  // Finite ranges keep their exact [now-range, now] endpoints. Within either
-  // a finite range or All, long gaps use short break slots so separated live
-  // runs remain readable.
-  const fixedTimeDomain = timeDomain && timeDomain.end > timeDomain.start;
-  const gapScale = buildGapScale(
-    history,
-    m.l,
-    m.l+pw,
-    fixedTimeDomain ? timeDomain : null,
-  );
-  const sx = gapScale.map;
-  const gaps = gapScale.gaps;
+  const domain = timeDomain || {start:history[0]?.t || 0, end:history.at(-1)?.t || 1};
+  const sx = makeScale(domain.start, domain.end, m.l, m.l+pw);
+  const invert = makeScale(m.l, m.l+pw, domain.start, domain.end);
+  const gaps = historyGaps(history);
   const sy = makeScale(yMin, yMax, m.t+ph, m.t);
   const yticks = niceTicks(yMin, yMax, 4);
   let parts = "";
@@ -993,13 +824,10 @@ function drawChart(svg, tipEl, history, series, fmtY, timeDomain=null){
     parts += `<line class="gridline" x1="${m.l}" x2="${m.l+pw}" y1="${y.toFixed(2)}" y2="${y.toFixed(2)}"/>`;
     parts += `<text class="tick" x="${m.l-8}" y="${(y+3).toFixed(2)}" text-anchor="end">${fmtY(tv)}</text>`;
   }
-  // Space ticks evenly after gap folding, then convert each screen position
-  // back to its real timestamp. This keeps labels out of collapsed clusters
-  // while preserving the exact first and last time boundaries.
   const xtickCount = Math.min(6, Math.max(2, Math.floor(pw/80)));
   const xticks = [];
   for(let i=0; i<=xtickCount; i++){
-    xticks.push(gapScale.invert(m.l + pw*i/xtickCount));
+    xticks.push(invert(m.l + pw*i/xtickCount));
   }
   let prevDate = null;
   for(const timestamp of xticks){
@@ -1011,20 +839,13 @@ function drawChart(svg, tipEl, history, series, fmtY, timeDomain=null){
     prevDate = dateStr;
     parts += `<text class="tick" x="${x.toFixed(2)}" y="${(m.t+ph+15).toFixed(2)}" text-anchor="middle">${showDate ? escapeText(dateStr) : ""}<tspan x="${x.toFixed(2)}" dy="13">${escapeText(timeStr)}</tspan></text>`;
   }
-  if(gaps.length){
-    const axY = m.t+ph, by = m.t+ph+6, dy = m.t+ph-6;
-    for(const g of gaps){
-      const gx = sx(g.t0) + (sx(g.t1) - sx(g.t0)) / 2;
-      parts += `<line class="gap-line" x1="${gx.toFixed(2)}" x2="${gx.toFixed(2)}" y1="${m.t}" y2="${(m.t+ph).toFixed(2)}"/>`;
-      parts += `<path class="axis-break" d="M${(gx-3).toFixed(2)} ${by} L${(gx+3).toFixed(2)} ${dy} M${(gx-3).toFixed(2)} ${dy} L${(gx+3).toFixed(2)} ${by}"/>`;
-    }
-  }
   parts += `<line class="axis" x1="${m.l}" x2="${m.l+pw}" y1="${(m.t+ph).toFixed(2)}" y2="${(m.t+ph).toFixed(2)}"/>`;
   parts += `<line class="axis" x1="${m.l}" x2="${m.l}" y1="${m.t}" y2="${(m.t+ph).toFixed(2)}"/>`;
+  if(!history.length) parts += `<text x="${W/2}" y="${H/2}" text-anchor="middle" class="tick">waiting for data…</text>`;
   const seriesPts = [];
   for(const s of series){
-    const pts = history.map(p => { const v = p[s.key]; if(v===UNSET||v==null) return null; return {x:sx(p.t), y:sy(v)}; }).filter(Boolean);
-    seriesPts.push({s, pts});
+    const pts = history.map(p => { const v = p[s.key]; if(v===UNSET||v==null) return null; return {x:sx(p.t), y:sy(v)}; });
+    seriesPts.push({s, pts:pts.filter(Boolean)});
     const color = cs(s.colorVar);
     parts += `<path class="series" stroke="${color}" d="${linePathGapped(pts, gaps)}"/>`;
   }
@@ -1037,11 +858,14 @@ function drawChart(svg, tipEl, history, series, fmtY, timeDomain=null){
   parts += `<line class="crosshair" id="ch-x" x1="0" x2="0" y1="${m.t}" y2="${m.t+ph}"/>`;
   parts += `<rect class="hover-hit" x="${m.l}" y="${m.t}" width="${pw}" height="${ph}"/>`;
 
+  parts += `<rect class="zoom-selection" x="0" y="${m.t}" width="0" height="${ph}"/>`;
   svg.innerHTML = parts;
+  tipEl.style.display = "none";
   const chx = svg.querySelector("#ch-x");
   const hit = svg.querySelector(".hover-hit");
 
   function move(ev){
+    if(!history.length) return;
     const rect = svg.getBoundingClientRect();
     const px = (ev.clientX - rect.left) / rect.width * W;
     let best = 0, bd = Infinity;
@@ -1064,8 +888,49 @@ function drawChart(svg, tipEl, history, series, fmtY, timeDomain=null){
     tipEl.style.left = tx + "px"; tipEl.style.top = ty + "px";
   }
   function leave(){ chx.style.opacity = 0; tipEl.style.display = "none"; }
-  hit.onmousemove = move;
-  hit.onmouseleave = leave;
+  const selection = svg.querySelector(".zoom-selection");
+  function plotX(event){
+    const rect = svg.getBoundingClientRect();
+    return Math.max(m.l, Math.min(m.l+pw, (event.clientX-rect.left)/rect.width*W));
+  }
+  svg.onpointerdown = event=>{
+    if(event.button !== 0 || !event.target.closest(".hover-hit")) return;
+    chartDragging = {cid:svg.id, start:plotX(event), end:plotX(event), domain, invert};
+    svg.setPointerCapture(event.pointerId);
+    leave();
+  };
+  svg.onpointermove = event=>{
+    if(chartDragging?.cid !== svg.id){ if(event.target === hit) move(event); return; }
+    chartDragging.end = plotX(event);
+    selection.setAttribute("x", Math.min(chartDragging.start, chartDragging.end));
+    selection.setAttribute("width", Math.abs(chartDragging.end-chartDragging.start));
+  };
+  svg.onpointerup = event=>{
+    if(chartDragging?.cid !== svg.id) return;
+    const drag = chartDragging;
+    drag.end = plotX(event);
+    chartDragging = null;
+    selection.setAttribute("width", 0);
+    if(svg.hasPointerCapture(event.pointerId)) svg.releasePointerCapture(event.pointerId);
+    if(Math.abs(drag.end-drag.start) >= 5){
+      setChartView(svg.id, drag.invert(Math.min(drag.start,drag.end)), drag.invert(Math.max(drag.start,drag.end)));
+    }
+  };
+  svg.onpointercancel = ()=>{ chartDragging = null; selection.setAttribute("width",0); };
+  svg.onpointerleave = leave;
+  svg.ondblclick = ()=>{ chartViews[svg.id] = null; resetHistoryAndPoll(); };
+  svg.onwheel = event=>{
+    event.preventDefault();
+    if(chartDragging || pollInFlight) return;
+    const anchor = invert(plotX(event));
+    const factor = event.deltaY < 0 ? .75 : 1/.75;
+    const span = Math.min(MAX_HISTORY_SECONDS, Math.max(1, (domain.end-domain.start)*factor));
+    const fraction = (anchor-domain.start)/(domain.end-domain.start);
+    const now = Number(currentData?.now) || Date.now()/1000;
+    const end = Math.min(now, Math.max(now-MAX_HISTORY_SECONDS+span, anchor+(1-fraction)*span));
+    setChartView(svg.id, end-span, end);
+  };
+
 }
 
 let currentData = null;
@@ -1113,7 +978,7 @@ function mergeSnapshot(previous, update){
     const old = previousNodes.get(node.key);
     if(!old) return node;
     node.history = mergeHistory(
-      old.history, node.history, chartRanges["chart-queue"], now
+      old.history, node.history, MAX_HISTORY_SECONDS, now
     );
     const oldTraffic = old.traffic_history || {};
     const newTraffic = node.traffic_history || {};
@@ -1122,7 +987,7 @@ function mergeSnapshot(previous, update){
     node.traffic_history = {};
     names.forEach(name => {
       const history = mergeHistory(
-        oldTraffic[name], newTraffic[name], chartRanges["chart-bandwidth"], now
+        oldTraffic[name], newTraffic[name], MAX_HISTORY_SECONDS, now
       );
       if(history.length || currentServices.has(name)) node.traffic_history[name] = history;
     });
@@ -1142,6 +1007,7 @@ function resetHistoryAndPoll(){
 
 function render(data){
   currentData = data;
+  if(chartDragging) return;
   renderFlowMap(data.flow_map);
   const nodes = data.nodes || [];
   const renderNow = Number(data.now) || Date.now()/1000;
@@ -1196,11 +1062,8 @@ function render(data){
   drawSpark($("spark-tcpqd"), win.map(p=>p.tcp_qd), "--series-2");
   drawSpark($("spark-udpqd"), win.map(p=>p.udp_qd), "--series-4");
 
-  const queueRange = chartRanges["chart-queue"];
-  const queueHist = windowHistory(hist, queueRange, renderNow);
-  const queueDomain = queueRange == null
-    ? null
-    : {start:renderNow-queueRange, end:renderNow};
+  const queueDomain = chartDomain("chart-queue", renderNow);
+  const queueHist = windowHistory(hist, queueDomain);
   drawChart($("chart-queue"), $("tip-queue"), queueHist,
     [{name:"Control queue", colorVar:"--series-1", key:"cqd"},
      {name:"TCP transfer queue", colorVar:"--series-2", key:"tcp_qd"},
@@ -1248,11 +1111,8 @@ function render(data){
   populateServiceSelect(bandwidthServices);
   const selectedBandwidth = bandwidthServices.find(item => item.key === bandwidthSelection);
   const bwHist = selectedBandwidth ? selectedBandwidth.history : [];
-  const bandwidthRange = chartRanges["chart-bandwidth"];
-  const bwWindow = windowHistory(bwHist, bandwidthRange, renderNow);
-  const bandwidthDomain = bandwidthRange == null
-    ? null
-    : {start:renderNow-bandwidthRange, end:renderNow};
+  const bandwidthDomain = chartDomain("chart-bandwidth", renderNow);
+  const bwWindow = windowHistory(bwHist, bandwidthDomain);
   drawChart($("chart-bandwidth"), $("tip-bandwidth"), bwWindow,
     [{name:"RX (service → client)", colorVar:"--series-5", key:"rx_bps"},
      {name:"TX (client → service)", colorVar:"--series-6", key:"tx_bps"}],
@@ -1266,11 +1126,11 @@ async function poll(){
   const generation = pollGeneration;
   try{
     const query = new URLSearchParams({
-      queue_range: chartRanges["chart-queue"] === null ? "all" : chartRanges["chart-queue"],
-      bandwidth_range: chartRanges["chart-bandwidth"] === null ? "all" : chartRanges["chart-bandwidth"],
-      flow_service: flowServiceFilter,
-      flow_protocol: flowProtocolFilter,
+      queue_range: chartViews["chart-queue"] ? chartViews["chart-queue"].end-chartViews["chart-queue"].start : chartRanges["chart-queue"],
+      bandwidth_range: chartViews["chart-bandwidth"] ? chartViews["chart-bandwidth"].end-chartViews["chart-bandwidth"].start : chartRanges["chart-bandwidth"],
     });
+    if(chartViews["chart-queue"]) query.set("queue_until", String(chartViews["chart-queue"].end));
+    if(chartViews["chart-bandwidth"]) query.set("bandwidth_until", String(chartViews["chart-bandwidth"].end));
     if(historyCursor !== null) query.set("history_after", String(historyCursor));
     const r = await fetch("/api/snapshot?" + query, {cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);

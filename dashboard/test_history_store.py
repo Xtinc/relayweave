@@ -6,11 +6,65 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from history_store import HistoryStore
+from history_store import HistoryStore, MAX_HISTORY_SECONDS
 
 
 class HistoryStoreTest(unittest.TestCase):
+    def setUp(self) -> None:
+        clock = patch("history_store._wall_time", return_value=6000.0)
+        self.clock = clock.start()
+        self.addCleanup(clock.stop)
+
+    def test_seven_day_retention_expires_both_tables_and_preserves_caches(self) -> None:
+        self.clock.return_value = MAX_HISTORY_SECONDS + 100
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "history.sqlite3"
+            store = HistoryStore(database)
+            store.save_ip_location("1.1.1.1", "AU", "SYD", "Sydney", "NSW")
+            for timestamp in (99, 100, 101):
+                store.append_queue("node-a", timestamp, 1, 2, 3)
+                store.append_traffic("node-a", timestamp, [("ssh", 4, 5)])
+            self.assertEqual([row[0] for row in store.queue_history("node-a", None)], [100, 101])
+            self.assertEqual([row[0] for row in store.traffic_history("node-a", None, ["ssh"])["ssh"]], [100, 101])
+            # Advance time without an append: reads must still hide expired rows.
+            self.clock.return_value += 1
+            self.assertEqual([row[0] for row in store.queue_history("node-a", None)], [101])
+            self.assertEqual([row[0] for row in store.traffic_history("node-a", None, ["ssh"])["ssh"]], [101])
+            store._last_retention_check = 0
+            store.queue_history("node-a", None)
+            for table in ("node_queue_history", "node_traffic_history"):
+                self.assertEqual(store._connection.execute(f"SELECT COUNT(*) FROM {table} WHERE timestamp < 101").fetchone()[0], 0)
+            store.append_queue("node-b", self.clock.return_value, 1, 2, 3)
+            for table in ("node_queue_history", "node_traffic_history"):
+                self.assertGreaterEqual(store._connection.execute(f"SELECT MIN(timestamp) FROM {table}").fetchone()[0], 101)
+            store.close()
+            self.clock.return_value += 1
+            store = HistoryStore(database)
+            try:
+                self.assertEqual(store.queue_history("node-a", None), [])
+                self.assertEqual(store.traffic_history("node-a", None, ["ssh"])["ssh"], [])
+                self.assertIn("1.1.1.1", store.load_ip_locations())
+                for table in ("node_queue_history", "node_traffic_history"):
+                    self.assertEqual(store._connection.execute(f"SELECT COUNT(*) FROM {table} WHERE timestamp < 102").fetchone()[0], 0)
+            finally:
+                store.close()
+
+    def test_zoom_bounds_are_applied_before_downsampling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = HistoryStore(Path(directory) / "history.sqlite3")
+            try:
+                for timestamp in range(100):
+                    store.append_queue("node-a", timestamp, timestamp, 2, 3)
+                    store.append_traffic("node-a", timestamp, [("ssh", timestamp, 5)])
+                queue = store.queue_history("node-a", 10, max_points=3, until=12)
+                traffic = store.traffic_history("node-a", 10, ["ssh"], max_points=3, until=12)["ssh"]
+                self.assertEqual([row[0] for row in queue], [10, 11, 12])
+                self.assertEqual([row[0] for row in traffic], [10, 11, 12])
+            finally:
+                store.close()
+
     def test_load_history_is_migrated_to_queue_history(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "history.sqlite3"

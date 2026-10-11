@@ -7,12 +7,17 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from time import time as _wall_time
+
+
+MAX_HISTORY_SECONDS = 7 * 24 * 60 * 60
 
 
 class HistoryStore:
     """Persist raw samples and return time-spanning chart data.
 
-    The database is capped at ``max_bytes``. Once the main file plus WAL/SHM
+    Samples expire after seven days. The database is capped at ``max_bytes``.
+    Once the main file plus WAL/SHM
     exceeds that footprint, the oldest timestamp groups are removed until the
     compacted database is below a target watermark. Recent history is retained.
     """
@@ -26,6 +31,7 @@ class HistoryStore:
         self._max_bytes = max_bytes
         self._lock = threading.Lock()
         self._last_size_check = 0.0  # time.monotonic() of the last rolling check
+        self._last_retention_check = 0.0
         self._connection = sqlite3.connect(database, check_same_thread=False)
         with self._connection:
             self._connection.execute("PRAGMA journal_mode=WAL")
@@ -113,6 +119,20 @@ class HistoryStore:
                 )
                 """
             )
+
+            self._expire_history(_wall_time())
+        self._last_retention_check = time.monotonic()
+
+    def _expire_history(self, now: float) -> None:
+        cutoff = now - MAX_HISTORY_SECONDS
+        for table in ("node_queue_history", "node_traffic_history"):
+            self._connection.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+
+    def _maybe_expire_history(self) -> None:
+        now = time.monotonic()
+        if now - self._last_retention_check >= 60:
+            self._expire_history(_wall_time())
+            self._last_retention_check = now
 
     def close(self) -> None:
         with self._lock:
@@ -224,8 +244,11 @@ class HistoryStore:
         transfer_tcp_queue_delay_us: int,
         transfer_udp_queue_delay_us: int,
     ) -> None:
+        if timestamp < _wall_time() - MAX_HISTORY_SECONDS:
+            return
         with self._lock, self._connection:
             self._maybe_roll_if_too_large()
+            self._maybe_expire_history()
             self._connection.execute(
                 "INSERT OR REPLACE INTO node_queue_history VALUES (?, ?, ?, ?, ?)",
                 (
@@ -242,8 +265,11 @@ class HistoryStore:
     ) -> None:
         if not services:
             return
+        if timestamp < _wall_time() - MAX_HISTORY_SECONDS:
+            return
         with self._lock, self._connection:
             self._maybe_roll_if_too_large()
+            self._maybe_expire_history()
             self._connection.executemany(
                 "INSERT OR REPLACE INTO node_traffic_history VALUES (?, ?, ?, ?, ?)",
                 (
@@ -253,14 +279,19 @@ class HistoryStore:
             )
 
     def queue_history(
-        self, node_key: str, since: float | None, max_points: int = 2000
+        self, node_key: str, since: float | None, max_points: int = 2000, *, until: float | None = None
     ) -> list[tuple[float, int, int, int]]:
+        since = max(since if since is not None else -math.inf, _wall_time() - MAX_HISTORY_SECONDS)
         conditions = "node_key = ?"
         params: tuple = (node_key,)
         if since is not None:
             conditions += " AND timestamp >= ?"
             params += (since,)
-        with self._lock:
+        if until is not None:
+            conditions += " AND timestamp <= ?"
+            params += (until,)
+        with self._lock, self._connection:
+            self._maybe_expire_history()
             count, first, last = self._connection.execute(
                 "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM node_queue_history "
                 f"WHERE {conditions}",
@@ -285,15 +316,20 @@ class HistoryStore:
             ).fetchall()
 
     def traffic_history(
-        self, node_key: str, since: float | None, services: list[str], max_points: int = 2000
+        self, node_key: str, since: float | None, services: list[str], max_points: int = 2000, *, until: float | None = None
     ) -> dict[str, list[tuple[float, int, int]]]:
+        since = max(since if since is not None else -math.inf, _wall_time() - MAX_HISTORY_SECONDS)
         result: dict[str, list[tuple[float, int, int]]] = {}
-        with self._lock:
+        with self._lock, self._connection:
+            self._maybe_expire_history()
             service_conditions = "node_key = ?"
             service_params: tuple = (node_key,)
             if since is not None:
                 service_conditions += " AND timestamp >= ?"
                 service_params += (since,)
+            if until is not None:
+                service_conditions += " AND timestamp <= ?"
+                service_params += (until,)
             stored_services = self._connection.execute(
                 "SELECT DISTINCT service FROM node_traffic_history "
                 f"WHERE {service_conditions}",
@@ -306,6 +342,9 @@ class HistoryStore:
                 if since is not None:
                     conditions += " AND timestamp >= ?"
                     params += (since,)
+                if until is not None:
+                    conditions += " AND timestamp <= ?"
+                    params += (until,)
                 count, first, last = self._connection.execute(
                     "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM node_traffic_history "
                     f"WHERE {conditions}",

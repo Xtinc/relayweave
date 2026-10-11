@@ -27,7 +27,7 @@ from flask import Flask, abort, jsonify, render_template, request
 DASHBOARD_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(DASHBOARD_DIR))
 
-from history_store import HistoryStore  # noqa: E402
+from history_store import HistoryStore, MAX_HISTORY_SECONDS  # noqa: E402
 from flow_map import FlowMapRenderer  # noqa: E402
 from ip_location import IpLocationCache  # noqa: E402
 from proxy_client import ProxyControlClient  # noqa: E402
@@ -37,7 +37,7 @@ app = Flask(__name__, template_folder="templates", static_folder=None)
 _client: ProxyControlClient | None = None
 _flow_renderer = FlowMapRenderer()
 _location_cache: IpLocationCache | None = None
-MAX_HISTORY_RANGE_SECONDS = 7 * 24 * 60 * 60
+MAX_HISTORY_RANGE_SECONDS = MAX_HISTORY_SECONDS
 GZIP_MINIMUM_SIZE = 512
 GZIP_MIMETYPES = {
     "application/json",
@@ -90,24 +90,23 @@ def api_snapshot():
         abort(400, description="Invalid Flow map filter")
     now = time.time()
     history_after = _history_after()
-    queue_since = _history_since("queue_range", now)
-    traffic_since = _history_since("bandwidth_range", now)
+    queue_until = _history_until("queue_until", now)
+    traffic_until = _history_until("bandwidth_until", now)
+    queue_since = max(now - MAX_HISTORY_RANGE_SECONDS, _history_since("queue_range", queue_until))
+    traffic_since = max(now - MAX_HISTORY_RANGE_SECONDS, _history_since("bandwidth_range", traffic_until))
     if history_after is not None:
         # HistoryStore uses an inclusive lower bound. Move to the next
         # representable float so an incremental request is strictly newer
         # than the last sample already held by the browser.
         incremental_since = math.nextafter(history_after, math.inf)
-        queue_since = (
-            max(queue_since, incremental_since)
-            if queue_since is not None
-            else incremental_since
-        )
-        traffic_since = (
-            max(traffic_since, incremental_since)
-            if traffic_since is not None
-            else incremental_since
-        )
-    snap = _client.snapshot(queue_since, traffic_since)
+        queue_since = max(queue_since, incremental_since)
+        traffic_since = max(traffic_since, incremental_since)
+    bounds = {}
+    if "queue_until" in request.args:
+        bounds["queue_until"] = queue_until
+    if "bandwidth_until" in request.args:
+        bounds["traffic_until"] = traffic_until
+    snap = _client.snapshot(queue_since, traffic_since, **bounds)
     flow_map = _flow_renderer.render(snap.flow_map, flow_service, flow_protocol)
     nodes = [_node_snapshot(node, now) for node in snap.nodes.values()]
     nodes.sort(key=lambda node: node["node_id"])
@@ -272,10 +271,23 @@ def _cluster_counts(snap) -> tuple[int, int]:
     return sum(node.connected for node in snap.nodes.values()), len(snap.nodes)
 
 
-def _history_since(parameter: str, now: float) -> float | None:
-    value = request.args.get(parameter, "300")
+def _history_until(parameter: str, now: float) -> float:
+    value = request.args.get(parameter)
+    if value is None:
+        return now
+    try:
+        timestamp = float(value)
+        if not math.isfinite(timestamp) or not now - MAX_HISTORY_RANGE_SECONDS <= timestamp <= now:
+            raise ValueError
+    except (OverflowError, ValueError):
+        abort(400, description=f"{parameter} must be a finite timestamp within the last seven days")
+    return timestamp
+
+
+def _history_since(parameter: str, now: float) -> float:
+    value = request.args.get(parameter, "60")
     if value == "all":
-        return None
+        return now - MAX_HISTORY_RANGE_SECONDS
     try:
         seconds = float(value)
         if not math.isfinite(seconds) or seconds <= 0 or seconds > MAX_HISTORY_RANGE_SECONDS:

@@ -195,7 +195,10 @@ class ProxyControlClient:
         if self._thread:
             self._thread.join()
 
-    def snapshot(self, queue_since: float | None, traffic_since: float | None) -> Snapshot:
+    def snapshot(
+        self, queue_since: float | None, traffic_since: float | None, *,
+        queue_until: float | None = None, traffic_until: float | None = None,
+    ) -> Snapshot:
         """Return a copy of the current cluster snapshot for the UI."""
         with self._lock:
             topology = self._snapshot.topology
@@ -237,10 +240,10 @@ class ProxyControlClient:
         for node in snap.nodes.values():
             node.queue_history = [
                 QueueSample(*row)
-                for row in self._history_store.queue_history(node.node_id, queue_since)
+                for row in self._history_store.queue_history(node.node_id, queue_since, until=queue_until)
             ]
             traffic_rows = self._history_store.traffic_history(
-                node.node_id, traffic_since, sorted(node.service_traffic)
+                node.node_id, traffic_since, sorted(node.service_traffic), until=traffic_until
             )
             node.traffic_history = {
                 service: [

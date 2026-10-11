@@ -23,7 +23,14 @@ Browser responses negotiate gzip through the standard `Accept-Encoding`
 header.  The first `/api/snapshot` request returns the selected history
 window and a `history_cursor`; later requests send that cursor as
 `history_after` and receive only newer chart samples.  Changing either chart
-range resets the cursor and performs a new full-window request.
+range or mouse selection resets the cursor and performs a new full-window request.
+Both charts offer **1m / 1h / 1d / 7d**. Drag across a chart to zoom into an
+interval, scroll to zoom around the pointer, and double-click to restore the
+selected preset. Time axes remain continuous; missing samples leave blank gaps.
+Zoom queries filter their exact interval before downsampling. Chart samples
+expire after seven days in SQLite and in browser history; the database size
+cap can remove older samples sooner. Expired rows are cleaned at startup and
+during collection and queries, including while collection is idle.
 
 ## Protocol summary (from the C++ source)
 
@@ -118,9 +125,9 @@ Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
 Agents, service, protocol and ordered Node path merge and list every business ID.
 Agent stations are identified by attachment Node plus control IP:port; Nodes
 share stations. Geometry and colors are deterministic, and count-only refreshes
-retain coordinates. The browser preserves pan, zoom and valid route selection.
-Click a route or legend entry for details; use the filters, wheel/zoom buttons,
-dragging, and **Fit all** to explore the map. Flow data is only held in memory
+retain coordinates. The map always fits all current routes and preserves valid
+route selection. Click a route or legend entry for details. Current Flows has
+no filter, pan, or zoom controls. Flow data is only held in memory
 and is not added to SQLite history.
 
 Run the live three-Node tests with `RELAYWEAVE_NODE_BINARY` set to the built

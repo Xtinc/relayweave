@@ -108,7 +108,7 @@ class DashboardServiceTest(unittest.TestCase):
         self.stop()
         self.assertEqual(self.process.returncode, 0)
         with closing(sqlite3.connect(self.database)) as database, database:
-            database.execute("INSERT INTO node_queue_history VALUES ('saved-node', 100, 1, 2, 3)")
+            database.execute("INSERT INTO node_queue_history VALUES ('saved-node', ?, 1, 2, 3)", (time.time(),))
         self.start()
         self.stop()
         self.assertEqual(self.process.returncode, 0)
@@ -129,7 +129,7 @@ class DashboardServiceTest(unittest.TestCase):
             'def slow_history():',
             f'    Path({str(started)!r}).touch()',
             '    time.sleep(6)',
-            '    service._client._history_store.append_queue("slow-request", 100, 1, 2, 3)',
+            '    service._client._history_store.append_queue("slow-request", time.time(), 1, 2, 3)',
             '    return "completed"',
             'raise SystemExit(service.main())',
         ])
