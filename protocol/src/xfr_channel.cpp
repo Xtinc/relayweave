@@ -194,15 +194,20 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
             log_transfer_end(er, "tcp", "read", from, to);
             if (er == asio::error::eof)
             {
-                asio::error_code ignored;
-                to.shutdown(tcp::socket::shutdown_send, ignored);
+                asio::error_code shutdown_error;
+                to.shutdown(tcp::socket::shutdown_send, shutdown_error);
+                if (shutdown_error && shutdown_error != asio::error::not_connected)
+                {
+                    throw asio::system_error(shutdown_error, "shutdown TCP send");
+                }
+                co_return;
             }
-            co_return;
+            throw asio::system_error(er, "read TCP stream");
         }
 
         if (limiter && !limiter->try_consume(nr) && !co_await wait_for_limit(*limiter, timer, nr))
         {
-            co_return;
+            throw asio::system_error(asio::error::operation_aborted, "wait for TCP rate limit");
         }
 
         auto [ew, nw] = co_await asio::async_write(to, asio::buffer(buffer.data(), nr), use_nothrow_awaitable);
@@ -214,7 +219,7 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
         if (ew)
         {
             log_transfer_end(ew, "tcp", "write", from, to);
-            co_return;
+            throw asio::system_error(ew, "write TCP stream");
         }
     }
 }
@@ -223,8 +228,8 @@ asio::awaitable<void> relay_tcp(tcp::socket &left, tcp::socket &right, TokenBuck
                                 TokenBucket *right_to_left_limiter, TrafficCounter *left_to_right_traffic,
                                 TrafficCounter *right_to_left_traffic)
 {
-    return (transfer_tcp(left, right, left_to_right_limiter, left_to_right_traffic) &&
-              transfer_tcp(right, left, right_to_left_limiter, right_to_left_traffic));
+    return await_transfers(transfer_tcp(left, right, left_to_right_limiter, left_to_right_traffic),
+                           transfer_tcp(right, left, right_to_left_limiter, right_to_left_traffic));
 }
 
 template <typename From, typename To>

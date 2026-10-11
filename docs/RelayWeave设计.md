@@ -1183,7 +1183,8 @@ AgentSession 在 control_io 调用 select_relay，按目的 Node 读取有效 LR
    同一个 Agent 的 Single 请求方和服务方可以共用一个 UUID，ready/closed/error 必须作用于两种角色。
 6. 结束时注销实例、关闭拥有的 socket，释放入口引用；UDP forward 保留并按服务状态决定重试。
 
-Node 现有单节点 TCP/TLS 复制语义保持不变；多节点继续使用 relay_halfclose，允许单向 FIN 后反向排空。
+单节点 TCP 使用 relay_tcp，正常 EOF 保留半关闭，真实错误取消并排空对向；TLS 使用现有 relay_tls。
+多节点使用 relay_halfclose，同样允许单向 FIN 后反向排空，并在真实错误时收敛两个方向。
 Multi 复制结束后等待 Node 的 stream complete 通知，再释放入口引用，避免控制关闭抢在最后 DATA/FIN 之前。
 该正常通知只记录完成，不提前取消数据读取；真实错误仍保存原始原因并收敛当前实例。
 
@@ -1477,7 +1478,7 @@ UDP 每包为 8 字节相邻 NodeLink ID + 32 字节头 + 帧体，精确验证�
 | `relay_udp_connected()` | AgentSession | 本地 UDP ↔ 公网 UDP | 增删 session header，并在两个 connected socket 间逐包转发 |
 
 流式函数内部同时运行两个复制方向。任一方向发生致命错误时取消配对方向；正常 EOF 按对应 transport 的
-关闭规则收敛（`relay_tcp()` 的异常退出待修正，见下一节）。UDP Node 的逐包路由由 DatagramMgr 直接实现，
+关闭规则收敛。UDP Node 的逐包路由由 DatagramMgr 直接实现，
 `relay_udp_connected()` 只用于 Agent 本地目标与 Node session 之间的转换。
 
 ### 11.2 TCP Pipeline
@@ -1486,9 +1487,10 @@ UDP 每包为 8 字节相邻 NodeLink ID + 32 字节头 + 帧体，精确验证�
 
 普通 EOF 使用半关闭：A 读到 EOF 后只对 B 执行 `shutdown(send)`，B 到 A 的方向继续运行并排空。两个方向都结束后再关闭 socket。显式取消由调用方清理双方。
 
-待修正（本轮只记录）：`transfer_tcp()` 当前把读写错误记录后正常返回，`relay_tcp()` 的 `&&` 因而可能继续
-等待另一个仍阻塞读取的方向，例如单侧 RST、对向空闲。后续应让真实 I/O 错误传播，并复用现有
-`await_transfers()` 取消、排空另一方向，同时保留正常 EOF 后的半关闭与回传；需以真实 socket 验证该场景。
+`transfer_tcp()` 的读写错误、限速等待取消和非预期 shutdown 错误以异常传播。`relay_tcp()` 复用
+`await_transfers()`：一个方向失败后取消并排空另一方向，按完成顺序保留原始错误，避免对向空闲读取或
+限速定时器使会话一直挂起。正常 EOF 仍只半关闭发送方向，等待反向数据与 EOF，不触发对向取消。
+真实 TCP socket 测试覆盖两侧 RST、发送失败、限速等待中的对向失败，以及双向半关闭回传和流量计数。
 TLS 的整体退出策略独立审核，不直接套用 TCP 半关闭规则。
 
 RemotePair 的两个复制方向分别持有一个可复用定时器，启动时选择该方向的令牌桶；每块数据同步预留令牌，
@@ -1843,6 +1845,7 @@ NodeConnection 在解析、连接、TLS、节点识别恢复时检查 running。
 - 同步数据操作不形成子协程，逐包发送和逐帧 Flow 接收不 co_spawn；限速足额时直接继续复制。
 - 重复身份、来源和跨等待后的存活检查仍承担实际业务边界，按值跨 co_await 的资源引用用于安全排空。
 - UDP 服务方双向复制在单侧 I/O 失败时传播原异常并排空对向，避免一侧退出而实例仍挂在业务容器。
+- TCP 双向复制同样传播 I/O 错误并排空对向，保留正常 EOF 的半关闭；限速等待取消不再作为正常结束。
 - 路由只使用实际测量入口；ICMP 持续运行至关闭，测试自己控制结束时刻，不给生产探测增加有限次数模式。
 
 Dashboard 的 HistoryStore 由应用创建和关闭，采集客户端只使用传入的存储；IP 查询和 UN/LOCODE 下载直接
@@ -1850,7 +1853,7 @@ Dashboard 的 HistoryStore 由应用创建和关闭，采集客户端只使用�
 未使用的容器扩展接口及独立路由查询已移除；保留实际服务容量、批量删除、拓扑和多目的地选路所需接口。
 
 本审查不把存在的功能差异强行合并：NodeFlow 的控制授权与数据状态、peer 错误位置与本地进度、
-本地 EOF 与对端 finished、单次取消与完成通知都不能互相替代。已知暂缓项见 11.2，未实现扩展见 18。
+本地 EOF 与对端 finished、单次取消与完成通知都不能互相替代。未实现扩展见 18。
 
 ## 16. 构建与验证
 
@@ -1896,6 +1899,7 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 - `relay_protocol`：控制命令枚举映射、自定义命令、三种协议 attach、帧校验、UDP session header
   和限速基础逻辑；
 - `relay_integration`：TCP/TLS Relay、ticket/role、半关闭、RelayAgent/RelayNode 完整往返；
+- `tcp_relay`：真实 TCP socket 的读写失败、限速等待退出、原始异常保留、半关闭回传与计数；
 - `udp_relay_integration`、`udp_session_routing`：UDP 单侧 I/O 失败排空、attach、路由、endpoint 固定、丢包边界、重建和统计，
   以及离线不分配资源、注册不复活旧请求、半接入超时、过期票据丢弃、ready 后无运行超时和容量恢复；
 - `agent_lifecycle`、`agent_reconnect`：重复启动/停止、可等待停止、断线重连取消以及停止后的对象释放。
@@ -1915,22 +1919,23 @@ python test/dashboard_service_smoke.py --build-dir build --two-nodes
 
 ### 16.1 当前整理的验证范围
 
-2026-10-11 最终整理验证：
+2026-10-11 最终整理及 TCP 异常退出修复验证：
 
 | 检查 | 结果 | 证据 |
 |---|---|---|
-| Debug 全目标构建 | 通过，无编译警告 | build/final-audit-build.log、build/final-audit-udp-build.log |
-| 完整 CTest | 29 项通过，1 项原始 ICMP 权限跳过，0 失败；176.38 秒 | build/final-audit-tests.log |
+| Debug 全目标构建 | 通过，无编译警告 | build/tcp-relay-fix-build.log |
+| 完整 CTest | 30 项通过，1 项原始 ICMP 权限跳过，0 失败；178.99 秒 | build/tcp-relay-fix-tests.log |
 | Dashboard 单元与集成测试 | 46 项通过 | build/final-audit-dashboard-tests.log |
 | 文档本地链接与本页章节锚点 | 75 个目标有效 | 对 README、设计、部署及 Dashboard 文档逐项检查 |
 | 修改格式 | git diff --check 通过 | 无空白错误 |
 
 新增 UDP 回归使用真实 socket 分别关闭目标侧与 Node 接入侧，确认对向仍在等待时也能排空，原始错误仍向调用方传播。
+TCP 回归同样使用真实 socket，分别验证两侧 RST、发送失败、限速等待中的对向失败，以及正常 EOF 后的反向回传和流量计数。
 已有测试覆盖 NodeConnection 停止、重复停止、建立失败、对象释放，以及单/多节点 TCP/TLS/UDP、FIN 排空、
 共享 Flow 隔离、服务恢复和路由失效。生产测试接口已删除；集群测试使用真实协议对端，路由测量夹具及私有访问仅在 test/。
 
 验证基于单机 Linux 的 loopback socket 和 mTLS。原始 ICMP 需要 CAP_NET_RAW，本机权限不足而明确跳过；
-不将跳过、历史阶段结果或功能测试作为原始 ICMP、跨机器吞吐与功耗验证。此前明确暂缓的 TCP 异常退出项见 11.2。
+不将跳过、历史阶段结果或功能测试作为原始 ICMP、跨机器吞吐与功耗验证。
 
 ## 17. 模块源码索引
 
@@ -1968,10 +1973,6 @@ python test/dashboard_service_smoke.py --build-dir build --two-nodes
 - [`protocol/inc/dualindex_map.h`](../protocol/inc/dualindex_map.h)：主次索引查找、次键调整与按次键批量删除。
 
 ## 18. 已知限制与后续扩展位置
-
-11.2 记录的单节点 relay_tcp 异常退出问题按此前要求暂缓：单侧读写错误被转成正常返回时，双向 `&&` 可能
-继续等待空闲的反方向。后续需要让真实 I/O 错误传播并触发对向取消，同时保留正常 EOF 的半关闭排空。
-该项不是本次清理冗余的修改内容，也不能由正常往返与 FIN 测试通过推断已修复。
 
 | 扩展 | 合理位置 | 必须明确的语义 |
 |---|---|---|

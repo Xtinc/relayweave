@@ -76,6 +76,11 @@ add_executable(test_relay_protocol relay_protocol_test.cpp)
 target_link_libraries(test_relay_protocol PRIVATE relayweave_protocol)
 add_test(NAME relay_protocol COMMAND test_relay_protocol)
 
+add_executable(test_tcp_relay tcp_relay_test.cpp)
+target_link_libraries(test_tcp_relay PRIVATE relayweave_protocol)
+add_test(NAME tcp_relay COMMAND test_tcp_relay)
+set_tests_properties(tcp_relay PROPERTIES TIMEOUT 10 LABELS "protocol;unit")
+
 add_executable(test_dual_index_map dual_index_map_test.cpp)
 target_link_libraries(test_dual_index_map PRIVATE relayweave_protocol)
 add_test(NAME dual_index_map COMMAND test_dual_index_map)
