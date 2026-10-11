@@ -164,7 +164,6 @@ void ICMP::run(std::vector<asio::ip::address_v4> destinations, const History &hi
         sessions_.clear();
         throw asio::system_error(open_error, "ICMP socket open failed");
     }
-    // Set up the local endpoint before starting the receive coroutine.
     asio::error_code bind_error;
     socket_.bind(ICMPProtocol::endpoint(asio::ip::address_v4::any(), 0), bind_error);
     if (bind_error)

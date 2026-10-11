@@ -190,7 +190,6 @@ asio::awaitable<void> verify(asio::io_context &io)
     }
     require(!best_candidate(routing, "service"), "Closed Agent retained a usable local route");
 
-    // A consuming Agent also probes potential ingress nodes discovered in topology.
     AgentRouting candidates(io, true, 2);
     now = AgentRouting::Clock::now();
     candidates.begin_request(1, now);

@@ -305,7 +305,6 @@ void flow_integration()
                 }
                 co_await test_node::close_flow(nodes[0], s2.epoch, s2.id);
             }
-            // Master as first, middle and last; extra direct edges use the same Node listeners.
             for (auto path : {std::vector<std::string>{"master", "a", "c"}, {"a", "master", "c"}, {"a", "b", "master"}})
             {
                 auto s = co_await test_node::open_flow(nodes[0], path, RelayProtocol::Tcp);

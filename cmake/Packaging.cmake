@@ -81,7 +81,6 @@ set(CPACK_DEBIAN_DASHBOARD_PACKAGE_CONTROL_EXTRA
     "${PROJECT_SOURCE_DIR}/packaging/dashboard/postrm"
 )
 
-# Ship the maintained design and deployment guides with every independently installed role.
 foreach(component IN ITEMS agent node proxy dashboard)
     install(FILES
         "${PROJECT_SOURCE_DIR}/docs/RelayWeave设计.md"

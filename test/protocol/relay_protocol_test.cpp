@@ -345,7 +345,6 @@ void test_message_fragmentation()
     require_throws([&] { missing.receive(njson::to_cbor(njson::array())); },
                    "Non-object control payload was accepted");
 
-    // Reusing the parsed JSON must retain the same command/params validation.
     for (const auto &invalid : {njson::object(), njson{{"command", 1u}}, njson{{"command", "invalid-command"}},
                                njson{{"command", "ping"}, {"params", njson::array()}}})
     {

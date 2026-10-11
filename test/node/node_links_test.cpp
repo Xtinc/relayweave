@@ -100,7 +100,6 @@ void integration()
             require(!denied && denied.stage == "ensure", "slave was allowed to coordinate");
             for (auto transport : {RelayProtocol::Tcp, RelayProtocol::Udp})
             {
-                // Concurrent calls must share a single attempt and NodeLink ID.
                 asio::experimental::channel<void(asio::error_code, LinkResult)> results(control, 2);
                 auto call = [&]() -> asio::awaitable<void> {
                     auto link = co_await test_node::ensure_link(nodes[0], "master", "a", transport);
@@ -613,7 +612,6 @@ void data_failures()
                 const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(body)};
                 co_await asio::async_write(socket, buffers, asio::use_awaitable);
             };
-            // Exercise the actual receive boundary with a real peer, without production injection hooks.
             co_await send(7, 21, true, {99});
             co_await send(7, 999, false, {98});
             co_await send(6, 21, false, {97});
@@ -736,7 +734,6 @@ void notification_overflow()
 {
     asio::io_context io(1);
     auto module = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "a", "127.0.0.1", 1, "127.0.0.1", 1);
-    // Every rejected prepare emits one control notification without allocating a live flow.
     for (std::uint64_t id = 1; id <= 4097; ++id)
     {
         module->prepare_flow(njson{{"epoch", std::uint64_t(7)},

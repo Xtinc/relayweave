@@ -42,14 +42,12 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     using tcp = asio::ip::tcp;
     using Stream = typename Transport::Stream;
 
-    // Forwarding between an attached Agent and a NodeFlow.
     struct RemotePair : RelayEndpoint
     {
         using RelayEndpoint::RelayEndpoint;
         std::optional<Stream> stream;
     };
 
-    // Single-node forwarding between two attached Agents.
     struct LocalPair
     {
         explicit LocalPair(asio::any_io_executor executor) : attached(executor)

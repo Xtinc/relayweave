@@ -204,7 +204,6 @@ struct Datagram
 class LnkChannel : public std::enable_shared_from_this<LnkChannel>
 {
   public:
-    // Channel lifecycle and control-domain notifications.
     LnkChannel(asio::any_io_executor executor, asio::any_io_executor event_executor, std::string node_id,
                std::string tcp_address, std::uint16_t tcp_port, std::string udp_address, std::uint16_t udp_port);
     void start();
@@ -243,7 +242,6 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     using udp = asio::ip::udp;
     using Clock = std::chrono::steady_clock;
 
-    // Logical flow lifecycle and local delivery/forwarding.
     void link_flows_closed(std::uint64_t id);
     FlowSendStatus send_flow(const FlowFrame &frame, std::span<const std::uint8_t> payload);
     bool deliver(const std::shared_ptr<lnk::NodeFlow> &flow, lnk::Frame &frame);
@@ -253,7 +251,6 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     void expire_preparations(Clock::time_point now);
     void incoming_flow(const lnk::NodeLink &link, lnk::Frame frame);
 
-    // Physical links, handshake and transport I/O.
     void notify(const std::shared_ptr<lnk::NodeLink> &link, CtrlCommand command, std::string reason = {},
                 std::string_view stage = {});
     void fail(const std::shared_ptr<lnk::NodeLink> &link, std::string reason, std::string_view stage = {});
@@ -271,13 +268,11 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     asio::awaitable<void> udp_read();
     asio::awaitable<void> udp_write();
 
-    // Shared control notifications, task draining and deadline scheduling.
     void emit(CtrlMessage message);
     void spawn(asio::awaitable<void> task);
     void schedule_monitor(Clock::time_point deadline);
     asio::awaitable<void> monitor();
 
-    // Local identity and listening resources.
     asio::any_io_executor executor_;
     std::string node_id_;
     tcp::acceptor acceptor_;
@@ -289,13 +284,11 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     // Single cluster_data_io owner. Declared before all queues so their buffers die before the pool.
     std::pmr::unsynchronized_pool_resource payload_pool_;
 
-    // Physical connections and the shared UDP send budget.
     std::map<std::uint64_t, std::shared_ptr<lnk::NodeLink>> links_;
     std::set<std::shared_ptr<tcp::socket>> accepting_;
     asio::experimental::channel<void(asio::error_code, lnk::Datagram)> udp_writes_;
     std::size_t udp_pending_data_ = 0;
 
-    // Logical paths, closed identity deduplication and endpoint receive budget.
     std::map<std::uint64_t, std::shared_ptr<lnk::NodeFlow>> flows_;
     std::map<std::uint64_t, Clock::time_point> retired_;
     std::size_t buffered_bytes_ = 0;

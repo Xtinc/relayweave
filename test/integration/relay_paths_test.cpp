@@ -724,7 +724,6 @@ void integration()
                     RelayProtocol::Udp, {"a", "b", "c"}, false, "parallel-udp"));
             channels[3]->send(CtrlMessage(CtrlCommand::ServerTraffic, njson{{"request_id", 90}}));
             const auto accounting = co_await receive(channels[3], CtrlCommand::ServerTrafficReported);
-            // Each UDP direction forwards one three-byte payload and one maximum payload.
             const auto udp_bytes = 3 + LnkFrameHeader::maximum_payload;
             for (const auto &service : accounting.params->at("services"))
             {
@@ -775,7 +774,6 @@ void integration()
             const auto cancelled = co_await receive(channels[1], CtrlCommand::RelayError);
             require(cancelled.params->at("reason") == "test cancellation", "Cancellation reason lost");
             co_await receive(channels[3], CtrlCommand::RelayClosed);
-            // The master can be the first or an intermediate Node.
             co_await exercise(channels[0], channels[3], client_ssl, configs[0], configs[3], epoch, 41,
                               RelayProtocol::Tcp, {"master", "b", "c"});
             co_await exercise(channels[1], channels[3], client_ssl, configs[1], configs[3], epoch, 42,
@@ -845,7 +843,6 @@ void integration()
                         "Socket failure did not preserve its RESET reason");
                 co_await receive(channels[3], CtrlCommand::RelayClosed);
             }
-            // Real producer Agent forwards service data over all three protocols after readiness.
             for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
             {
                 channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
@@ -947,7 +944,6 @@ void integration()
                 consumer_config.forwards.push_back({"auto-" + std::string(relay_protocol_name(protocol)),
                     "127.0.0.1", port, protocol});
             }
-            // A TCP-only discovery Agent has no proactive business instance.
             auto discovery_config = consumer_config;
             discovery_config.forwards.resize(1);
             discovery_config.forwards.front().listen_port = tcp_port(client);
@@ -964,7 +960,6 @@ void integration()
             discovery_agent->start();
             co_await asio::co_spawn(agent_control, RelayAgentTestAccess::verify_entry_lifetime(
                 *discovery_agent, epoch), asio::use_awaitable);
-            // Both Single roles share the same Agent control and Node UUID.
             for (const auto port : self_ports)
             {
                 tcp::socket app(client);

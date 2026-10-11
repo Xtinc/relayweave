@@ -167,7 +167,6 @@ static asio::awaitable<bool> wait_for_limit(TokenBucket &limiter, asio::steady_t
     co_return !error;
 }
 
-// Log current endpoints and the original error at the I/O completion point.
 template <class From, class To>
 static void log_transfer_end(const asio::error_code &error, const char *protocol, const char *operation,
                              const From &from, const To &to)

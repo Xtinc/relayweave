@@ -221,7 +221,6 @@ int main()
         }
         {
             Fixture f;
-            // Exercise both pre-buffered delivery and repeated receives across executor boundaries.
             for (int i = 0; i < 64; ++i)
             {
                 f.send(LnkFrType::Data, i % 2 != 0);

@@ -22,7 +22,6 @@ configure_file(
     @ONLY
 )
 
-# Statically link the GCC runtimes on Linux (glibc stays dynamic).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_link_options(-static-libstdc++ -static-libgcc)
 endif()
@@ -30,19 +29,16 @@ endif()
 if(WIN32 AND NOT DEFINED OPENSSL_ROOT_DIR)
     set(OPENSSL_ROOT_DIR "D:/Program Files/OpenSSL-Win64")
 endif()
-# set(OPENSSL_USE_STATIC_LIBS TRUE)
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_library(asio INTERFACE)
 target_include_directories(asio INTERFACE "${CMAKE_SOURCE_DIR}/vendor/asio-1.38.2/include")
 target_compile_definitions(asio INTERFACE $<$<CXX_COMPILER_ID:MSVC>:_WIN32_WINNT=0x0601>)
-# Propagate the system threads library (pthread on Linux) to every consumer of asio.
 target_link_libraries(asio INTERFACE Threads::Threads)
 
 option(ENABLE_IO_URING "Use Asio's io_uring backend on Linux" OFF)
 
-# Asio 1.38.2 requires Linux 5.10 or newer for its io_uring backend.
 # Keep epoll as the default because io_uring can cause high iowait on some VMs.
 if(ENABLE_IO_URING)
     if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")

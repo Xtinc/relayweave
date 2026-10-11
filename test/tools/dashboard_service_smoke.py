@@ -30,7 +30,6 @@ def main() -> None:
                         help='Collect through a Slave, verify directed quality and entry restart')
     args = parser.parse_args()
     build = args.build_dir.resolve()
-    # Fail before starting any process if the dashboard environment is incomplete.
     import flask  # noqa: F401
     import cbor2  # noqa: F401
 
@@ -98,7 +97,6 @@ def main() -> None:
         publisher = dict(client, forwards=[], services=published_services)
         if args.two_nodes:
             client['server'] = dict(client['server'], port=slave_control)
-        # Dashboard has its own control-channel configuration, independent of either Agent.
         collector = {'server': client['server'], 'certificate': client['certificate']}
         (work / 'node.json').write_text(json.dumps(config))
         (work / 'publisher.json').write_text(json.dumps(publisher))
@@ -129,7 +127,6 @@ def main() -> None:
                 assert process.returncode == 0, f'process stopped with {process.returncode}'
 
         def get(port: int, route: str) -> bytes:
-            # Explicitly bypass any HTTP proxy configured in the developer environment.
             opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
             with opener.open(f'http://127.0.0.1:{port}{route}', timeout=2) as response:
                 assert response.status == 200

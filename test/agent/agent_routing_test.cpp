@@ -216,7 +216,6 @@ int main()
         bad["nodes"][1]["node_id"] = "D";
         require(!routing.accept_snapshot(bad, at(0)), "A terminated request resumed");
 
-        // Quality changes must change recommendations without changing service ownership.
         routing.begin_request(9, at(0));
         auto competition = snapshot(9,
             Json::array({node("A", "192.0.2.1"), node("D", "192.0.2.2")}),
@@ -242,7 +241,6 @@ int main()
         require(routing.request_pending(at(0)), "Unrelated malformed response aborted the active request");
         require(routing.accept_snapshot(first, at(0)), "Active request did not survive an unrelated malformed response");
 
-        // Limiting diagnostic logs must not truncate the routing result.
         test_routing::Fixture many_ingresses(io, false, 4);
         many_ingresses.begin_request(1, at(0));
         many_ingresses.accept_snapshot(snapshot(1,

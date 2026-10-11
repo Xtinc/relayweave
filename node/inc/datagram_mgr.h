@@ -15,7 +15,6 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
         Consumer,
     };
 
-    // Single-node forwarding between two attached Agents.
     struct LocalPair
     {
         explicit LocalPair(asio::any_io_executor executor) : attached(executor), finished(executor)
@@ -43,7 +42,6 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
         bool closed = false;
     };
 
-    // Forwarding between an attached Agent and a NodeFlow.
     struct RemotePair : RelayEndpoint
     {
         RemotePair(asio::any_io_executor executor, int role) : RelayEndpoint(executor, role), received(executor, 16)

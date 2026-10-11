@@ -178,7 +178,6 @@ class ProxyControlClient:
         # thread issues cluster queries; both share one SSL socket.
         self._send_lock = threading.Lock()
 
-    # ------------------------------------------------------------------ public
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -252,7 +251,6 @@ class ProxyControlClient:
             }
         return snap
 
-    # --------------------------------------------------------------- internals
 
     def _allocate_request_id(self) -> int:
         rid = self._next_request_id
@@ -294,7 +292,6 @@ class ProxyControlClient:
         ctx.load_cert_chain(certfile=self.cert_file, keyfile=self.key_file)
         ctx.check_hostname = True
         ctx.verify_mode = ssl.CERT_REQUIRED
-        # Match the server's option set: no SSLv2/3/TLS1.0/1.1.
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         return ctx
 
@@ -452,7 +449,6 @@ class ProxyControlClient:
                     try:
                         self._handle_message(sock, msg)
                     except OSError:
-                        # send failed -> socket is dead.
                         session_dead.set()
                         return
         except Exception:  # noqa: BLE001

@@ -345,7 +345,6 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     co_await send_datagram(consumer_socket, server, udp_datagram(consumer_id, early_payload));
     co_await require_no_datagram(producer_socket, "Expired UDP session ID remained routable");
 
-    // Missing services fail immediately without allocating a Node waiting instance.
     consumer->send(CtrlMessage{
         "relay.open", njson{{"request_id", 38U}, {"service", "udp-recovery"}, {"protocol", "udp"}}});
     const auto unavailable = co_await receive_command(consumer, "relay.error");

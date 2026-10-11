@@ -216,7 +216,6 @@ AgentRouting::CandidatePaths AgentRouting::candidate_paths(Clock::time_point now
         return {};
     }
 
-    // Keep the lowest access cost for each measured ingress.
     std::map<std::string, double> ingress_costs;
     for (const auto &entry : entries)
     {
