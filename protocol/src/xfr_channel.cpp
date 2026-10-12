@@ -84,8 +84,13 @@ void TrafficCounter::saturating_add(std::atomic<std::uint64_t> &counter, std::ui
     }
 }
 
-TokenBucket::TokenBucket(std::uint64_t bytes_per_second, std::uint64_t burst_bytes) noexcept
-    : rate_(bytes_per_second), burst_(burst_bytes), tokens_(static_cast<double>(burst_bytes))
+TokenBucket::TokenBucket(std::uint64_t bytes_per_second, std::uint64_t burst_bytes, Mode mode) noexcept
+    : mode_(mode), rate_(bytes_per_second),
+      burst_(mode == Mode::Fixed ? burst_bytes
+             : rate_             ? std::min<std::uint64_t>(burst_bytes, LnkFrameHeader::maximum_payload)
+                                 : LnkFrameHeader::maximum_payload),
+      ceiling_(rate_ ? rate_ : std::numeric_limits<std::uint64_t>::max()), tokens_(static_cast<double>(burst_)),
+      last_update_(Clock::now())
 {
 }
 
@@ -98,22 +103,17 @@ TokenBucket::TimePoint TokenBucket::reserve(std::size_t bytes, TimePoint now)
 
     refill(now);
 
-    const auto requested = static_cast<double>(bytes);
-    if (last_update_ <= now && tokens_ >= requested)
-    {
-        tokens_ -= requested;
-        return now;
-    }
-
-    const auto deficit = std::max(0.0, requested - tokens_);
-    tokens_ = 0.0;
-    last_update_ = std::max(last_update_, now) + duration_for(deficit);
-    return last_update_;
+    tokens_ -= static_cast<double>(bytes);
+    return deadline(now);
 }
 
-bool TokenBucket::try_consume_at(std::size_t bytes, TimePoint now)
+bool TokenBucket::try_consume(std::size_t bytes)
 {
-    refill(now);
+    if (closed_ || paused_)
+        return false;
+    if (rate_ == 0 || bytes == 0)
+        return true;
+    refill(Clock::now());
     const auto requested = static_cast<double>(bytes);
     if (tokens_ < requested)
     {
@@ -123,22 +123,108 @@ bool TokenBucket::try_consume_at(std::size_t bytes, TimePoint now)
     return true;
 }
 
-bool TokenBucket::try_consume(std::size_t bytes)
+void TokenBucket::set_rate(std::uint64_t bytes_per_second, std::uint64_t burst_bytes)
 {
-    if (rate_ == 0 || bytes == 0)
+    const auto now = Clock::now();
+    refill(now);
+    if (bytes_per_second < rate_ || rate_ == 0)
+        tokens_ = std::min(tokens_, 0.0);
+    if (mode_ == Mode::Dynamic)
+        burst_bytes = std::min<std::uint64_t>(burst_bytes, LnkFrameHeader::maximum_payload);
+    tokens_ = std::min(tokens_, static_cast<double>(burst_bytes));
+    rate_ = bytes_per_second;
+    burst_ = burst_bytes;
+    if (!rate_)
+        tokens_ = 0.0;
+    if (timer_)
+        timer_->cancel();
+}
+
+void TokenBucket::feedback(std::uint64_t sequence, FlowPressure action)
+{
+    if (mode_ != Mode::Dynamic || closed_ || sequence <= sequence_ || action < FlowPressure::Decrease ||
+        action > FlowPressure::Increase)
+        return;
+    constexpr std::uint64_t initial_rate = 1024 * 1024;
+    constexpr std::uint64_t additive_step = 64 * 1024;
+    auto rate = rate_;
+    const bool was_paused = paused_;
+    switch (action)
     {
-        return true;
+    case FlowPressure::Decrease:
+        rate = std::max<std::uint64_t>(1, (rate ? rate : initial_rate) / 2);
+        break;
+    case FlowPressure::Pause:
+        if (!rate)
+            rate = initial_rate;
+        paused_ = true;
+        break;
+    case FlowPressure::Resume:
+        if (!sequence_)
+            return;
+        paused_ = false;
+        break;
+    case FlowPressure::Increase:
+        if (!sequence_ || paused_)
+            return;
+        rate = std::min(rate, ceiling_);
+        rate += std::min(additive_step, ceiling_ - rate);
+        break;
     }
-    return try_consume_at(bytes, Clock::now());
+    sequence_ = sequence;
+    if (rate != rate_)
+        set_rate(rate, burst_);
+    else if (paused_ != was_paused && timer_)
+        timer_->cancel();
+}
+
+asio::awaitable<void> TokenBucket::wait(std::size_t bytes)
+{
+    bool charged = false;
+    for (;;)
+    {
+        const auto cancellation = co_await asio::this_coro::cancellation_state;
+        if (closed_ || cancellation.cancelled() != asio::cancellation_type::none)
+            throw asio::system_error(asio::error::operation_aborted);
+        if (!paused_ && bytes == 0)
+            co_return;
+        const auto now = Clock::now();
+        TimePoint until;
+        if (paused_)
+            until = TimePoint::max();
+        else if (!charged)
+        {
+            until = reserve(bytes, now);
+            charged = true;
+        }
+        else
+            until = deadline(now);
+        if (until <= now)
+            co_return;
+        if (!timer_)
+            timer_ = std::make_unique<asio::steady_timer>(co_await asio::this_coro::executor);
+        timer_->expires_at(until);
+        const auto [error] = co_await timer_->async_wait(use_nothrow_awaitable);
+        if (error && error != asio::error::operation_aborted)
+            throw asio::system_error(error);
+        // Feedback rechecks the same reservation; close/cancellation exits above.
+    }
+}
+
+void TokenBucket::close()
+{
+    closed_ = true;
+    if (timer_)
+        timer_->cancel();
+}
+
+TokenBucket::TimePoint TokenBucket::deadline(TimePoint now) const noexcept
+{
+    return rate_ && tokens_ < 0.0 ? std::max(now, last_update_ + duration_for(-tokens_)) : now;
 }
 
 void TokenBucket::refill(TimePoint now) noexcept
 {
-    if (!initialised_)
-    {
-        last_update_ = now;
-        initialised_ = true;
-    }
     if (now > last_update_)
     {
         const auto elapsed = std::chrono::duration<double>(now - last_update_).count();
@@ -154,19 +240,6 @@ TokenBucket::Clock::duration TokenBucket::duration_for(double bytes) const noexc
     return std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(rounded));
 }
 
-static asio::awaitable<bool> wait_for_limit(TokenBucket &limiter, asio::steady_timer &timer, std::size_t bytes)
-{
-    const auto now = std::chrono::steady_clock::now();
-    const auto target = limiter.reserve(bytes, now);
-    if (target <= now)
-    {
-        co_return true;
-    }
-    timer.expires_at(target);
-    auto [error] = co_await timer.async_wait(use_nothrow_awaitable);
-    co_return !error;
-}
-
 template <class From, class To>
 static void log_transfer_end(const asio::error_code &error, const char *protocol, const char *operation,
                              const From &from, const To &to)
@@ -176,14 +249,13 @@ static void log_transfer_end(const asio::error_code &error, const char *protocol
         PROXY_DEBUG_PRINT("Transfer ended %s %s %s -> %s reason=%s", protocol, operation, socket_peer(from).c_str(),
                           socket_peer(to).c_str(), error.message().c_str());
     else
-        PROXY_ERROR_PRINT("Transfer failed %s %s %s -> %s reason=%s", protocol, operation,
-                          socket_peer(from).c_str(), socket_peer(to).c_str(), error.message().c_str());
+        PROXY_ERROR_PRINT("Transfer failed %s %s %s -> %s reason=%s", protocol, operation, socket_peer(from).c_str(),
+                          socket_peer(to).c_str(), error.message().c_str());
 }
 
 static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, TokenBucket *limiter,
                                           TrafficCounter *traffic)
 {
-    asio::steady_timer timer(from.get_executor());
     std::array<std::uint8_t, 64 * 1024> buffer{};
     for (;;)
     {
@@ -204,10 +276,8 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
             throw asio::system_error(er, "read TCP stream");
         }
 
-        if (limiter && !limiter->try_consume(nr) && !co_await wait_for_limit(*limiter, timer, nr))
-        {
-            throw asio::system_error(asio::error::operation_aborted, "wait for TCP rate limit");
-        }
+        if (limiter && !limiter->try_consume(nr))
+            co_await limiter->wait(nr);
 
         auto [ew, nw] = co_await asio::async_write(to, asio::buffer(buffer.data(), nr), use_nothrow_awaitable);
         if (traffic && nw != 0)
@@ -251,15 +321,14 @@ asio::awaitable<std::size_t> read_tls_data(tls_stream &stream, std::span<std::ui
     co_return size;
 }
 
-asio::awaitable<void> write_tls_data(tls_stream &stream, std::span<const std::uint8_t> payload,
-                                    TrafficCounter *traffic)
+asio::awaitable<void> write_tls_data(tls_stream &stream, std::span<const std::uint8_t> payload, TrafficCounter *traffic)
 {
     while (!payload.empty())
     {
         const auto size = std::min(payload.size(), tls_data_maximum_payload);
-        const std::array<std::uint8_t, 4> header{
-            static_cast<std::uint8_t>(size >> 24), static_cast<std::uint8_t>(size >> 16),
-            static_cast<std::uint8_t>(size >> 8), static_cast<std::uint8_t>(size)};
+        const std::array<std::uint8_t, 4> header{static_cast<std::uint8_t>(size >> 24),
+                                                 static_cast<std::uint8_t>(size >> 16),
+                                                 static_cast<std::uint8_t>(size >> 8), static_cast<std::uint8_t>(size)};
         const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload.data(), size)};
         const auto [error, written] = co_await asio::async_write(stream, buffers, use_nothrow_awaitable);
         if (traffic && written > header.size())
@@ -284,7 +353,6 @@ asio::awaitable<void> finish_tls_data(tls_stream &stream)
 template <typename From, typename To>
 static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limiter, TrafficCounter *traffic)
 {
-    asio::steady_timer timer(from.get_executor());
     std::array<std::uint8_t, tls_data_maximum_payload> buffer{};
     for (;;)
     {
@@ -324,17 +392,16 @@ static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limit
             }
             co_return;
         }
-        if (limiter && !limiter->try_consume(size) && !co_await wait_for_limit(*limiter, timer, size))
-        {
-            throw asio::system_error(asio::error::operation_aborted, "wait for TLS rate limit");
-        }
+        if (limiter && !limiter->try_consume(size))
+            co_await limiter->wait(size);
         if constexpr (std::is_same_v<To, tls_stream>)
         {
             co_await write_tls_data(to, std::span<const std::uint8_t>(buffer.data(), size), traffic);
         }
         else
         {
-            const auto [error, written] = co_await asio::async_write(to, asio::buffer(buffer.data(), size), use_nothrow_awaitable);
+            const auto [error, written] =
+                co_await asio::async_write(to, asio::buffer(buffer.data(), size), use_nothrow_awaitable);
             if (traffic)
             {
                 traffic->add(written);
@@ -443,10 +510,10 @@ asio::awaitable<void> relay_udp_connected(udp::socket &local_socket, udp::socket
 asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming)
 {
     const auto executor = co_await asio::this_coro::executor;
-    const auto [order, outgoing_error, incoming_error] = co_await asio::experimental::make_parallel_group(
-        asio::co_spawn(executor, std::move(outgoing), asio::deferred),
-        asio::co_spawn(executor, std::move(incoming), asio::deferred)
-    ).async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
+    const auto [order, outgoing_error, incoming_error] =
+        co_await asio::experimental::make_parallel_group(asio::co_spawn(executor, std::move(outgoing), asio::deferred),
+                                                         asio::co_spawn(executor, std::move(incoming), asio::deferred))
+            .async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
     // operator&& retains only the outgoing exception if both fail; that can hide the original I/O error.
     for (const auto index : order)
     {

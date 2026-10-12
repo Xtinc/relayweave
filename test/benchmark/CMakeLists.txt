@@ -6,3 +6,7 @@ target_include_directories(benchmark_udp_node PRIVATE "${PROJECT_SOURCE_DIR}/tes
 add_executable(benchmark_dual_index_map dual_index_map_benchmark.cpp)
 target_link_libraries(benchmark_dual_index_map PRIVATE relayweave_protocol)
 target_include_directories(benchmark_dual_index_map PRIVATE "${PROJECT_SOURCE_DIR}/test/support")
+
+add_executable(benchmark_token_bucket token_bucket_benchmark.cpp)
+target_link_libraries(benchmark_token_bucket PRIVATE relayweave_protocol)
+target_include_directories(benchmark_token_bucket PRIVATE "${PROJECT_SOURCE_DIR}/test/support")

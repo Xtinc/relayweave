@@ -173,6 +173,91 @@ int main()
                 expect_failure(event, "Node control event queue capacity exceeded");
             }
         }
+        for (bool reverse : {false, true})
+        {
+            Fixture f;
+            for (int i = 0; i < 2; ++i)
+            {
+                auto event = f.receive_event();
+                f.pump_caller();
+                event.get();
+            }
+            for (std::size_t i = 0; i < lnk::NodeFlow::high_watermark; ++i)
+                f.send(LnkFrType::Data, reverse);
+            auto high = f.receive_event();
+            f.pump_caller();
+            const auto feedback = high.get();
+            check(feedback.type() == CtrlCommand::RelayPressure &&
+                      feedback.params->at("reverse") == reverse &&
+                      feedback.params->at("action") == static_cast<unsigned>(FlowPressure::Decrease),
+                  "high water did not immediately request a decrease");
+            // A repeated commit must not reset the running flow's water state.
+            asio::post(f.data, [&f] { f.channel->commit_flow(101); });
+            f.pump_data();
+            auto committed = f.receive_event();
+            f.pump_caller();
+            check(committed.get().type() == CtrlCommand::FlowCommitted, "repeat commit was not acknowledged");
+            auto pause = f.receive_event();
+            f.pump_caller();
+            for (std::size_t i = lnk::NodeFlow::high_watermark; i < lnk::NodeFlow::pause_watermark - 1; ++i)
+            {
+                f.send(LnkFrType::Data, reverse);
+                f.pump_caller();
+                check(pause.wait_for(0s) != std::future_status::ready,
+                      "same high-water episode repeated decrease");
+            }
+            f.send(LnkFrType::Data, reverse);
+            f.pump_caller();
+            const auto stopped = pause.get();
+            check(stopped.params->at("action") == static_cast<unsigned>(FlowPressure::Pause),
+                  "pause water did not report without a timed sample");
+            for (std::size_t i = lnk::NodeFlow::pause_watermark; i > lnk::NodeFlow::low_watermark; --i)
+            {
+                auto frame = f.receive();
+                f.pump_caller();
+                f.pump_data();
+                f.pump_caller();
+                check(frame.get().payload == BytesBuf{1, 2, 3}, "pressure changed DATA");
+            }
+            auto low = f.receive_event();
+            f.pump_caller();
+            const auto recovery = low.get();
+            check(recovery.type() == CtrlCommand::RelayPressure &&
+                      recovery.params->at("action") == static_cast<unsigned>(FlowPressure::Resume) &&
+                      recovery.params->at("sequence") > stopped.params->at("sequence"),
+                  "low water did not produce newer recovery feedback");
+            auto increase = f.receive_event();
+            f.pump_caller();
+            for (std::size_t i = 0; i < lnk::NodeFlow::low_watermark; ++i)
+            {
+                auto frame = f.receive();
+                f.pump_caller();
+                f.pump_data();
+                f.pump_caller();
+                check(frame.get().payload == BytesBuf{1, 2, 3}, "tiny frames were changed");
+            }
+            auto consume = [&](std::size_t size) {
+                asio::post(f.data, [&f, size, reverse] {
+                    check(f.channel->send_flow({7, 101, reverse, LnkFrType::Data, BytesBuf(size, 7)}) ==
+                              FlowSendStatus::Queued,
+                          "could not submit consumption block");
+                });
+                f.pump_data();
+                auto frame = f.receive();
+                f.pump_caller();
+                f.pump_data();
+                f.pump_caller();
+                check(frame.get().payload.size() == size, "consumption block changed size");
+            };
+            consume(LnkFrameHeader::maximum_payload);
+            consume(lnk::NodeFlow::increase_bytes - lnk::NodeFlow::low_watermark * 3 - 1 -
+                    LnkFrameHeader::maximum_payload);
+            check(increase.wait_for(0s) != std::future_status::ready, "increase was driven by frame count");
+            consume(1);
+            const auto grown = increase.get();
+            check(grown.params->at("action") == static_cast<unsigned>(FlowPressure::Increase),
+                  "consumed byte batch did not immediately request additive increase");
+        }
         {
             Fixture f;
             auto caller_work = asio::make_work_guard(f.caller);

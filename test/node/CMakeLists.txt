@@ -1,4 +1,4 @@
-foreach(name IN ITEMS node_config node_status)
+foreach(name IN ITEMS node_config node_status relay_pressure)
     relayweave_test(${name} ${name}_test.cpp
         LIBRARIES relayweave_node_lib LABELS node unit)
 endforeach()

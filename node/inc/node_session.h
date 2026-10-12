@@ -32,6 +32,7 @@ class NodeSession
     asio::awaitable<void> activate();
     asio::awaitable<void> bridge();
     asio::awaitable<void> close();
+    void pressure(const njson &params);
     std::uint64_t uuid() const;
     RelayNode &node_;
     std::variant<ControlRouterSingle, ControlRouterMulti> control_;

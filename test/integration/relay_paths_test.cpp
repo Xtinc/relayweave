@@ -22,6 +22,13 @@ TEST_MEMBER(RelayAgent, entry_waits_)
 TEST_MEMBER(RelayAgent, select_relay)
 TEST_MEMBER(RelayAgent, collect_idle_connections)
 TEST_MEMBER(RelayAgent, primary_connection_id_)
+TEST_MEMBER(RelayNode, tcp_pipeline_)
+TEST_MEMBER(RelayNode, tls_pipeline_)
+TEST_MEMBER(TcpPipeline, remote_pairs_)
+TEST_MEMBER(TokenBucket, rate_)
+TEST_MEMBER(TokenBucket, sequence_)
+TEST_MEMBER(TokenBucket, paused_)
+TEST_MEMBER(TlsPipeline, remote_pairs_)
 
 namespace
 {
@@ -311,6 +318,270 @@ asio::awaitable<void> cancel_during_stream_limit(const std::shared_ptr<TLSChanne
             "Rate-wait cancellation retained a socket or sent queued data");
 }
 
+template <typename Function>
+auto pressure_endpoint(const std::shared_ptr<RelayNode> &node, RelayProtocol protocol, std::uint64_t uuid,
+                       Function function)
+{
+    if (protocol == RelayProtocol::Tls)
+        return function(
+            *test_access::TlsPipeline_remote_pairs_(*test_access::RelayNode_tls_pipeline_(*node)).at(uuid));
+    return function(
+        *test_access::TcpPipeline_remote_pairs_(*test_access::RelayNode_tcp_pipeline_(*node)).at(uuid));
+}
+
+struct PressureStatus
+{
+    bool blocked = false;
+    std::uint64_t sequence = 0;
+    std::uint64_t rate = 0;
+    bool operator==(const PressureStatus &) const = default;
+};
+
+asio::awaitable<PressureStatus> pressure_status(std::shared_ptr<RelayNode> node,
+                                                asio::any_io_executor transfer, RelayProtocol protocol,
+                                                std::uint64_t uuid)
+{
+    co_return co_await asio::co_spawn(
+        transfer,
+        [node, protocol, uuid]() -> asio::awaitable<PressureStatus> {
+            co_return pressure_endpoint(node, protocol, uuid, [](auto &endpoint) {
+                auto &limiter = endpoint.role == RelayAttach::Producer ? endpoint.rx_limiter : endpoint.tx_limiter;
+                return PressureStatus{test_access::TokenBucket_paused_(limiter),
+                                      test_access::TokenBucket_sequence_(limiter), test_access::TokenBucket_rate_(limiter)};
+            });
+        },
+        asio::use_awaitable);
+}
+
+template <typename Stream> asio::awaitable<void> pressure_write(Stream &stream, const BytesBuf &bytes)
+{
+    if constexpr (std::is_same_v<Stream, TLSStream>)
+        co_await write_tls_data(stream, bytes);
+    else
+        co_await asio::async_write(stream, asio::buffer(bytes), asio::use_awaitable);
+}
+
+template <typename Stream> asio::awaitable<BytesBuf> pressure_read(Stream &stream, std::size_t size)
+{
+    BytesBuf result(size);
+    if constexpr (std::is_same_v<Stream, TLSStream>)
+    {
+        BytesBuf frame(tls_data_maximum_payload);
+        std::size_t offset = 0;
+        while (offset < size)
+        {
+            const auto count = co_await read_tls_data(stream, frame);
+            require(count && count <= size - offset, "Pressure TLS delivery length changed");
+            std::copy_n(frame.begin(), count, result.begin() + offset);
+            offset += count;
+        }
+    }
+    else
+        co_await asio::async_read(stream, asio::buffer(result), asio::cancel_after(4s, asio::use_awaitable));
+    co_return result;
+}
+
+template <typename Stream>
+asio::awaitable<void> verify_pressure(Stream &from, Stream &to, RelayProtocol protocol,
+                                      const std::shared_ptr<RelayNode> &entry,
+                                      const std::shared_ptr<RelayNode> &exit, asio::any_io_executor control,
+                                      asio::any_io_executor transfer, std::uint64_t epoch,
+                                      std::uint64_t flow_id, std::uint64_t entry_uuid,
+                                      std::uint64_t exit_uuid, bool reverse_flow = false,
+                                      std::shared_ptr<TLSChannel> cancel_control = {},
+                                      std::uint64_t cancel_request = 0)
+{
+    // Park one write so tiny following frames exercise frame watermarks, without timed flow sampling.
+    co_await asio::co_spawn(
+        transfer,
+        [exit, protocol, exit_uuid]() -> asio::awaitable<void> {
+            pressure_endpoint(exit, protocol, exit_uuid, [](auto &endpoint) {
+                auto &limiter =
+                    endpoint.role == RelayAttach::Producer ? endpoint.tx_limiter : endpoint.rx_limiter;
+                limiter = TokenBucket(4096, 0);
+            });
+            co_return;
+        },
+        asio::use_awaitable);
+    BytesBuf expected(4096, 0xa5);
+    require(co_await test_node::send_flow(entry, {epoch, flow_id, reverse_flow, LnkFrType::Data, expected}) ==
+                FlowSendStatus::Queued,
+            "Pressure first block rejected");
+    for (std::uint8_t i = 0; i < lnk::NodeFlow::pause_watermark; ++i)
+    {
+        require(co_await test_node::send_flow(entry, {epoch, flow_id, reverse_flow, LnkFrType::Data, {i}}) ==
+                    FlowSendStatus::Queued,
+                "Pressure tiny DATA rejected");
+        expected.push_back(i);
+    }
+    PressureStatus status;
+    for (unsigned i = 0; i < 40; ++i)
+    {
+        status = co_await pressure_status(entry, transfer, protocol, entry_uuid);
+        if (status.blocked)
+            break;
+        co_await pause(5ms);
+    }
+    require(status.blocked && status.sequence >= 2 && status.rate == 512 * 1024,
+            "Queue feedback did not halve once and pause the remote sending entry");
+
+    // Invalid fields, direction, epoch and stale sequence must leave this valid pause intact.
+    auto feedback = njson{{"epoch", epoch},
+                          {"flow_id", flow_id},
+                          {"reverse", reverse_flow},
+                          {"sequence", status.sequence},
+                          {"action", static_cast<unsigned>(FlowPressure::Resume)}};
+    co_await asio::co_spawn(
+        control,
+        [entry, exit, feedback, reverse_flow]() mutable -> asio::awaitable<void> {
+            auto &cluster = test_node::cluster(exit);
+            const auto target = reverse_flow ? "c" : "a";
+            cluster.send(target, CtrlMessage("relay.peer.pressure", feedback));
+            feedback["sequence"] = feedback.at("sequence").get<std::uint64_t>() + 100;
+            test_node::cluster(entry).send(target, CtrlMessage("relay.peer.pressure", feedback));
+            feedback["reverse"] = !reverse_flow;
+            cluster.send(target, CtrlMessage("relay.peer.pressure", feedback));
+            feedback["reverse"] = reverse_flow;
+            feedback["action"] = 5;
+            cluster.send(target, CtrlMessage("relay.peer.pressure", feedback));
+            feedback["action"] = static_cast<unsigned>(FlowPressure::Resume);
+            feedback["reverse"] = 1;
+            cluster.send(target, CtrlMessage("relay.peer.pressure", feedback));
+            feedback["reverse"] = reverse_flow;
+            feedback["epoch"] = feedback.at("epoch").get<std::uint64_t>() + 1;
+            cluster.send(target, CtrlMessage("relay.peer.pressure", feedback));
+            co_return;
+        },
+        asio::use_awaitable);
+    co_await pause(20ms);
+    const auto unchanged = co_await pressure_status(entry, transfer, protocol, entry_uuid);
+    require(unchanged == status, "Invalid pressure feedback changed active supply");
+    if (cancel_control)
+    {
+        cancel_control->send(
+            CtrlMessage(CtrlCommand::RelayCancel,
+                        njson{{"request_id", cancel_request}, {"reason", "cancel during pressure"}}));
+        co_return;
+    }
+    const BytesBuf real{0xf0, 0xf1, 0xf2};
+    co_await pressure_write(from, real);
+    expected.insert(expected.end(), real.begin(), real.end());
+    const BytesBuf reverse{7, 8, 9};
+    co_await pressure_write(to, reverse);
+    require(co_await pressure_read(from, reverse.size()) == reverse,
+            "Pressure blocked the reverse direction");
+    require(co_await pressure_read(to, expected.size()) == expected,
+            "Pressure recovery lost or reordered DATA");
+    const auto resumed = co_await pressure_status(entry, transfer, protocol, entry_uuid);
+    require(!resumed.blocked && resumed.sequence > status.sequence && resumed.rate == status.rate,
+            "Low water did not resume with the saved rate");
+    co_await asio::co_spawn(
+        transfer,
+        [exit, protocol, exit_uuid]() -> asio::awaitable<void> {
+            pressure_endpoint(exit, protocol, exit_uuid, [](auto &endpoint) {
+                auto &limiter =
+                    endpoint.role == RelayAttach::Producer ? endpoint.tx_limiter : endpoint.rx_limiter;
+                limiter = TokenBucket{};
+            });
+            co_return;
+        },
+        asio::use_awaitable);
+    const BytesBuf batch(lnk::NodeFlow::increase_bytes, 0x5a);
+    co_await pressure_write(from, batch);
+    require(co_await pressure_read(to, batch.size()) == batch, "Additive growth changed DATA");
+    PressureStatus grown;
+    for (unsigned i = 0; i < 40; ++i)
+    {
+        grown = co_await pressure_status(entry, transfer, protocol, entry_uuid);
+        if (grown.sequence > resumed.sequence)
+            break;
+        co_await pause(5ms);
+    }
+    require(!grown.blocked && grown.rate == resumed.rate + 64 * 1024,
+            "Consumed bytes did not trigger additive growth through the control route");
+}
+
+asio::awaitable<void> exercise_pressure(const std::shared_ptr<TLSChannel> &consumer,
+                                        const std::shared_ptr<TLSChannel> &producer, asio::ssl::context &ssl,
+                                        const std::shared_ptr<RelayNode> &entry,
+                                        const std::shared_ptr<RelayNode> &exit, const NodeConfig &first,
+                                        const NodeConfig &last, asio::any_io_executor control,
+                                        asio::any_io_executor transfer, std::uint64_t epoch,
+                                        RelayProtocol protocol, bool cancel = false)
+{
+    const auto request = 200 + static_cast<unsigned>(protocol) + (cancel ? 10 : 0);
+    consumer->send(CtrlMessage(CtrlCommand::RelayOpen,
+                               njson{{"request_id", request},
+                                     {"service", "manual-" + std::string(relay_protocol_name(protocol))},
+                                     {"protocol", relay_protocol_name(protocol)},
+                                     {"epoch", epoch},
+                                     {"path", {"a", "b", "c"}}}));
+    const auto opened = co_await receive(consumer, CtrlCommand::RelayOpened);
+    const auto offered = co_await receive(producer, CtrlCommand::RelayOffer);
+    const auto executor = co_await asio::this_coro::executor;
+    std::vector<tcp::socket> sockets;
+    std::vector<TLSStream> tls;
+    for (int role : {RelayAttach::Consumer, RelayAttach::Producer})
+    {
+        const auto &descriptor = role == RelayAttach::Consumer ? *opened.params : *offered.params;
+        const auto &config = role == RelayAttach::Consumer ? first : last;
+        if (protocol == RelayProtocol::Tcp)
+            sockets.push_back(co_await attach_tcp(descriptor, config, role));
+        else
+        {
+            tcp::socket socket(executor);
+            co_await socket.async_connect(
+                {asio::ip::make_address(config.control.address), config::message_data_port(descriptor)},
+                asio::use_awaitable);
+            tls.emplace_back(std::move(socket), ssl);
+            configure_tls_client(tls.back(), "localhost");
+            co_await tls.back().async_handshake(asio::ssl::stream_base::client, asio::use_awaitable);
+            auto attachment = RelayAttach::to_msg({role, descriptor.at("uuid").get<std::uint64_t>(),
+                                                   descriptor.at("ticket").get<std::uint64_t>()});
+            (*attachment.params)["tls_framing"] = descriptor.at("tls_framing");
+            const auto frame = WireMessage::pack(std::move(attachment));
+            co_await asio::async_write(tls.back(), asio::buffer(frame), asio::use_awaitable);
+        }
+    }
+    co_await receive(consumer, CtrlCommand::RelayReady);
+    co_await receive(producer, CtrlCommand::RelayReady);
+    const auto flow_id = opened.params->at("flow_id").get<std::uint64_t>();
+    const auto entry_uuid = opened.params->at("uuid").get<std::uint64_t>();
+    const auto exit_uuid = offered.params->at("uuid").get<std::uint64_t>();
+    if (protocol == RelayProtocol::Tls)
+    {
+        co_await verify_pressure(tls[0], tls[1], protocol, entry, exit, control, transfer, epoch, flow_id,
+                                 entry_uuid, exit_uuid, false, cancel ? consumer : nullptr, request);
+        if (!cancel)
+        {
+            co_await verify_pressure(tls[1], tls[0], protocol, exit, entry, control, transfer, epoch, flow_id,
+                                     exit_uuid, entry_uuid, true);
+            co_await finish_tls_data(tls[0]);
+            co_await finish_tls_data(tls[1]);
+            BytesBuf buffer(tls_data_maximum_payload);
+            require(co_await read_tls_data(tls[0], buffer) == 0 &&
+                        co_await read_tls_data(tls[1], buffer) == 0,
+                    "Pressure TLS FIN lost");
+        }
+    }
+    else
+    {
+        co_await verify_pressure(sockets[0], sockets[1], protocol, entry, exit, control, transfer, epoch,
+                                 flow_id, entry_uuid, exit_uuid, false, cancel ? consumer : nullptr, request);
+        if (!cancel)
+        {
+            co_await verify_pressure(sockets[1], sockets[0], protocol, exit, entry, control, transfer, epoch,
+                                     flow_id, exit_uuid, entry_uuid, true);
+            sockets[0].shutdown(tcp::socket::shutdown_send);
+            sockets[1].shutdown(tcp::socket::shutdown_send);
+        }
+    }
+    const auto closed = co_await receive(consumer, CtrlCommand::RelayClosed);
+    co_await receive(producer, CtrlCommand::RelayClosed);
+    require(closed.params->at("reason") == (cancel ? "cancel during pressure" : "stream complete"),
+            "Pressure did not preserve clean FIN completion");
+}
+
 // A real Agent/Node data handshake. Ownership of all data sockets remains in this coroutine.
 asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, const std::shared_ptr<TLSChannel> &producer,
                                asio::ssl::context &ssl, const NodeConfig &entry, const NodeConfig &exit,
@@ -560,7 +831,7 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
     }
 }
 
-void integration()
+void integration(bool pressure_only)
 {
     asio::io_context control(1);
     asio::io_context transfer(1);
@@ -667,7 +938,9 @@ void integration()
             FlowResult warm;
             for (unsigned attempt = 0; attempt < 100; ++attempt)
             {
-                warm = co_await test_node::open_flow(nodes[0], {"a", "b", "c"}, RelayProtocol::Tcp);
+                warm = co_await asio::co_spawn(
+                    control, test_node::open_flow(nodes[0], {"a", "b", "c"}, RelayProtocol::Tcp),
+                    asio::use_awaitable);
                 if (warm)
                 {
                     break;
@@ -676,7 +949,8 @@ void integration()
             }
             require(bool(warm), "Cluster membership did not converge");
             const auto epoch = warm.epoch;
-            co_await test_node::close_flow(nodes[0], warm.epoch, warm.id);
+            co_await asio::co_spawn(control, test_node::close_flow(nodes[0], warm.epoch, warm.id),
+                                    asio::use_awaitable);
             for (const auto &config : configs)
             {
                 channels.push_back(co_await connect_control(client_ssl, config));
@@ -705,6 +979,22 @@ void integration()
                 njson{{"request_id", 5}, {"service", "manual-tcp"}, {"protocol", "tcp"}}));
             location = co_await receive(channels[0], CtrlCommand::ServiceLocated);
             require(location.params->at("node_id") == "c", "Entry lookup changed service ownership");
+            if (pressure_only)
+            {
+                for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls})
+                {
+                    co_await exercise_pressure(channels[1], channels[3], client_ssl, nodes[1], nodes[3],
+                                               configs[1], configs[3], control.get_executor(),
+                                               transfer.get_executor(), epoch, protocol);
+                    co_await exercise_pressure(channels[1], channels[3], client_ssl, nodes[1], nodes[3],
+                                               configs[1], configs[3], control.get_executor(),
+                                               transfer.get_executor(), epoch, protocol, true);
+                }
+                for (auto &channel : channels)
+                    co_await channel->async_disconnect();
+                co_await agent->async_stop();
+                co_return;
+            }
             // Flow rejection happens before install(): the requester must still receive the original error.
             for (const auto ingress : {0U, 1U})
             {
@@ -716,11 +1006,15 @@ void integration()
                               {"protocol", relay_protocol_name(protocol)}, {"path", path}, {"epoch", epoch}}));
                     const auto error = co_await receive(channels[ingress], CtrlCommand::RelayError);
                     require(error.params->at("request_id") == 8 && error.params->at("epoch") == epoch &&
-                            error.params->at("path") == path && error.params->at("protocol") == relay_protocol_name(protocol) &&
-                            error.params->at("stage") == "open" && error.params->at("reason") == "path node offline" &&
-                            !error.params->contains("uuid") && !error.params->contains("flow_id") &&
-                            !error.params->contains("ticket") && !error.params->contains("data_port"),
-                            "Flow rejection without an endpoint lost its failure reply: " + error.params->dump());
+                                error.params->at("path") == path &&
+                                error.params->at("protocol").get<std::string>() ==
+                                    relay_protocol_name(protocol) &&
+                                error.params->at("stage") == "open" &&
+                                error.params->at("reason") == "path node offline" &&
+                                !error.params->contains("uuid") && !error.params->contains("flow_id") &&
+                                !error.params->contains("ticket") && !error.params->contains("data_port"),
+                            "Flow rejection without an endpoint lost its failure reply: " +
+                                error.params->dump());
                 }
             }
             // Egress rejection can race the ingress notification; either order must close the same request.
@@ -945,7 +1239,8 @@ void integration()
                 failed_socket.set_option(asio::socket_base::linger(true, 0));
                 failed_socket.close();
                 const auto reset = co_await receive(channels[1], CtrlCommand::RelayClosed);
-                require(reset.params->at("reason").get<std::string>().find("reset") != std::string::npos,
+                require(reset.params->at("reason").get<std::string>().find(
+                            asio::error_code(asio::error::connection_reset).message()) != std::string::npos,
                         "Socket failure did not preserve its RESET reason");
                 co_await receive(channels[3], CtrlCommand::RelayClosed);
             }
@@ -1210,9 +1505,16 @@ void integration()
                       {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             const auto rejected = co_await receive(channels[1], CtrlCommand::RelayError);
+            const auto target_error = rejected.params->at("reason").get<std::string>();
+            // Windows may still be retrying the refused connect when the Agent's deadline expires.
             require(rejected.params->at("stage") == "attach" &&
-                    rejected.params->at("reason").get<std::string>().find("refused") != std::string::npos,
-                    "Producer target failure did not preserve the original error");
+                        (target_error.find(asio::error_code(asio::error::connection_refused).message()) !=
+                             std::string::npos ||
+                         (target_error.find("relay establishment deadline exceeded") != std::string::npos &&
+                          target_error.find(asio::error_code(asio::error::operation_aborted).message()) !=
+                              std::string::npos)),
+                    "Producer target failure did not preserve the original error: " +
+                        rejected.params->dump());
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 51}, {"service", "auto-tcp"}, {"protocol", "tcp"},
                       {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
@@ -1302,12 +1604,16 @@ void integration()
 }
 }
 
-int main()
+int main(int argc, char **argv)
 {
     try
     {
-        integration();
-        std::cout << "[PASS] Routed relay control, TCP/TLS/UDP business transfer and half-close\n";
+        const bool pressure_only = argc > 1 && std::string_view(argv[1]) == "--pressure-only";
+        integration(pressure_only);
+        std::cout << (pressure_only
+                          ? "[PASS] Routed TCP/TLS bidirectional pressure feedback, recovery, validation and "
+                            "cancellation\n"
+                          : "[PASS] Routed relay control, TCP/TLS/UDP business transfer and half-close\n");
         return 0;
     }
     catch (const std::exception &error)

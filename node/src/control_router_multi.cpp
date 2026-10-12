@@ -42,9 +42,13 @@ std::optional<njson> ControlRouterMulti::status_report() const
     {
         return std::nullopt;
     }
-    njson report{{"mode", "multi"}, {"role", ingress_ ? "ingress" : "egress"},
-                 {"service", params_.at("service")}, {"protocol", params_.at("protocol")},
-                 {"epoch", epoch_}, {"flow_id", flow_id_}, {"agent_peer", std::string(session->peer())}};
+    njson report{{"mode", "multi"},
+                 {"role", ingress_ ? "ingress" : "egress"},
+                 {"service", params_.at("service")},
+                 {"protocol", params_.at("protocol")},
+                 {"epoch", epoch_},
+                 {"flow_id", flow_id_},
+                 {"agent_peer", std::string(session->peer())}};
     if (ingress_)
     {
         report["path"] = params_.at("path");
@@ -177,6 +181,11 @@ void ControlRouterMulti::handle_peer(const CtrlMessage &message)
     if ((message.command == "relay.peer.attached" && ingress_) || (message.command == "relay.peer.ready" && !ingress_))
     {
         peer_prepared_ = true;
+    }
+    else if (message.command == "relay.peer.pressure")
+    {
+        relay_.pressure(params);
+        return;
     }
     else if (message.command == "relay.peer.finished")
     {

@@ -43,6 +43,46 @@ void LnkChannel::notify_flow(const std::shared_ptr<NodeFlow> &s, CtrlCommand com
     emit(CtrlMessage(command, std::move(p)));
 }
 
+void LnkChannel::notify_pressure(NodeFlow &flow, bool reverse, FlowPressure action)
+{
+    emit(CtrlMessage(CtrlCommand::RelayPressure, njson{{"epoch", flow.epoch},
+                                                       {"flow_id", flow.params.at("flow_id")},
+                                                       {"reverse", reverse},
+                                                       {"sequence", ++flow.pressure_sequence},
+                                                       {"action", static_cast<unsigned>(action)}}));
+}
+
+void LnkChannel::update_pressure(NodeFlow &flow, bool reverse)
+{
+    using State = NodeFlow::State;
+    if (flow.pending_frames >= NodeFlow::pause_watermark && flow.state != State::Paused)
+    {
+        flow.state = State::Paused;
+        notify_pressure(flow, reverse, FlowPressure::Pause);
+    }
+    else if (flow.pending_frames >= NodeFlow::high_watermark &&
+             (flow.state == State::Active || flow.state == State::Low))
+    {
+        flow.state = State::High;
+        notify_pressure(flow, reverse, FlowPressure::Decrease);
+    }
+    else if (flow.pending_frames <= NodeFlow::low_watermark &&
+             (flow.state == State::High || flow.state == State::Paused))
+    {
+        flow.state = State::Low;
+        flow.consumed_bytes = 0;
+        notify_pressure(flow, reverse, FlowPressure::Resume);
+    }
+    else if (flow.pending_frames <= NodeFlow::low_watermark && flow.state == State::Low &&
+             flow.consumed_bytes >= NodeFlow::increase_bytes)
+    {
+        flow.consumed_bytes %= NodeFlow::increase_bytes;
+        notify_pressure(flow, reverse, FlowPressure::Increase);
+    }
+    if (flow.pending_frames > NodeFlow::low_watermark)
+        flow.consumed_bytes = 0;
+}
+
 void LnkChannel::prepare_flow(njson p)
 {
     if (stopping_)
@@ -111,7 +151,8 @@ void LnkChannel::commit_flow(std::uint64_t id)
         return;
     }
 
-    s->state = NodeFlow::State::Active;
+    if (s->state == NodeFlow::State::Prepared)
+        s->state = NodeFlow::State::Active;
     notify_flow(s, CtrlCommand::FlowCommitted, "commit");
 }
 
@@ -132,6 +173,8 @@ void LnkChannel::close_flow(std::uint64_t id, std::string reason)
 
     buffered_bytes_ -= s->bytes;
     s->bytes = 0;
+    s->pending_frames = 0;
+    s->consumed_bytes = 0;
     s->received.cancel();
     s->received.close();
     flows_.erase(it);
@@ -182,6 +225,11 @@ bool LnkChannel::deliver(const std::shared_ptr<NodeFlow> &s, Frame &f)
 
         s->bytes += bytes;
         buffered_bytes_ += bytes;
+        if (s->transport == RelayProtocol::Tcp)
+        {
+            ++s->pending_frames;
+            update_pressure(*s, direction != 0);
+        }
     }
 
     if (kind == LnkFrType::Fin)
@@ -242,7 +290,7 @@ FlowSendStatus LnkChannel::send_flow(FlowFrame f)
 FlowSendStatus LnkChannel::send_flow(const FlowFrame &f, std::span<const std::uint8_t> payload)
 {
     auto it = flows_.find(f.flow_id);
-    if (it == flows_.end() || it->second->state != NodeFlow::State::Active || it->second->epoch != f.epoch)
+    if (it == flows_.end() || !it->second->active() || it->second->epoch != f.epoch)
     {
         return FlowSendStatus::Closed;
     }
@@ -283,7 +331,7 @@ void LnkChannel::incoming_flow(const NodeLink &link, Frame f)
 
     auto s = it->second;
     // The read entry validates Link epoch; prepare requires the Flow and its adjacent Links to share it.
-    if (s->state != NodeFlow::State::Active || (f.header.reverse ? s->next : s->previous) != link.id ||
+    if (!s->active() || (f.header.reverse ? s->next : s->previous) != link.id ||
         !accepts(*s, f.header.kind, f.header.reverse))
     {
         return;
@@ -350,7 +398,7 @@ asio::awaitable<FlowFrame> LnkChannel::receive_flow(std::uint64_t epoch, std::ui
                                       finish = std::move(finish)]() mutable {
                 const auto it = self->flows_.find(id);
                 if (it == self->flows_.end() || it->second->epoch != epoch ||
-                    it->second->state != NodeFlow::State::Active)
+                    !it->second->active())
                 {
                     finish(std::make_exception_ptr(std::runtime_error("flow is not active")), {});
                     return;
@@ -370,6 +418,14 @@ asio::awaitable<FlowFrame> LnkChannel::receive_flow(std::uint64_t epoch, std::ui
                         const auto used = charge(frame);
                         flow->bytes -= used;
                         self->buffered_bytes_ -= used;
+                        if (flow->transport == RelayProtocol::Tcp)
+                        {
+                            assert(flow->pending_frames != 0);
+                            --flow->pending_frames;
+                            if (flow->state == NodeFlow::State::Low)
+                                flow->consumed_bytes += frame.payload.size();
+                            self->update_pressure(*flow, frame.header.reverse);
+                        }
                         result = {frame.header.epoch, frame.header.id, frame.header.reverse, frame.header.kind};
                         const auto bytes = frame.payload.bytes();
                         if (!bytes.empty())

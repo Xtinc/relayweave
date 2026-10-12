@@ -102,6 +102,20 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
             const auto type = message.type();
             switch (type)
             {
+            case CtrlCommand::RelayPressure: {
+                const auto &params = message.params.value();
+                const auto id = params.at("flow_id").get<std::uint64_t>();
+                const auto endpoint = flow_endpoints_.find(id);
+                if (endpoint == flow_endpoints_.end() || !endpoint->second.value("committed", false) ||
+                    endpoint->second.at("epoch") != params.at("epoch") || endpoint->second.at("transport") != "tcp")
+                    break;
+                const auto path = endpoint->second.at("path").get<std::vector<std::string>>();
+                const bool reverse = params.at("reverse").get<bool>();
+                if (path.size() < 2 || (reverse ? path.front() : path.back()) != config_.node_id)
+                    break;
+                cluster_.send(reverse ? path.back() : path.front(), CtrlMessage("relay.peer.pressure", params));
+                break;
+            }
             case CtrlCommand::LinkPrepared:
             case CtrlCommand::LinkReady:
             case CtrlCommand::LinkError:
@@ -517,7 +531,6 @@ void NodeLinkMgr::members_changed()
         it = flow_endpoints_.erase(it);
     }
 }
-
 
 NodeLinkMgr::FlowRequest::FlowRequest(asio::any_io_executor executor, njson values)
     : params(std::move(values)), timeout(executor), completed_event(executor), released_event(executor)

@@ -274,7 +274,8 @@ template <typename Transport>
 void StreamPipeline<Transport>::bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch,
                                                  std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor)
 {
-    remote_pairs_.at(uuid)->bind(channel, epoch, flow_id, config_, std::move(traffic), std::move(accessor));
+    remote_pairs_.at(uuid)->bind(channel, epoch, flow_id, config_, std::move(traffic), std::move(accessor),
+                                TokenBucket::Mode::Dynamic);
 }
 
 template <typename Transport>
@@ -282,9 +283,10 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
 {
     std::array<std::uint8_t, LnkFrameHeader::maximum_payload> buffer;
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
-    asio::steady_timer timer(executor_);
     for (;;)
     {
+        if (!limiter.try_consume())
+            co_await limiter.wait();
         std::size_t size;
         if constexpr (std::is_same_v<Transport, TlsTransport>)
         {
@@ -300,20 +302,12 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
             }
             size = received;
         }
+        if (!limiter.try_consume(size))
+            co_await limiter.wait(size);
         if (size == 0)
         {
             co_await endpoint->send(LnkFrType::Fin);
             co_return;
-        }
-        if (!limiter.try_consume(size))
-        {
-            const auto now = TokenBucket::Clock::now();
-            const auto until = limiter.reserve(size, now);
-            if (until > now)
-            {
-                timer.expires_at(until);
-                co_await timer.async_wait(asio::use_awaitable);
-            }
         }
         // Enqueue completion guarantees that the data executor no longer borrows this buffer.
         co_await endpoint->send_data(std::span<const std::uint8_t>(buffer.data(), size));
@@ -325,7 +319,6 @@ template <typename Transport>
 asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
-    asio::steady_timer timer(executor_);
     for (;;)
     {
         auto frame = co_await endpoint->receive();
@@ -348,15 +341,7 @@ asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_p
         }
         // LnkChannel reports RESET as a flow failure; the remaining frames are DATA.
         if (!limiter.try_consume(frame.payload.size()))
-        {
-            const auto now = TokenBucket::Clock::now();
-            const auto until = limiter.reserve(frame.payload.size(), now);
-            if (until > now)
-            {
-                timer.expires_at(until);
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-        }
+            co_await limiter.wait(frame.payload.size());
         if constexpr (std::is_same_v<Transport, TlsTransport>)
         {
             co_await write_tls_data(*endpoint->stream, frame.payload);
@@ -438,6 +423,8 @@ template <typename Transport> void StreamPipeline<Transport>::close_remote_pair(
     auto endpoint = it->second;
     remote_pairs_.erase(it);
     endpoint->closed = true;
+    endpoint->rx_limiter.close();
+    endpoint->tx_limiter.close();
     if (endpoint->stream)
     {
         asio::error_code ignored;
@@ -445,6 +432,21 @@ template <typename Transport> void StreamPipeline<Transport>::close_remote_pair(
     }
     endpoint->attached.notify_all();
     id_allocator_->release(uuid);
+}
+
+template <typename Transport>
+void StreamPipeline<Transport>::pressure_remote_pair(std::uint64_t uuid, std::uint64_t epoch, std::uint64_t flow_id,
+                                                     bool reverse, std::uint64_t sequence, FlowPressure action)
+{
+    const auto it = remote_pairs_.find(uuid);
+    if (it == remote_pairs_.end())
+        return;
+    auto &endpoint = *it->second;
+    if (endpoint.closed || !endpoint.channel || endpoint.epoch != epoch || endpoint.flow_id != flow_id ||
+        reverse != (endpoint.role == RelayAttach::Producer))
+        return;
+    auto &limiter = endpoint.role == RelayAttach::Producer ? endpoint.rx_limiter : endpoint.tx_limiter;
+    limiter.feedback(sequence, action);
 }
 
 template <typename Transport>

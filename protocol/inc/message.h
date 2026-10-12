@@ -4,6 +4,7 @@
 #include "nlohmann/json.hpp"
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <optional>
@@ -18,6 +19,15 @@ enum class RelayProtocol
     Tcp,
     Tls,
     Udp,
+};
+
+// Receiver feedback; the sending endpoint owns the AIMD rate.
+enum class FlowPressure : std::uint8_t
+{
+    Decrease = 1,
+    Pause,
+    Resume,
+    Increase,
 };
 
 std::string_view relay_protocol_name(RelayProtocol protocol) noexcept;
@@ -61,6 +71,7 @@ enum class CtrlCommand
     RelayCancel,
     RelayClosed,
     RelayError,
+    RelayPressure,
     LinkPrepare,
     LinkPrepared,
     LinkConnect,

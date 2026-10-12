@@ -71,6 +71,7 @@ static constexpr std::pair<CtrlCommand, std::string_view> ctrl_commands[] = {
     {CtrlCommand::RelayCancel, "relay.cancel"},
     {CtrlCommand::RelayClosed, "relay.closed"},
     {CtrlCommand::RelayError, "relay.error"},
+    {CtrlCommand::RelayPressure, "relay.pressure"},
     {CtrlCommand::LinkPrepare, "link.prepare"},
     {CtrlCommand::LinkPrepared, "link.prepared"},
     {CtrlCommand::LinkConnect, "link.connect"},

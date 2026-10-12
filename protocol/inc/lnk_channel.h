@@ -2,8 +2,8 @@
 #define RELAYWEAVE_LNK_CHANNEL_H
 #include "async_event.h"
 #include "tls_channel.h"
-#include <asio/experimental/concurrent_channel.hpp>
 #include <array>
+#include <asio/experimental/concurrent_channel.hpp>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -170,12 +170,26 @@ struct NodeLink
 
 struct NodeFlow
 {
+    static constexpr std::size_t low_watermark = 16;
+    static constexpr std::size_t high_watermark = 32;
+    static constexpr std::size_t pause_watermark = 64;
+    static constexpr std::size_t increase_bytes = 64 * 1024;
+
     enum class State
     {
         Prepared,
+        // All states between Prepared and Closed are running flows.
         Active,
+        Low,
+        High,
+        Paused,
         Closed
     };
+
+    bool active() const noexcept
+    {
+        return state != State::Prepared && state != State::Closed;
+    }
 
     NodeFlow(asio::any_io_executor executor, njson params);
 
@@ -192,6 +206,10 @@ struct NodeFlow
 
     FrameQueue received;
     std::size_t bytes = 0;
+    // A path endpoint receives one direction into this queue; transit frames are forwarded.
+    std::size_t pending_frames = 0;
+    std::size_t consumed_bytes = 0;
+    std::uint64_t pressure_sequence = 0;
 };
 
 struct Datagram
@@ -236,7 +254,7 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     asio::awaitable<FlowSendStatus> async_send_flow(FlowFrame frame);
     // DATA submission borrows payload until completion; only the data executor allocates pool storage.
     asio::awaitable<FlowSendStatus> async_send_flow_data(std::uint64_t epoch, std::uint64_t id, bool reverse,
-                                                       std::span<const std::uint8_t> payload);
+                                                         std::span<const std::uint8_t> payload);
     // Cross-executor receive; pool storage stays on the data executor, completion returns to the caller.
     // Cancellation wakes all pending receivers of this Flow; its owner still controls Flow closure.
     asio::awaitable<FlowFrame> receive_flow(std::uint64_t epoch, std::uint64_t id);
@@ -249,6 +267,8 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     void link_flows_closed(std::uint64_t id);
     FlowSendStatus send_flow(const FlowFrame &frame, std::span<const std::uint8_t> payload);
     bool deliver(const std::shared_ptr<lnk::NodeFlow> &flow, lnk::Frame &frame);
+    void update_pressure(lnk::NodeFlow &flow, bool reverse);
+    void notify_pressure(lnk::NodeFlow &flow, bool reverse, FlowPressure action);
     void notify_flow(const std::shared_ptr<lnk::NodeFlow> &flow, CtrlCommand command, std::string stage,
                      std::string reason = {});
     void fail_flow(const std::shared_ptr<lnk::NodeFlow> &flow, std::string stage, std::string reason);

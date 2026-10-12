@@ -5,6 +5,7 @@
 #include "asio/ssl.hpp"
 #include "message.h"
 #include <atomic>
+#include <memory>
 #include <span>
 #include <string_view>
 
@@ -39,20 +40,36 @@ class TokenBucket
     using Clock = std::chrono::steady_clock;
     using TimePoint = Clock::time_point;
 
-    TokenBucket(std::uint64_t bytes_per_second = 0, std::uint64_t burst_bytes = 0) noexcept;
-    TimePoint reserve(std::size_t bytes, TimePoint now);
-    bool try_consume(std::size_t bytes);
+    enum class Mode
+    {
+        Fixed,
+        Dynamic
+    };
+
+    TokenBucket(std::uint64_t bytes_per_second = 0, std::uint64_t burst_bytes = 0, Mode mode = Mode::Fixed) noexcept;
+    bool try_consume(std::size_t bytes = 0);
+    asio::awaitable<void> wait(std::size_t bytes = 0);
+    void close();
+
+    void set_rate(std::uint64_t bytes_per_second, std::uint64_t burst_bytes);
+    void feedback(std::uint64_t sequence, FlowPressure action);
 
   private:
-    bool try_consume_at(std::size_t bytes, TimePoint now);
+    TimePoint reserve(std::size_t bytes, TimePoint now);
+    TimePoint deadline(TimePoint now) const noexcept;
     void refill(TimePoint now) noexcept;
     Clock::duration duration_for(double bytes) const noexcept;
 
+    Mode mode_;
     std::uint64_t rate_{};
     std::uint64_t burst_{};
-    bool initialised_{};
+    std::uint64_t ceiling_{};
+    std::uint64_t sequence_ = 0;
+    bool paused_ = false;
+    bool closed_ = false;
     double tokens_{};
     TimePoint last_update_{};
+    std::unique_ptr<asio::steady_timer> timer_;
 };
 
 asio::awaitable<void> relay_tcp(asio::ip::tcp::socket &left, asio::ip::tcp::socket &right,
@@ -65,9 +82,9 @@ inline constexpr std::string_view tls_data_framing = "length32-fin-v1";
 inline constexpr std::size_t tls_data_maximum_payload = LnkFrameHeader::maximum_payload;
 
 asio::awaitable<std::size_t> read_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
-                                          std::span<std::uint8_t> buffer);
+                                           std::span<std::uint8_t> buffer);
 asio::awaitable<void> write_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
-                                    std::span<const std::uint8_t> payload, TrafficCounter *traffic = nullptr);
+                                     std::span<const std::uint8_t> payload, TrafficCounter *traffic = nullptr);
 asio::awaitable<void> finish_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream);
 
 asio::awaitable<void> relay_tls(asio::ip::tcp::socket &left, asio::ssl::stream<asio::ip::tcp::socket> &right);

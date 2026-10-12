@@ -14,7 +14,8 @@ void check_send_status(FlowSendStatus status)
 } // namespace
 
 void RelayEndpoint::bind(LnkChannel &flow_channel, std::uint64_t flow_epoch, std::uint64_t id,
-                         const TrafficLimitConfig &limits, SRVTrafficPtr service_traffic, std::string client)
+                         const TrafficLimitConfig &limits, SRVTrafficPtr service_traffic, std::string client,
+                         TokenBucket::Mode outgoing_mode)
 {
     if (closed || channel || !flow_epoch || !id)
     {
@@ -23,8 +24,10 @@ void RelayEndpoint::bind(LnkChannel &flow_channel, std::uint64_t flow_epoch, std
     channel = &flow_channel;
     epoch = flow_epoch;
     flow_id = id;
-    rx_limiter = TokenBucket(limits.rx_bytes_per_second, limits.rx_burst_bytes);
-    tx_limiter = TokenBucket(limits.tx_bytes_per_second, limits.tx_burst_bytes);
+    rx_limiter = TokenBucket(limits.rx_bytes_per_second, limits.rx_burst_bytes,
+                            role == RelayAttach::Producer ? outgoing_mode : TokenBucket::Mode::Fixed);
+    tx_limiter = TokenBucket(limits.tx_bytes_per_second, limits.tx_burst_bytes,
+                            role == RelayAttach::Consumer ? outgoing_mode : TokenBucket::Mode::Fixed);
     traffic = std::move(service_traffic);
     accessor = std::move(client);
 }

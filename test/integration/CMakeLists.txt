@@ -4,6 +4,8 @@ relayweave_test(udp_relay_integration udp_relay_integration_test.cpp TIMEOUT 20
     LIBRARIES relayweave_agent_lib relayweave_node_lib LABELS end_to_end integration)
 relayweave_test(relay_paths relay_paths_test.cpp TIMEOUT 60
     LIBRARIES relayweave_agent_lib relayweave_node_lib LABELS end_to_end cluster integration)
+add_test(NAME relay_pressure_paths COMMAND test_relay_paths --pressure-only)
+set_tests_properties(relay_pressure_paths PROPERTIES TIMEOUT 25 LABELS "end_to_end;cluster;integration")
 relayweave_test(agent_reconnect agent_reconnect_test.cpp TIMEOUT 15
     LIBRARIES relayweave_agent_lib relayweave_node_lib LABELS end_to_end agent integration)
 relayweave_test(agent_cluster agent_cluster_test.cpp TIMEOUT 25

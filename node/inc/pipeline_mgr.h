@@ -16,7 +16,7 @@ struct TcpTransport
 
     asio::awaitable<Stream> prepare(Stream socket, std::chrono::steady_clock::time_point deadline) const;
     static asio::awaitable<void> relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
-                                      TokenBucket &tx_limiter, ServiceTraffic &traffic);
+                                       TokenBucket &tx_limiter, ServiceTraffic &traffic);
 };
 
 struct TlsTransport
@@ -27,17 +27,15 @@ struct TlsTransport
 
     static constexpr std::string_view name = "TLS";
 
-    asio::awaitable<Stream> prepare(asio::ip::tcp::socket socket,
-                                    std::chrono::steady_clock::time_point deadline) const;
+    asio::awaitable<Stream> prepare(asio::ip::tcp::socket socket, std::chrono::steady_clock::time_point deadline) const;
     static asio::awaitable<void> relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
-                                      TokenBucket &tx_limiter, ServiceTraffic &traffic);
+                                       TokenBucket &tx_limiter, ServiceTraffic &traffic);
 
   private:
     asio::ssl::context &context_;
 };
 
-template <typename Transport>
-class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transport>>
+template <typename Transport> class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transport>>
 {
     using tcp = asio::ip::tcp;
     using Stream = typename Transport::Stream;
@@ -77,10 +75,12 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     njson install_remote_pair(int role);
     asio::awaitable<bool> wait_remote_pair(std::uint64_t uuid);
     void bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch, std::uint64_t flow_id,
-                       SRVTrafficPtr traffic, std::string accessor);
+                          SRVTrafficPtr traffic, std::string accessor);
     void activate_remote_pair(std::uint64_t uuid);
     asio::awaitable<void> run_remote_pair(std::uint64_t uuid);
     void close_remote_pair(std::uint64_t uuid);
+    void pressure_remote_pair(std::uint64_t uuid, std::uint64_t epoch, std::uint64_t flow_id, bool reverse,
+                              std::uint64_t sequence, FlowPressure action);
     njson install_local_pair();
     asio::awaitable<bool> wait_local_pair(std::uint64_t uuid);
     void bind_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor);

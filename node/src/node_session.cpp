@@ -5,14 +5,13 @@
 namespace
 {
 // Run one synchronous data operation, then return its result or exception to control_io.
-template <typename Function>
-auto invoke_on(asio::any_io_executor executor, Function function)
+template <typename Function> auto invoke_on(asio::any_io_executor executor, Function function)
 {
     using Result = std::invoke_result_t<Function>;
     auto initiate = [executor, function = std::move(function)](auto handler) mutable {
         const auto reply_executor = asio::get_associated_executor(handler);
-        asio::dispatch(executor, [function = std::move(function), handler = std::move(handler),
-                                  reply_executor, work = asio::make_work_guard(reply_executor)]() mutable {
+        asio::dispatch(executor, [function = std::move(function), handler = std::move(handler), reply_executor,
+                                  work = asio::make_work_guard(reply_executor)]() mutable {
             std::exception_ptr error;
             if constexpr (std::is_void_v<Result>)
             {
@@ -39,17 +38,16 @@ auto invoke_on(asio::any_io_executor executor, Function function)
                 {
                     error = std::current_exception();
                 }
-                asio::post(reply_executor, [handler = std::move(handler), error, result = std::move(result),
-                                            work = std::move(work)]() mutable {
-                    std::move(handler)(error, std::move(result));
-                });
+                asio::post(reply_executor,
+                           [handler = std::move(handler), error, result = std::move(result),
+                            work = std::move(work)]() mutable { std::move(handler)(error, std::move(result)); });
             }
         });
     };
     if constexpr (std::is_void_v<Result>)
     {
-        return asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr)>(
-            std::move(initiate), asio::use_awaitable);
+        return asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr)>(std::move(initiate),
+                                                                                             asio::use_awaitable);
     }
     else
     {
@@ -121,6 +119,32 @@ bool NodeSession::handle(const ControlSessionPtr &session, const CtrlMessage &me
     return std::visit([&](auto &controller) { return controller.handle(session, message); }, control_);
 }
 
+void NodeSession::pressure(const njson &params)
+{
+    if (endpoint_.empty() || std::holds_alternative<DatagramMgr *>(data_))
+        return;
+    const auto epoch = config::require_unsigned(params, "epoch", true);
+    const auto flow_id = config::require_unsigned(params, "flow_id", true);
+    const auto sequence = config::require_unsigned(params, "sequence", true);
+    const auto action = config::require_unsigned(params, "action", true);
+    if (action > static_cast<unsigned>(FlowPressure::Increase) || !params.at("reverse").is_boolean())
+        throw std::invalid_argument("invalid relay pressure fields");
+    const bool reverse = params.at("reverse").get<bool>();
+    std::visit(
+        [&](auto *manager) {
+            if constexpr (!std::is_same_v<std::remove_pointer_t<decltype(manager)>, DatagramMgr>)
+            {
+                // Feedback is posted without an acknowledgement; keep its destination alive through delivery.
+                asio::post(data_executor(), [manager = manager->shared_from_this(), id = uuid(), epoch, flow_id,
+                                             reverse, sequence, action] {
+                    manager->pressure_remote_pair(id, epoch, flow_id, reverse, sequence,
+                                                  static_cast<FlowPressure>(action));
+                });
+            }
+        },
+        data_);
+}
+
 std::uint64_t NodeSession::uuid() const
 {
     if (endpoint_.empty())
@@ -133,12 +157,12 @@ std::uint64_t NodeSession::uuid() const
 
 asio::awaitable<void> NodeSession::install(int role)
 {
-    endpoint_ = co_await invoke_on(data_executor(),
-        [data = data_, role, single = std::holds_alternative<ControlRouterSingle>(control_)] {
-            return std::visit([&](auto *manager) {
-                return single ? manager->install_local_pair() : manager->install_remote_pair(role);
-            }, data);
-        });
+    endpoint_ = co_await invoke_on(data_executor(), [data = data_, role,
+                                                     single = std::holds_alternative<ControlRouterSingle>(control_)] {
+        return std::visit(
+            [&](auto *manager) { return single ? manager->install_local_pair() : manager->install_remote_pair(role); },
+            data);
+    });
 }
 
 asio::awaitable<bool> NodeSession::wait_attach(std::chrono::steady_clock::time_point deadline)
@@ -156,28 +180,32 @@ asio::awaitable<void> NodeSession::bind(std::string accessor, std::uint64_t epoc
 {
     auto *channel = std::holds_alternative<ControlRouterMulti>(control_) ? &node_.nodelink_mgr_->channel() : nullptr;
     // Copy immutable binding values before crossing to the owning data executor.
-    return invoke_on(data_executor(), [data = data_, id = uuid(), epoch, flow_id, channel,
-                                       traffic = traffic_, accessor = std::move(accessor)] {
-        std::visit([&](auto *manager) {
-            if (channel)
-                manager->bind_remote_pair(id, *channel, epoch, flow_id, traffic, accessor);
-            else
-                manager->bind_local_pair(id, traffic, accessor);
-        }, data);
+    return invoke_on(data_executor(), [data = data_, id = uuid(), epoch, flow_id, channel, traffic = traffic_,
+                                       accessor = std::move(accessor)] {
+        std::visit(
+            [&](auto *manager) {
+                if (channel)
+                    manager->bind_remote_pair(id, *channel, epoch, flow_id, traffic, accessor);
+                else
+                    manager->bind_local_pair(id, traffic, accessor);
+            },
+            data);
     });
 }
 
 asio::awaitable<void> NodeSession::activate()
 {
-    return invoke_on(data_executor(), [data = data_, id = uuid(),
-                                       single = std::holds_alternative<ControlRouterSingle>(control_)] {
-        std::visit([&](auto *manager) {
-            if (single)
-                manager->activate_local_pair(id);
-            else
-                manager->activate_remote_pair(id);
-        }, data);
-    });
+    return invoke_on(data_executor(),
+                     [data = data_, id = uuid(), single = std::holds_alternative<ControlRouterSingle>(control_)] {
+                         std::visit(
+                             [&](auto *manager) {
+                                 if (single)
+                                     manager->activate_local_pair(id);
+                                 else
+                                     manager->activate_remote_pair(id);
+                             },
+                             data);
+                     });
 }
 
 asio::awaitable<void> NodeSession::bridge()
@@ -197,13 +225,15 @@ asio::awaitable<void> NodeSession::close()
     {
         co_return;
     }
-    co_await invoke_on(data_executor(), [data = data_, id = uuid(),
-                                        single = std::holds_alternative<ControlRouterSingle>(control_)] {
-        std::visit([&](auto *manager) {
-            if (single)
-                manager->close_local_pair(id);
-            else
-                manager->close_remote_pair(id);
-        }, data);
-    });
+    co_await invoke_on(data_executor(),
+                       [data = data_, id = uuid(), single = std::holds_alternative<ControlRouterSingle>(control_)] {
+                           std::visit(
+                               [&](auto *manager) {
+                                   if (single)
+                                       manager->close_local_pair(id);
+                                   else
+                                       manager->close_remote_pair(id);
+                               },
+                               data);
+                       });
 }
