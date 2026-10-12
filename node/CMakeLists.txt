@@ -9,8 +9,6 @@ add_library(relayweave_node_lib
     src/relay_endpoint.cpp
     src/node_config.cpp
     src/relay_node.cpp
-    src/relay_node_control.cpp
-    src/relay_node_relays.cpp
     src/cluster_mgr.cpp
     src/topology.cpp
     src/nodelink_mgr.cpp
