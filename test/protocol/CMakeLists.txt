@@ -4,7 +4,7 @@ foreach(name IN ITEMS relay_protocol lnk_frame)
 endforeach()
 
 # These use real loopback sockets or cross-executor channel delivery.
-foreach(name IN ITEMS tcp_relay udp_relay lnk_flow_receive)
+foreach(name IN ITEMS tcp_relay tls_relay udp_relay lnk_flow_receive)
     relayweave_test(${name} ${name}_test.cpp
         LIBRARIES relayweave_protocol LABELS protocol integration)
 endforeach()

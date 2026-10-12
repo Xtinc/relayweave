@@ -1,5 +1,6 @@
 #include "agent_session.h"
 #include "forwarder.h"
+#include "xfr_channel.h"
 #include <array>
 #include <cassert>
 
@@ -220,30 +221,22 @@ asio::awaitable<void> AgentSession::run()
         else
         {
             auto &sockets = std::get<StreamData>(data);
-            if (endpoint.contains("flow_id"))
-            {
-                if (sockets.tls)
-                {
-                    co_await relay_halfclose(sockets.local, *sockets.tls);
-                }
-                else
-                {
-                    co_await relay_halfclose(sockets.local, sockets.transfer);
-                }
-                // Both local directions ended; retain the entry connection while Nodes drain FIN.
-                while (!node_closed && reason.empty())
-                {
-                    changed.expires_at(Clock::time_point::max());
-                    co_await changed.async_wait(use_nothrow_awaitable);
-                }
-            }
-            else if (sockets.tls)
+            if (sockets.tls)
             {
                 co_await relay_tls(sockets.local, *sockets.tls);
             }
             else
             {
                 co_await relay_tcp(sockets.local, sockets.transfer);
+            }
+            if (endpoint.contains("flow_id"))
+            {
+                // Both local directions ended; retain the entry connection while Nodes drain FIN.
+                while (!node_closed && reason.empty())
+                {
+                    changed.expires_at(Clock::time_point::max());
+                    co_await changed.async_wait(use_nothrow_awaitable);
+                }
             }
         }
     }
@@ -307,8 +300,16 @@ asio::awaitable<void> AgentSession::attach()
     const auto port = config::message_data_port(endpoint);
     const auto uuid = config::require_unsigned(endpoint, "uuid", true);
     const auto ticket = config::require_unsigned(endpoint, "ticket", true);
-    const auto frame = WireMessage::pack(
-        RelayAttach::to_msg({producer() ? RelayAttach::Producer : RelayAttach::Consumer, uuid, ticket}));
+    auto attachment = RelayAttach::to_msg({producer() ? RelayAttach::Producer : RelayAttach::Consumer, uuid, ticket});
+    if (service.protocol == RelayProtocol::Tls)
+    {
+        if (endpoint.value("tls_framing", std::string{}) != tls_data_framing)
+        {
+            throw std::invalid_argument("Unsupported TLS data framing");
+        }
+        (*attachment.params)["tls_framing"] = std::string(tls_data_framing);
+    }
+    const auto frame = WireMessage::pack(std::move(attachment));
     const auto remaining = [&](Clock::duration timeout) {
         if (!reason.empty())
         {

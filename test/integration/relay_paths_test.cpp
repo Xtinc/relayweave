@@ -2,6 +2,7 @@
 #include "node_fixture.h"
 #include "relay_agent.h"
 #include "forwarder.h"
+#include "xfr_channel.h"
 #include <asio/experimental/awaitable_operators.hpp>
 #include <array>
 #include <future>
@@ -350,7 +351,12 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
         const auto &descriptor = role == RelayAttach::Consumer ? first : last;
         const auto &settings = role == RelayAttach::Consumer ? entry : exit;
         const auto ticket = descriptor.at("ticket").get<std::uint64_t>() ^ (bad_ticket && role == RelayAttach::Consumer ? 1 : 0);
-        const auto frame = WireMessage::pack(RelayAttach::to_msg({role, descriptor.at("uuid").get<std::uint64_t>(), ticket}));
+        auto attachment = RelayAttach::to_msg({role, descriptor.at("uuid").get<std::uint64_t>(), ticket});
+        if (protocol == RelayProtocol::Tls)
+        {
+            (*attachment.params)["tls_framing"] = descriptor.at("tls_framing");
+        }
+        const auto frame = WireMessage::pack(std::move(attachment));
         if (protocol == RelayProtocol::Udp)
         {
             datagrams.emplace_back(executor, udp::v4());
@@ -506,7 +512,35 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
         };
         if (protocol == RelayProtocol::Tls)
         {
-            co_await transfer(tls_streams[0], tls_streams[1]);
+            auto &left = tls_streams[0];
+            auto &right = tls_streams[1];
+            BytesBuf payload(8193);
+            for (std::size_t i = 0; i < payload.size(); ++i)
+            {
+                payload[i] = static_cast<std::uint8_t>(i);
+            }
+            const auto started = std::chrono::steady_clock::now();
+            co_await write_tls_data(left, payload);
+            co_await finish_tls_data(left);
+            BytesBuf received(tls_data_maximum_payload);
+            const auto size = co_await read_tls_data(right, received);
+            require(size == payload.size() && std::equal(payload.begin(), payload.end(), received.begin()),
+                    "TLS DATA changed before FIN");
+            require(std::chrono::steady_clock::now() - started >= 400ms,
+                    "TLS endpoint did not enforce its configured stream rate limit");
+            require(co_await read_tls_data(right, received) == 0, "TLS business FIN was lost");
+            const BytesBuf reply(expected.begin(), expected.end());
+            co_await write_tls_data(right, reply);
+            co_await finish_tls_data(right);
+            std::size_t total = 0;
+            while (const auto count = co_await read_tls_data(left, received))
+            {
+                require(total + count <= reply.size() &&
+                        std::equal(received.begin(), received.begin() + count, reply.begin() + total),
+                        "TLS reverse DATA changed after FIN");
+                total += count;
+            }
+            require(total == reply.size(), "TLS FIN truncated the reverse reply");
         }
         else
         {
@@ -922,8 +956,13 @@ void integration()
                           {"protocol", relay_protocol_name(protocol)}, {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
                 const auto opened = co_await receive(channels[1], CtrlCommand::RelayOpened);
                 const auto &p = *opened.params;
-                const auto frame = WireMessage::pack(RelayAttach::to_msg({RelayAttach::Consumer,
-                    p.at("uuid").get<std::uint64_t>(), p.at("ticket").get<std::uint64_t>()}));
+                auto attachment = RelayAttach::to_msg({RelayAttach::Consumer,
+                    p.at("uuid").get<std::uint64_t>(), p.at("ticket").get<std::uint64_t>()});
+                if (protocol == RelayProtocol::Tls)
+                {
+                    (*attachment.params)["tls_framing"] = p.at("tls_framing");
+                }
+                const auto frame = WireMessage::pack(std::move(attachment));
                 tcp::socket socket(client);
                 std::optional<TLSStream> tls;
                 udp::socket datagram(client);
@@ -975,7 +1014,7 @@ void integration()
                     std::array<std::uint8_t, 3> data;
                     if (tls)
                     {
-                        co_await asio::async_read(*tls, asio::buffer(data), asio::cancel_after(1s, asio::use_awaitable));
+                        require(co_await read_tls_data(*tls, data) == data.size(), "TLS return DATA length changed");
                     }
                     else
                     {

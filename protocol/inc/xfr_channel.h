@@ -5,6 +5,8 @@
 #include "asio/ssl.hpp"
 #include "message.h"
 #include <atomic>
+#include <span>
+#include <string_view>
 
 void set_current_thread_scheduler_policy();
 
@@ -59,6 +61,15 @@ asio::awaitable<void> relay_tcp(asio::ip::tcp::socket &left, asio::ip::tcp::sock
                                 TrafficCounter *left_to_right_traffic = nullptr,
                                 TrafficCounter *right_to_left_traffic = nullptr);
 
+inline constexpr std::string_view tls_data_framing = "length32-fin-v1";
+inline constexpr std::size_t tls_data_maximum_payload = LnkFrameHeader::maximum_payload;
+
+asio::awaitable<std::size_t> read_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
+                                          std::span<std::uint8_t> buffer);
+asio::awaitable<void> write_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
+                                    std::span<const std::uint8_t> payload, TrafficCounter *traffic = nullptr);
+asio::awaitable<void> finish_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream);
+
 asio::awaitable<void> relay_tls(asio::ip::tcp::socket &left, asio::ssl::stream<asio::ip::tcp::socket> &right);
 asio::awaitable<void> relay_tls(asio::ssl::stream<asio::ip::tcp::socket> &left,
                                 asio::ssl::stream<asio::ip::tcp::socket> &right,
@@ -67,12 +78,9 @@ asio::awaitable<void> relay_tls(asio::ssl::stream<asio::ip::tcp::socket> &left,
                                 TrafficCounter *left_to_right_traffic = nullptr,
                                 TrafficCounter *right_to_left_traffic = nullptr);
 
-// Routed streams preserve the opposite direction after EOF and propagate I/O failures.
-// Same executor: drain both tasks and preserve the first failure, rather than sibling cancellation.
+// Stream relays preserve the opposite direction after business EOF and propagate I/O failures.
+// Same executor: wait for both normal completions; on failure cancel and drain the sibling.
 asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming);
-asio::awaitable<void> relay_halfclose(asio::ip::tcp::socket &local, asio::ip::tcp::socket &transfer);
-asio::awaitable<void> relay_halfclose(asio::ip::tcp::socket &local,
-                                     asio::ssl::stream<asio::ip::tcp::socket> &transfer);
 
 asio::awaitable<void> relay_udp_connected(asio::ip::udp::socket &local_socket, asio::ip::udp::socket &transfer_socket,
                                           DatagramHeader::Buffer session_header);

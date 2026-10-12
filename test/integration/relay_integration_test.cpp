@@ -4,6 +4,7 @@
 #include "relay_node.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <future>
@@ -395,14 +396,19 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     co_await consumer->async_disconnect();
 }
 
-asio::awaitable<void> echo_session(tcp::socket socket)
+asio::awaitable<void> echo_session(tcp::socket socket, bool wait_for_fin)
 {
     std::array<std::uint8_t, 8192> buffer{};
+    BytesBuf pending;
     for (;;)
     {
         auto [read_error, length] = co_await socket.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
         if (read_error == asio::error::eof)
         {
+            if (wait_for_fin)
+            {
+                co_await asio::async_write(socket, asio::buffer(pending), asio::use_awaitable);
+            }
             asio::error_code ignored;
             socket.shutdown(tcp::socket::shutdown_send, ignored);
             co_return;
@@ -410,6 +416,11 @@ asio::awaitable<void> echo_session(tcp::socket socket)
         if (read_error)
         {
             co_return;
+        }
+        if (wait_for_fin)
+        {
+            pending.insert(pending.end(), buffer.begin(), buffer.begin() + length);
+            continue;
         }
         auto [write_error, _] =
             co_await asio::async_write(socket, asio::buffer(buffer.data(), length), use_nothrow_awaitable);
@@ -420,7 +431,7 @@ asio::awaitable<void> echo_session(tcp::socket socket)
     }
 }
 
-asio::awaitable<void> echo_accept_loop(tcp::acceptor &acceptor)
+asio::awaitable<void> echo_accept_loop(tcp::acceptor &acceptor, const std::atomic<bool> &wait_for_fin)
 {
     for (;;)
     {
@@ -429,7 +440,7 @@ asio::awaitable<void> echo_accept_loop(tcp::acceptor &acceptor)
         {
             co_return;
         }
-        asio::co_spawn(acceptor.get_executor(), echo_session(std::move(socket)), asio::detached);
+        asio::co_spawn(acceptor.get_executor(), echo_session(std::move(socket), wait_for_fin.load()), asio::detached);
     }
 }
 
@@ -441,7 +452,8 @@ asio::awaitable<void> relay_round_trip(std::uint16_t port, bool half_close, asio
     co_await socket.async_connect(tcp::endpoint(asio::ip::address_v4::loopback(), port),
                                   asio::cancel_after(1s, asio::use_awaitable));
 
-    const std::string payload = "relay integration payload";
+    const std::string payload = half_close ? std::string(2 * LnkFrameHeader::maximum_payload + 17, 'z')
+                                           : "relay integration payload";
     co_await asio::async_write(socket, asio::buffer(payload), asio::cancel_after(1s, asio::use_awaitable));
     if (half_close)
     {
@@ -519,7 +531,8 @@ int main()
         const auto forward_port = unused_port(transfer_tcp_io);
 
         tcp::acceptor echo_acceptor(transfer_tcp_io, tcp::endpoint(asio::ip::address_v4::loopback(), target_port));
-        asio::co_spawn(transfer_tcp_io, echo_accept_loop(echo_acceptor), asio::detached);
+        std::atomic<bool> wait_for_fin{false};
+        asio::co_spawn(transfer_tcp_io, echo_accept_loop(echo_acceptor, wait_for_fin), asio::detached);
 
         NodeConfig server_config = make_test_node_config();
         server_config.control.address = "127.0.0.1";
@@ -602,12 +615,14 @@ int main()
         consumer->start();
         std::size_t completed_round_trips = 0;
         std::string last_failure;
-        for (std::size_t round = 0; round < 2; ++round)
+        for (std::size_t round = 0; round < 4; ++round)
         {
+            const bool half_close = round >= 2;
+            wait_for_fin.store(half_close);
             bool succeeded = false;
             for (int attempt = 0; attempt < 20 && !succeeded; ++attempt)
             {
-                auto result = asio::co_spawn(control_io, relay_round_trip(forward_port, false, consumer_context, control_port), asio::use_future);
+                auto result = asio::co_spawn(control_io, relay_round_trip(forward_port, half_close, consumer_context, control_port), asio::use_future);
                 try
                 {
                     result.get();
@@ -648,7 +663,7 @@ int main()
         transfer_udp_thread.join();
 
         require(weak_consumer.expired() && weak_producer.expired(), "Stopped Agents are retained by Forwarder tasks");
-        require(completed_round_trips == 2, "Pipeline capacity was not released after the first transfer");
+        require(completed_round_trips == 4, "Pipeline capacity was not released after the first transfer");
         std::cout << "[PASS] Server lifecycle, resource limits, Pipe forwarding, and half-close\n";
         return 0;
     }

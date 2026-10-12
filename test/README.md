@@ -6,7 +6,7 @@
 | 目录 | 内容 | CTest 标签 |
 |---|---|---|
 | `common/` | 双索引容器、LRU、缓冲池、AsyncEvent、令牌桶、流量计数 | `common`、`unit` |
-| `protocol/` | 控制/二进制编解码、mTLS、LnkChannel、TCP/UDP 复制 | `protocol`，按用例区分 `unit` / `integration` |
+| `protocol/` | 控制/二进制编解码、mTLS、LnkChannel、TCP/TLS/UDP 复制 | `protocol`，按用例区分 `unit` / `integration` |
 | `route/` | 链路质量、路径算法、DNS 探测生命周期、真实 ICMP | `routing`，真实 ICMP 另标 `icmp` |
 | `agent/` | Agent/Session/Forwarder 生命周期、路由组装和缓存 | `agent`，路由相关另标 `routing` |
 | `node/` | 配置/统计、启动停止、集群控制、共享 NodeLink、Flow、UDP session 路由、拓扑 | `node`，集群相关另标 `cluster` |
@@ -69,7 +69,8 @@ build/test/benchmark/benchmark_udp_node --help
 - TCP 复制：两侧读/写失败和限速等待中的对向失败必须排空；正常 EOF 保留反向回传，校验原始异常和实际流量。
 - UDP 复制：零长度、4097 字节及最大合法载荷双向保持原样；短头、错误 session、超限包丢弃后仍能处理后续包；两侧 I/O 失败都能排空。
 - 多节点 UDP：65467 字节载荷在共享 Link 和多跳路径中双向完整转发；65468 字节在接入时丢弃；最大长度的非法帧不会妨碍后续合法帧。
-- 多节点 TCP/TLS：小请求半关闭后，服务方仍能完整返回超过两个最大 DATA 载荷的连续字节流，并正常传递反向 EOF。
+- 单节点 TLS 和多节点 TCP/TLS：请求半关闭后，服务方仍能完整返回超过两个最大 DATA 载荷的连续字节流，并正常传递反向 EOF。
+- TLS 1.2/1.3：DATA/FIN 业务半关闭、反向排空、仅载荷流量计数；未收到业务 FIN 的异常截断及非法长度必须失败并排空对向。
 - 限速与计数：快路径不能重复扣费，失败试扣不能吃掉令牌，预留债务必须累积，空包与无限速不等待；并发计数/采样不丢字节，计数溢出饱和。
 - 控制与生命周期：并发/重复停止、取消后排空、超时、旧 request/epoch、断线恢复、服务迁移及对象释放继续保留独立回归。
 - 保留旧配置拒绝用例：`node_config_legacy.json` 验证旧字段不能绕过当前配置校验。生成的配置放在临时目录，先验证有效基线能通过，再逐项检查非法字段。

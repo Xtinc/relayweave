@@ -1,7 +1,9 @@
 #include "xfr_channel.h"
-#include "asio/experimental/awaitable_operators.hpp"
+#include "asio/experimental/parallel_group.hpp"
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
+#include <type_traits>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -13,8 +15,6 @@
 using tcp = asio::ip::tcp;
 using udp = asio::ip::udp;
 using tls_stream = asio::ssl::stream<tcp::socket>;
-using namespace asio::experimental::awaitable_operators;
-using std::chrono::steady_clock;
 
 constexpr auto use_nothrow_awaitable = asio::as_tuple(asio::use_awaitable);
 
@@ -231,49 +231,133 @@ asio::awaitable<void> relay_tcp(tcp::socket &left, tcp::socket &right, TokenBuck
                            transfer_tcp(right, left, right_to_left_limiter, right_to_left_traffic));
 }
 
+asio::awaitable<std::size_t> read_tls_data(tls_stream &stream, std::span<std::uint8_t> buffer)
+{
+    std::array<std::uint8_t, 4> header{};
+    co_await asio::async_read(stream, asio::buffer(header), asio::use_awaitable);
+    std::uint32_t size = 0;
+    for (const auto byte : header)
+    {
+        size = (size << 8) | byte;
+    }
+    if (size > tls_data_maximum_payload || size > buffer.size())
+    {
+        throw std::invalid_argument("Invalid TLS DATA length");
+    }
+    if (size != 0)
+    {
+        co_await asio::async_read(stream, asio::buffer(buffer.data(), size), asio::use_awaitable);
+    }
+    co_return size;
+}
+
+asio::awaitable<void> write_tls_data(tls_stream &stream, std::span<const std::uint8_t> payload,
+                                    TrafficCounter *traffic)
+{
+    while (!payload.empty())
+    {
+        const auto size = std::min(payload.size(), tls_data_maximum_payload);
+        const std::array<std::uint8_t, 4> header{
+            static_cast<std::uint8_t>(size >> 24), static_cast<std::uint8_t>(size >> 16),
+            static_cast<std::uint8_t>(size >> 8), static_cast<std::uint8_t>(size)};
+        const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload.data(), size)};
+        const auto [error, written] = co_await asio::async_write(stream, buffers, use_nothrow_awaitable);
+        if (traffic && written > header.size())
+        {
+            traffic->add(written - header.size());
+        }
+        if (error)
+        {
+            throw asio::system_error(error, "write TLS DATA");
+        }
+        payload = payload.subspan(size);
+    }
+}
+
+asio::awaitable<void> finish_tls_data(tls_stream &stream)
+{
+    const std::array<std::uint8_t, 4> fin{};
+    co_await asio::async_write(stream, asio::buffer(fin), asio::use_awaitable);
+}
+
+// Business FIN is independent of TLS shutdown, including on TLS 1.2 connections.
 template <typename From, typename To>
 static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limiter, TrafficCounter *traffic)
 {
     asio::steady_timer timer(from.get_executor());
-    std::array<std::uint8_t, 64 * 1024> buffer{};
+    std::array<std::uint8_t, tls_data_maximum_payload> buffer{};
     for (;;)
     {
-        auto [read_error, read_size] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
-        if (read_error)
+        std::size_t size;
+        if constexpr (std::is_same_v<From, tls_stream>)
         {
-            log_transfer_end(read_error, "tls", "read", from, to);
+            size = co_await read_tls_data(from, buffer);
+        }
+        else
+        {
+            const auto [error, received] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
+            if (error && error != asio::error::eof)
+            {
+                throw asio::system_error(error, "read local TCP stream");
+            }
+            size = received;
+            // Deliver any final bytes before propagating EOF.
+            if (!error && size == 0)
+            {
+                continue;
+            }
+        }
+        if (size == 0)
+        {
+            if constexpr (std::is_same_v<To, tls_stream>)
+            {
+                co_await finish_tls_data(to);
+            }
+            else
+            {
+                asio::error_code error;
+                to.shutdown(tcp::socket::shutdown_send, error);
+                if (error && error != asio::error::not_connected)
+                {
+                    throw asio::system_error(error, "shutdown local TCP send");
+                }
+            }
             co_return;
         }
-        if (limiter && !limiter->try_consume(read_size) && !co_await wait_for_limit(*limiter, timer, read_size))
+        if (limiter && !limiter->try_consume(size) && !co_await wait_for_limit(*limiter, timer, size))
         {
-            co_return;
+            throw asio::system_error(asio::error::operation_aborted, "wait for TLS rate limit");
         }
-
-        auto [write_error, written] =
-            co_await asio::async_write(to, asio::buffer(buffer.data(), read_size), use_nothrow_awaitable);
-        if (traffic && written != 0)
+        if constexpr (std::is_same_v<To, tls_stream>)
         {
-            traffic->add(written);
+            co_await write_tls_data(to, std::span<const std::uint8_t>(buffer.data(), size), traffic);
         }
-        if (write_error)
+        else
         {
-            log_transfer_end(write_error, "tls", "write", from, to);
-            co_return;
+            const auto [error, written] = co_await asio::async_write(to, asio::buffer(buffer.data(), size), use_nothrow_awaitable);
+            if (traffic)
+            {
+                traffic->add(written);
+            }
+            if (error)
+            {
+                throw asio::system_error(error, "write local TCP stream");
+            }
         }
     }
 }
 
 asio::awaitable<void> relay_tls(tcp::socket &left, tls_stream &right)
 {
-    co_await (transfer_tls(left, right, nullptr, nullptr) || transfer_tls(right, left, nullptr, nullptr));
+    return await_transfers(transfer_tls(left, right, nullptr, nullptr), transfer_tls(right, left, nullptr, nullptr));
 }
 
 asio::awaitable<void> relay_tls(tls_stream &left, tls_stream &right, TokenBucket *left_to_right_limiter,
                                 TokenBucket *right_to_left_limiter, TrafficCounter *left_to_right_traffic,
                                 TrafficCounter *right_to_left_traffic)
 {
-    co_await (transfer_tls(left, right, left_to_right_limiter, left_to_right_traffic) ||
-              transfer_tls(right, left, right_to_left_limiter, right_to_left_traffic));
+    return await_transfers(transfer_tls(left, right, left_to_right_limiter, left_to_right_traffic),
+                           transfer_tls(right, left, right_to_left_limiter, right_to_left_traffic));
 }
 
 static asio::awaitable<void> send_udp_payloads(udp::socket &local_socket, udp::socket &transfer_socket,
@@ -356,32 +440,6 @@ asio::awaitable<void> relay_udp_connected(udp::socket &local_socket, udp::socket
                            receive_udp_payloads(transfer_socket, local_socket, session_header));
 }
 
-// Same transfer executor. Transport EOF represents one business direction only.
-template <typename From, typename To>
-static asio::awaitable<void> transfer_halfclose(From &from, To &to)
-{
-    std::array<std::uint8_t, 64 * 1024> buffer;
-    for (;;)
-    {
-        const auto [error, size] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
-        if (error == asio::error::eof || error == asio::ssl::error::stream_truncated)
-        {
-            asio::error_code shutdown_error;
-            to.lowest_layer().shutdown(tcp::socket::shutdown_send, shutdown_error);
-            if (shutdown_error && shutdown_error != asio::error::not_connected)
-            {
-                throw asio::system_error(shutdown_error);
-            }
-            co_return;
-        }
-        if (error)
-        {
-            throw asio::system_error(error);
-        }
-        co_await asio::async_write(to, asio::buffer(buffer.data(), size), asio::use_awaitable);
-    }
-}
-
 asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming)
 {
     const auto executor = co_await asio::this_coro::executor;
@@ -397,14 +455,4 @@ asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awai
             std::rethrow_exception(error);
         }
     }
-}
-
-asio::awaitable<void> relay_halfclose(tcp::socket &local, tcp::socket &transfer)
-{
-    return await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
-}
-
-asio::awaitable<void> relay_halfclose(tcp::socket &local, tls_stream &transfer)
-{
-    return await_transfers(transfer_halfclose(local, transfer), transfer_halfclose(transfer, local));
 }

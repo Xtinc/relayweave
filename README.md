@@ -15,7 +15,7 @@ master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
 Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
 Agent 服务发现只保存目的 Node 位置，选路后才取得实际入口控制连接；发现继续使用主控，不提供主控离线定位。
 Forwarder 拥有长期本地监听和业务容器，AgentSession 统一一次 TCP/TLS/UDP 接入与复制；UDP 服务离线时只保留本地 forward。
-多跳 TCP/TLS 保留双向半关闭，UDP 多跳载荷上限为 4096 字节；服务限速和统计保留在端点，
+单跳和多跳 TCP/TLS 均保留双向半关闭，UDP 单节点用户载荷上限为 65499 字节、多节点为 65467 字节；服务限速和统计保留在端点，
 共享通道、路径事务、数据热路径和生命周期统一见 [RelayWeave 设计](docs/RelayWeave设计.md)。
 部署见 [打包与安装](docs/RelayWeave打包与安装.md)、[证书制作与部署](docs/证书制作与部署.md)
 和 [管理面板部署说明](dashboard/README.md)。

@@ -691,7 +691,8 @@ Multi 首 Node 先建立 NodeFlow，再向末 Node 发送 relay.peer.open；末 
 | relay.peer.finished | 本端两个方向已结束并排空 | 双方均 finished 后才允许释放 Flow |
 | relay.peer.close | 本端失败、取消或收尾 | 对端保留原因并关闭本端业务，不反向回声 |
 
-首末各自激活后向自己的 Agent 发 relay.ready。TCP/TLS 本地读 EOF 转为 FIN，收到 FIN 只 shutdown_send；
+首末各自激活后向自己的 Agent 发 relay.ready。TCP 接入 EOF 转为 Flow FIN、收到 FIN 只 shutdown_send；
+TLS 接入在受 TLS 保护的业务 DATA/FIN 和 Flow DATA/FIN 之间转换，FIN 后保留反方向；
 真实 I/O 失败尽力发送 RESET 并走控制关闭。双方 finished 的确认防止首端抢先删除仍有尾部 DATA/FIN 的 Flow。
 正常 relay.closed 不取消 Agent 的本地排空，AgentSession 仍以自己复制的结果判断是否成功。
 
@@ -1169,8 +1170,8 @@ AgentSession 在 control_io 调用 select_relay，按目的 Node 读取有效 LR
    同一个 Agent 的 Single 请求方和服务方可以共用一个 UUID，ready/closed/error 必须作用于两种角色。
 6. 结束时注销实例、关闭拥有的 socket，释放入口引用；UDP forward 保留并按服务状态决定重试。
 
-单节点 TCP 使用 relay_tcp，正常 EOF 保留半关闭，真实错误取消并排空对向；TLS 使用现有 relay_tls。
-多节点使用 relay_halfclose，同样允许单向 FIN 后反向排空，并在真实错误时收敛两个方向。
+单节点 TCP 使用 relay_tcp，TLS 使用 relay_tls；正常业务 EOF 保留半关闭，真实错误取消并排空对向。
+多节点使用相同的 relay_tcp / relay_tls，同样允许单向 FIN 后反向排空，并在真实错误时收敛两个方向。
 Multi 复制结束后等待 Node 的 stream complete 通知，再释放入口引用，避免控制关闭抢在最后 DATA/FIN 之前。
 该正常通知只记录完成，不提前取消数据读取；真实错误仍保存原始原因并收敛当前实例。
 
@@ -1572,10 +1573,10 @@ primary 可以同时是该入口，也可以不在数据路径上。Producer 的
 | 业务 | Consumer 接入 | Node 内部路径 | Producer 接入 | 结束规则 |
 |---|---|---|---|---|
 | Single TCP | 本地 TCP → Agent → Node tcp.port | TCP StreamPipeline LocalPair | Node → Agent → 目标 TCP | 两个方向各自 EOF、半关闭排空 |
-| Single TLS | 本地 TCP → Agent → Node tls.port 的 mTLS stream | TLS StreamPipeline LocalPair | Node mTLS → Agent → 目标 TCP | 任一方向结束后取消并排空对向 |
+| Single TLS | 本地 TCP → Agent → Node tls.port 的 mTLS stream | TLS StreamPipeline LocalPair | Node mTLS → Agent → 目标 TCP | TLS 内业务 FIN 半关闭、双向排空 |
 | Single UDP | 本地 UDP → Agent session datagram → Node udp.port | DatagramMgr LocalPair 改写 session 头 | Node session datagram → Agent → 目标 UDP | 控制取消/失效、Agent I/O 失败或 stop |
 | Multi TCP | 本地 TCP → Agent → 首 Node tcp.port | 首 RemotePair → TCP NodeFlow → 末 RemotePair | 末 Node → Agent → 目标 TCP | 双向 FIN 排空、首末 finished 后释放 Flow |
-| Multi TLS | 本地 TCP → Agent → 首 Node tls.port 的 mTLS stream | 首末 TLS RemotePair，Node 间 TCP NodeFlow | 末 Node mTLS → Agent → 目标 TCP | 接入 EOF 转 FIN、双向排空及 finished |
+| Multi TLS | 本地 TCP → Agent → 首 Node tls.port 的 mTLS stream | 首末 TLS RemotePair，Node 间 TCP NodeFlow | 末 Node mTLS → Agent → 目标 TCP | TLS 内业务 FIN 转 Flow FIN、双向排空及 finished |
 | Multi UDP | 本地 UDP → Agent session datagram → 首 Node udp.port | 首 RemotePair → UDP NodeFlow → 末 RemotePair | 末 Node session datagram → Agent → 目标 UDP | 控制取消/失效、Flow 失败或 stop，无 FIN |
 
 TCP/TLS 每个本地应用连接创建独立 AgentSession 和 Node 业务；UDP 每个配置 forward 使用一个当前
@@ -1605,7 +1606,9 @@ payload 是：
 
 `role=1` 是 Producer，`role=2` 是 Consumer。payload 长度必须在 1～64 KiB。TCP/TLS 在 stream 上精确读取一帧；UDP 的一个 datagram 必须完整包含一帧，而且长度字段必须与剩余长度完全一致。
 
-TLS 数据通道先完成 mTLS 握手，再在加密流内发送 attach。TCP 和 UDP 的 attach 位于明文数据通道，但 ticket 只通过已认证控制连接下发。
+TLS 数据通道先完成 mTLS 握手，再在加密流内发送 attach；其 params 额外要求
+`tls_framing="length32-fin-v1"`，与 Node 下发的 TLS endpoint 描述符一致。TCP 和 UDP 的 attach 位于明文数据通道，
+不携带该字段；ticket 只通过已认证控制连接下发。
 
 manager 按 `uuid` 查找 Relay，再验证 ticket 是否属于声明的 role。以下情况会被拒绝：帧或 CBOR 非法、命令错误、Relay 不存在或过期、ticket/role 不匹配、同一 role 重复接入、超过 setup timeout 或容量上限。
 
@@ -1698,10 +1701,19 @@ Node 读取一个 TLS stream 的应用字节并写入另一个 TLS stream，由�
 Node 的 relay_tls(TLS, TLS) 执行限速和统计，Agent 的 relay_tls(TCP, TLS) 做本地与公网转换。
 attach、TLS record 和握手不计入业务流量。
 
-Single TLS 使用 `transfer_tls(...) || transfer_tls(...)`：一个方向读结束、读写失败或限速等待取消后返回，
-组合等待取消并排空另一个方向，随后关闭两端的数据 socket。它不采用 relay_tcp 的“正常 EOF 后
-反方向继续运行”规则；当前底层错误也不通过同一方式重新抛给控制器。
-因此 Single TLS 与 Multi TLS 的结束语义必须分别说明，不能从协议名 TLS 推断统一的半关闭策略。
+Single 与 Multi TLS 统一保留业务半关闭：本地 TCP EOF 转为 TLS 内的业务 FIN，收到 FIN 只对本地
+TCP 执行 shutdown(send)，反向继续复制；两个方向完成后才释放资源。真实读写错误、取消和限速等待失败
+取消并排空对向，并向控制器传播原始错误。Node LocalPair 将 DATA/FIN 从一个 TLS stream 转发到另一个。
+
+TLS 接入在原有 relay.attach 首帧后使用 `length32-fin-v1`：4 字节大端长度，1..65467 表示随后相应长度的
+DATA，0 表示 FIN、无帧体。较大的业务写入拆成多帧；应用的原始 TCP 写入边界不保留。
+DATA/FIN 同方向有序且均受 TLS 保护，头部和 FIN 不计业务流量；FIN 只结束业务方向，不立即关闭 TLS。
+Node TLS endpoint 描述符与 TLS relay.attach 均携带 `tls_framing="length32-fin-v1"`，Agent 校验描述符，
+Node 校验 attach，缺失或不同的标识拒绝接入。该格式适用于 TLS 1.2/1.3；旧版未分帧的 Agent/Node
+不能与新版混用 TLS 数据接入，部署时需要配套升级。
+
+TLS EOF、close_notify 或 stream_truncated 若在业务 FIN 之前出现，均按传输失败处理，不能当作完整业务结束。
+双方业务 FIN 排空后数据所有者才关闭 TLS socket；控制通道仍使用 TLSChannel 自己的关闭流程。
 
 ### 10.3 DatagramHeader 与 UDP 路由流程
 
@@ -1900,7 +1912,7 @@ Consumer 向服务发字节时 reverse=false，Producer 回传时 reverse=true�
 
 | 位置 | 输入 → 输出 | 实际操作 |
 |---|---|---|
-| Consumer / Producer AgentSession | 本地 TCP ↔ 首/末 Node TCP | relay_halfclose 双向复制，正常 EOF 只半关闭对端发送 |
+| Consumer / Producer AgentSession | 本地 TCP ↔ 首/末 Node TCP | relay_tcp 双向复制，正常 EOF 只半关闭对端发送 |
 | H/T StreamPipeline RemotePair | Agent TCP ↔ NodeFlow | 两个持续协程：read_remote_pair 将字节切成 DATA；write_remote_pair 写回 DATA 或处理 FIN |
 | H/I/T LnkChannel | FlowFrame ↔ 相邻 TCP NodeLink | 查 Flow 身份、方向和入边，按固定路径入队；中间节点直接移动载荷，不经过业务控制协程 |
 
@@ -1963,11 +1975,11 @@ H 的 read_remote_pair 从接入 TLS stream 读取应用字节，以普通 DATA 
 反向传输对称。Node 间共享数据通道是明文 TCP，接入 mTLS 不会使 H-I-T 变成端到端 TLS 通道；
 业务本身使用 HTTPS/SSH 时，它的加密内容仍作为原始字节传递。
 
-Multi 使用 StreamPipeline 的 RemotePair 和 Agent relay_halfclose，读取 EOF 或实现接受的
-`ssl::error::stream_truncated` 时提交 FIN；收到 FIN 后对对应接入 stream 的底层 socket shutdown(send)，
-保留另一方向。这里没有为 Flow FIN 增加独立 TLS close_notify 协议或 TLS record 转发状态。
-最终仍按双向排空、首末 peer.finished、relay.closed 和 Flow close 收尾。
-这与 Single TLS 的 relay_tls 任一方向结束即整体退出不同。
+Multi 使用 StreamPipeline 的 RemotePair 和与 Single 共用的 Agent relay_tls。TLS 接入使用与 Single 相同的
+length32-fin-v1 DATA/FIN 分帧：read_remote_pair 收到业务 FIN 后在前序 DATA 之后提交 Flow FIN；
+write_remote_pair 收到 Flow FIN 后发送 TLS 内的业务 FIN，保留反方向。TCP 接入仍用 EOF/shutdown(send)。
+TLS 传输 EOF 或 stream_truncated 不代替业务 FIN，而作为真实 I/O 失败传播 RESET。
+最终按双向排空、首末 peer.finished、relay.closed 和 Flow close 收尾，避免控制关闭抢在尾部 DATA/FIN 之前。
 
 ### 10.8 多节点 UDP 的报文转换、队列与生命周期
 
@@ -2020,7 +2032,7 @@ Consumer 保留本地 forward；下一次重建重新选路、分配 Flow 和接
 | attach 非法、票据过期或重复角色 | 数据 listener | TCP/TLS 拒绝该接入 socket，UDP 丢当前包；不能借此替换已接入资源 |
 | 本端建立 deadline 到期 | AgentSession / Single / Multi | 终止本端等待和 I/O，通知已知对端，释放本端资源；不续期或传递双端预算 |
 | 正常 TCP EOF / Multi FIN | 数据复制协程 | 只半关闭对应发送方向，反向排空；Multi 再等双方 finished |
-| Single TLS 一侧复制结束 | relay_tls | 取消、排空另一方向，整体结束 LocalPair |
+| Single/Multi TLS 业务 FIN / 传输失败 | relay_tls / TLS RemotePair | 正常 FIN 只结束对应方向；真实错误取消并排空对向 |
 | Agent UDP I/O 失败或 TCP 真实错误 | 当前复制实例 | 结束该实例、排空对向，保留原原因；Node UDP 共享 listener 的单包失败另按 10.3.1 处理 |
 | Multi Flow/Link 失效 | LnkChannel → NodeLinkMgr → watch_flow | 唤醒业务并取消本地复制，通知 Agent/peer，释放 Flow；Link 失效影响依赖它的全部 Flow |
 | 本地取消或控制连接断线 | 业务控制器 | 幂等保留首次原因，清理 socket/来源/队列；接收 peer.close 不反向回声 |
@@ -2038,7 +2050,7 @@ NodeSession 是 control_io 中业务任务的所有者，通过跨域操作管�
 | 协议 | 公网数据保护 | 转发对象 | 限速行为 | 关闭特点 |
 |---|---|---|---|---|
 | `tcp` | 明文，attach ticket 鉴权 | TCP byte stream | 等待令牌，形成背压 | 支持 TCP 半关闭排空 |
-| `tls` | client 到 server 的 mTLS；server 可见明文 | TLS 解密后的 byte stream | 等待令牌，形成背压 | 任一方向结束后整体关闭 |
+| `tls` | client 到 server 的 mTLS；server 可见明文 | TLS 内 DATA/FIN 对应的业务 byte stream | 等待令牌，形成背压 | 业务 FIN 半关闭，真实错误整体关闭 |
 | `udp` | 明文，`session_id` 路由 | 完整 datagram | 令牌不足时整包丢弃 | 随控制会话或显式取消释放 |
 
 ### 11.1 XfrChannel 复制入口
@@ -2073,8 +2085,9 @@ RemotePair 的两个复制方向分别持有一个可复用定时器，启动时
 
 TLS 的复制同样按应用明文字节背压和统计。加密在 RelayAgent 与 RelayNode 之间终止，服务器能看到业务 payload，因此它不是两个客户端之间的端到端加密。需要防止服务器读取内容时，应在业务层继续使用 SSH、HTTPS 等端到端协议。
 
-单节点 relay_tls 任一方向 EOF 或错误后取消另一方向，排空并发 read/write 后由数据所有者关闭 socket。
-多节点 Agent↔Node 的 TLS 接入使用 relay_halfclose，首末桥接通过 Flow FIN 保留业务双向排空，见 5.8。
+单节点与多节点直接共用 relay_tls 的业务 DATA/FIN 复制：FIN 后保留反方向，
+真实错误取消并排空对向。TLS 1.2/1.3 均通过受 TLS 保护的业务 FIN 表达半关闭，不用底层 TCP FIN 代替。
+首末桥接在 TLS 业务 FIN 和 NodeFlow FIN 之间转换，保留双向排空，见 5.8。
 控制连接的 TLS shutdown 则由 TLSChannel 自己完成，不与数据复制的结束策略混用。
 
 ### 11.4 UDP Datagram
@@ -2481,6 +2494,7 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
   和协议选择；
 - `relay_integration`：TCP/TLS Relay、ticket/role、半关闭、RelayAgent/RelayNode 完整往返；
 - `tcp_relay`：真实 TCP socket 的读写失败、限速等待退出、原始异常保留、半关闭回传与计数；
+- `tls_relay`：TLS 1.2/1.3 的 Single/Multi 接入半关闭、大回复、分帧流量计数、异常截断及非法长度；
 - `udp_relay`：零长度、超过 4096 和最大合法 UDP 载荷、session/短头丢弃后的继续转发、超限丢弃及两侧 I/O 失败排空；
 - `token_bucket`、`traffic_counter`：足额快路径、不足时预留、债务累积、补充与 burst 上限、无限速/空包，以及并发计数/采样和饱和；
 - `node_config`、`node_status`、`node_lifecycle`：配置校验、旧配置拒绝、服务统计及超长报告、监听回滚和停止后的对象释放；
