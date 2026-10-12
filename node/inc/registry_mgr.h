@@ -43,6 +43,7 @@ class RegistryMgr
     std::optional<Service> find_service(const std::string &service);
     std::vector<std::string> service_names();
     void sample_traffic();
+    double bytes_per_second();
     njson traffic_report();
 
     void stop();

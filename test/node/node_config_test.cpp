@@ -23,6 +23,7 @@ void verify_server_config()
     require(std::filesystem::is_regular_file(modern_file) && std::filesystem::is_regular_file(legacy_file),
             "Missing Node configuration fixtures");
     const auto modern = load_node_config(modern_file);
+    require(modern.bandwidth_mbps == 100, "Node bandwidth budget was not parsed");
     require(modern.cluster.role == ClusterConfig::Role::Master && modern.cluster.node_id == "master-1" &&
                 modern.cluster.control_port == 18447, "Cluster configuration was not parsed");
     require(modern.control.advertise_address == "198.51.100.10",
@@ -99,7 +100,13 @@ void verify_server_config()
         require(rejected, "Invalid server configuration was accepted: " + std::string(description));
     };
 
-    for (const auto *object : {"control", "cluster", "tcp", "tls", "udp", "certificate"})
+    for (const auto &invalid : {njson(0), njson(-1), njson(1.5), njson(true), njson("100"), njson(nullptr)})
+    {
+        auto candidate = baseline;
+        candidate["bandwidth_mbps"] = invalid;
+        require_rejected(candidate, "invalid bandwidth_mbps");
+    }
+    for (const auto *object : {"bandwidth_mbps", "control", "cluster", "tcp", "tls", "udp", "certificate"})
     {
         auto candidate = baseline;
         candidate.erase(object);

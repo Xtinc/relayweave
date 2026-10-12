@@ -50,7 +50,7 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
                                                 config_.channel, config_.control.max_connections);
     topology_ = std::make_unique<Topology>(
         control_io, config_.cluster.node_id, config_.cluster.role == ClusterConfig::Role::Master, *cluster_mgr_,
-        control_queue_delay_us_, transfer_tcp_queue_delay_us_, transfer_udp_queue_delay_us_);
+        control_queue_delay_us_, transfer_tcp_queue_delay_us_, transfer_udp_queue_delay_us_, available_);
     nodelink_mgr_ =
         std::make_unique<NodeLinkMgr>(control_executor_, cluster_data_executor_, config_.cluster, config_.tcp.address,
                                       config_.datagram.address, *cluster_mgr_, *topology_);
@@ -78,6 +78,7 @@ void RelayNode::start()
         datagram_mgr_->start();
         nodelink_mgr_->start();
         started_at_ = std::chrono::steady_clock::now();
+        bandwidth_at_ = started_at_;
         cluster_mgr_->start();
         topology_->start();
         nodelink_mgr_->activate();
@@ -393,11 +394,21 @@ void RelayNode::schedule_queue_probe(asio::steady_timer &timer, std::atomic<std:
         {
             return;
         }
-        const auto elapsed = std::chrono::steady_clock::now() - deadline;
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = now - deadline;
         const auto microseconds = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
         const auto max_valid = static_cast<std::chrono::microseconds::rep>(invalid - 1);
         const auto delay = microseconds < 0 ? invalid : static_cast<std::uint32_t>(std::min(microseconds, max_valid));
         queue_delay_us.store(delay, std::memory_order_relaxed);
+        if (&timer == &self->control_probe_timer_ &&
+            now - self->bandwidth_at_ >= std::chrono::seconds(5))
+        {
+            const double seconds = std::chrono::duration<double>(now - self->bandwidth_at_).count();
+            const double used = self->registry_.bytes_per_second() +
+                                self->nodelink_mgr_->channel().take_forwarded_bytes() / seconds;
+            self->available_ = std::clamp(1.0 - used * 8.0 / (self->config_.bandwidth_mbps * 1e6), 0.0, 1.0);
+            self->bandwidth_at_ = now;
+        }
         self->schedule_queue_probe(timer, queue_delay_us);
     });
 }

@@ -1,4 +1,5 @@
 {
+  "bandwidth_mbps": 100,
   "log": {
     "debug_enable": false
   },

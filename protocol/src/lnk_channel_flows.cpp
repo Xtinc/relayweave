@@ -289,6 +289,11 @@ void LnkChannel::incoming_flow(const NodeLink &link, Frame f)
         return;
     }
 
+    if (f.header.kind == LnkFrType::Data)
+    {
+        forwarded_bytes_.fetch_add(f.payload.size(), std::memory_order_relaxed);
+    }
+
     std::string reason;
     const bool reset = f.header.kind == LnkFrType::Reset;
     if (reset && f.payload.size())

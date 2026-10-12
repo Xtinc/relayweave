@@ -216,6 +216,10 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     {
         return executor_;
     }
+    std::uint64_t take_forwarded_bytes() noexcept
+    {
+        return forwarded_bytes_.exchange(0, std::memory_order_relaxed);
+    }
 
     // Physical neighbour connections; prepare parameters are validated by NodeLinkMgr.
     void prepare(njson params);
@@ -292,6 +296,7 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     std::map<std::uint64_t, std::shared_ptr<lnk::NodeFlow>> flows_;
     std::map<std::uint64_t, Clock::time_point> retired_;
     std::size_t buffered_bytes_ = 0;
+    std::atomic<std::uint64_t> forwarded_bytes_{0};
 
     // Control notifications cross executors.
     asio::experimental::concurrent_channel<void(asio::error_code, CtrlMessage)> events_;

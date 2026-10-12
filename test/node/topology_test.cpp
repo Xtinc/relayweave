@@ -35,6 +35,7 @@ njson report(std::string source, std::uint64_t sequence, njson links, std::uint3
                  {"control_queue_delay_us", delay},
                  {"transfer_tcp_queue_delay_us", delay + 1},
                  {"transfer_udp_queue_delay_us", delay + 2},
+                 {"available", 1.0},
                  {"links", std::move(links)}};
 }
 } // namespace
@@ -64,7 +65,8 @@ int main()
         std::atomic<std::uint32_t> control_delay{1};
         std::atomic<std::uint32_t> tcp_delay{2};
         std::atomic<std::uint32_t> udp_delay{3};
-        Topology topology(control_io, "master", true, *cluster, control_delay, tcp_delay, udp_delay);
+        const double available = 1.0;
+        Topology topology(control_io, "master", true, *cluster, control_delay, tcp_delay, udp_delay, available);
 
         stage = "update members";
         topology.update_members(njson{{"source", "master"},
@@ -93,7 +95,9 @@ int main()
         }
         require(rejected_master_change, "Topology accepted a membership list from a non-master Node");
         stage = "update reports";
-        topology.update_report(report("master", 1, njson::array({link("slave", 12.0, 1.0, 0.05)}), 11));
+        auto master_report = report("master", 1, njson::array({link("slave", 12.0, 1.0, 0.05)}), 11);
+        master_report["available"] = 0.25;
+        topology.update_report(master_report);
         topology.update_report(report("slave", 1, njson::array({link("master", 15.0, 2.0, 0.10)}), 21));
 
         stage = "snapshot";
@@ -108,6 +112,8 @@ int main()
         require(params.at("nodes").at(0).at("control_queue_delay_us") == 11 &&
                     params.at("nodes").at(1).at("control_queue_delay_us") == 21,
                 "Topology snapshot did not preserve Node queue delay");
+        require(params.at("nodes").at(0).at("available") == 0.25 &&
+                    params.at("nodes").at(1).at("available") == 1.0, "Topology lost bandwidth availability");
 
         const auto version = params.at("snapshot_version").get<std::uint64_t>();
         topology.update_report(report("slave", 1, njson::array({link("master", 99.0, 9.0, 0.4)}), 99));

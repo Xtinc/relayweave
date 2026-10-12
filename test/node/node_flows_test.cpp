@@ -1,4 +1,5 @@
 #include "node_fixture.h"
+TEST_MEMBER(RelayNode, bandwidth_at_)
 #include <asio/experimental/awaitable_operators.hpp>
 #include <future>
 #include <iostream>
@@ -191,6 +192,11 @@ void flow_integration()
                 s2 = co_await test_node::open_flow(nodes[0], path2, transport);
                 auto shared = co_await test_node::ensure_link(nodes[0], "a", middle, transport);
                 require_flow(bool(s1) && bool(s2) && bool(shared), "forked flows failed");
+                for (const auto &node : nodes)
+                {
+                    test_access::RelayNode_bandwidth_at_(*node) = std::chrono::steady_clock::now();
+                    test_node::links(node).channel().take_forwarded_bytes();
+                }
                 for (std::uint8_t i = 0; i < 12; ++i)
                 {
                     co_await queued(1, s1, false, {1, i, 0, 255});
@@ -218,6 +224,13 @@ void flow_integration()
                 co_await receive(4, s2, false, large);
                 co_await receive(1, s1, true, large);
                 co_await receive(1, s2, true, large);
+                require_flow(test_node::links(nodes[middle_index]).channel().take_forwarded_bytes() ==
+                                 144 + 4 * large.size(), "Transit bandwidth counted payloads incorrectly");
+                require_flow(test_node::links(nodes[1]).channel().take_forwarded_bytes() ==
+                                 48 + 2 * large.size(), "Ingress bandwidth counted outgoing payloads");
+                require_flow(test_node::links(nodes[3]).channel().take_forwarded_bytes() == 48 + large.size() &&
+                                 test_node::links(nodes[4]).channel().take_forwarded_bytes() == 48 + large.size(),
+                             "Tail bandwidth did not count only incoming payloads");
                 co_await queued(1, s1, false, {});
                 co_await receive(3, s1, false, {});
                 auto wrong = co_await test_node::send_flow(nodes[middle_index],

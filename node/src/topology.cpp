@@ -120,6 +120,8 @@ void Topology::validate_snapshot(const njson &params, std::string_view location)
     {
         config::required_string(node, "node_id", location);
         config::required_string(node, "address", location);
+        if (!node.at("available").is_null())
+            finite_number(node, "available", 0.0, 1.0, location);
         const auto report_age = node.find("report_age_ms");
         if (report_age == node.end() || (!report_age->is_null() && !report_age->is_number_unsigned()))
         {
@@ -144,11 +146,11 @@ void Topology::validate_snapshot(const njson &params, std::string_view location)
 Topology::Topology(asio::io_context &io_context, std::string node_id, bool master, ClusterMgr &cluster_mgr,
                    const std::atomic<std::uint32_t> &control_queue_delay_us,
                    const std::atomic<std::uint32_t> &transfer_tcp_queue_delay_us,
-                   const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us)
+                   const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us, const double &available)
     : io_context_(io_context), node_id_(std::move(node_id)), master_(master), cluster_mgr_(cluster_mgr),
       control_queue_delay_us_(control_queue_delay_us), transfer_tcp_queue_delay_us_(transfer_tcp_queue_delay_us),
-      transfer_udp_queue_delay_us_(transfer_udp_queue_delay_us), wake_timer_(io_context), finished_wait_(io_context),
-      probes_(io_context)
+      transfer_udp_queue_delay_us_(transfer_udp_queue_delay_us), available_(available), wake_timer_(io_context),
+      finished_wait_(io_context), probes_(io_context)
 {
     if (node_id_.empty())
     {
@@ -287,6 +289,7 @@ void Topology::update_report(const njson &params)
     report.control_queue_delay_us = queue_delay(params, "control_queue_delay_us", "topology.report");
     report.transfer_tcp_queue_delay_us = queue_delay(params, "transfer_tcp_queue_delay_us", "topology.report");
     report.transfer_udp_queue_delay_us = queue_delay(params, "transfer_udp_queue_delay_us", "topology.report");
+    report.available = finite_number(params, "available", 0.0, 1.0, "topology.report");
 
     const auto raw_links = params.find("links");
     if (raw_links == params.end() || !raw_links->is_array())
@@ -406,6 +409,7 @@ void Topology::send_report()
                           {"control_queue_delay_us", control_queue_delay_us_.load(std::memory_order_relaxed)},
                           {"transfer_tcp_queue_delay_us", transfer_tcp_queue_delay_us_.load(std::memory_order_relaxed)},
                           {"transfer_udp_queue_delay_us", transfer_udp_queue_delay_us_.load(std::memory_order_relaxed)},
+                          {"available", available_},
                           {"links", std::move(links)}}});
 }
 
@@ -430,6 +434,7 @@ void Topology::rebuild_snapshot()
             node["control_queue_delay_us"] = nullptr;
             node["transfer_tcp_queue_delay_us"] = nullptr;
             node["transfer_udp_queue_delay_us"] = nullptr;
+            node["available"] = nullptr;
         }
         else
         {
@@ -437,6 +442,7 @@ void Topology::rebuild_snapshot()
             node["control_queue_delay_us"] = report->second.control_queue_delay_us;
             node["transfer_tcp_queue_delay_us"] = report->second.transfer_tcp_queue_delay_us;
             node["transfer_udp_queue_delay_us"] = report->second.transfer_udp_queue_delay_us;
+            node["available"] = report->second.available;
             for (const auto &link : report->second.links)
             {
                 auto age = link.age;

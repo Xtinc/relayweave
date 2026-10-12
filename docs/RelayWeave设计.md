@@ -214,6 +214,7 @@ server.host 是长期主控制和服务发现入口；实际业务入口由所�
 
 ```json
 {
+  "bandwidth_mbps": 100,
   "cluster": {
     "role": "master",
     "node_id": "master-1",
@@ -1387,7 +1388,13 @@ Node 与 Dashboard 统一升级，不支持缺失 relays 的旧报告；Agent �
 | `topology.query` | client → 入口 → master | `request_id`；入口附加内部会话路由字段 |
 | `topology.snapshot` | master → 入口 → client | `request_id`, `epoch`, `snapshot_version`, `created_age_ms`, `nodes`, `links` |
 
-节点条目包含 `node_id`、`address`、`report_age_ms` 和三类排队延迟；缺失或过期报告的年龄和排队值为 null。
+节点条目包含 `node_id`、`address`、`report_age_ms`、三类排队延迟和带宽可用率 `available`。
+Node 根级配置 `bandwidth_mbps` 为必填正整数，表示入站业务 payload 吞吐预算，单位十进制 Mbps。
+control 延迟探测回调每五秒按实际间隔计算 NodeLink 接收速率，并加上现有各服务 RX 速率之和；
+LnkChannel 仅在接收到有效 DATA 时累计 payload，入口、中间和出口节点均按接收量统计。
+服务 TX 和 NodeLink 发送量不参与带宽估算。可用率为
+`clamp(1 - 总速率 × 8 / (bandwidth_mbps × 1000000), 0, 1)`，不统计帧头或重传。
+首次采样前 `available=1`，估计速率为零时为 1，超载为 0；快照中缺失/过期报告的值为 null。
 有向链路条目包含 `source`、`destination`、长期 `rtt_ms`、`jitter_ms`、`loss_rate`、
 `transmitted/received/completed`、`age_ms` 及质量摘要，例如：
 

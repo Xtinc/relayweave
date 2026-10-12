@@ -91,7 +91,7 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     using namespace config;
     const auto root = load_json(path);
 
-    reject_unknown_fields(root, {"log", "control", "cluster", "tcp", "tls", "udp", "certificate", "channel"}, "root");
+    reject_unknown_fields(root, {"log", "bandwidth_mbps", "control", "cluster", "tcp", "tls", "udp", "certificate", "channel"}, "root");
     const auto &control = required_object(root, "control", "root");
     reject_unknown_fields(
         control,
@@ -107,6 +107,7 @@ NodeConfig load_node_config(const std::filesystem::path &path)
                           "certificate");
 
     NodeConfig result;
+    result.bandwidth_mbps = require_unsigned(root, "bandwidth_mbps", true);
     result.cluster = parse_cluster_config(root);
 
     result.control.address = required_string(control, "address", "control");

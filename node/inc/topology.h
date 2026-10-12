@@ -18,7 +18,8 @@ class Topology
     Topology(asio::io_context &io_context, std::string node_id, bool master, ClusterMgr &cluster_mgr,
              const std::atomic<std::uint32_t> &control_queue_delay_us,
              const std::atomic<std::uint32_t> &transfer_tcp_queue_delay_us,
-             const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us);
+             const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us,
+             const double &available);
 
     void start();
     asio::awaitable<void> close();
@@ -68,6 +69,7 @@ class Topology
         std::uint32_t control_queue_delay_us = 0;
         std::uint32_t transfer_tcp_queue_delay_us = 0;
         std::uint32_t transfer_udp_queue_delay_us = 0;
+        double available = 1.0;
         std::vector<Link> links;
     };
 
@@ -94,6 +96,7 @@ class Topology
     const std::atomic<std::uint32_t> &control_queue_delay_us_;
     const std::atomic<std::uint32_t> &transfer_tcp_queue_delay_us_;
     const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us_;
+    const double &available_;
     asio::steady_timer wake_timer_;
     asio::steady_timer finished_wait_;
     ProbeSet probes_;

@@ -141,13 +141,20 @@ njson RegistryMgr::traffic_report()
     return report;
 }
 
+double RegistryMgr::bytes_per_second()
+{
+    double total = 0;
+    services_.for_each([&](const std::string &, const ServiceEntry &service) {
+        total += static_cast<double>(service.traffic->rx_bytes_per_second());
+    });
+    return total;
+}
+
 std::vector<std::string> RegistryMgr::service_names()
 {
     std::vector<std::string> names;
     names.reserve(services_.size());
-    services_.for_each([&](const std::string &name, ServiceEntry &) {
-        names.push_back(name);
-    });
+    services_.for_each([&](const std::string &name, ServiceEntry &) { names.push_back(name); });
     std::ranges::sort(names);
     return names;
 }

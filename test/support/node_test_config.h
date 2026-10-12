@@ -30,6 +30,7 @@ inline void configure_test_cluster_data(ClusterConfig &config)
 inline NodeConfig make_test_node_config()
 {
     NodeConfig config;
+    config.bandwidth_mbps = 100;
     const auto data = test_data::directory();
     config.certificate_chain = data / "tls_channel_test_server.pem";
     config.private_key = data / "tls_channel_test_server.key";

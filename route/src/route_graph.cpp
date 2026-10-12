@@ -21,8 +21,8 @@ RouteGraph::RouteGraph(std::span<const Link> links)
 {
     for (const auto &link : links)
     {
-        if (link.from.empty() || link.to.empty() || link.from == link.to ||
-            !std::isfinite(link.cost) || link.cost < 0.0)
+        if (link.from.empty() || link.to.empty() || link.from == link.to || !std::isfinite(link.cost) ||
+            link.cost < 0.0)
         {
             continue;
         }
@@ -40,15 +40,14 @@ RouteGraph::RouteGraph(std::span<const Link> links)
             }
             return left.cost < right.cost;
         });
-        edges.erase(std::unique(edges.begin(), edges.end(), [](const Arc &left, const Arc &right) {
-                        return left.to == right.to;
-                    }),
+        edges.erase(std::unique(edges.begin(), edges.end(),
+                                [](const Arc &left, const Arc &right) { return left.to == right.to; }),
                     edges.end());
     }
 }
 
-std::map<std::string, RouteGraph::Path> RouteGraph::shortest_paths(
-    std::span<const Entry> entries, std::size_t max_nodes) const
+std::map<std::string, RouteGraph::Path> RouteGraph::shortest_paths(std::span<const Entry> entries,
+                                                                   std::size_t max_nodes) const
 {
     if (max_nodes == 0)
     {

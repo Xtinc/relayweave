@@ -1,4 +1,5 @@
 {
+  "bandwidth_mbps": 100,
   "cluster": {
     "role": "master",
     "node_id": "master-1",

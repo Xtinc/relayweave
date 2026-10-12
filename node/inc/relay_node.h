@@ -45,6 +45,7 @@ struct DatagramNodeConfig
 struct NodeConfig
 {
     static constexpr std::size_t maximum_services = 256;
+    std::uint64_t bandwidth_mbps = 0;
 
     ControlNodeConfig control;
     ClusterConfig cluster;
@@ -142,6 +143,8 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     std::unique_ptr<NodeLinkMgr> nodelink_mgr_;
     RegistryMgr registry_;
     std::chrono::steady_clock::time_point started_at_{};
+    std::chrono::steady_clock::time_point bandwidth_at_{};
+    double available_ = 1.0;
     SessionId next_session_id_ = 1;
     std::vector<std::shared_ptr<NodeSession>> relay_sessions_;
     asio::steady_timer relays_done_;
