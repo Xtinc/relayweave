@@ -1004,9 +1004,9 @@ min(1, 长尺度有效完成样本权重 / evidence_target))`，其中 `evidence
 使链路不可选路：连续失败达到 5 次、短尺度丢包率达到 50%、最后成功达到 45 秒、最后完成样本达到 15 秒。
 没有成功证据时 `cost=null`、`usable=false`。ICMP 反映主机往返质量，不测量业务端口、带宽或单向时延。
 
-基础质量成本与最终边权分开。纯函数 `routing_cost(quality, age)` 对可用摘要应用新鲜度及冷启动惩罚：
+纯函数 `routing_cost(quality, age)` 对基础质量成本应用新鲜度及冷启动惩罚：
 
-`edge_cost = quality.cost × freshness + 5 × (1 − confidence)`
+`quality_cost = quality.cost × freshness + 5 × (1 − confidence)`
 
 `age` 为最后成功测量的年龄；消费远端摘要时还要累加快照经过时间。25 秒内 `freshness = 1`；
 25–45 秒为 `1 + 0.5 × ((age_seconds − 25) / 20)²`。信心为 1 时无额外成本，为 0 时增加 5。
@@ -1026,7 +1026,13 @@ min(1, 长尺度有效完成样本权重 / evidence_target))`，其中 `evidence
 
 `path.cost = Agent 到入口的 edge_cost + Σ(Node 间有向边的 edge_cost) + 2 × (N − 1)`
 
-每个终点之前的 Node 增加中继成本 2。单 Node 直达路径只有 Agent 到目的 Node 的接入成本；
+构图时每条边的成本为 `edge_cost = quality_cost + bandwidth_penalty(目标节点)`，Agent 接入边同样处理。
+`bandwidth_penalty = 10 × (1 / max(available, 0.05) − 1)`；可用率 100%、50%、20%、≤5% 分别增加 0、10、40、190。
+例如 `Agent → A → B → C` 的三条边分别加 A、B、C 的惩罚，搜索后不再额外加分。
+Agent 保存 `available` 原值，选路时直接计算公式；缺失/null、报告年龄未知、报告或快照达到 15 秒时惩罚为 0。
+非 null 的可用率必须是 0–1 的有限数。现有候选路径缓存和指标更新规则保持不变。
+
+每个终点之前的 Node 增加中继成本 2。单 Node 直达路径包含 Agent 到目的 Node 的接入边成本；
 三 Node 路径有一条接入链路、两条 Node 间链路，并额外增加 4。当前质量基于 ICMP，因此服务协议名称
 TCP、TLS 或 UDP 不改变上述公式。
 
@@ -1045,7 +1051,7 @@ calculate_service_paths 返回最佳 Node 序列；命中有效 LRU 时直接取
 命中只更新次序，不续期；必需探测目标变化、主控制断开或拓扑 epoch 改变时清空。
 同 epoch 的指标及普通快照版本变化不直接清空缓存；TTL 到期后的下一次业务使用当前测量重新计算。
 有效候选只用于选择最佳路径，不复用之前的接入票据或 Flow。
-`cost` 是含质量、新鲜度、冷启动及中继惩罚的路由成本，不等同于 RTT。
+`cost` 是含质量、新鲜度、冷启动、带宽及中继惩罚的路由成本，不等同于 RTT。
 路径为空或仅一个 Node 时按目的服务位置走 Single；多节点首 Node 定位或连接失败结束当前实例，
 不在原实例内重新选路或回退。业务实例以服务名、本地 uuid 及 Flow 身份关联。
 Forwarder 使用 `ServerRoute::id`（host:port）管理入口连接与 Relay。

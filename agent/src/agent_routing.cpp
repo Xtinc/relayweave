@@ -2,6 +2,7 @@
 #include "link_quality.h"
 #include "message.h"
 #include <algorithm>
+#include <cmath>
 #include <set>
 
 static std::chrono::milliseconds age(std::uint64_t value)
@@ -88,6 +89,7 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
         std::map<std::string, std::string> nodes;
         std::vector<Link> links;
         std::map<std::string, std::chrono::milliseconds> report_ages;
+        std::map<std::string, double> available;
         std::set<std::pair<std::string, std::string>> edges;
         for (const auto &node : snapshot.at("nodes"))
         {
@@ -99,6 +101,16 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
             }
             report_ages[id] = node.at("report_age_ms").is_null() ? std::chrono::milliseconds::max()
                                                                  : age(require_unsigned(node, "report_age_ms"));
+            const auto value = node.find("available");
+            if (value != node.end() && !value->is_null())
+            {
+                if (!value->is_number() || !std::isfinite(value->get<double>()) ||
+                    value->get<double>() < 0.0 || value->get<double>() > 1.0)
+                {
+                    throw std::invalid_argument("Node available must be a finite number between 0 and 1");
+                }
+                available.emplace(id, value->get<double>());
+            }
         }
 
         for (const auto &entry : snapshot.at("links"))
@@ -118,6 +130,7 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
 
         nodes_ = std::move(nodes);
         report_ages_ = std::move(report_ages);
+        available_ = std::move(available);
         update_targets();
         links_ = std::move(links);
         snapshot_at_ = pending_.started - created_age;
@@ -137,6 +150,7 @@ void AgentRouting::invalidate_snapshot()
 {
     nodes_.clear();
     report_ages_.clear();
+    available_.clear();
     links_.clear();
     pending_ = Pending{};
     epoch_ = version_ = 0;
@@ -185,10 +199,27 @@ RouteGraph AgentRouting::graph(Clock::time_point now) const
         const auto current_age = link.age + std::min(elapsed, std::chrono::milliseconds::max() - link.age);
         if (const auto cost = routing_cost(link.quality, current_age))
         {
-            links.push_back({link.from, link.to, *cost});
+            links.push_back({link.from, link.to, *cost + bandwidth_penalty(link.to, now)});
         }
     }
     return RouteGraph(links);
+}
+
+double AgentRouting::bandwidth_penalty(const std::string &node, Clock::time_point now) const
+{
+    const auto available = available_.find(node);
+    const auto report = report_ages_.find(node);
+    if (available == available_.end() || report == report_ages_.end() || now < snapshot_at_)
+    {
+        return 0.0;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - snapshot_at_);
+    if (elapsed >= SNAPSHOT_EXPIRY || report->second >= SNAPSHOT_EXPIRY - elapsed)
+    {
+        return 0.0;
+    }
+    // Charge the destination's headroom; cap saturation at a finite penalty.
+    return 10.0 * (1.0 / std::max(available->second, 0.05) - 1.0);
 }
 
 std::vector<RouteGraph::Entry> AgentRouting::measured_entries() const
@@ -227,7 +258,7 @@ AgentRouting::CandidatePaths AgentRouting::candidate_paths(Clock::time_point now
     CandidatePaths result;
     for (const auto &[node, cost] : ingress_costs)
     {
-        const RouteGraph::Entry entry{node, cost};
+        const RouteGraph::Entry entry{node, cost + bandwidth_penalty(node, now)};
         for (auto &[destination, path] : routes.shortest_paths(std::span(&entry, 1), max_nodes_))
         {
             result[destination].push_back(std::move(path));

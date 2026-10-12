@@ -62,6 +62,79 @@ template <typename Fn> void rejects(Fn function, const char *reason)
     }
     require(rejected, reason);
 }
+
+void test_bandwidth(asio::io_context &io)
+{
+    test_routing::Fixture routing(io, true, 4);
+    auto topology = snapshot(1,
+        Json::array({node("A", "192.0.2.1"), node("B", "192.0.2.2"),
+                     node("C", "192.0.2.3"), node("D", "192.0.2.4")}),
+        Json::array({edge("A", "B", 1.0), edge("B", "D", 1.0),
+                     edge("A", "C", 5.0), edge("C", "D", 5.0)}));
+    topology["created_age_ms"] = 0u;
+    for (auto &item : topology["nodes"]) item["available"] = 1.0;
+    unsigned version = 0;
+    const auto apply = [&] {
+        topology["request_id"] = ++version;
+        topology["snapshot_version"] = version;
+        routing.begin_request(version, at(0));
+        require(routing.accept_snapshot(topology, at(0)), "Bandwidth snapshot rejected");
+    };
+    const std::vector<RouteGraph::Entry> access{{"A", 3.0}, {"D", 50.0}};
+    apply();
+    require(calculate_path(routing, "D", access, at(0))->cost == 9.0, "Idle bandwidth changed route cost");
+    topology["nodes"][1]["available"] = 0.5;
+    apply();
+    require(calculate_path(routing, "D", access, at(0))->nodes == std::vector<std::string>({"A", "C", "D"}),
+            "Destination bandwidth did not affect search within the same ingress");
+    topology["nodes"][0]["available"] = 0.1;
+    apply();
+    require(calculate_path(routing, "D", access, at(0))->nodes == std::vector<std::string>({"D"}),
+            "Congested ingress did not lose to direct access");
+
+    topology["links"] = Json::array({edge("A", "B", 1.0), edge("B", "D", 1.0)});
+    topology["nodes"][0]["available"] = 0.5;
+    topology["nodes"][1]["available"] = 0.25;
+    topology["nodes"][3]["available"] = 0.2;
+    apply();
+    const auto paths = test_routing::candidates(routing, at(0), access).at("D");
+    require(paths.size() == 2 && std::abs(paths[0].cost - 89.0) < 1e-9 && std::abs(paths[1].cost - 90.0) < 1e-9,
+            "Ingress, intermediate or endpoint bandwidth was omitted or counted twice");
+
+    const auto direct_cost = [&](int seconds = 0) {
+        return calculate_path(routing, "D", std::span(access).subspan(1), at(seconds))->cost;
+    };
+    for (const auto &[available, penalty] : std::vector<std::pair<double, double>>{
+             {1.0, 0.0}, {0.5, 10.0}, {0.2, 40.0}, {0.05, 190.0}, {0.0, 190.0}})
+    {
+        topology["nodes"][3]["available"] = available;
+        apply();
+        require(std::abs(direct_cost() - 50.0 - penalty) < 1e-9, "Bandwidth formula or saturation cap incorrect");
+    }
+    topology["nodes"][3]["report_age_ms"] = 14000u;
+    apply();
+    require(direct_cost() == 240.0 && direct_cost(1) == 50.0 && direct_cost(15) == 50.0,
+            "Expired report or snapshot still charged bandwidth");
+    topology["nodes"][3]["report_age_ms"] = nullptr;
+    apply();
+    require(direct_cost() == 50.0, "Unknown report age charged bandwidth");
+    topology["nodes"][3]["report_age_ms"] = 0u;
+    topology["nodes"][3]["available"] = nullptr;
+    apply();
+    require(direct_cost() == 50.0, "Unknown availability charged bandwidth");
+    topology["nodes"][3]["available"] = 0.5;
+    apply();
+    for (const auto &value : std::vector<Json>{-0.1, 1.1, "0.5", true, std::numeric_limits<double>::infinity()})
+    {
+        topology["nodes"][3]["available"] = value;
+        topology["request_id"] = ++version;
+        routing.begin_request(version, at(0));
+        rejects([&] { routing.accept_snapshot(topology, at(0)); }, "Invalid availability accepted");
+        require(direct_cost() == 60.0, "Invalid reply replaced last valid availability");
+    }
+    routing.invalidate_snapshot();
+    require(direct_cost() == 50.0, "Disconnected snapshot retained bandwidth penalty");
+}
 }
 
 int main()
@@ -69,6 +142,7 @@ int main()
     try
     {
         asio::io_context io(1);
+        test_bandwidth(io);
         require(AgentConfig{}.routing_max_nodes == 4, "Default real Node budget changed");
         const auto data = test_data::directory();
         const auto temporary = std::filesystem::temp_directory_path() /

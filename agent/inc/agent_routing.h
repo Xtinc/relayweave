@@ -53,6 +53,7 @@ class AgentRouting
     };
 
     RouteGraph graph(Clock::time_point now) const;
+    double bandwidth_penalty(const std::string &node, Clock::time_point now) const;
     std::vector<RouteGraph::Entry> measured_entries() const;
     void update_targets();
 
@@ -62,6 +63,7 @@ class AgentRouting
     ProbeSet::Targets required_targets_;
     ProbeSet::Targets nodes_;
     std::map<std::string, std::chrono::milliseconds> report_ages_;
+    std::map<std::string, double> available_;
     std::vector<Link> links_;
     Pending pending_;
     Clock::time_point snapshot_at_;
