@@ -20,6 +20,15 @@ struct RelayEndpoint
     asio::awaitable<FlowFrame> receive();
     void count(bool from_agent, std::size_t size);
 
+    TokenBucket &outgoing_limiter() noexcept
+    {
+        return role == RelayAttach::Producer ? rx_limiter : tx_limiter;
+    }
+    TokenBucket &incoming_limiter() noexcept
+    {
+        return role == RelayAttach::Producer ? tx_limiter : rx_limiter;
+    }
+
     std::uint64_t ticket = 0;
     int role;
     AsyncEvent attached;

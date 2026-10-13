@@ -34,6 +34,7 @@ class TrafficCounter
     alignas(64) std::atomic<std::uint64_t> interval_{};
 };
 
+// Access is serialized on the owning executor; only one wait() may run at a time.
 class TokenBucket
 {
   public:
@@ -51,10 +52,10 @@ class TokenBucket
     asio::awaitable<void> wait(std::size_t bytes = 0);
     void close();
 
-    void set_rate(std::uint64_t bytes_per_second, std::uint64_t burst_bytes);
     void feedback(std::uint64_t sequence, FlowPressure action);
 
   private:
+    void set_rate(std::uint64_t bytes_per_second, std::uint64_t burst_bytes);
     TimePoint reserve(std::size_t bytes, TimePoint now);
     TimePoint deadline(TimePoint now) const noexcept;
     void refill(TimePoint now) noexcept;

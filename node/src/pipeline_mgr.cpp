@@ -282,7 +282,7 @@ template <typename Transport>
 asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
     std::array<std::uint8_t, LnkFrameHeader::maximum_payload> buffer;
-    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
+    auto &limiter = endpoint->outgoing_limiter();
     for (;;)
     {
         if (!limiter.try_consume())
@@ -318,7 +318,7 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
 template <typename Transport>
 asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
-    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
+    auto &limiter = endpoint->incoming_limiter();
     for (;;)
     {
         auto frame = co_await endpoint->receive();
@@ -445,8 +445,7 @@ void StreamPipeline<Transport>::pressure_remote_pair(std::uint64_t uuid, std::ui
     if (endpoint.closed || !endpoint.channel || endpoint.epoch != epoch || endpoint.flow_id != flow_id ||
         reverse != (endpoint.role == RelayAttach::Producer))
         return;
-    auto &limiter = endpoint.role == RelayAttach::Producer ? endpoint.rx_limiter : endpoint.tx_limiter;
-    limiter.feedback(sequence, action);
+    endpoint.outgoing_limiter().feedback(sequence, action);
 }
 
 template <typename Transport>

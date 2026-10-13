@@ -94,7 +94,7 @@ void DatagramMgr::bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std:
 
 asio::awaitable<void> DatagramMgr::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
-    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
+    auto &limiter = endpoint->outgoing_limiter();
     for (;;)
     {
         auto payload = co_await endpoint->received.async_receive(asio::use_awaitable);
@@ -112,7 +112,7 @@ asio::awaitable<void> DatagramMgr::read_remote_pair(std::shared_ptr<RemotePair> 
 asio::awaitable<void> DatagramMgr::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
     const auto header = DatagramHeader::encode(endpoint->session_id);
-    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
+    auto &limiter = endpoint->incoming_limiter();
     for (;;)
     {
         auto frame = co_await endpoint->receive();

@@ -7,9 +7,6 @@ using lnk::Frame;
 using lnk::NodeFlow;
 using lnk::NodeLink;
 
-// Absorb bursts across concurrent TCP/TLS responses while retaining bounded admission.
-static constexpr std::size_t tcp_receive_queue_capacity = 128;
-static constexpr std::size_t udp_receive_queue_capacity = 16;
 static constexpr std::size_t max_flows = 1000;
 static constexpr std::size_t max_buffered_bytes = 64 * 1024 * 1024;
 static constexpr std::size_t frame_overhead = 128;
@@ -52,35 +49,52 @@ void LnkChannel::notify_pressure(NodeFlow &flow, bool reverse, FlowPressure acti
                                                        {"action", static_cast<unsigned>(action)}}));
 }
 
-void LnkChannel::update_pressure(NodeFlow &flow, bool reverse)
+void LnkChannel::update_pressure(NodeFlow &flow, bool reverse, std::size_t consumed)
 {
     using State = NodeFlow::State;
-    if (flow.pending_frames >= NodeFlow::pause_watermark && flow.state != State::Paused)
+    switch (flow.state)
     {
-        flow.state = State::Paused;
-        notify_pressure(flow, reverse, FlowPressure::Pause);
+    case State::Prepared:
+    case State::Closed:
+        return;
+    case State::Low:
+        if (flow.pending_frames > NodeFlow::low_watermark)
+            flow.consumed_bytes = 0;
+        else
+        {
+            flow.consumed_bytes += consumed;
+            if (flow.consumed_bytes >= NodeFlow::increase_bytes)
+            {
+                flow.consumed_bytes %= NodeFlow::increase_bytes;
+                notify_pressure(flow, reverse, FlowPressure::Increase);
+            }
+        }
+        [[fallthrough]];
+    case State::Active:
+        // Queue accounting changes one frame at a time, so High precedes Paused.
+        if (flow.pending_frames >= NodeFlow::high_watermark)
+        {
+            flow.state = State::High;
+            notify_pressure(flow, reverse, FlowPressure::Decrease);
+        }
+        return;
+    case State::High:
+        if (flow.pending_frames >= NodeFlow::pause_watermark)
+        {
+            flow.state = State::Paused;
+            notify_pressure(flow, reverse, FlowPressure::Pause);
+            return;
+        }
+        [[fallthrough]];
+    case State::Paused:
+        if (flow.pending_frames <= NodeFlow::low_watermark)
+        {
+            flow.state = State::Low;
+            flow.consumed_bytes = 0;
+            notify_pressure(flow, reverse, FlowPressure::Resume);
+        }
+        return;
     }
-    else if (flow.pending_frames >= NodeFlow::high_watermark &&
-             (flow.state == State::Active || flow.state == State::Low))
-    {
-        flow.state = State::High;
-        notify_pressure(flow, reverse, FlowPressure::Decrease);
-    }
-    else if (flow.pending_frames <= NodeFlow::low_watermark &&
-             (flow.state == State::High || flow.state == State::Paused))
-    {
-        flow.state = State::Low;
-        flow.consumed_bytes = 0;
-        notify_pressure(flow, reverse, FlowPressure::Resume);
-    }
-    else if (flow.pending_frames <= NodeFlow::low_watermark && flow.state == State::Low &&
-             flow.consumed_bytes >= NodeFlow::increase_bytes)
-    {
-        flow.consumed_bytes %= NodeFlow::increase_bytes;
-        notify_pressure(flow, reverse, FlowPressure::Increase);
-    }
-    if (flow.pending_frames > NodeFlow::low_watermark)
-        flow.consumed_bytes = 0;
 }
 
 void LnkChannel::prepare_flow(njson p)
@@ -422,9 +436,7 @@ asio::awaitable<FlowFrame> LnkChannel::receive_flow(std::uint64_t epoch, std::ui
                         {
                             assert(flow->pending_frames != 0);
                             --flow->pending_frames;
-                            if (flow->state == NodeFlow::State::Low)
-                                flow->consumed_bytes += frame.payload.size();
-                            self->update_pressure(*flow, frame.header.reverse);
+                            self->update_pressure(*flow, frame.header.reverse, frame.payload.size());
                         }
                         result = {frame.header.epoch, frame.header.id, frame.header.reverse, frame.header.kind};
                         const auto bytes = frame.payload.bytes();

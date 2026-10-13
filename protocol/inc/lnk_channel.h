@@ -170,10 +170,15 @@ struct NodeLink
 
 struct NodeFlow
 {
+    // Absorb concurrent stream response bursts, with room for feedback to take effect.
+    static constexpr std::size_t tcp_receive_queue_capacity = 128;
+    static constexpr std::size_t udp_receive_queue_capacity = 16;
     static constexpr std::size_t low_watermark = 16;
     static constexpr std::size_t high_watermark = 32;
     static constexpr std::size_t pause_watermark = 64;
     static constexpr std::size_t increase_bytes = 64 * 1024;
+    static_assert(low_watermark < high_watermark && high_watermark < pause_watermark &&
+                  pause_watermark < tcp_receive_queue_capacity);
 
     enum class State
     {
@@ -267,7 +272,7 @@ class LnkChannel : public std::enable_shared_from_this<LnkChannel>
     void link_flows_closed(std::uint64_t id);
     FlowSendStatus send_flow(const FlowFrame &frame, std::span<const std::uint8_t> payload);
     bool deliver(const std::shared_ptr<lnk::NodeFlow> &flow, lnk::Frame &frame);
-    void update_pressure(lnk::NodeFlow &flow, bool reverse);
+    void update_pressure(lnk::NodeFlow &flow, bool reverse, std::size_t consumed = 0);
     void notify_pressure(lnk::NodeFlow &flow, bool reverse, FlowPressure action);
     void notify_flow(const std::shared_ptr<lnk::NodeFlow> &flow, CtrlCommand command, std::string stage,
                      std::string reason = {});

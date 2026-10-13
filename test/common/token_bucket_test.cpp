@@ -9,6 +9,7 @@
 
 TEST_MEMBER(TokenBucket, timer_)
 TEST_MEMBER(TokenBucket, rate_)
+TEST_MEMBER(TokenBucket, set_rate)
 TEST_MEMBER(TokenBucket, sequence_)
 TEST_MEMBER(TokenBucket, reserve)
 TEST_MEMBER(TokenBucket, deadline)
@@ -84,25 +85,25 @@ void dynamic_debt()
     TokenBucket limiter(100, 0);
     const auto original = test_access::TokenBucket_reserve(limiter, 10000, now);
     const auto before_down = TokenBucket::Clock::now();
-    limiter.set_rate(50, 0);
+    test_access::TokenBucket_set_rate(limiter, 50, 0);
     const auto after_down = TokenBucket::Clock::now();
     const auto down = test_access::TokenBucket_deadline(limiter, TokenBucket::Clock::now());
     require(down >= original + (original - after_down) && down <= original + (original - before_down) + 1us,
             "Lower rate lost unserved bytes");
     const auto before_up = TokenBucket::Clock::now();
-    limiter.set_rate(200, 0);
+    test_access::TokenBucket_set_rate(limiter, 200, 0);
     const auto after_up = TokenBucket::Clock::now();
     const auto up = test_access::TokenBucket_deadline(limiter, TokenBucket::Clock::now());
     require(up >= before_up + (down - before_up) / 4 - 1us && up <= after_up + (down - after_up) / 4 + 1us,
             "Higher rate did not shorten wait");
     require_deadline(test_access::TokenBucket_reserve(limiter, 50, after_up), up + 250ms, "Rate update charged debt twice");
-    limiter.set_rate(0, 0);
+    test_access::TokenBucket_set_rate(limiter, 0, 0);
     const auto unlimited_now = TokenBucket::Clock::now();
     require(test_access::TokenBucket_deadline(limiter, unlimited_now) == unlimited_now && limiter.try_consume(1000),
             "Unlimited update did not release debt");
     TokenBucket burst(100, 100);
     const auto before_burst = TokenBucket::Clock::now();
-    burst.set_rate(10, 10);
+    test_access::TokenBucket_set_rate(burst, 10, 10);
     const auto after_burst = TokenBucket::Clock::now();
     require(!burst.try_consume(1), "Rate reduction retained accumulated burst");
     const auto due = test_access::TokenBucket_reserve(burst, 10, TokenBucket::Clock::now());
@@ -154,7 +155,7 @@ void modes_and_fast_path()
         io.restart();
         io.poll();
         require(pending.wait_for(0s) != std::future_status::ready, "Rate wait did not block");
-        limited.set_rate(64 * 1024, 0);
+        test_access::TokenBucket_set_rate(limited, 64 * 1024, 0);
         io.restart();
         io.run_for(1s);
         require(pending.wait_for(0s) == std::future_status::ready, "Rate change did not wake the wait");

@@ -5,6 +5,7 @@
 
 TEST_MEMBER(TcpPipeline, remote_pairs_)
 TEST_MEMBER(TokenBucket, rate_)
+TEST_MEMBER(TokenBucket, set_rate)
 TEST_MEMBER(TokenBucket, sequence_)
 TEST_MEMBER(TokenBucket, paused_)
 
@@ -153,18 +154,18 @@ int main()
         }
         {
             Fixture f(RelayAttach::Consumer);
-            f.limiter().set_rate(1, 0);
+            test_access::TokenBucket_set_rate(f.limiter(), 1, 0);
             auto waiting = f.wait(10);
             f.pump();
             check(waiting.wait_for(0s) != std::future_status::ready, "rate wait did not block");
-            f.limiter().set_rate(64 * 1024, 0);
+            test_access::TokenBucket_set_rate(f.limiter(), 64 * 1024, 0);
             f.io.run_for(1s);
             check(waiting.wait_for(0s) == std::future_status::ready, "set_rate did not wake its own wait");
             waiting.get();
             f.pressure(1, FlowPressure::Pause);
             auto paused = f.wait();
             f.pump();
-            f.limiter().set_rate(128 * 1024, 0);
+            test_access::TokenBucket_set_rate(f.limiter(), 128 * 1024, 0);
             f.pump();
             check(paused.wait_for(0s) != std::future_status::ready, "set_rate released pressure pause");
             f.pressure(2, FlowPressure::Resume);
