@@ -155,9 +155,6 @@ within the map area to keep labels readable. Current Flows has no filter, pan,
 or zoom controls. Flow data is only held in memory
 and is not added to SQLite history.
 
-Run the live three-Node tests with `RELAYWEAVE_NODE_BINARY` set to the built
-`relayweave-node` executable:
-`python -m unittest discover -s dashboard -p 'test_flow_integration.py' -v`.
 Age includes query and page-assembly time and uses a monotonic clock. This topology is observational only and is
 not used to route Relay traffic.
 
@@ -300,7 +297,15 @@ Dashboard 打包时仅复制 Python 源码，不探测或绑定构建机的 Pyth
 
 ```bash
 python -m unittest discover -s dashboard -p 'test_*.py'
-python test/tools/dashboard_service_smoke.py --build-dir build
+```
+
+日常 Dashboard 修改只运行这些本地测试，不需要编译 Node/Agent 或执行仓库全量验证。
+测试覆盖 API、采集状态、车站余量与路线连接数、历史范围/保留、位置缓存及 Python 侧协议解析。
+Dashboard 测试不启动 Node/Agent 或 HTTP 服务子进程；采集器停止检查只使用本地 socket。
+
+仅在修改跨组件转发或服务部署时，额外运行仓库中的冒烟脚本：
+
+```bash
 python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 ```
 
