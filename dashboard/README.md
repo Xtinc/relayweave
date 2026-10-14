@@ -171,7 +171,7 @@ sudo apt install ./build-package/packages/relayweave-dashboard_*_all.deb
 cpack --config build/CPackConfig.cmake -G DEB -D CPACK_COMPONENTS_ALL=dashboard
 ```
 
-此包安装 `relayweave-dashboard.service`、专用系统用户 `relayweave-dashboard` 和 Python 代码，运行时使用系统的 `/usr/bin/python3` 和发行版提供的 Flask、cbor2、Waitress，不绑定构建机器上的 Python 版本；不安装或修改 Node/Agent 配置。首次安装会启用开机启动，但不会立即启动；先完成配置和证书准备。升级会重启已经运行的看板服务。
+此包安装 `relayweave-dashboard.service`、专用系统用户 `relayweave-dashboard` 和 Python 代码，运行时使用系统的 `/usr/bin/python3` 和发行版提供的 Flask、cbor2、Waitress，不绑定构建机器上的 Python 版本；不安装或修改 Node/Agent 配置。首次安装会启用开机启动，但不会立即启动；先完成配置和证书准备。升级或重复安装不启动或重启看板服务，也不改变原有开机启动设置。软件文件在安装时更新；需要加载新程序时执行 `sudo systemctl restart relayweave-dashboard`，或等待下次开机启动服务。
 
 | 内容 | 路径 |
 |---|---|

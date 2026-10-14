@@ -217,9 +217,12 @@ sudo apt install ./relayweave-proxy_1.0.0-2_arm64.deb
 
 - 配置继续按 conffile 规则保留；
 - 新程序安装完成后执行 `systemctl daemon-reload`；
-- 升级前正在运行的服务会重启并加载新程序和配置；
+- 升级或重复安装不重启服务，已有进程继续运行；
 - 原本停止的服务不会因为升级被意外启动；
-- 三个组件是独立包，可以分别升级。
+- 保留原有开机启动设置，不重新 enable 或 disable 服务；
+- 四个组件是独立包，可以分别升级。
+
+软件文件在安装时更新。需要加载新程序和配置时，手动执行 `sudo systemctl restart relayweave-<role>`；也可以等下次开机启动服务，前提是对应服务保持 enabled。`systemctl daemon-reload` 只重新读取 unit 定义，不会重启已有进程。这一策略控制包安装脚本的启停行为，不提供整套文件延迟替换机制。
 
 链路质量协议使用 `quality: {cost, confidence, usable}`，Node、Agent、Dashboard 应统一升级，不支持
 混用旧质量格式。Agent 的 routing 配置默认启用且只接受可选 `max_nodes`（默认 4，范围 1–8）；
@@ -239,12 +242,13 @@ systemctl --no-pager --full status relayweave-node.service relayweave-agent.serv
 
 回退时可以重新安装保留的旧包，但必须确认当前配置仍兼容旧程序。
 
-配置或证书与软件同时更新时，推荐先用部署工具验证并写入新文件但不操作服务，再安装新 Deb。正在运行的服务会由包升级流程重启一次并加载全部新内容：
+配置或证书与软件同时更新时，推荐先用部署工具验证并写入新文件但不操作服务，再安装新 Deb，最后在合适的时机手动重启服务以加载全部新内容：
 
 ```console
 sudo relayweave-provision-node --cert-dir /secure/relayweave/nodes/master-1 \
   --config /secure/relayweave/config/master-1.json --verify-host proxy.example.com
 sudo apt install ./relayweave-node_1.1.0-1_arm64.deb
+sudo systemctl restart relayweave-node
 ```
 
 只轮换配置或证书、不升级软件时使用 `--restart`。原文件备份用于人工回退，工具不会自动恢复旧版本。
@@ -254,11 +258,11 @@ sudo apt install ./relayweave-node_1.1.0-1_arm64.deb
 | dpkg 阶段 | 行为 |
 |---|---|
 | 首次 `postinst configure` | reload systemd，enable 服务，不启动 |
-| 升级 `postinst configure <old-version>` | 仅当服务当前 active 时 restart |
+| 升级或重复安装 `postinst configure <old-version>` | reload systemd，不启动或重启服务，保留开机启动设置 |
 | `prerm remove/deconfigure` | disable 并停止服务 |
 | `postrm remove/purge/...` | reload systemd 并清除 failed 状态 |
 
-unit 使用 `Restart=on-failure` 和 5 秒重启间隔，并启用 `NoNewPrivileges=true`、`PrivateTmp=true`。Node 和 Agent 使用 systemd 系统服务的默认身份运行，AmbientCapabilities 和 CapabilityBoundingSet 均保留 `CAP_NET_RAW` 与 `CAP_NET_BIND_SERVICE`，用于原始 ICMP 和低端口监听。两者的安装脚本与部署工具检查 ICMP 能力，包含 systemd override 的实际生效配置；升级会 reload unit，并重启原本运行的服务。
+unit 使用 `Restart=on-failure` 和 5 秒重启间隔，并启用 `NoNewPrivileges=true`、`PrivateTmp=true`。Node 和 Agent 使用 systemd 系统服务的默认身份运行，AmbientCapabilities 和 CapabilityBoundingSet 均保留 `CAP_NET_RAW` 与 `CAP_NET_BIND_SERVICE`，用于原始 ICMP 和低端口监听。两者的安装脚本与部署工具检查 ICMP 能力，包含 systemd override 的实际生效配置；升级会 reload unit，但不会重启原本运行的服务。
 
 Proxy 不需要特权端口或证书文件，使用 `DynamicUser=true`，并额外启用只读系统目录、隐藏 home 和私有设备等限制。Dashboard 本身不打开原始 socket；发布它的 Agent 仍需要上述探测权限。
 
@@ -376,6 +380,6 @@ systemctl show relayweave-node.service -p AmbientCapabilities -p CapabilityBound
 
 ## Dashboard 独立服务
 
-Dashboard 通过 `relayweave-dashboard` 包独立安装，由专用用户运行。配置位于 `/etc/relayweave/dashboard.json`，证书位于 `/etc/relayweave/dashboard-certs/`，历史数据库位于 `/var/lib/relayweave-dashboard/history.sqlite3`。首次安装启用 unit 但不立即启动；准备证书并编辑配置后执行 `sudo systemctl enable --now relayweave-dashboard`。包升级只重启已运行的看板服务，卸载不主动清理历史库。
+Dashboard 通过 `relayweave-dashboard` 包独立安装，由专用用户运行。配置位于 `/etc/relayweave/dashboard.json`，证书位于 `/etc/relayweave/dashboard-certs/`，历史数据库位于 `/var/lib/relayweave-dashboard/history.sqlite3`。首次安装启用 unit 但不立即启动；准备证书并编辑配置后执行 `sudo systemctl enable --now relayweave-dashboard`。包升级或重复安装不启动或重启看板服务，保留开机启动设置；手动重启或下次开机启动时加载新程序。卸载不主动清理历史库。
 
 服务默认监听服务器的 `127.0.0.1:5000`。由同机 Agent 的 `services` 发布 `dashboard`，客户端 Agent 用 `forwards` 监听 `127.0.0.1:15000`，浏览器即可访问 `http://127.0.0.1:15000/`。Node 无需新增功能或配置字段，客户端无需安装 Python。详细的证书权限、发布/消费配置和历史迁移步骤见 [Dashboard 部署说明](../dashboard/README.md#独立服务部署)。
