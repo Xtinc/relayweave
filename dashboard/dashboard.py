@@ -107,7 +107,8 @@ def api_snapshot():
     if "bandwidth_until" in request.args:
         bounds["traffic_until"] = traffic_until
     snap = _client.snapshot(queue_since, traffic_since, **bounds)
-    flow_map = _flow_renderer.render(snap.flow_map, flow_service, flow_protocol)
+    topology = _topology_snapshot(snap.topology, time.monotonic(), snap.connected)
+    flow_map = _flow_renderer.render(snap.flow_map, flow_service, flow_protocol, topology=topology)
     nodes = [_node_snapshot(node, now) for node in snap.nodes.values()]
     nodes.sort(key=lambda node: node["node_id"])
     connected_nodes, total_nodes = _cluster_counts(snap)
@@ -124,7 +125,7 @@ def api_snapshot():
             "entry_node_id": snap.entry_node_id,
             "entry_peer": snap.peer,
             "entry_error": snap.last_error,
-            "topology": _topology_snapshot(snap.topology, time.monotonic(), snap.connected),
+            "topology": topology,
             "flow_map": flow_map,
         }
     )
@@ -221,6 +222,7 @@ def _topology_snapshot(snap, now: float, connected: bool) -> dict | None:
                 "control_queue_delay_us": node.control_queue_delay_us if node.node_id in reporting_nodes and not stale else None,
                 "transfer_tcp_queue_delay_us": node.transfer_tcp_queue_delay_us if node.node_id in reporting_nodes and not stale else None,
                 "transfer_udp_queue_delay_us": node.transfer_udp_queue_delay_us if node.node_id in reporting_nodes and not stale else None,
+                "available": node.available if node.node_id in reporting_nodes and not stale else None,
             }
             for node in snap.nodes
         ],

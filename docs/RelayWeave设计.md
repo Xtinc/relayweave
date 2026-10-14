@@ -842,9 +842,10 @@ Agent 和 Dashboard 使用相同规则，以单调时钟的“请求开始时间
 没有匹配请求身份的非法回复不终止当前请求。Dashboard 还保存最高已接受请求编号，同版本的
 完整回复也推进水位，防止迟到回复恢复旧 epoch。断线使当前结果失效，历史记录与 HTTP 游标继续使用墙钟。
 
-Dashboard 页面先展示集群状态，再展示所选 Node 的五项健康指标和自适应排队/带宽图表、集群当前 Flow 交通图，最后展示集群服务。
+Dashboard 页面先展示集群状态和当前 Flow 交通图，再展示所选 Node 的五项精简健康指标及排队/带宽图表，最后展示集群服务。Node 选择器位于健康指标区域，页头只标识采集入口。
 交通图展示已 Ready 的 Single 和 Multi 业务，独立于健康指标选择；拓扑采集提供成员、当前排队值和 API 链路质量；API 根据成本生成展示分数
 `100 × exp(−cost / 100)`，线协议不发送 score，Python 不重新计算质量模型。
+车站圆环显示节点配置带宽占用，圆心显示 `available` 带宽余量；报告过期或断开时显示未知。路线线宽按业务连接数采用固定平方根尺度，车站业务数量按途经路径计数一次，部分采集显示数量下界。详情只显示端点、路径、数量和余量，不展示 UUID、epoch 或 Flow ID。
 
 ## 5. 数据面：接入、逻辑流与邻接传输
 
@@ -2796,7 +2797,7 @@ Flow→Producer 在 socket 写入后累计 TX，首 Node 和中间 Node 不重�
 Single 报告 mode、service、protocol、uuid、consumer_peer、producer_peer。Multi 首节点报告 mode、role=ingress、service、protocol、epoch、flow_id、agent_peer 和完整有序 path；末节点报告 role=egress 和 Producer 的 agent_peer，不报告 path。
 Python 按同一 server.cluster 请求轮次收集；已知成员全部回复后发布，三个周期仍缺报则发布部分结果并列出缺报节点。Multi 按 epoch + flow_id 拼接，并验证服务、协议和路径端点；未拼齐的业务不生成路线。
 每轮替换业务集合，空数组清理旧业务，断线使当前业务失效，成员或 epoch 变化清理旧轮次。同端点、服务、协议和有序路径合并成一条线路，业务 ID 转为字符串。
-`dashboard/flow_map.py` 集中实现拼接、合并、确定性 BFS 网格布局和转义 SVG；页面处理筛选、选择、缩放、拖动与恢复全图。Flow 数据只存在内存，不写入历史 SQLite。
+`dashboard/flow_map.py` 集中实现拼接、合并、车站计数、确定性 BFS 网格布局和转义 SVG；页面处理车站及路线选择，不提供筛选、缩放或拖动控件。车站使用拓扑已有的 `available` 字段显示带宽余量，路线按连接数显示线宽。空闲成员仍显示车站，图幅过大时可在图内滚动，保证标签可读。Flow 数据只存在内存，不写入历史 SQLite。
 Node 与 Dashboard 统一升级，不支持缺失 relays 的旧报告；Agent 无需为本功能修改。完整字段和接口见 [Dashboard 说明](../dashboard/README.md#current-flows)。
 
 ### A.4 Topology 与 AgentRouting：成员、质量与快照

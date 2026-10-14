@@ -9,6 +9,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import hashlib
 import json
+import math
 import threading
 import xml.etree.ElementTree as ET
 
@@ -208,22 +209,38 @@ class FlowMapRenderer:
         self._signature = None
         self._geometry = None
 
-    def render(self, snapshot: dict, service: str = "", protocol: str = "") -> dict:
+    def render(self, snapshot: dict, service: str = "", protocol: str = "", *, topology: dict | None = None) -> dict:
         routes = [route for route in snapshot["routes"]
                   if (not service or route["service"] == service) and (not protocol or route["protocol"] == protocol)]
-        signature = tuple(sorted(route["id"] for route in routes))
+        members = {node["node_id"]: node for node in (topology or {}).get("nodes", [])}
+        node_ids = sorted(set(members) | {node for route in routes for node in route["path"]})
+        routes_by_node = defaultdict(list)
+        for route in routes:
+            for node in route["path"]:
+                routes_by_node[node].append(route)
+        stations = []
+        for node in node_ids:
+            station_routes = routes_by_node[node]
+            stations.append({"node_id": node, "available": (members.get(node, {}).get("available")
+                                                            if not (topology or {}).get("stale") else None),
+                             "connection_count": (sum(route["count"] for route in station_routes)
+                                                  if snapshot["state"] in {"ready", "partial"} else None),
+                             "partial": snapshot["partial"], "route_ids": [route["id"] for route in station_routes]})
+        signature = (tuple(sorted(route["id"] for route in routes)), tuple(node_ids))
         with self._lock:
             if signature != self._signature:
-                self._signature, self._geometry = signature, self._layout(routes)
+                self._signature, self._geometry = signature, self._layout(routes, node_ids)
             geometry = self._geometry
         return {**snapshot, "routes": routes, "visible_route_count": len(routes),
                 "visible_flow_count": sum(route["count"] for route in routes),
                 "services": sorted({route["service"] for route in snapshot["routes"]}),
-                "svg": self._svg(routes, geometry)}
+                "nodes": stations, "svg": self._svg(routes, geometry, stations)}
 
     @staticmethod
-    def _layout(routes: list[dict]) -> tuple:
+    def _layout(routes: list[dict], node_ids=()) -> tuple:
         graph = defaultdict(set)
+        for node in node_ids:
+            graph[node]
         agents = {}
         for route in routes:
             for node in route["path"]:
@@ -241,6 +258,8 @@ class FlowMapRenderer:
         positions = {}
         remaining = set(graph)
         base = 65
+        idle_nodes = sorted(node for node in graph if not graph[node] and not by_node[node])
+        remaining.difference_update(idle_nodes)
         while remaining:
             root = min(remaining)
             levels = {root: 0}
@@ -259,19 +278,23 @@ class FlowMapRenderer:
             for row in range(rows):
                 row_nodes = [nodes[row] for nodes in columns.values() if row < len(nodes)]
                 for node in row_nodes:
-                    x, y = 225 + levels[node] * 430, base
+                    x, y = 225 + levels[node] * 320, base
                     positions["node:" + node] = (x, y)
                     for index, key in enumerate(by_node[node]):
                         side = -1 if agents[key]["roles"] == {"consumer"} else 1
                         positions[key] = (x + side * 120, y + 85 + index * 65)
                 base += 160 + max((len(by_node[node]) for node in row_nodes), default=0) * 65
             base += 70
+        idle_base = max((y for x, y in positions.values()), default=-35) + 100
+        for index, node in enumerate(idle_nodes):
+            positions["node:" + node] = (100 + index % 3 * 240, idle_base + index // 3 * 130)
         lanes = defaultdict(list)
         for route in sorted(routes, key=lambda r: r["id"]):
             stations = _stations(route)
             for index, (left, right) in enumerate(zip(stations, stations[1:])):
                 lanes[tuple(sorted((left, right)))].append((route["id"], index))
-        offsets = {track: (index - (len(tracks) - 1) / 2) * 7
+        # Leave room for the widest count-encoded line without relaying out on refresh.
+        offsets = {track: (index - (len(tracks) - 1) / 2) * 22
                    for tracks in lanes.values() for index, track in enumerate(tracks)}
         polylines = {}
         for route in routes:
@@ -296,18 +319,20 @@ class FlowMapRenderer:
         positions = {key: (x + shift_x, y + shift_y) for key, (x, y) in positions.items()}
         width = max(max((x for x, y in positions.values()), default=480) + 215,
                     max((x + shift_x for x, y in all_points), default=0) + 35)
-        height = max(max((y for x, y in positions.values()), default=100) + 65,
+        height = max(max((y for x, y in positions.values()), default=100) + 85,
                      max((y + shift_y for x, y in all_points), default=0) + 35)
         paths = {key: " ".join(_rounded_path([(x + shift_x, y + shift_y) for x, y in points])
                               for points in segments) for key, segments in polylines.items()}
         return positions, agents, paths, width, height
 
     @staticmethod
-    def _svg(routes: list[dict], geometry: tuple) -> str:
+    def _svg(routes: list[dict], geometry: tuple, stations: list[dict]) -> str:
         positions, agents, paths, width, height = geometry
+        nodes = {station["node_id"]: station for station in stations}
         svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "class": "flow-svg",
-                                 "viewBox": f"0 0 {width} {height}", "role": "img",
-                                 "aria-label": "Current relay routes"})
+                                 "viewBox": f"0 0 {width} {height}", "width": str(width), "height": str(height),
+                                 "style": f"min-width:{width * .92:.0f}px", "role": "group",
+                                 "aria-label": "Current relay routes and Node bandwidth headroom"})
         layer = ET.SubElement(svg, "g", {"class": "flow-scene"})
         for route in routes:
             line = ET.SubElement(layer, "g", {"class": "flow-line", "data-route": route["id"],
@@ -317,13 +342,37 @@ class FlowMapRenderer:
                 f'{route["service"]} / {route["protocol"].upper()} · {route["count"]} connections\n'
                 + route["consumer"]["peer"] + " → " + " → ".join(route["path"]) + " → " + route["producer"]["peer"])
             ET.SubElement(line, "path", {"d": paths[route["id"]], "class": "flow-hit"})
-            ET.SubElement(line, "path", {"d": paths[route["id"]], "stroke": route["color"], "class": "flow-track"})
+            stroke_width = min(14, 3 + .8 * math.sqrt(route["count"]))
+            ET.SubElement(line, "path", {"d": paths[route["id"]], "stroke": route["color"],
+                                        "stroke-width": f"{stroke_width:.2f}", "class": "flow-track"})
         for key, (x, y) in sorted(positions.items()):
             station = ET.SubElement(layer, "g", {"class": "flow-station", "transform": f"translate({x} {y})"})
             if key.startswith("node:"):
                 name = key[5:]
-                ET.SubElement(station, "circle", {"r": "7", "class": "flow-node"})
-                title = "Node " + name
+                node = nodes[name]
+                available = node["available"]
+                count = node["connection_count"]
+                count_text = ("Connections pending" if count is None else
+                              f'{"≥ " if node["partial"] else ""}{count} connections')
+                headroom = "—" if available is None else f"{available:.0%}"
+                state = ("unknown" if available is None else "critical" if available < .1 else
+                         "warning" if available < .3 else "good")
+                station.set("data-node", name)
+                station.set("tabindex", "0")
+                station.set("role", "button")
+                station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom, {count_text}")
+                station.set("class", f"flow-station flow-node-station {state}")
+                ET.SubElement(station, "circle", {"r": "24", "class": "flow-node"})
+                if available is not None:
+                    circumference = 2 * math.pi * 24
+                    ET.SubElement(station, "circle", {"r": "24", "class": "flow-capacity",
+                                                      "transform": "rotate(-90)",
+                                                      "stroke-dasharray": f"{circumference * (1 - available):.3f} {circumference:.3f}"})
+                ET.SubElement(station, "text", {"y": "4", "text-anchor": "middle",
+                                                "class": "flow-headroom"}).text = headroom
+                ET.SubElement(station, "text", {"y": "64", "text-anchor": "middle",
+                                                "class": "flow-count"}).text = count_text
+                title = f"Node {name}\nBandwidth headroom: {headroom}\n{count_text}"
             else:
                 agent = agents[key]
                 name = agent["peer"]
@@ -331,6 +380,7 @@ class FlowMapRenderer:
                                                 "rx": "4", "class": "flow-agent"})
                 title = f'Agent {name} · {agent["node"]} · {" / ".join(sorted(agent["roles"]))}'
             ET.SubElement(station, "title").text = title
-            label = ET.SubElement(station, "text", {"x": "0", "y": "25", "text-anchor": "middle"})
+            label = ET.SubElement(station, "text", {"x": "0", "y": "46" if key.startswith("node:") else "25",
+                                                    "text-anchor": "middle", "class": "flow-label"})
             label.text = name if len(name) <= 25 else name[:22] + "…"
         return ET.tostring(svg, encoding="unicode")

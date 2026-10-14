@@ -164,6 +164,68 @@ class FlowMapTest(unittest.TestCase):
         self.assertIs(renderer._geometry, geometry)
         self.assertEqual(before["routes"][0]["id"], after["routes"][0]["id"])
         self.assertIn("2 connections", after["svg"])
+        ns = {"s": "http://www.w3.org/2000/svg"}
+        width = lambda result: float(ET.fromstring(result["svg"]).find(".//s:path[@class='flow-track']", ns).get("stroke-width"))
+        self.assertGreater(width(after), width(before))
+
+    def test_station_counts_each_business_once_and_includes_idle_members(self):
+        view = collect({"a": [half("ingress", 1), half("ingress", 2), single(3)], "b": [],
+                        "c": [half("egress", 1), half("egress", 2)]}).snapshot(True)
+        topology = {"nodes": [{"node_id": node, "available": available}
+                              for node, available in (("a", .64), ("b", .18), ("c", .79), ("idle", 1))]}
+        result = FlowMapRenderer().render(view, topology=topology)
+        nodes = {node["node_id"]: node for node in result["nodes"]}
+        self.assertEqual({node: data["connection_count"] for node, data in nodes.items()},
+                         {"a": 3, "b": 2, "c": 2, "idle": 0})
+        self.assertEqual(len(nodes["b"]["route_ids"]), 1)
+        self.assertEqual(nodes["b"]["available"], .18)
+        svg = ET.fromstring(result["svg"])
+        ns = {"s": "http://www.w3.org/2000/svg"}
+        self.assertEqual(len(svg.findall(".//s:circle[@class='flow-capacity']", ns)), 4)
+        self.assertIn('flow-node-station warning', result["svg"])
+        self.assertIn('18%', result["svg"])
+
+    def test_capacity_only_changes_reuse_layout_and_stale_values_are_unknown(self):
+        view = collect({"a": [single()]}).snapshot(True)
+        topology = {"nodes": [{"node_id": "a", "available": .8}]}
+        renderer = FlowMapRenderer()
+        first = renderer.render(view, topology=topology)
+        geometry = renderer._geometry
+        topology["nodes"][0]["available"] = .05
+        second = renderer.render(view, topology=topology)
+        self.assertIs(renderer._geometry, geometry)
+        self.assertIn('flow-node-station critical', second["svg"])
+        self.assertNotEqual(first["svg"], second["svg"])
+        topology["stale"] = True
+        stale = renderer.render(view, topology=topology)
+        self.assertIsNone(stale["nodes"][0]["available"])
+        self.assertNotIn('class="flow-capacity"', stale["svg"])
+        self.assertIn('flow-node-station unknown', stale["svg"])
+
+    def test_pending_disconnected_and_partial_counts_are_not_reported_as_complete(self):
+        topology = {"nodes": [{"node_id": "idle", "available": None}]}
+        renderer = FlowMapRenderer()
+        for connected in (True, False):
+            result = renderer.render(FlowCollection().snapshot(connected), topology=topology)
+            self.assertIsNone(result["nodes"][0]["connection_count"])
+            self.assertIn('Connections pending', result["svg"])
+        view = collect({"a": [single()]}).snapshot(True)
+        view.update(state="partial", partial=True)
+        result = renderer.render(view)
+        self.assertEqual(result["nodes"][0]["connection_count"], 1)
+        self.assertIn('≥ 1 connections', result["svg"])
+
+    def test_line_width_has_a_fixed_scale_and_cap(self):
+        view = collect({"a": [single()]}).snapshot(True)
+        renderer = FlowMapRenderer()
+        widths = []
+        for count in (1, 10, 100, 10000):
+            view["routes"][0]["count"] = count
+            result = renderer.render(view)
+            ns = {"s": "http://www.w3.org/2000/svg"}
+            widths.append(float(ET.fromstring(result["svg"]).find(".//s:path[@class='flow-track']", ns).get("stroke-width")))
+        self.assertEqual(widths, sorted(widths))
+        self.assertEqual(widths[-1], 14)
 
     def test_shared_horizontal_edges_use_distinct_rounded_tracks(self):
         view = collect({"a": [half("ingress", 1, path=["a", "c"]),

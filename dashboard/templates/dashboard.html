@@ -104,7 +104,7 @@
   main { padding: 20px 24px 48px; max-width: 1320px; margin: 0 auto; }
 
   .tile-row {
-    display: grid; gap: 16px;
+    display: grid; gap: 12px;
     grid-template-columns: repeat(5, minmax(0, 1fr));
     margin-bottom: 20px;
   }
@@ -122,23 +122,21 @@
   .tile {
     background: var(--surface-2);
     border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 16px 18px;
-    box-shadow: var(--shadow);
+    border-radius: 8px;
+    padding: 12px 14px;
   }
   .tile .label {
     color: var(--text-secondary); font-size: 12.5px;
     text-transform: none; letter-spacing: 0;
-    display: flex; align-items: flex-start; gap: 8px; min-height: 38px;
+    display: flex; align-items: flex-start; gap: 8px;
   }
   .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; margin-top: 4px; }
   .tile .value {
-    font-size: 30px; font-weight: 600; line-height: 1.15;
+    font-size: 24px; font-weight: 600; line-height: 1.15;
     margin-top: 8px; color: var(--text-primary);
     font-variant-numeric: tabular-nums;
   }
   .tile .sub { color: var(--text-muted); font-size: 12px; margin-top: 4px; font-variant-numeric: tabular-nums; }
-  .tile .spark { margin-top: 10px; height: 34px; width: 100%; display: block; }
 
   .chart-row { display: grid; gap: 16px; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 20px; }
   .chart-row .card { min-width: 0; }
@@ -179,12 +177,9 @@
   svg.chart { width: 100%; height: 240px; display: block; overflow: visible; }
   svg.chart .gridline { stroke: var(--gridline); stroke-width: 1; shape-rendering: crispEdges; }
   svg.chart .axis     { stroke: var(--baseline); stroke-width: 1; shape-rendering: crispEdges; }
-  svg.chart .tick, svg.spark .tick { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-  /* .series is scoped to BOTH chart and sparkline: the line path must have
-     fill:none, or SVG defaults it to black and fills the polygon closed by
-     start->end (the "black triangle" artifact on sparklines). */
-  svg.chart .series, svg.spark .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
-  svg.chart .marker, svg.spark .marker { stroke: var(--surface-2); stroke-width: 2; }
+  svg.chart .tick { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  svg.chart .series { fill: none; stroke-width: 2; stroke-linejoin: round; stroke-linecap: round; }
+  svg.chart .marker { stroke: var(--surface-2); stroke-width: 2; }
   svg.chart .crosshair{ stroke: var(--text-muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: 0; }
   svg.chart .hover-hit{ fill: transparent; cursor: crosshair; }
   svg.chart { touch-action: none; user-select: none; }
@@ -288,28 +283,44 @@
   }
   .footer-note { color: var(--text-muted); font-size: 12px; margin-top: 24px; }
   .stale { opacity: 0.5; transition: opacity 0.3s; }
-  .flow-viewport { height:420px; overflow:hidden; border:1px solid var(--border); border-radius:8px; }
-  .flow-svg { width:100%; height:100%; display:block; }
-  .flow-track { fill:none; stroke-width:4; stroke-linejoin:round; stroke-linecap:round; }
-  .flow-hit { fill:none; stroke:transparent; stroke-width:18; cursor:pointer; }
+  .flow-card { margin-bottom:24px; }
+  .flow-viewport { max-height:540px; overflow:auto; background:var(--surface-1); border-radius:8px; }
+  .flow-svg { width:100%; height:auto; display:block; }
+  .flow-track { fill:none; stroke-linejoin:round; stroke-linecap:round; }
+  .flow-hit { fill:none; stroke:transparent; stroke-width:20; cursor:pointer; }
   .flow-line { cursor:pointer; }
   .flow-line.dimmed { opacity:.18; }
-  .flow-line.selected .flow-track, .flow-line:focus .flow-track { stroke-width:7; }
-  .flow-line:focus { outline:none; }
+  .flow-line.selected .flow-track, .flow-line:focus .flow-track { filter:drop-shadow(0 0 2px var(--text-muted)); }
+  .flow-line:focus-visible, .flow-node-station:focus-visible { outline:2px solid var(--series-1); outline-offset:5px; }
   .flow-node, .flow-agent { fill:var(--surface-1); stroke:var(--text-primary); stroke-width:2; }
   .flow-station text { fill:var(--text-secondary); font-size:12px; paint-order:stroke; stroke:var(--surface-2); stroke-width:4; stroke-linejoin:round; }
+  .flow-node-station { cursor:pointer; }
+  .flow-node-station .flow-node { stroke:var(--baseline); stroke-width:5; }
+  .flow-node-station .flow-capacity { fill:none; stroke-width:5; }
+  .flow-node-station.good .flow-capacity { stroke:var(--status-good); }
+  .flow-node-station.warning .flow-capacity { stroke:var(--status-warning); }
+  .flow-node-station.critical .flow-capacity { stroke:var(--status-critical); }
+  .flow-node-station.selected .flow-node { fill:var(--surface-2); }
+  .flow-node-station.selected .flow-label { font-weight:600; fill:var(--text-primary); }
+  .flow-station .flow-headroom { fill:var(--text-primary); font-weight:600; stroke:none; }
+  .flow-key { color:var(--text-secondary); font-size:12px; margin:10px 0 0; }
   .flow-status { color:var(--text-secondary); font-size:12px; margin:8px 0 12px; }
-  .flow-legend { display:flex; flex-wrap:wrap; gap:7px; margin:12px 0; max-height:140px; overflow:auto; }
+  .flow-legend { display:flex; flex-wrap:wrap; gap:7px; margin:12px 0; }
   .flow-legend button {
     background:var(--surface-1); border:1px solid var(--border); border-left:5px solid;
     border-radius:7px; padding:6px 10px; color:var(--text-primary);
     cursor:pointer; font:inherit; font-size:12px;
   }
   .flow-legend button[aria-pressed="true"] { background:var(--surface-2); outline:2px solid var(--baseline); }
-  .flow-details { font-size:12px; color:var(--text-secondary); line-height:1.7; overflow-wrap:anywhere; max-height:220px; overflow:auto; }
+  .flow-details { font-size:13px; color:var(--text-secondary); line-height:1.7; overflow-wrap:anywhere; border-top:1px solid var(--border); padding-top:10px; }
   .flow-details strong { color:var(--text-primary); }
+  .flow-details dl { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:2px 14px; margin:8px 0; }
+  .flow-details dt { color:var(--text-secondary); }
+  .flow-details dd { margin:0; color:var(--text-primary); }
+  .flow-detail-route { display:block; background:none; border:0; color:var(--text-primary); padding:4px 0; font:inherit; text-align:left; cursor:pointer; text-decoration:underline; text-underline-offset:3px; }
   .flow-empty { display:grid; place-items:center; height:100%; padding:24px; text-align:center; box-sizing:border-box; color:var(--text-muted); }
-  @media (max-width:700px) { .flow-card .card-head { align-items:flex-start; flex-direction:column; } .flow-viewport { height:340px; } }
+  @media (pointer:coarse) { .flow-legend button, .flow-detail-route { min-height:44px; } }
+  @media (max-width:700px) { .flow-viewport { max-height:420px; } }
 </style>
 </head>
 <body class="viz-root">
@@ -321,16 +332,30 @@
       <span class="dot"></span><span class="label" id="conn-label">disconnected</span>
     </span>
     <span class="spacer"></span>
-    <select class="svc-select node-select" id="node-select" aria-label="Selected server node"></select>
     <span class="peer" id="peer">—</span>
   </header>
 
   <main>
     <div class="error-banner" id="error-banner" style="display:none"></div>
 
+    <section class="card flow-card" aria-labelledby="flow-heading">
+      <div class="card-head">
+        <h2 id="flow-heading">Current Flows</h2>
+        <span class="hint">Across the cluster</span>
+      </div>
+      <div class="flow-status" id="flow-status" role="status">Waiting for current business reports</div>
+      <div class="flow-viewport" id="flow-viewport" aria-label="Current Flow map">
+        <div class="flow-empty">Waiting for reports</div>
+      </div>
+      <p class="flow-key">Node rings: bandwidth used · center: headroom · line width: connections · squares: Agents</p>
+      <div class="flow-legend" id="flow-legend" aria-label="Active routes"></div>
+      <div class="flow-details" id="flow-details" aria-live="polite">Select a Node or route for details.</div>
+    </section>
+
     <div class="section-head">
       <h2>Node health</h2>
-      <span class="hint" id="node-health-hint">Select a Node in the header</span>
+      <select class="svc-select node-select" id="node-select" aria-label="Node health selection"></select>
+      <span class="hint" id="node-health-hint">Select a Node</span>
     </div>
 
     <div class="tile-row">
@@ -338,19 +363,16 @@
         <div class="label"><span class="swatch" style="background:var(--series-1)"></span>Control queue</div>
         <div class="value" id="tile-cqd">—</div>
         <div class="sub">scheduler lag</div>
-        <svg class="spark" id="spark-cqd"></svg>
       </div>
       <div class="tile">
         <div class="label"><span class="swatch" style="background:var(--series-2)"></span>TCP transfer queue</div>
         <div class="value" id="tile-tcpqd">—</div>
         <div class="sub">scheduler lag</div>
-        <svg class="spark" id="spark-tcpqd"></svg>
       </div>
       <div class="tile">
         <div class="label"><span class="swatch" style="background:var(--series-4)"></span>UDP transfer queue</div>
         <div class="value" id="tile-udpqd">—</div>
         <div class="sub">scheduler lag</div>
-        <svg class="spark" id="spark-udpqd"></svg>
       </div>
       <div class="tile">
         <div class="label">Services registered</div>
@@ -368,8 +390,8 @@
       <div class="card">
         <div class="card-head">
           <span class="head-text">
-            <h2>Control &amp; transfer queue delay</h2>
-            <span class="hint">Control / TCP / UDP scheduling delay · µs</span>
+            <h2>Queue delay</h2>
+            <span class="hint">Selected Node · scheduling delay · µs</span>
           </span>
           <select class="range-select" data-chart="chart-queue" aria-label="Queue chart time range"></select>
         </div>
@@ -404,17 +426,6 @@
         </div>
       </div>
     </div>
-    <div class="card flow-card">
-      <div class="card-head">
-        <h2>Current Flows</h2>
-      </div>
-      <div class="flow-status" id="flow-status" role="status">Waiting for current business reports</div>
-      <div class="flow-viewport" id="flow-viewport" aria-label="Current Flow map">
-        <div class="flow-empty">Waiting for reports</div>
-      </div>
-      <div class="flow-legend" id="flow-legend" aria-label="Active routes"></div>
-      <div class="flow-details" id="flow-details">Select a route to inspect its connections.</div>
-    </div>
     <div class="card table-card">
       <div class="card-head">
         <h2>Registered services</h2>
@@ -447,7 +458,7 @@
       </div>
     </div>
 
-    <p class="footer-note">Services cover the whole cluster. Node health follows the Node selected in the header; bandwidth follows the selected service.</p>
+    <p class="footer-note">Flows and services cover the cluster. Queue delay follows the selected Node; bandwidth follows the selected service.</p>
   </main>
 </div>
 
@@ -535,47 +546,103 @@ function setChartView(cid, start, end){
 let bandwidthSelection = null;
 let selectedNodeKey = null;
 let flowSelected = null;
+let flowNodeSelected = null;
 let flowMapData = null;
 let flowSvgText = null;
 function selectFlow(id){
   flowSelected = flowSelected === id ? null : id;
+  flowNodeSelected = null;
   renderFlowSelection();
+}
+function selectFlowNode(id){
+  flowNodeSelected = flowNodeSelected === id ? null : id;
+  flowSelected = null;
+  renderFlowSelection();
+}
+function fmtHeadroom(value){
+  return value === null || value === undefined ? "—" : `${Math.round(value*100)}%`;
+}
+function flowConnectionCount(node){
+  return node.connection_count === null ? "Connections pending"
+    : `${node.partial ? "≥ " : ""}${node.connection_count} connections`;
+}
+function appendFlowFields(details, fields){
+  const list = document.createElement("dl");
+  fields.forEach(([label, value]) => {
+    const term = document.createElement("dt"), definition = document.createElement("dd");
+    term.textContent = label; definition.textContent = value;
+    list.append(term, definition);
+  });
+  details.append(list);
 }
 function renderFlowSelection(){
   const route = flowMapData?.routes.find(item => item.id === flowSelected);
+  const node = flowMapData?.nodes.find(item => item.node_id === flowNodeSelected);
   if(!route) flowSelected = null;
+  if(!node) flowNodeSelected = null;
   $("flow-viewport").querySelectorAll(".flow-line").forEach(line => {
-    line.classList.toggle("selected", line.dataset.route === flowSelected);
-    line.classList.toggle("dimmed", !!flowSelected && line.dataset.route !== flowSelected);
+    const selected = line.dataset.route === flowSelected || !!node?.route_ids.includes(line.dataset.route);
+    line.classList.toggle("selected", selected);
+    line.classList.toggle("dimmed", !!(route || node) && !selected);
+    line.setAttribute("aria-pressed", String(selected));
+  });
+  $("flow-viewport").querySelectorAll("[data-node]").forEach(station => {
+    station.classList.toggle("selected", station.dataset.node === flowNodeSelected);
+    station.setAttribute("aria-pressed", String(station.dataset.node === flowNodeSelected));
   });
   $("flow-legend").querySelectorAll("button").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.route === flowSelected)));
   const details = $("flow-details");
   details.replaceChildren();
-  if(!route){ details.textContent = "Select a route to inspect its connections. Circles: Nodes · squares: Agents. Traffic is bidirectional."; return; }
+  if(!route && !node){ details.textContent = "Select a Node or route for details. Traffic is bidirectional."; return; }
   const heading = document.createElement("strong");
+  if(node){
+    heading.textContent = `Node ${node.node_id} · ${flowConnectionCount(node)}`;
+    details.append(heading);
+    appendFlowFields(details, [
+      ["Bandwidth headroom", `${fmtHeadroom(node.available)} · estimated from configured bandwidth`],
+      ["Active routes", String(node.route_ids.length)],
+    ]);
+    node.route_ids.forEach(id => {
+      const item = flowMapData.routes.find(r => r.id === id);
+      const button = document.createElement("button"); button.type = "button"; button.className = "flow-detail-route";
+      button.textContent = `${item.service} / ${item.protocol.toUpperCase()} · ${item.count} connections`;
+      button.addEventListener("click", () => selectFlow(id)); details.append(button);
+    });
+    return;
+  }
   heading.textContent = `${route.service} / ${route.protocol.toUpperCase()} · ${route.count} connections`;
   details.append(heading);
-  const rows = [
-    `Consumer Agent: ${route.consumer.peer} @ ${route.consumer.node}`,
-    `Node path: ${route.path.join(" → ")}`,
-    `Producer Agent: ${route.producer.peer} @ ${route.producer.node}`,
-    ...route.businesses.map(business => business.mode === "single"
-      ? `Single · ${business.node} · UUID ${business.uuid}`
-      : `Multi · epoch ${business.epoch} · Flow ${business.flow_id}`),
-  ];
-  rows.forEach(text => { const row=document.createElement("div"); row.textContent=text; details.append(row); });
+  const pathNodes = route.path.map(id => flowMapData.nodes.find(item => item.node_id === id));
+  const headroom = pathNodes.every(item => item && item.available !== null)
+    ? Math.min(...pathNodes.map(item => item.available)) : null;
+  appendFlowFields(details, [
+    ["Consumer Agent", `${route.consumer.peer} @ ${route.consumer.node}`],
+    ["Node path", route.path.join(" → ")],
+    ["Producer Agent", `${route.producer.peer} @ ${route.producer.node}`],
+    ["Minimum Node headroom", fmtHeadroom(headroom)],
+  ]);
 }
 function renderFlowMap(map){
   flowMapData = map;
-  const messages = [`${map.flow_count} current connections · ${map.route_count} routes`];
+  const collected = map.state === "ready" || map.state === "partial";
+  const messages = collected
+    ? [`${map.partial ? "≥ " : ""}${map.flow_count} connections · ${map.route_count} routes · ${map.nodes.length} Nodes`]
+    : [];
   if(map.state === "disconnected") messages.push("Collection disconnected — current Flow data unavailable");
   if(map.state === "pending") messages.push("Waiting for a complete collection round");
   if(map.missing_nodes.length) messages.push(`Incomplete collection — missing: ${map.missing_nodes.join(", ")}`);
   if(map.unmatched_count) messages.push(`${map.unmatched_count} multi-node businesses awaiting matching endpoints`);
   $("flow-status").textContent = messages.join(" · ");
   const viewport = $("flow-viewport");
-  if(map.routes.length){
-    if(flowSvgText !== map.svg){ viewport.innerHTML = map.svg; flowSvgText = map.svg; }
+  if(map.routes.length || map.nodes.length){
+    if(flowSvgText !== map.svg){
+      const active = document.activeElement;
+      const focused = viewport.contains(active) && (active.dataset.node
+        ? `[data-node="${CSS.escape(active.dataset.node)}"]` : active.dataset.route
+        ? `[data-route="${CSS.escape(active.dataset.route)}"]` : null);
+      viewport.innerHTML = map.svg; flowSvgText = map.svg;
+      if(focused) viewport.querySelector(focused)?.focus({preventScroll:true});
+    }
   }else{
     flowSvgText = null;
     const empty = document.createElement("div"); empty.className = "flow-empty";
@@ -589,19 +656,26 @@ function renderFlowMap(map){
   map.routes.forEach(route => {
     const button = document.createElement("button"); button.type="button"; button.dataset.route=route.id;
     button.style.borderLeftColor=route.color;
-    button.textContent=`${route.service} / ${route.protocol.toUpperCase()} · ${route.count}`;
+    button.textContent=`${route.service} / ${route.protocol.toUpperCase()} · ${route.count} connections`;
     button.title=`${route.consumer.peer} → ${route.path.join(" → ")} → ${route.producer.peer}`;
     button.addEventListener("click", ()=>selectFlow(route.id)); legend.append(button);
   });
   renderFlowSelection();
 }
 $("flow-viewport").addEventListener("click", event=>{
+  const node=event.target.closest("[data-node]");
+  if(node){ selectFlowNode(node.dataset.node); return; }
   const line=event.target.closest("[data-route]");
   if(line) selectFlow(line.dataset.route);
 });
 $("flow-viewport").addEventListener("keydown", event=>{
+  if(event.key !== "Enter" && event.key !== " ") return;
+  const node=event.target.closest("[data-node]");
   const line=event.target.closest("[data-route]");
-  if(line && (event.key === "Enter" || event.key === " ")){ event.preventDefault(); selectFlow(line.dataset.route); }
+  if(node || line){
+    event.preventDefault();
+    if(node) selectFlowNode(node.dataset.node); else selectFlow(line.dataset.route);
+  }
 });
 
 function windowHistory(hist, domain){
@@ -728,12 +802,6 @@ function linePathGapped(pts, gaps){
   });
   return d.trim();
 }
-function areaPath(pts, baseY){
-  if(!pts.length) return "";
-  return linePath(pts) + " L" + pts[pts.length-1].x.toFixed(2) + " " + baseY.toFixed(2)
-       + " L" + pts[0].x.toFixed(2) + " " + baseY.toFixed(2) + " Z";
-}
-
 function niceTicks(min, max, count){
   if(min===max){ min=min-1; max=max+1; }
   const span = max - min;
@@ -773,28 +841,6 @@ function niceCeil(v){
     else ceil = 1.5 * mag * 10;
   }
   return ceil;
-}
-
-// Draw a sparkline: area wash + line + end-dot. The area path carries its own
-// fill; the line path must end up with fill:none (see the .series rule, which
-// is scoped to both svg.chart and svg.spark) — otherwise SVG defaults the line
-// path's fill to black and it fills the polygon closed by start->end.
-function drawSpark(svg, values, colorVar){
-  const w = svg.clientWidth || 200, h = svg.clientHeight || 34;
-  svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
-  const color = cs(colorVar);
-  const clean = values.filter(v => v !== UNSET);
-  if(clean.length < 2){ svg.innerHTML = ""; return; }
-  const max = Math.max(...clean);
-  const yMax = niceCeil(max) || 1;
-  const sx = makeScale(0, values.length-1, 2, w-2);
-  const sy = makeScale(0, yMax, h-3, 3);
-  const pts = values.map((v,i)=> v===UNSET ? null : {x:sx(i),y:sy(v)}).filter(Boolean);
-  const area = areaPath(pts, h-3);
-  svg.innerHTML =
-    `<path d="${area}" fill="${color}" opacity="0.10"/>` +
-    `<path class="series" stroke="${color}" d="${linePath(pts)}"/>` +
-    `<circle class="marker" cx="${pts[pts.length-1].x.toFixed(2)}" cy="${pts[pts.length-1].y.toFixed(2)}" r="3" fill="${color}"/>`;
 }
 
 // Draw a full chart with axes + crosshair tooltip. series: [{name,colorVar,key(xData)}]
@@ -1041,7 +1087,7 @@ function render(data){
     ? (data.topology.nodes || []).find(item => item.node_id === node.node_id)
     : null;
   $("node-health-hint").textContent = node ? nodeName(node) + " · " + nodeState(node) : "Waiting for Node reports";
-  $("peer").textContent = topologyNode ? topologyNode.address : (data.entry_peer || "—");
+  $("peer").textContent = data.entry_node_id ? "Entry: " + data.entry_node_id : (data.entry_peer || "—");
   const hist = node ? node.history || [] : [];
   const last = topologyNode ? {
     cqd:topologyNode.control_queue_delay_us,
@@ -1056,11 +1102,6 @@ function render(data){
   $("tile-svc-sub").textContent = node ? "on " + nodeName(node) + " · refreshed " + fmtAge(node.service_traffic_age_s) : "waiting for reports";
   $("tile-up").textContent = !node || node.uptime_s === null ? "—" : fmtUptime(node.uptime_s);
   $("tile-up-sub").textContent = node ? "report refreshed " + fmtAge(node.report_age_s) : "waiting for reports";
-
-  const win = hist.slice(-60);
-  drawSpark($("spark-cqd"), win.map(p=>p.cqd), "--series-1");
-  drawSpark($("spark-tcpqd"), win.map(p=>p.tcp_qd), "--series-2");
-  drawSpark($("spark-udpqd"), win.map(p=>p.udp_qd), "--series-4");
 
   const queueDomain = chartDomain("chart-queue", renderNow);
   const queueHist = windowHistory(hist, queueDomain);

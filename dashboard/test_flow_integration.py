@@ -44,6 +44,8 @@ class Control:
     def __init__(self, context, address, port):
         raw = socket.create_connection((address, port), timeout=5)
         self.socket = context.wrap_socket(raw, server_hostname="localhost")
+        # Link/relay setup can take ten seconds; do not time out the observer first.
+        self.socket.settimeout(15)
         self.receiver = MessageReceiver()
 
     def send(self, command, params=None):
@@ -221,18 +223,34 @@ class LiveFlowTest(unittest.TestCase):
                 stream.close()
         return close
 
-    def test_all_protocols_single_and_multi_publish_and_clear(self):
-        for protocol in ("tcp", "tls", "udp"):
-            for path in (["a"], ["a", "b", "c"]):
-                with self.subTest(protocol=protocol, path=path):
-                    close = self.open_business(protocol, path)
-                    view = self.wait_map(lambda item: item["flow_count"] == 1 and item["state"] == "ready")
+    def assert_protocol_businesses(self, protocol):
+        for path in (["a"], ["a", "b", "c"]):
+            with self.subTest(protocol=protocol, path=path):
+                close = self.open_business(protocol, path)
+                try:
+                    view = self.wait_map(lambda item: item["flow_count"] == 1 and item["state"] == "ready"
+                                         and all(station["available"] is not None for station in item["nodes"]))
                     self.assertEqual(view["routes"][0]["path"], path)
                     self.assertEqual(view["routes"][0]["protocol"], protocol)
                     self.assertEqual(view["routes"][0]["consumer"]["node"], path[0])
                     self.assertEqual(view["routes"][0]["producer"]["node"], path[-1])
+                    stations = {node["node_id"]: node for node in view["nodes"]}
+                    self.assertEqual(set(stations), {"a", "b", "c"})
+                    self.assertEqual({node: station["connection_count"] for node, station in stations.items()},
+                                     {node: int(node in path) for node in stations})
+                    self.assertTrue(all(station["available"] is not None for station in stations.values()))
+                finally:
                     close()
-                    self.wait_map(lambda item: item["flow_count"] == 0 and item["state"] == "ready")
+                self.wait_map(lambda item: item["flow_count"] == 0 and item["state"] == "ready")
+
+    def test_tcp_single_and_multi_publish_and_clear(self):
+        self.assert_protocol_businesses("tcp")
+
+    def test_tls_single_and_multi_publish_and_clear(self):
+        self.assert_protocol_businesses("tls")
+
+    def test_udp_single_and_multi_publish_and_clear(self):
+        self.assert_protocol_businesses("udp")
 
     def test_same_route_connections_merge_and_filter_in_python(self):
         close_one = self.open_business("tcp", ["a", "b", "c"])

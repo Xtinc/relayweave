@@ -77,6 +77,7 @@ class TopologyNode:
     control_queue_delay_us: int | None
     transfer_tcp_queue_delay_us: int | None
     transfer_udp_queue_delay_us: int | None
+    available: float | None = None
 
 
 @dataclass(frozen=True)
@@ -661,6 +662,9 @@ class ProxyControlClient:
             address = entry.get("address")
             if not isinstance(node_id, str) or not node_id or not isinstance(address, str) or not address:
                 raise ValueError("topology.snapshot node identity is invalid")
+            available = self._nullable_number(entry, "available")
+            if available is not None and available > 1:
+                raise ValueError("topology.snapshot.available is out of range")
             nodes.append(
                 TopologyNode(
                     node_id=node_id,
@@ -675,6 +679,7 @@ class ProxyControlClient:
                     transfer_udp_queue_delay_us=self._nullable_unsigned(
                         entry, "transfer_udp_queue_delay_us", QUEUE_DELAY_UNSET
                     ),
+                    available=available,
                 )
             )
 

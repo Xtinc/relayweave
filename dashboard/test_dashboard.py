@@ -116,6 +116,7 @@ def _topology(
                     "control_queue_delay_us": 1,
                     "transfer_tcp_queue_delay_us": 2,
                     "transfer_udp_queue_delay_us": 3,
+                    "available": .25,
                 } for identity in ("node-a", "node-b")
             ],
             "links": [
@@ -427,6 +428,7 @@ class ClusterPollingTest(unittest.TestCase):
                 topology = client.snapshot(None, None).topology
                 self.assertIsNotNone(topology)
                 self.assertEqual(topology.version, 7)
+                self.assertTrue(all(node.available == .25 for node in topology.nodes))
                 self.assertEqual({node.node_id for node in topology.nodes}, {"node-a", "node-b"})
                 self.assertEqual(
                     {(link.source, link.destination) for link in topology.links},
@@ -464,9 +466,62 @@ class ClusterPollingTest(unittest.TestCase):
                 self.assertFalse(rendered["stale"])
                 self.assertTrue(all(not link["usable"] for link in rendered["links"]))
                 self.assertTrue(all(node["control_queue_delay_us"] is None for node in rendered["nodes"]))
+                self.assertTrue(all(node["available"] is None for node in rendered["nodes"]))
                 self.assertAlmostEqual(rendered["links"][0]["quality_score"], 100 * math.exp(-0.25))
                 self.assertFalse(dashboard_module._topology_snapshot(topology, 100.0, False)["links"][0]["usable"])
                 self.assertTrue(dashboard_module._topology_snapshot(topology, 115.0, True)["stale"])
+            finally:
+                client.stop()
+                client._history_store.close()
+
+    def test_node_headroom_is_published_to_api_and_invalidated_on_expiry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(directory)
+            sock = _Socket()
+            try:
+                client._set(connected=True)
+                with patch("proxy_client.time.monotonic", return_value=100.0):
+                    client._poll_once(sock)
+                    request = _request_id(sock.outgoing)
+                    client._handle_message(sock, _topology(request))
+                    for node in ("node-a", "node-b"):
+                        client._handle_message(sock, _status(request, node))
+                with patch.object(dashboard_module, "_client", client), patch("dashboard.time.monotonic", return_value=101.0):
+                    response = dashboard_module.app.test_client().get("/api/snapshot")
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(all(node["available"] == .25 for node in response.json["topology"]["nodes"]))
+                stations = response.json["flow_map"]["nodes"]
+                self.assertEqual(len(stations), 2)
+                self.assertTrue(all(node["available"] == .25 and node["connection_count"] == 0 for node in stations))
+                self.assertIn('25%', response.json["flow_map"]["svg"])
+                with patch.object(dashboard_module, "_client", client), patch("dashboard.time.monotonic", return_value=116.0):
+                    expired = dashboard_module.app.test_client().get("/api/snapshot").json
+                self.assertTrue(all(node["available"] is None for node in expired["flow_map"]["nodes"]))
+                self.assertNotIn('class="flow-capacity"', expired["flow_map"]["svg"])
+            finally:
+                client.stop()
+                client._history_store.close()
+
+    def test_headroom_validation_and_unknown_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            client = self.make_client(directory)
+            sock = _Socket()
+            try:
+                for value in (-.1, 1.1, float("nan"), float("inf"), True, "0.5"):
+                    with self.subTest(value=value):
+                        sock.outgoing.clear()
+                        client._poll_once(sock)
+                        message = _topology(_request_id(sock.outgoing))
+                        message.params["nodes"][0]["available"] = value
+                        with self.assertRaises(ValueError):
+                            client._record_topology_snapshot(message.params)
+                sock.outgoing.clear()
+                client._poll_once(sock)
+                message = _topology(_request_id(sock.outgoing))
+                message.params["nodes"][0]["available"] = None
+                message.params["nodes"][1].pop("available")
+                client._record_topology_snapshot(message.params)
+                self.assertTrue(all(node.available is None for node in client.snapshot(None, None).topology.nodes))
             finally:
                 client.stop()
                 client._history_store.close()

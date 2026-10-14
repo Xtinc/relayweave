@@ -87,9 +87,10 @@ TCP, and UDP executor queue delays every five seconds. The Master replaces a
 complete versioned snapshot after membership or report changes; raw ICMP
 samples are not centralized.
 
-The page starts with cluster status, followed by the selected Node's five
-health metrics and responsive queue/bandwidth charts, the cluster-wide Current Flows
-metro map, then registered services. The map shows established TCP/TLS/UDP
+The page starts with cluster status and the cluster-wide Current Flows metro
+map, followed by the selected Node's five compact health metrics and responsive
+queue/bandwidth charts, then registered services. The Node picker belongs to
+the health section; the header identifies the collection entry. The map shows established TCP/TLS/UDP
 businesses, independently of the selected health Node. Agent route calculations,
 per-ingress candidate costs, and connection establishment are recorded in Agent logs. Topology collection still supplies
 current membership and queue values; the API retains link quality data. The score
@@ -119,15 +120,39 @@ no inferred route. Disconnects clear current availability; membership or epoch
 changes invalidate old rounds. Empty reports remove closed businesses.
 
 `/api/snapshot` includes `flow_map`: collection state, missing Nodes, unmatched
-count, business/route counts, route details and escaped SVG. Optional
+count, business/route counts, route details, Node station summaries and escaped SVG. Optional
 `flow_service` and `flow_protocol` query parameters filter the map in Python.
 Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
 Agents, service, protocol and ordered Node path merge and list every business ID.
 Agent stations are identified by attachment Node plus control IP:port; Nodes
-share stations. Geometry and colors are deterministic, and count-only refreshes
-retain coordinates. The map always fits all current routes and preserves valid
-route selection. Click a route or legend entry for details. Current Flows has
-no filter, pan, or zoom controls. Flow data is only held in memory
+share stations. Geometry and colors are deterministic; count and capacity updates
+retain coordinates. Line width uses a fixed `min(14, 3 + 0.8 * sqrt(count))`
+pixel scale for business connection count. Parallel tracks reserve space for
+the maximum width, so count updates do not move other routes.
+
+Each station has a fixed-size ring showing bandwidth used (`1 - available`),
+with the estimated remaining percentage in its center. Headroom is green at
+30% or above, amber from 10% to 30%, and red below 10%; missing or expired
+capacity has a gray ring and a dash. The Node-provided `available` ratio is
+already in `topology.snapshot`; Dashboard retains it in `topology.nodes` and
+`flow_map.nodes`. This is remaining configured Node bandwidth, not measured
+NodeLink capacity or an absolute Mbps value. Snapshot/source-report ages of
+15 seconds or a collection disconnect invalidate the ratio.
+
+`flow_map.nodes` includes `node_id`, `available`, `connection_count`, `partial`
+and `route_ids`. Stations include idle topology members. Connection count sums
+the displayed businesses that traverse the Node once each, including intermediate
+Nodes; it does not sum both incident hops. Pending or disconnected collections
+have unknown counts, and partial rounds display known counts as lower bounds.
+These counts describe businesses rather than physical NodeLinks.
+
+The map preserves valid route/Node selection and keyboard focus on refreshed
+stations. Click a route or legend entry for service, connection count, Agent
+endpoints, path and minimum Node headroom; protocol UUIDs, epochs and Flow IDs
+remain available in the API but are not displayed. Click a Node to highlight
+its routes and inspect its headroom and connection count. Larger maps scroll
+within the map area to keep labels readable. Current Flows has no filter, pan,
+or zoom controls. Flow data is only held in memory
 and is not added to SQLite history.
 
 Run the live three-Node tests with `RELAYWEAVE_NODE_BINARY` set to the built
@@ -283,9 +308,10 @@ python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 
 ## Dashboard design
 
-The header selector chooses the node shown by the metric tiles and charts.
+The Node health selector chooses the node shown by the metric tiles and queue chart.
 The registered-services table combines services from all discovered nodes.
-Five health metrics follow the table; queue-delay and per-service bandwidth
+The cluster Flow map comes first, with five compact health metrics below it;
+queue-delay and per-service bandwidth
 charts share a row on wide screens and stack on narrow screens.
 Queue history is sampled from the Master's immutable
 topology snapshots rather than duplicated `server.cluster` fields.
