@@ -126,9 +126,10 @@ Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
 Agents, service, protocol and ordered Node path merge and list every business ID.
 Agent stations are identified by attachment Node plus control IP:port; Nodes
 share stations. Geometry and colors are deterministic; count and capacity updates
-retain coordinates. Line width uses a fixed `min(14, 3 + 0.8 * sqrt(count))`
-pixel scale for business connection count. Parallel tracks reserve space for
-the maximum width, so count updates do not move other routes.
+retain coordinates. Line width uses a fixed `3 + 0.8 * sqrt(min(count, 50))`
+pixel scale for business connection count. The maximum is about 8.7px, smaller
+than the 14px Agent squares. Parallel tracks reserve space for the maximum
+width, so count updates do not move other routes.
 
 Each station has a fixed-size ring showing bandwidth used (`1 - available`),
 with the estimated remaining percentage in its center. Headroom is green at
@@ -143,16 +144,18 @@ NodeLink capacity or an absolute Mbps value. Snapshot/source-report ages of
 and `route_ids`. Stations include idle topology members. Connection count sums
 the displayed businesses that traverse the Node once each, including intermediate
 Nodes; it does not sum both incident hops. Pending or disconnected collections
-have unknown counts, and partial rounds display known counts as lower bounds.
+have unknown counts, and partial rounds expose known counts as lower bounds.
 These counts describe businesses rather than physical NodeLinks.
 
-The map preserves valid route/Node selection and keyboard focus on refreshed
-stations. Click a route or legend entry for service, connection count, Agent
+Node stations show their name and capacity, without connection-count labels
+or click actions. The map preserves valid route selection and keyboard focus on refreshed
+routes. Click a route or legend entry for service, connection count, Agent
 endpoints, path and minimum Node headroom; protocol UUIDs, epochs and Flow IDs
-remain available in the API but are not displayed. Click a Node to highlight
-its routes and inspect its headroom and connection count. Larger maps scroll
-within the map area to keep labels readable. Current Flows has no filter, pan,
-or zoom controls. Flow data is only held in memory
+remain available in the API but are not displayed. The entire map automatically
+fits the available area without scrollbars. Zoom buttons, directional buttons
+and Fit adjust the view explicitly; hovering, dragging and the mouse wheel do
+not change the map view. Count and capacity refreshes preserve the current view;
+topology changes fit the new map. Flow data is only held in memory
 and is not added to SQLite history.
 
 Age includes query and page-assembly time and uses a monotonic clock. This topology is observational only and is

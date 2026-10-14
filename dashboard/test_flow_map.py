@@ -208,24 +208,41 @@ class FlowMapTest(unittest.TestCase):
         for connected in (True, False):
             result = renderer.render(FlowCollection().snapshot(connected), topology=topology)
             self.assertIsNone(result["nodes"][0]["connection_count"])
-            self.assertIn('Connections pending', result["svg"])
+            self.assertNotIn('Connections pending', result["svg"])
         view = collect({"a": [single()]}).snapshot(True)
         view.update(state="partial", partial=True)
         result = renderer.render(view)
         self.assertEqual(result["nodes"][0]["connection_count"], 1)
-        self.assertIn('≥ 1 connections', result["svg"])
+        self.assertTrue(result["nodes"][0]["partial"])
 
-    def test_line_width_has_a_fixed_scale_and_cap(self):
+    def test_line_width_uses_square_root_scale_capped_at_50_connections(self):
         view = collect({"a": [single()]}).snapshot(True)
         renderer = FlowMapRenderer()
         widths = []
-        for count in (1, 10, 100, 10000):
+        for count in (1, 10, 49, 50, 51, 100, 10000):
             view["routes"][0]["count"] = count
             result = renderer.render(view)
             ns = {"s": "http://www.w3.org/2000/svg"}
             widths.append(float(ET.fromstring(result["svg"]).find(".//s:path[@class='flow-track']", ns).get("stroke-width")))
+            self.assertAlmostEqual(widths[-1], 3 + .8 * min(count, 50)**.5, places=2)
         self.assertEqual(widths, sorted(widths))
-        self.assertEqual(widths[-1], 14)
+        self.assertGreater(widths[3], widths[2])
+        self.assertEqual(widths[3:], [widths[3]] * 4)
+        self.assertLess(widths[-1], 14)  # Keep tracks narrower than Agent stations.
+
+    def test_nodes_show_name_and_capacity_without_interactive_counts(self):
+        result = FlowMapRenderer().render(collect({"a": [single()]}).snapshot(True),
+                                          topology={"nodes": [{"node_id": "a", "available": .64}]})
+        svg = ET.fromstring(result["svg"])
+        ns = {"s": "http://www.w3.org/2000/svg"}
+        station = svg.find(".//s:g[@data-node='a']", ns)
+        self.assertNotIn("tabindex", station.attrib)
+        self.assertNotIn("role", station.attrib)
+        self.assertNotIn("connections", "".join(station.itertext()))
+        self.assertEqual(station.find("s:text[@class='flow-label']", ns).text, "a")
+        self.assertEqual(station.find("s:text[@class='flow-headroom']", ns).text, "64%")
+        self.assertNotIn("min-width", svg.get("style", ""))
+        self.assertEqual(svg.get("preserveAspectRatio"), "xMidYMid meet")
 
     def test_shared_horizontal_edges_use_distinct_rounded_tracks(self):
         view = collect({"a": [half("ingress", 1, path=["a", "c"]),

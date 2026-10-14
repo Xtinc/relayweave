@@ -331,7 +331,7 @@ class FlowMapRenderer:
         nodes = {station["node_id"]: station for station in stations}
         svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "class": "flow-svg",
                                  "viewBox": f"0 0 {width} {height}", "width": str(width), "height": str(height),
-                                 "style": f"min-width:{width * .92:.0f}px", "role": "group",
+                                 "preserveAspectRatio": "xMidYMid meet", "role": "group",
                                  "aria-label": "Current relay routes and Node bandwidth headroom"})
         layer = ET.SubElement(svg, "g", {"class": "flow-scene"})
         for route in routes:
@@ -342,7 +342,7 @@ class FlowMapRenderer:
                 f'{route["service"]} / {route["protocol"].upper()} · {route["count"]} connections\n'
                 + route["consumer"]["peer"] + " → " + " → ".join(route["path"]) + " → " + route["producer"]["peer"])
             ET.SubElement(line, "path", {"d": paths[route["id"]], "class": "flow-hit"})
-            stroke_width = min(14, 3 + .8 * math.sqrt(route["count"]))
+            stroke_width = 3 + .8 * math.sqrt(min(route["count"], 50))
             ET.SubElement(line, "path", {"d": paths[route["id"]], "stroke": route["color"],
                                         "stroke-width": f"{stroke_width:.2f}", "class": "flow-track"})
         for key, (x, y) in sorted(positions.items()):
@@ -351,16 +351,11 @@ class FlowMapRenderer:
                 name = key[5:]
                 node = nodes[name]
                 available = node["available"]
-                count = node["connection_count"]
-                count_text = ("Connections pending" if count is None else
-                              f'{"≥ " if node["partial"] else ""}{count} connections')
                 headroom = "—" if available is None else f"{available:.0%}"
                 state = ("unknown" if available is None else "critical" if available < .1 else
                          "warning" if available < .3 else "good")
                 station.set("data-node", name)
-                station.set("tabindex", "0")
-                station.set("role", "button")
-                station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom, {count_text}")
+                station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom")
                 station.set("class", f"flow-station flow-node-station {state}")
                 ET.SubElement(station, "circle", {"r": "24", "class": "flow-node"})
                 if available is not None:
@@ -370,9 +365,7 @@ class FlowMapRenderer:
                                                       "stroke-dasharray": f"{circumference * (1 - available):.3f} {circumference:.3f}"})
                 ET.SubElement(station, "text", {"y": "4", "text-anchor": "middle",
                                                 "class": "flow-headroom"}).text = headroom
-                ET.SubElement(station, "text", {"y": "64", "text-anchor": "middle",
-                                                "class": "flow-count"}).text = count_text
-                title = f"Node {name}\nBandwidth headroom: {headroom}\n{count_text}"
+                title = f"Node {name}\nBandwidth headroom: {headroom}"
             else:
                 agent = agents[key]
                 name = agent["peer"]
