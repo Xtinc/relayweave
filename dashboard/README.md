@@ -140,7 +140,7 @@ ICMP probing by Nodes and Agents requires `CAP_NET_RAW`. Their packaged services
 retain it in both AmbientCapabilities and CapabilityBoundingSet, and installation
 and provisioning check the effective capability. The Dashboard itself needs no raw
 socket capability. Quality and route design is documented in
-[RelayWeave 设计](../docs/RelayWeave设计.md#77-链路质量与推荐路径).
+[RelayWeave 设计](../docs/RelayWeave设计.md#4-路由面测量拓扑与路径决策).
 
 ## 独立服务部署
 
