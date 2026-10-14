@@ -12,3 +12,5 @@ relayweave_test(tls_channel tls_channel_test.cpp NAME tls_channel_mtls TIMEOUT 1
     LIBRARIES relayweave_protocol LABELS protocol integration)
 relayweave_test(lnk_channel_flows lnk_channel_flows_test.cpp TIMEOUT 45
     LIBRARIES relayweave_protocol LABELS protocol integration)
+relayweave_test(lnk_flow_control lnk_flow_control_test.cpp TIMEOUT 20
+    LIBRARIES relayweave_protocol LABELS protocol integration)

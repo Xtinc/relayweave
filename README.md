@@ -5,7 +5,9 @@
 
 设计、配置、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)，测试分组与运行入口见 [测试目录](test/README.md)。
 RelayNode 直接持有 node/nodelink_mgr，统一协调 NodeLink 建连与 NodeFlow 路径事务，层次与 Pipeline/DatagramMgr 一致。
-NodeLink 共享 TCP/UDP 通道与 NodeFlow 分派由管理器直接持有的 protocol/lnk_channel 管理；protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBOR。
+NodeLinkMgr 直接持有 protocol/FlowProtocol；协议服务持有 lnk_channel 的邻接 TCP/UDP 传输并统一管理 Flow。
+部件通过 FlowStream/FlowDatagram 收发，层次与接口见 [设计文档中的协议边界](docs/RelayWeave设计.md#571-协议服务端点与内部状态)。
+protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBOR。
 控制通知使用有界协程收发接口，数据域直接逐跳分派，不通过模块回调注册。
 Flow 提交后不做周期续租；控制连接断开、epoch/路径成员失效、NodeLink 断开或显式关闭时清理。
 超时仅用于建立阶段和关闭确认，NodeLink 与集群控制连接使用各自的心跳检测失联。
@@ -17,6 +19,8 @@ Agent 服务发现只保存目的 Node 位置，选路后才取得实际入口�
 Forwarder 拥有长期本地监听和业务容器，AgentSession 统一一次 TCP/TLS/UDP 接入与复制；UDP 服务离线时只保留本地 forward。
 单跳和多跳 TCP/TLS 均保留双向半关闭，UDP 单节点用户载荷上限为 65499 字节、多节点为 65467 字节；服务限速和统计保留在端点，
 共享通道、路径事务、数据热路径和生命周期统一见 [RelayWeave 设计](docs/RelayWeave设计.md)。
+多节点 TCP/TLS 使用逐跳双向信用窗口，拥塞时等待；UDP 满队列丢包而不关闭健康 Flow。
+固定窗口、预算和协议升级边界见 [共享数据面容量与信用算法](docs/RelayWeave设计.md#124-node-共享数据面容量)，公平调度仍为待实现项。
 部署见 [打包与安装](docs/RelayWeave打包与安装.md)、[证书制作与部署](docs/证书制作与部署.md)
 和 [管理面板部署说明](dashboard/README.md)。
 

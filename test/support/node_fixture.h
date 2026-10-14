@@ -3,6 +3,7 @@
 
 #include "node_test_config.h"
 #include "member_access.h"
+#include "flow_test_io.h"
 
 TEST_MEMBER(RelayNode, nodelink_mgr_)
 TEST_MEMBER(RelayNode, cluster_mgr_)
@@ -35,11 +36,11 @@ inline asio::awaitable<void> close_flow(std::shared_ptr<RelayNode> node, std::ui
 }
 inline asio::awaitable<FlowSendStatus> send_flow(std::shared_ptr<RelayNode> node, FlowFrame frame)
 {
-    co_return co_await links(node).channel().async_send_flow(std::move(frame));
+    co_return co_await test_flow::submit(links(node).protocol().shared_from_this(), std::move(frame));
 }
 inline asio::awaitable<FlowFrame> receive_flow(std::shared_ptr<RelayNode> node, std::uint64_t epoch, std::uint64_t id)
 {
-    co_return co_await links(node).channel().receive_flow(epoch, id);
+    co_return co_await test_flow::receive(links(node).protocol().shared_from_this(), epoch, id);
 }
 inline asio::awaitable<void> close_link(std::shared_ptr<RelayNode> node, std::uint64_t id)
 {

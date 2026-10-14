@@ -5,6 +5,7 @@
 #include "asio/ssl.hpp"
 #include "message.h"
 #include <atomic>
+#include <optional>
 #include <span>
 #include <string_view>
 
@@ -42,6 +43,9 @@ class TokenBucket
     TokenBucket(std::uint64_t bytes_per_second = 0, std::uint64_t burst_bytes = 0) noexcept;
     TimePoint reserve(std::size_t bytes, TimePoint now);
     bool try_consume(std::size_t bytes);
+    // Stream consumers wait here; datagram consumers use try_consume to drop instead.
+    // All access stays on one executor, with at most one pending consume per bucket.
+    asio::awaitable<void> consume(std::size_t bytes);
 
   private:
     bool try_consume_at(std::size_t bytes, TimePoint now);
@@ -53,6 +57,7 @@ class TokenBucket
     bool initialised_{};
     double tokens_{};
     TimePoint last_update_{};
+    std::optional<asio::steady_timer> timer_;
 };
 
 asio::awaitable<void> relay_tcp(asio::ip::tcp::socket &left, asio::ip::tcp::socket &right,

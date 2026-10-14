@@ -1,4 +1,5 @@
 #include "datagram_mgr.h"
+#include "flow_protocol.h"
 #include "frame_io.h"
 #include <algorithm>
 
@@ -86,27 +87,27 @@ asio::awaitable<bool> DatagramMgr::wait_remote_pair(std::uint64_t uuid)
     co_return co_await endpoint->attached.wait() && !endpoint->closed;
 }
 
-void DatagramMgr::bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch,
+asio::awaitable<void> DatagramMgr::bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch,
                                 std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor)
 {
-    remote_pairs_.at(uuid)->bind(channel, epoch, flow_id, config_, std::move(traffic), std::move(accessor));
-}
-
-asio::awaitable<void> DatagramMgr::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
-{
-    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
-    for (;;)
+    const auto endpoint = remote_pairs_.at(uuid);
+    if (endpoint->closed || endpoint->flow)
     {
-        auto payload = co_await endpoint->received.async_receive(asio::use_awaitable);
-        // UDP rate limits drop individual datagrams instead of delaying the shared listener.
-        if (!limiter.try_consume(payload.size()))
-        {
-            continue;
-        }
-        const auto size = payload.size();
-        co_await endpoint->send(LnkFrType::Data, std::move(payload));
-        endpoint->count(true, size);
+        throw std::runtime_error("relay endpoint cannot bind flow");
     }
+    // Cross from the socket executor to the protocol owner once; binding itself is synchronous.
+    auto port = co_await asio::co_spawn(channel.executor(),
+        [protocol = channel.shared_from_this(), epoch, flow_id, reverse = endpoint->role == RelayAttach::Producer,
+         transfer = executor_]() -> asio::awaitable<std::shared_ptr<lnk::FlowDatagram>> {
+            co_return protocol->bind_datagram_flow(epoch, flow_id, reverse, transfer);
+        }, asio::use_awaitable);
+    if (endpoint->closed)
+    {
+        port->close("endpoint closed during binding");
+        throw std::runtime_error("relay endpoint closed during binding");
+    }
+    endpoint->bind(config_, std::move(traffic), std::move(accessor));
+    endpoint->flow = std::move(port);
 }
 
 asio::awaitable<void> DatagramMgr::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
@@ -115,26 +116,26 @@ asio::awaitable<void> DatagramMgr::write_remote_pair(std::shared_ptr<RemotePair>
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
     for (;;)
     {
-        auto frame = co_await endpoint->receive();
-        if (!limiter.try_consume(frame.payload.size()))
+        auto data = co_await endpoint->flow->receive();
+        if (!limiter.try_consume(data.size()))
         {
             continue;
         }
         // One datagram from two buffers; this coroutine owns both until send completes.
-        const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(frame.payload)};
+        const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(data.data(), data.size())};
         const auto sent = co_await socket_.async_send_to(buffers, *endpoint->source, asio::use_awaitable);
-        if (sent != header.size() + frame.payload.size())
+        if (sent != header.size() + data.size())
         {
             throw std::runtime_error("truncated relay datagram");
         }
-        endpoint->count(false, frame.payload.size());
+        endpoint->count(false, data.size());
     }
 }
 
 void DatagramMgr::activate_remote_pair(std::uint64_t uuid)
 {
     auto endpoint = remote_pairs_.at(uuid);
-    if (!endpoint->source || !endpoint->channel || endpoint->active)
+    if (!endpoint->source || !endpoint->flow || endpoint->active)
     {
         throw std::runtime_error("relay bridge unavailable");
     }
@@ -158,8 +159,8 @@ asio::awaitable<void> DatagramMgr::run_remote_pair(std::uint64_t uuid)
             endpoint->traffic->remove_accessor(endpoint->accessor);
         }
     });
-    // Both directions are owned by this task and cancelled/drained together.
-    co_await await_transfers(read_remote_pair(endpoint), write_remote_pair(endpoint));
+    // Inbound datagrams are routed by the shared listener; only the return path waits here.
+    co_await write_remote_pair(endpoint);
 }
 
 void DatagramMgr::close_remote_pair(std::uint64_t uuid)
@@ -172,8 +173,11 @@ void DatagramMgr::close_remote_pair(std::uint64_t uuid)
     auto endpoint = it->second;
     remote_pairs_.erase(it);
     endpoint->closed = true;
+    if (endpoint->flow)
+    {
+        endpoint->flow->close("relay endpoint closed");
+    }
     bindings_.erase(endpoint->session_id);
-    endpoint->received.close();
     endpoint->attached.notify_all();
     id_allocator_->release(uuid);
 }
@@ -380,8 +384,11 @@ std::optional<DatagramMgr::RoutedDatagram> DatagramMgr::route_datagram(std::span
         if (endpoint->active && endpoint->source == source &&
             payload.size() <= LnkFrameHeader::maximum_payload)
         {
-            // A full local UDP queue drops this datagram, like the UDP rate limiter.
-            endpoint->received.try_send(asio::error_code{}, BytesBuf(payload.begin(), payload.end()));
+            auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
+            if (limiter.try_consume(payload.size()) && endpoint->flow->try_send(payload))
+            {
+                endpoint->count(true, payload.size());
+            }
         }
         return std::nullopt;
     }

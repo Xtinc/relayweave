@@ -154,17 +154,19 @@ asio::awaitable<bool> NodeSession::wait_attach(std::chrono::steady_clock::time_p
 
 asio::awaitable<void> NodeSession::bind(std::string accessor, std::uint64_t epoch, std::uint64_t flow_id)
 {
-    auto *channel = std::holds_alternative<ControlRouterMulti>(control_) ? &node_.nodelink_mgr_->channel() : nullptr;
+    auto *channel = std::holds_alternative<ControlRouterMulti>(control_) ? &node_.nodelink_mgr_->protocol() : nullptr;
     // Copy immutable binding values before crossing to the owning data executor.
-    return invoke_on(data_executor(), [data = data_, id = uuid(), epoch, flow_id, channel,
-                                       traffic = traffic_, accessor = std::move(accessor)] {
-        std::visit([&](auto *manager) {
-            if (channel)
-                manager->bind_remote_pair(id, *channel, epoch, flow_id, traffic, accessor);
-            else
-                manager->bind_local_pair(id, traffic, accessor);
-        }, data);
-    });
+    return std::visit([&](auto *manager) -> asio::awaitable<void> {
+        if (channel)
+        {
+            return asio::co_spawn(data_executor(),
+                manager->bind_remote_pair(uuid(), *channel, epoch, flow_id, traffic_, std::move(accessor)),
+                asio::use_awaitable);
+        }
+        return invoke_on(data_executor(), [manager, id = uuid(), traffic = traffic_, accessor = std::move(accessor)] {
+            manager->bind_local_pair(id, traffic, accessor);
+        });
+    }, data_);
 }
 
 asio::awaitable<void> NodeSession::activate()

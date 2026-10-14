@@ -3,6 +3,7 @@
 
 #include "app_common.h"
 #include "relay_endpoint.h"
+#include "flow_protocol.h"
 #include "xfr_channel.h"
 
 class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
@@ -44,10 +45,10 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
 
     struct RemotePair : RelayEndpoint
     {
-        RemotePair(asio::any_io_executor executor, int role) : RelayEndpoint(executor, role), received(executor, 16)
+        std::shared_ptr<lnk::FlowDatagram> flow;
+        RemotePair(asio::any_io_executor executor, int role) : RelayEndpoint(executor, role)
         {
         }
-        asio::experimental::channel<void(asio::error_code, BytesBuf)> received;
         std::uint64_t session_id = 0;
         std::optional<udp::endpoint> source;
     };
@@ -73,7 +74,7 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
     // These entry points require the owning transfer executor.
     njson install_remote_pair(int role);
     asio::awaitable<bool> wait_remote_pair(std::uint64_t uuid);
-    void bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch, std::uint64_t flow_id,
+    asio::awaitable<void> bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
                        SRVTrafficPtr traffic, std::string accessor);
     void activate_remote_pair(std::uint64_t uuid);
     asio::awaitable<void> run_remote_pair(std::uint64_t uuid);
@@ -89,7 +90,6 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
   private:
     asio::awaitable<void> receive_datagram();
     std::optional<RoutedDatagram> route_datagram(std::span<std::uint8_t> datagram, const udp::endpoint &source);
-    asio::awaitable<void> read_remote_pair(std::shared_ptr<RemotePair> endpoint);
     asio::awaitable<void> write_remote_pair(std::shared_ptr<RemotePair> endpoint);
     std::uint64_t allocate_session_id() const;
 

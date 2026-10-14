@@ -99,6 +99,12 @@ void verify_server_config()
         }
         require(rejected, "Invalid server configuration was accepted: " + std::string(description));
     };
+    for (const auto *field : {"flow_window_bytes", "flow_buffer_budget_bytes"})
+    {
+        auto candidate = baseline;
+        candidate["cluster"][field] = 524288;
+        require_rejected(candidate, "Flow control uses fixed constants");
+    }
 
     for (const auto &invalid : {njson(0), njson(-1), njson(1.5), njson(true), njson("100"), njson(nullptr)})
     {

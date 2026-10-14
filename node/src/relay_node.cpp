@@ -520,7 +520,7 @@ void RelayNode::schedule_queue_probe(asio::steady_timer &timer, std::atomic<std:
         {
             const double seconds = std::chrono::duration<double>(now - self->bandwidth_at_).count();
             const double used = self->registry_.bytes_per_second() +
-                                self->nodelink_mgr_->channel().take_forwarded_bytes() / seconds;
+                                self->nodelink_mgr_->protocol().take_forwarded_bytes() / seconds;
             self->available_ = std::clamp(1.0 - used * 8.0 / (self->config_.bandwidth_mbps * 1e6), 0.0, 1.0);
             self->bandwidth_at_ = now;
         }

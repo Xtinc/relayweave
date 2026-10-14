@@ -6,7 +6,7 @@
 | 目录 | 内容 | CTest 标签 |
 |---|---|---|
 | `common/` | 双索引容器、LRU、缓冲池、AsyncEvent、令牌桶、流量计数 | `common`、`unit` |
-| `protocol/` | 控制/二进制编解码、mTLS、LnkChannel、TCP/TLS/UDP 复制 | `protocol`，按用例区分 `unit` / `integration` |
+| `protocol/` | 控制/二进制编解码、mTLS、FlowProtocol/NodeLink、Stream/Datagram 端点、TCP/TLS/UDP 复制 | `protocol`，按用例区分 `unit` / `integration` |
 | `route/` | 链路质量、路径算法、DNS 探测生命周期、真实 ICMP | `routing`，真实 ICMP 另标 `icmp` |
 | `agent/` | Agent/Session/Forwarder 生命周期、路由组装和缓存 | `agent`，路由相关另标 `routing` |
 | `node/` | 配置/统计、启动停止、集群控制、共享 NodeLink、Flow、UDP session 路由、拓扑 | `node`，集群相关另标 `cluster` |
@@ -68,7 +68,13 @@ build/test/benchmark/benchmark_udp_node --help
 
 - TCP 复制：两侧读/写失败和限速等待中的对向失败必须排空；正常 EOF 保留反向回传，校验原始异常和实际流量。
 - UDP 复制：零长度、4097 字节及最大合法载荷双向保持原样；短头、错误 session、超限包丢弃后仍能处理后续包；两侧 I/O 失败都能排空。
-- 多节点 UDP：65467 字节载荷在共享 Link 和多跳路径中双向完整转发；65468 字节在接入时丢弃；最大长度的非法帧不会妨碍后续合法帧。
+- 多节点信用流控：窗口满时挂起并保持 Flow，出队不提前归还信用；三跳停读后有界、恢复后保持 DATA/FIN 顺序，
+  同 Link 另一条有信用的流继续推进；重复/旧 CREDIT 不增加额度，越窗只失败对应 Flow，取消/关闭排空拥有载荷的交接。
+- 百流预算与载荷池：固定 512 KiB 窗口及 256 MiB 预算容纳 100 条双向 TCP Flow，活动 Flow 未完成交付不提前退信用；Flow 关闭清理内部队列并退预算，在途业务池块由最终持有者归还，池空闲 size class 可回收且保留量有界。
+- 业务池缓冲交接：生产 PayloadPool 预热后 20,000 次取块归还不增加上游分配，包括两个线程的复用；端点移动保持载荷地址、缓冲晚于协议销毁，UDP 池容量不足/端口关闭丢包，TCP 池满仍可关闭 Flow。
+- 终点交付：channel 交接保持调用方执行器；socket 写完成前保持信用，通知后恢复下一帧交付；关闭唤醒挂起发送/接收并排空长期任务，迟到通知不修改预算。
+- TCP 任务组合：单向 FIN 保留反向传输；FIN 后另一方向失败仍报告实际错误；接收失败取消信用等待中的发送者，父任务排空后释放 Flow；物理 writer 失败取消 reader，保留原错误并关闭依赖 Flow。
+- 多节点 UDP：65467 字节载荷在共享 Link 和多跳路径中双向完整转发；65468 字节在接入时丢弃；最大长度的非法帧不会妨碍后续合法帧；各处队列满立即丢包，不创建 stream 状态或消费确认。
 - 单节点 TLS 和多节点 TCP/TLS：请求半关闭后，服务方仍能完整返回超过两个最大 DATA 载荷的连续字节流，并正常传递反向 EOF。
 - TLS 1.2/1.3：DATA/FIN 业务半关闭、反向排空、仅载荷流量计数；未收到业务 FIN 的异常截断及非法长度必须失败并排空对向。
 - 限速与计数：快路径不能重复扣费，失败试扣不能吃掉令牌，预留债务必须累积，空包与无限速不等待；并发计数/采样不丢字节，计数溢出饱和。

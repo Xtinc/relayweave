@@ -5,7 +5,10 @@
 #include <future>
 #include <iostream>
 #include <map>
+#include <thread>
 #include <vector>
+
+using lnk::PooledBuffer;
 
 void require_buffer(bool condition, const char *reason)
 {
@@ -116,7 +119,7 @@ void pool_reuse()
     CountingResource upstream;
     {
         constexpr std::array<std::size_t, 4> sizes{64, 512, 4096, 4137};
-        std::pmr::unsynchronized_pool_resource pool({64, sizes.back()}, &upstream);
+        auto pool = std::make_shared<lnk::PayloadPool>(4 * 1024 * 1024, &upstream);
         {
             std::vector<PooledBuffer> warm;
             warm.reserve(400);
@@ -137,9 +140,45 @@ void pool_reuse()
         }
         require_buffer(upstream.allocations == warmed_allocations,
                        "steady packet traffic kept allocating from the upstream heap after warmup");
-        std::cout << "[PASS] 10000 pooled packets required 0 upstream allocations after warmup\n";
+        auto transfer = [pool, sizes] {
+            for (int i = 0; i < 5000; ++i)
+            {
+                PooledBuffer packet(pool, sizes[i % sizes.size()]);
+                packet.bytes().front() = 42;
+                packet.bytes().back() = 255;
+            }
+        };
+        std::thread first(transfer);
+        std::thread second(transfer);
+        first.join();
+        second.join();
+        require_buffer(upstream.allocations == warmed_allocations,
+                       "cross-executor pool reuse kept allocating from the upstream heap");
+        std::cout << "[PASS] 20000 pooled packets required 0 upstream allocations after warmup\n";
     }
     require_buffer(upstream.valid_deallocations && upstream.live.empty(), "pool retained storage after destruction");
+}
+
+void shared_resource_lifetime()
+{
+    CountingResource upstream;
+    std::weak_ptr<lnk::PayloadPool> weak;
+    PooledBuffer payload;
+    {
+        auto pool = std::make_shared<lnk::PayloadPool>(65536, &upstream);
+        weak = pool;
+        payload = PooledBuffer(pool, 1024);
+        payload.bytes().front() = 42;
+        payload.slice(0, 1);
+    }
+    require_buffer(!weak.expired(), "business delivery released its allocator too early");
+    std::thread writer([payload = std::move(payload)]() mutable {
+        require_buffer(payload.bytes().front() == 42, "cross-executor delivery lost its payload");
+        payload = {};
+    });
+    writer.join();
+    require_buffer(weak.expired() && upstream.valid_deallocations && upstream.live.empty(),
+                   "last business delivery did not release its shared allocator");
 }
 
 int main()
@@ -149,6 +188,7 @@ int main()
         ownership();
         channel_transfer();
         pool_reuse();
+        shared_resource_lifetime();
         std::cout << "[PASS] exclusive ownership, offset views and asynchronous channel transfers\n";
     }
     catch (const std::exception &error)

@@ -195,7 +195,7 @@ void flow_integration()
                 for (const auto &node : nodes)
                 {
                     test_access::RelayNode_bandwidth_at_(*node) = std::chrono::steady_clock::now();
-                    test_node::links(node).channel().take_forwarded_bytes();
+                    test_node::links(node).protocol().take_forwarded_bytes();
                 }
                 for (std::uint8_t i = 0; i < 12; ++i)
                 {
@@ -224,12 +224,12 @@ void flow_integration()
                 co_await receive(4, s2, false, large);
                 co_await receive(1, s1, true, large);
                 co_await receive(1, s2, true, large);
-                require_flow(test_node::links(nodes[middle_index]).channel().take_forwarded_bytes() ==
+                require_flow(test_node::links(nodes[middle_index]).protocol().take_forwarded_bytes() ==
                                  144 + 4 * large.size(), "Transit bandwidth counted payloads incorrectly");
-                require_flow(test_node::links(nodes[1]).channel().take_forwarded_bytes() ==
+                require_flow(test_node::links(nodes[1]).protocol().take_forwarded_bytes() ==
                                  48 + 2 * large.size(), "Ingress bandwidth counted outgoing payloads");
-                require_flow(test_node::links(nodes[3]).channel().take_forwarded_bytes() == 48 + large.size() &&
-                                 test_node::links(nodes[4]).channel().take_forwarded_bytes() == 48 + large.size(),
+                require_flow(test_node::links(nodes[3]).protocol().take_forwarded_bytes() == 48 + large.size() &&
+                                 test_node::links(nodes[4]).protocol().take_forwarded_bytes() == 48 + large.size(),
                              "Tail bandwidth did not count only incoming payloads");
                 co_await queued(1, s1, false, {});
                 co_await receive(3, s1, false, {});
@@ -276,14 +276,14 @@ void flow_integration()
                 co_await queued(3, reversed, false, {11});
                 co_await receive(1, reversed, false, {11});
                 co_await test_node::close_flow(nodes[0], reversed.epoch, reversed.id);
-                // A slow endpoint reaches its bounded queue; only that flow fails.
+                // A slow endpoint must preserve its Flow and reverse direction.
                 auto crowded = co_await test_node::open_flow(nodes[0], path1, transport);
                 const auto congested_frames = transport == RelayProtocol::Tcp ? 136 : 24;
                 for (int i = 0; i < congested_frames; ++i)
                 {
                     auto result = co_await test_node::send_flow(nodes[1],
                         {crowded.epoch, crowded.id, false, LnkFrType::Data, {12}, {}});
-                    if (result == FlowSendStatus::Closed || result == FlowSendStatus::CapacityExceeded)
+                    if (result == FlowSendStatus::Closed || result == FlowSendStatus::Dropped)
                     {
                         break;
                     }
@@ -292,7 +292,9 @@ void flow_integration()
                 co_await delay_flow(100ms);
                 auto blocked =
                     co_await test_node::send_flow(nodes[3], {crowded.epoch, crowded.id, true, LnkFrType::Data, {13}, {}});
-                require_flow(blocked == FlowSendStatus::Closed, "full endpoint queue did not fail flow");
+                require_flow(blocked == FlowSendStatus::Queued, "slow endpoint closed the reverse direction");
+                co_await receive(1, crowded, true, {13});
+                co_await test_node::close_flow(nodes[0], crowded.epoch, crowded.id);
                 co_await queued(1, s2, false, {14});
                 co_await receive(4, s2, false, {14});
                 reused = co_await test_node::ensure_link(nodes[0], "a", middle, transport);

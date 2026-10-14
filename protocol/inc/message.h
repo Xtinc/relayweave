@@ -158,7 +158,8 @@ enum class LnkFrType : std::uint8_t
     Ping = 4,
     Pong = 5,
     Attach = 7,
-    Attached = 8
+    Attached = 8,
+    Credit = 9
 };
 
 struct DatagramHeader
@@ -175,7 +176,7 @@ struct DatagramHeader
 struct LnkFrameHeader
 {
     static constexpr std::uint8_t magic = 0x4e;
-    static constexpr std::uint8_t version = 1;
+    static constexpr std::uint8_t version = 2;
     static constexpr std::size_t length = 32;
     // UDP carries both the NodeLink ID and this frame header before the user payload.
     static constexpr std::size_t maximum_payload =
@@ -188,7 +189,7 @@ struct LnkFrameHeader
     std::uint32_t body_length = 0;
     std::uint64_t epoch = 0;
     std::uint64_t id = 0;       // Flow ID; zero for NodeLink control frames.
-    std::uint64_t sequence = 0; // PING/PONG sequence; otherwise zero.
+    std::uint64_t sequence = 0; // Heartbeat sequence or cumulative CREDIT limit; otherwise zero.
 
     // Pure encoding. Local callers validate their input before constructing this header.
     Buffer encode() const noexcept;
@@ -196,17 +197,6 @@ struct LnkFrameHeader
 
   private:
     void validate() const;
-};
-
-struct FlowFrame
-{
-    std::uint64_t epoch = 0;
-    std::uint64_t flow_id = 0;
-    bool reverse = false;
-    LnkFrType kind = LnkFrType::Data;
-    BytesBuf payload;
-    std::string reason;
-    [[nodiscard]] bool validate() const noexcept;
 };
 
 struct RelayAttach

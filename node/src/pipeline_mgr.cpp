@@ -1,4 +1,5 @@
 #include "pipeline_mgr.h"
+#include "flow_protocol.h"
 #include "frame_io.h"
 #include "xfr_channel.h"
 
@@ -271,18 +272,34 @@ template <typename Transport> asio::awaitable<bool> StreamPipeline<Transport>::w
 }
 
 template <typename Transport>
-void StreamPipeline<Transport>::bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch,
+asio::awaitable<void> StreamPipeline<Transport>::bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch,
                                                  std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor)
 {
-    remote_pairs_.at(uuid)->bind(channel, epoch, flow_id, config_, std::move(traffic), std::move(accessor));
+    const auto endpoint = remote_pairs_.at(uuid);
+    if (endpoint->closed || endpoint->flow)
+    {
+        throw std::runtime_error("relay endpoint cannot bind flow");
+    }
+    // Cross from the socket executor to the protocol owner once; binding itself is synchronous.
+    auto port = co_await asio::co_spawn(channel.executor(),
+        [protocol = channel.shared_from_this(), epoch, flow_id, reverse = endpoint->role == RelayAttach::Producer,
+         transfer = executor_]() -> asio::awaitable<std::shared_ptr<lnk::FlowStream>> {
+            co_return protocol->bind_stream_flow(epoch, flow_id, reverse, transfer);
+        }, asio::use_awaitable);
+    if (endpoint->closed)
+    {
+        port->close("endpoint closed during binding");
+        throw std::runtime_error("relay endpoint closed during binding");
+    }
+    endpoint->bind(config_, std::move(traffic), std::move(accessor));
+    endpoint->flow = std::move(port);
 }
 
 template <typename Transport>
 asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
-    std::array<std::uint8_t, LnkFrameHeader::maximum_payload> buffer;
+    std::array<std::uint8_t, lnk::FlowStream::maximum_chunk_size> buffer;
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
-    asio::steady_timer timer(executor_);
     for (;;)
     {
         std::size_t size;
@@ -302,21 +319,12 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
         }
         if (size == 0)
         {
-            co_await endpoint->send(LnkFrType::Fin);
+            co_await endpoint->flow->finish_send();
             co_return;
         }
-        if (!limiter.try_consume(size))
-        {
-            const auto now = TokenBucket::Clock::now();
-            const auto until = limiter.reserve(size, now);
-            if (until > now)
-            {
-                timer.expires_at(until);
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-        }
-        // Enqueue completion guarantees that the data executor no longer borrows this buffer.
-        co_await endpoint->send_data(std::span<const std::uint8_t>(buffer.data(), size));
+        co_await limiter.consume(size);
+        // Copy once into reusable storage; the channel transfers that block's ownership.
+        co_await endpoint->flow->send(endpoint->flow->copy_payload({buffer.data(), size}));
         endpoint->count(true, size);
     }
 }
@@ -325,11 +333,10 @@ template <typename Transport>
 asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
-    asio::steady_timer timer(executor_);
     for (;;)
     {
-        auto frame = co_await endpoint->receive();
-        if (frame.kind == LnkFrType::Fin)
+        auto data = co_await endpoint->flow->receive();
+        if (!data)
         {
             if constexpr (std::is_same_v<Transport, TlsTransport>)
             {
@@ -346,35 +353,28 @@ asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_p
             }
             co_return;
         }
-        // LnkChannel reports RESET as a flow failure; the remaining frames are DATA.
-        if (!limiter.try_consume(frame.payload.size()))
-        {
-            const auto now = TokenBucket::Clock::now();
-            const auto until = limiter.reserve(frame.payload.size(), now);
-            if (until > now)
-            {
-                timer.expires_at(until);
-                co_await timer.async_wait(asio::use_awaitable);
-            }
-        }
+        // A successful downstream write releases this delivery through the protocol endpoint.
+        co_await limiter.consume(data->size());
         if constexpr (std::is_same_v<Transport, TlsTransport>)
         {
-            co_await write_tls_data(*endpoint->stream, frame.payload);
-            endpoint->count(false, frame.payload.size());
+            co_await write_tls_data(*endpoint->stream, data->bytes());
+            endpoint->count(false, data->size());
         }
         else
         {
             const auto written =
-                co_await asio::async_write(*endpoint->stream, asio::buffer(frame.payload), asio::use_awaitable);
+                co_await asio::async_write(*endpoint->stream, asio::buffer(data->data(), data->size()), asio::use_awaitable);
             endpoint->count(false, written);
         }
+        data.reset();
+        endpoint->flow->complete_receive();
     }
 }
 
 template <typename Transport> void StreamPipeline<Transport>::activate_remote_pair(std::uint64_t uuid)
 {
     auto endpoint = remote_pairs_.at(uuid);
-    if (!endpoint->stream || !endpoint->channel || endpoint->active)
+    if (!endpoint->stream || !endpoint->flow || endpoint->active)
     {
         throw std::runtime_error("relay bridge unavailable");
     }
@@ -414,8 +414,7 @@ template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::r
         try
         {
             auto reason = exception_description(failure);
-            reason.resize(std::min(reason.size(), LnkFrameHeader::maximum_reason));
-            co_await endpoint->send(LnkFrType::Reset, {}, std::move(reason));
+            endpoint->flow->reset(std::move(reason));
         }
         catch (const std::exception &)
         {
@@ -438,6 +437,10 @@ template <typename Transport> void StreamPipeline<Transport>::close_remote_pair(
     auto endpoint = it->second;
     remote_pairs_.erase(it);
     endpoint->closed = true;
+    if (endpoint->flow)
+    {
+        endpoint->flow->close("relay endpoint closed");
+    }
     if (endpoint->stream)
     {
         asio::error_code ignored;

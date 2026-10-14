@@ -3,7 +3,7 @@
 
 #include "async_event.h"
 #include "cluster_mgr.h"
-#include "lnk_channel.h"
+#include "flow_protocol.h"
 #include "topology.h"
 #include <map>
 #include <tuple>
@@ -31,7 +31,7 @@ struct FlowResult
     }
 };
 
-// Link and Flow coordination belongs to control_io; LnkChannel owns cluster_data_io state.
+// Link and Flow coordination belongs to control_io; FlowProtocol owns cluster_data_io state.
 class NodeLinkMgr
 {
   public:
@@ -53,9 +53,9 @@ class NodeLinkMgr
                       RelayProtocol transport) const;
     asio::awaitable<std::string> wait_flow_closed(std::uint64_t epoch, std::uint64_t id);
     asio::awaitable<void> stop();
-    LnkChannel &channel() const
+    FlowProtocol &protocol() const
     {
-        return *channel_;
+        return *protocol_;
     }
 
   private:
@@ -125,7 +125,7 @@ class NodeLinkMgr
     ClusterConfig config_;
     ClusterMgr &cluster_;
     Topology &topology_;
-    std::shared_ptr<LnkChannel> channel_;
+    std::shared_ptr<FlowProtocol> protocol_;
     std::map<LinkKey, std::shared_ptr<LinkRequest>> link_requests_;
     std::map<std::uint64_t, njson> link_endpoints_;
     std::map<std::uint64_t, std::shared_ptr<FlowRequest>> flow_requests_;

@@ -3,6 +3,8 @@
 
 #include "app_common.h"
 #include "relay_endpoint.h"
+#include "flow_protocol.h"
+#include "tls_channel.h"
 #include "xfr_channel.h"
 #include <atomic>
 
@@ -45,6 +47,7 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     struct RemotePair : RelayEndpoint
     {
         using RelayEndpoint::RelayEndpoint;
+        std::shared_ptr<lnk::FlowStream> flow;
         std::optional<Stream> stream;
     };
 
@@ -76,7 +79,7 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     // These entry points require the owning transfer executor.
     njson install_remote_pair(int role);
     asio::awaitable<bool> wait_remote_pair(std::uint64_t uuid);
-    void bind_remote_pair(std::uint64_t uuid, LnkChannel &channel, std::uint64_t epoch, std::uint64_t flow_id,
+    asio::awaitable<void> bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
                        SRVTrafficPtr traffic, std::string accessor);
     void activate_remote_pair(std::uint64_t uuid);
     asio::awaitable<void> run_remote_pair(std::uint64_t uuid);

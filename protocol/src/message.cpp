@@ -724,6 +724,12 @@ void LnkFrameHeader::validate() const
     }
     switch (kind)
     {
+    case LnkFrType::Credit:
+        if (!id || !sequence || body_length)
+        {
+            throw std::invalid_argument("invalid NodeFlow credit header");
+        }
+        break;
     case LnkFrType::Data:
     case LnkFrType::Fin:
     case LnkFrType::Reset:
@@ -781,23 +787,4 @@ LnkFrameHeader LnkFrameHeader::decode(std::span<const std::uint8_t, length> head
                           decode_lnk_integer(header.subspan<24, 8>())};
     result.validate();
     return result;
-}
-
-bool FlowFrame::validate() const noexcept
-{
-    if (!epoch || !flow_id)
-    {
-        return false;
-    }
-    switch (kind)
-    {
-    case LnkFrType::Data:
-        return reason.empty() && payload.size() <= LnkFrameHeader::maximum_payload;
-    case LnkFrType::Fin:
-        return payload.empty() && reason.empty();
-    case LnkFrType::Reset:
-        return payload.empty() && reason.size() <= LnkFrameHeader::maximum_reason;
-    default:
-        return false;
-    }
 }
