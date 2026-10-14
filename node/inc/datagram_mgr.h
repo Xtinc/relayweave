@@ -2,7 +2,6 @@
 #define PROXY_DATAGRAM_MANAGER_HEADER
 
 #include "app_common.h"
-#include "relay_endpoint.h"
 #include "flow_protocol.h"
 #include "xfr_channel.h"
 

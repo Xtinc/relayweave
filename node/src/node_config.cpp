@@ -91,7 +91,8 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     using namespace config;
     const auto root = load_json(path);
 
-    reject_unknown_fields(root, {"log", "bandwidth_mbps", "control", "cluster", "tcp", "tls", "udp", "certificate", "channel"}, "root");
+    reject_unknown_fields(
+        root, {"log", "bandwidth_mbps", "control", "cluster", "tcp", "tls", "udp", "certificate", "channel"}, "root");
     const auto &control = required_object(root, "control", "root");
     reject_unknown_fields(
         control,
@@ -136,9 +137,19 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     result.datagram.address = required_string(udp, "address", "udp");
     result.datagram.port = required_port(udp, "port", "udp");
     result.datagram.max_relays = required_capacity(udp, "max_relays", "udp");
-    result.datagram.setup_timeout =
-        optional_duration(udp, "setup_timeout_ms", result.datagram.setup_timeout, "udp");
+    result.datagram.setup_timeout = optional_duration(udp, "setup_timeout_ms", result.datagram.setup_timeout, "udp");
     result.datagram.traffic = parse_traffic_limit_config(udp, "udp");
+    if (result.datagram.traffic.rx_bytes_per_second != 0 && result.datagram.traffic.rx_burst_bytes == 0)
+    {
+        throw std::invalid_argument("udp.rx_max_burst_bytes must be explicitly configured and positive when "
+                                    "udp.rx_bytes_per_second is nonzero");
+    }
+
+    if (result.datagram.traffic.tx_bytes_per_second != 0 && result.datagram.traffic.tx_burst_bytes == 0)
+    {
+        throw std::invalid_argument("udp.tx_max_burst_bytes must be explicitly configured and positive when "
+                                    "udp.tx_bytes_per_second is nonzero");
+    }
 
     const auto base = configuration_directory(path);
     result.ca_file = required_file(certificate, "ca_file", base, "certificate");

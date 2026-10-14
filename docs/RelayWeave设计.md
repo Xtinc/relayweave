@@ -1008,6 +1008,9 @@ UDP 每包为 8 字节相邻 NodeLink ID + 32 字节头 + 帧体，精确验证�
 服务端按传输类型分成 TCP/TLS StreamPipeline 和 UDP DatagramMgr。
 每个 manager 直接拥有 LocalPair / local_pairs_ 和 RemotePair / remote_pairs_；
 LocalPair 在本 Node 上配对双方 Agent，RemotePair 桥接本地接入的 Agent 与 NodeFlow。
+TCP/TLS 与 UDP 的 RemotePair 共用 app_common.h/.cpp 中的 RelayEndpoint，保存接入票据、角色、
+接入事件、激活/关闭标志、限速与统计绑定；只提供公共配置绑定和按角色映射 rx/tx 的载荷计数。
+具体 socket、UDP 来源和 Flow 端口由各自的 RemotePair 保存，接入校验、转发和关闭由 manager 执行。
 两种资源共同消耗该协议的 max_relays 容量。资源保存票据、已接入 socket 或来源 endpoint、接入事件、
 数据激活标志、限速与统计，不保存 Agent 身份、业务请求、服务等待或控制通知。
 
@@ -1635,6 +1638,8 @@ RX 固定表示 Producer 到 Consumer，TX 表示 Consumer 到 Producer。
 | `server.connect_timeout_ms` | RelayAgent 的解析/连接和数据连接超时 |
 
 TCP/TLS 的 `rx/tx_bytes_per_second` 为 0 时不限制；非零时配合对应 burst 值使用等待式令牌桶。UDP 使用同样方向定义，但无法对 datagram 做部分等待，令牌不足就丢包。
+UDP 任一方向的速率非零时，必须显式配置对应的 `rx_max_burst_bytes` 或 `tx_max_burst_bytes` 为正整数；
+缺失或为 0 会在配置加载阶段报错。burst 应至少容纳该方向希望转发的最大报文，否则更大的报文仍会丢弃。
 
 TLSChannel 的发送队列满时拒绝本帧、记录原因并直接关闭通道；编码失败、底层 TLS 写失败或业务接收队列满也进入同一关闭边界。系统没有可靠消息队列，不重试单条控制消息，也不会把 `send()` 调用当成成功确认。
 
@@ -2162,6 +2167,9 @@ NodeSession 是 control_io 中业务任务的所有者，通过跨域操作管�
 配置决定网络接口、证书、服务与本地监听；启动先建立长期所有者，停止沿业务依赖关系取消并排空，再释放被借用的管理器与协议服务。
 
 ### 8.1 部署配置模型
+
+仓库中的示例配置完整列出各组件支持的 JSON 配置项，包括使用默认值的可选项，作为部署和修改配置的参考。
+Dashboard 的 HTTP 端口、采样间隔和历史数据库参数仍使用命令行选项，不属于 JSON 配置项。
 
 #### 8.1.1 证书输入
 
@@ -2979,7 +2987,7 @@ TCP/TLS 在双方 finished 后正常收尾，由首 Node 关闭 Flow；UDP 没�
 - [`node/src/topology.cpp`](../node/src/topology.cpp)：成员探测、报告校验、master 汇总与完整拓扑快照；
 - [`node/src/registry_mgr.cpp`](../node/src/registry_mgr.cpp)：控制会话和本机服务注册；
 - [`node/src/datagram_mgr.cpp`](../node/src/datagram_mgr.cpp)：UDP Relay、session 路由和 endpoint 校验；
-- [`node/src/app_common.cpp`](../node/src/app_common.cpp)：Relay 标识、服务流量采样和共享 Node 数据结构；
+- [`node/src/app_common.cpp`](../node/src/app_common.cpp)：Relay 标识、服务流量采样、RelayEndpoint 公共绑定与计数，以及共享 Node 数据结构；
 - [`agent/src/main.cpp`](../agent/src/main.cpp)：RelayAgent 配置入口、双执行域线程和进程信号；
 - [`agent/src/relay_agent.cpp`](../agent/src/relay_agent.cpp)：服务器连接池、节点身份、重连和服务发现；
 - [`agent/src/agent_routing.cpp`](../agent/src/agent_routing.cpp)：拓扑组装、入口探测目标及推荐路径计算；

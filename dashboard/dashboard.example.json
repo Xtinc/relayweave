@@ -1,12 +1,16 @@
 {
   "server": {
     "host": "127.0.0.1",
-    "port": 18443
+    "port": 18443,
+    "connect_timeout_ms": 5000
   },
   "certificate": {
     "ca_file": "/etc/relayweave/dashboard-certs/server-ca.pem",
     "certificate_chain": "/etc/relayweave/dashboard-certs/shared-client.pem",
     "private_key": "/etc/relayweave/dashboard-certs/shared-client.key",
     "server_name": "203.0.113.10"
+  },
+  "channel": {
+    "handshake_timeout_ms": 5000
   }
 }
