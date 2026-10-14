@@ -25,7 +25,7 @@
 
 ```console
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug -DBUILD_TESTING=ON
-cmake --build build --parallel 1
+cmake --build build --config Debug --parallel 1
 ctest --test-dir build -C Debug --output-on-failure
 
 # 仅纯单元测试 / 某个组件 / 完整业务链路

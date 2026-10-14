@@ -118,7 +118,7 @@ asio::awaitable<std::optional<lnk::PooledBuffer>> lnk::FlowStream::receive()
         throw asio::system_error(error == asio::experimental::error::channel_cancelled ? asio::error::operation_aborted
                                                                                        : error);
     }
-    co_return data;
+    co_return std::move(data);
 }
 
 void lnk::FlowStream::complete_receive()
@@ -217,7 +217,7 @@ asio::awaitable<lnk::PooledBuffer> lnk::FlowDatagram::receive()
         throw asio::system_error(error == asio::experimental::error::channel_cancelled ? asio::error::operation_aborted
                                                                                        : error);
     }
-    co_return frame;
+    co_return std::move(frame);
 }
 
 void lnk::FlowDatagram::close(std::string close_reason)

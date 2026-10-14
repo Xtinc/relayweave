@@ -320,8 +320,11 @@ void verify_http_errors(RunningProxy &proxy)
     std::string request = "GET / HTTP/1.1\r\nHost: example.test\r\nX-Large: ";
     request.append(proxy.config.http.max_header_bytes, 'x');
     asio::write(oversized, asio::buffer(request));
-    require(read_all(oversized).find("431 Request Header Fields Too Large") != std::string::npos,
-            "Oversized HTTP request did not return 431");
+    // Complete the malformed request so the server need not wait for more header bytes.
+    oversized.shutdown(tcp::socket::shutdown_send);
+    const auto oversized_response = read_all(oversized);
+    require(oversized_response.find("431 Request Header Fields Too Large") != std::string::npos,
+            "Oversized HTTP request did not return 431: " + oversized_response);
 
     const auto closed_port = unused_port();
     tcp::socket unavailable(io);
@@ -500,7 +503,17 @@ void verify_listener_rollback()
 {
     asio::io_context io;
     auto config = test_config();
-    tcp::acceptor occupied(io, {asio::ip::address_v4::loopback(), config.http.port});
+    tcp::acceptor occupied(io);
+    occupied.open(tcp::v4());
+#if defined(_WIN32)
+    // SO_REUSEADDR can share an occupied port on Windows; make the fixture exclusive before bind.
+    const BOOL exclusive = TRUE;
+    require(::setsockopt(occupied.native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                         reinterpret_cast<const char *>(&exclusive), sizeof(exclusive)) == 0,
+            "Could not reserve an exclusive HTTP port for the rollback test");
+#endif
+    occupied.bind({asio::ip::address_v4::loopback(), config.http.port});
+    occupied.listen();
     auto server = std::make_shared<ProxyServer>(io, config);
     bool failed = false;
     try

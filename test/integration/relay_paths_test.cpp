@@ -638,7 +638,8 @@ void integration()
     agent_config.port = configs[0].control.port;
     agent_config.channel.disconnect_timeout = 100ms;
     agent_config.server_name = "localhost";
-    agent_config.relay_open_timeout = 2s;
+    // Windows can take about two seconds to report a refused loopback connection.
+    agent_config.relay_open_timeout = 3s;
     tcp::acceptor target(client, {asio::ip::address_v4::loopback(), 0});
     udp::socket udp_target(client, {asio::ip::address_v4::loopback(), 0});
     for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
@@ -716,7 +717,8 @@ void integration()
                               {"protocol", relay_protocol_name(protocol)}, {"path", path}, {"epoch", epoch}}));
                     const auto error = co_await receive(channels[ingress], CtrlCommand::RelayError);
                     require(error.params->at("request_id") == 8 && error.params->at("epoch") == epoch &&
-                            error.params->at("path") == path && error.params->at("protocol") == relay_protocol_name(protocol) &&
+                            error.params->at("path") == path &&
+                            error.params->at("protocol").get<std::string>() == relay_protocol_name(protocol) &&
                             error.params->at("stage") == "open" && error.params->at("reason") == "path node offline" &&
                             !error.params->contains("uuid") && !error.params->contains("flow_id") &&
                             !error.params->contains("ticket") && !error.params->contains("data_port"),
@@ -945,7 +947,8 @@ void integration()
                 failed_socket.set_option(asio::socket_base::linger(true, 0));
                 failed_socket.close();
                 const auto reset = co_await receive(channels[1], CtrlCommand::RelayClosed);
-                require(reset.params->at("reason").get<std::string>().find("reset") != std::string::npos,
+                const auto reset_reason = asio::error_code(asio::error::connection_reset).message();
+                require(reset.params->at("reason").get<std::string>().find(reset_reason) != std::string::npos,
                         "Socket failure did not preserve its RESET reason");
                 co_await receive(channels[3], CtrlCommand::RelayClosed);
             }
@@ -1025,7 +1028,7 @@ void integration()
                 channels[1]->send(CtrlMessage(CtrlCommand::RelayCancel, njson{{"request_id", 30}}));
                 co_await receive(channels[1], CtrlCommand::RelayClosed);
             }
-            // The producer Agent's two-second timeout expires before either Node's setup timeout.
+            // The producer Agent's timeout expires before either Node's TLS setup timeout.
             // Leave the consumer unattached so readiness cannot complete.
             const auto producer_started = std::chrono::steady_clock::now();
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
@@ -1210,8 +1213,9 @@ void integration()
                       {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             const auto rejected = co_await receive(channels[1], CtrlCommand::RelayError);
+            const auto refused_reason = asio::error_code(asio::error::connection_refused).message();
             require(rejected.params->at("stage") == "attach" &&
-                    rejected.params->at("reason").get<std::string>().find("refused") != std::string::npos,
+                    rejected.params->at("reason").get<std::string>().find(refused_reason) != std::string::npos,
                     "Producer target failure did not preserve the original error");
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 51}, {"service", "auto-tcp"}, {"protocol", "tcp"},
