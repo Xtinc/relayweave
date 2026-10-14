@@ -13,7 +13,6 @@
 | `proxy/` | HTTP、CONNECT、SOCKS5、容量、超时和监听回滚 | `proxy`、`integration` |
 | `integration/` | 单/多节点 TCP/TLS/UDP、恢复、迁移及 Proxy 完整链路 | `end_to_end`、`integration` |
 | `deployment/` | Deb 控制脚本换行与执行、能力校验、证书校验与配置 dry-run | `deployment`、`integration` |
-| `benchmark/` | UDP Node 吞吐、双索引容器性能比较 | 手动运行，不注册 CTest |
 | `tools/` | ICMP/TLS 手动诊断、真实 Dashboard 服务 smoke | 手动运行，不注册 CTest |
 | `support/` | 公共夹具、资源定位和容器对拍参考实现 | 不单独运行 |
 | `data/` | 测试证书和配置样本 | 只供测试使用 |
@@ -51,18 +50,16 @@ python3 test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 证书和配置统一从源码的 `test/data/` 读取，移动测试执行文件无需复制一份资源；
 路由 HTML 报告等运行产物写入构建目录。
 
-手动工具和性能基准位于构建目录中对应的分组：
+手动诊断工具位于构建目录中对应的分组：
 
 ```console
 build/test/tools/test_icmp 127.0.0.1 4
 build/test/tools/test_tls_channel_peer server 18443
 build/test/tools/test_tls_channel_peer client localhost 18443
-build/test/benchmark/benchmark_dual_index_map
-build/test/benchmark/benchmark_udp_node --help
 ```
 
 多配置生成器的可执行文件可能位于分组下的 `Debug/` 或 `Release/` 子目录；CTest 自动定位它们。
-基准只报告吞吐、丢包或耗时，不用机器性能阈值决定功能测试是否通过。
+性能基准的构建、运行和产物目录见 [benchmark/README.md](../benchmark/README.md)。
 
 ## 回归边界与整理原则
 

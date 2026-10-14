@@ -104,6 +104,11 @@ if(BUILD_TESTING)
     add_subdirectory(test)
 endif()
 
+option(BUILD_BENCHMARKS "Build manual performance benchmarks" OFF)
+if(BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
+endif()
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     include(cmake/Packaging.cmake)
 endif()

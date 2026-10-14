@@ -1,5 +1,6 @@
 /vendor
 /build*
+/flow-results/
 __pycache__/
 *.py[cod]
 /dashboard/*.sqlite3*

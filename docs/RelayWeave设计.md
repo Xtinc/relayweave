@@ -2526,7 +2526,7 @@ ctest --test-dir build -C Debug --output-on-failure
 
 测试目录按 `common/`、`protocol/`、`route/`、`agent/`、`node/`、`proxy/`、
 `integration/`、`deployment/` 分组；夹具与资源位于 `support/`、`data/`，
-性能基准和手动诊断分别位于 `benchmark/`、`tools/`。分组、覆盖边界及运行方法见
+性能基准和手动诊断分别位于仓库根目录的 `benchmark/` 和 `test/tools/`。分组、覆盖边界及运行方法见
 [`test/README.md`](../test/README.md)。所有自动用例有超时和组件/运行类型标签。
 
 路由模块测试集中在 `test/route/`；Agent 路由组装与 Node 拓扑测试分别位于
@@ -2573,7 +2573,10 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
   以及离线不分配资源、注册不复活旧请求、半接入超时、过期票据丢弃、ready 后无运行超时和容量恢复；
 - `agent_lifecycle`、`agent_reconnect`：重复启动/停止、可等待停止、断线重连取消以及停止后的对象释放。
 
-`benchmark_udp_node` 与 `benchmark_dual_index_map` 位于 `test/benchmark/`，不注册为 CTest。旧 UDP 集成测试内的环境变量压测分支已删除。前者是独立容量基准，它建立真实 mTLS 控制会话和 UDP Relay，再以原始 UDP socket 测量服务器数据路径。
+性能基准位于仓库根目录 `benchmark/`，由 `BUILD_BENCHMARKS` 独立启用，不注册为 CTest。
+用例覆盖缓冲池、编解码、限速与计数、索引与缓存、异步交接、路由与拓扑、注册表、TCP/TLS/UDP 复制、代理隧道及多节点 Flow。
+UDP Node 容量基准建立真实 mTLS 控制会话和 UDP Relay，再以原始 UDP socket 测量服务器数据路径；旧 UDP 集成测试内的环境变量压测分支已删除。
+组件用例、运行参数与记录格式见 [`benchmark/README.md`](../benchmark/README.md)，CSV、日志、曲线和实测报告保存在构建目录并由 Git 忽略。
 
 Dashboard 验证使用 Python 环境中的 Flask、cbor2、Waitress；部署测试仅使用标准库、临时目录、模拟 systemctl 和 dry-run，Linux 检测到 Python3 时自动注册到 CTest，
 不会修改主机配置或服务。双 Node smoke 启动真实 Node、发布/消费 Agent 与 Dashboard，验证 TCP/TLS、
