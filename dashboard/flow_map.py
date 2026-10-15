@@ -8,9 +8,11 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import hashlib
+import heapq
 import json
 import math
 import threading
+from bisect import bisect_right
 import xml.etree.ElementTree as ET
 
 
@@ -186,6 +188,125 @@ def _stations(route: dict) -> list[str]:
             _agent_key(route["producer"])]
 
 
+def _label(name: str) -> tuple[str, float]:
+    """Bound labels by display width, including wide Unicode Node names."""
+    text, width = "", 0
+    for character in name:
+        advance = (12 if not character.isascii() or character in "MW@" else
+                   3.6 if character in "il.,:;!'| " else 9 if character.isupper() else 7.2)
+        if width + advance > 168:
+            return text + "…", width + 12
+        text += character
+        width += advance
+    return text, width
+
+
+def _station_boxes(key: str, point: tuple[float, float], agents: dict) -> list[tuple]:
+    x, y = point
+    is_node = key.startswith("node:")
+    name = key[5:] if is_node else agents[key]["peer"]
+    half_width = _label(name)[1] / 2 + 10
+    label_y = y + (46 if is_node else 25)
+    radius = 34 if is_node else 17
+    return [(x - radius, y - radius, x + radius, y + radius),
+            (x - half_width, label_y - 21, x + half_width, label_y + 10)]
+
+
+class _FlowRouter:
+    """Route on shared orthogonal corridors, leaving station labels clear."""
+
+    def __init__(self, positions: dict, agents: dict, parallel: int):
+        boxes = [box for key, point in positions.items() for box in _station_boxes(key, point, agents)]
+        xs = {value for box in boxes for value in (box[0], box[2])}
+        ys = {value for box in boxes for value in (box[1], box[3])}
+        # A corridor on either side of every station gives parallel routes room.
+        for key, (x, y) in positions.items():
+            radius = 34 if key.startswith("node:") else 17
+            xs.update((x - radius, x + radius))
+            ys.add(y)
+            for lane in range(1, parallel + 1):
+                ys.update((y - radius - lane * 12, y + 66 + lane * 12))
+        xs.update((min(xs) - 24, max(xs) + 24))
+        ys.update((min(ys) - 24, max(ys) + 24))
+        self.xs, self.ys = sorted(xs), sorted(ys)
+        self.xindex = {value: index for index, value in enumerate(self.xs)}
+        self.yindex = {value: index for index, value in enumerate(self.ys)}
+        self.rows = [self._merge((left, right) for left, top, right, bottom in boxes if top < y < bottom)
+                     for y in self.ys]
+        self.columns = [self._merge((top, bottom) for left, top, right, bottom in boxes if left < x < right)
+                        for x in self.xs]
+        self.used = defaultdict(int)
+
+    @staticmethod
+    def _merge(intervals):
+        merged = []
+        for low, high in sorted(intervals):
+            if merged and low < merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(high, merged[-1][1]))
+            else:
+                merged.append((low, high))
+        return merged
+
+    @staticmethod
+    def _blocked(intervals, value):
+        index = bisect_right(intervals, (value, math.inf)) - 1
+        return index >= 0 and intervals[index][0] < value < intervals[index][1]
+
+    def path(self, left: str, right: str, positions: dict) -> list[tuple[float, float]]:
+        # Always use the same ports for reverse traffic between a station pair.
+        if left > right:
+            return list(reversed(self.path(right, left, positions)))
+        x1, y1 = positions[left]
+        x2, y2 = positions[right]
+        side = 1 if x2 >= x1 else -1
+        start = (x1 + side * (34 if left.startswith("node:") else 17), y1)
+        end = (x2 - side * (34 if right.startswith("node:") else 17), y2)
+        source = (self.xindex[start[0]], self.yindex[start[1]], 0)
+        target = (self.xindex[end[0]], self.yindex[end[1]])
+        queue = [(abs(start[0] - end[0]) + abs(start[1] - end[1]), 0, source)]
+        costs, previous = {source: 0}, {}
+        while queue:
+            _, cost, current = heapq.heappop(queue)
+            if cost != costs[current]:
+                continue
+            ix, iy, direction = current
+            if (ix, iy) == target:
+                break
+            for nx, ny, axis in ((ix - 1, iy, 0), (ix + 1, iy, 0), (ix, iy - 1, 1), (ix, iy + 1, 1)):
+                if not (0 <= nx < len(self.xs) and 0 <= ny < len(self.ys)):
+                    continue
+                x, y = self.xs[nx], self.ys[ny]
+                midpoint = (self.ys[iy] + y) / 2 if axis else (self.xs[ix] + x) / 2
+                if self._blocked(self.columns[ix] if axis else self.rows[iy], midpoint):
+                    continue
+                edge = tuple(sorted(((ix, iy), (nx, ny))))
+                length = abs(x - self.xs[ix]) + abs(y - self.ys[iy])
+                candidate = cost + length * (1 + .8 * self.used.get(edge, 0)) + (18 if axis != direction else 0)
+                neighbor = (nx, ny, axis)
+                if candidate < costs.get(neighbor, math.inf):
+                    costs[neighbor], previous[neighbor] = candidate, current
+                    heuristic = abs(x - end[0]) + abs(y - end[1])
+                    heapq.heappush(queue, (candidate + heuristic, candidate, neighbor))
+        else:
+            raise ValueError("Flow station ports must have an unobstructed route")
+        points = []
+        while current != source:
+            ix, iy, _ = current
+            points.append((self.xs[ix], self.ys[iy]))
+            parent = previous[current]
+            self.used[tuple(sorted((current[:2], parent[:2])))] += 1
+            current = parent
+        points.append(start)
+        points.reverse()
+        # Remove grid subdivisions so rounded corners only appear at real turns.
+        compact = [points[0]]
+        for point, following in zip(points[1:-1], points[2:]):
+            if not (compact[-1][0] == point[0] == following[0] or compact[-1][1] == point[1] == following[1]):
+                compact.append(point)
+        compact.append(end)
+        return [(x1, y1), *compact, (x2, y2)]
+
+
 def _rounded_path(points: list[tuple[float, float]]) -> str:
     """Round orthogonal corners without changing station endpoints."""
     points = [point for index, point in enumerate(points) if not index or point != points[index - 1]]
@@ -255,11 +376,8 @@ class FlowMapRenderer:
         by_node = defaultdict(list)
         for key, agent in sorted(agents.items()):
             by_node[agent["node"]].append(key)
-        positions = {}
+        blocks = []
         remaining = set(graph)
-        base = 65
-        idle_nodes = sorted(node for node in graph if not graph[node] and not by_node[node])
-        remaining.difference_update(idle_nodes)
         while remaining:
             root = min(remaining)
             levels = {root: 0}
@@ -271,56 +389,77 @@ class FlowMapRenderer:
                         levels[peer] = levels[node] + 1
                         queue.append(peer)
             remaining.difference_update(levels)
-            columns = defaultdict(list)
-            for node in sorted(levels):
-                columns[levels[node]].append(node)
-            rows = max(map(len, columns.values()))
-            for row in range(rows):
-                row_nodes = [nodes[row] for nodes in columns.values() if row < len(nodes)]
+            ordered = sorted(levels, key=lambda node: (levels[node], node))
+            column_count = max(1, math.ceil(math.sqrt(len(ordered))))
+            slots = {}
+            column_left, column_right = [100] * column_count, [100] * column_count
+            for index, node in enumerate(ordered):
+                sides = defaultdict(list)
+                for key in by_node[node]:
+                    sides[-1 if agents[key]["roles"] == {"consumer"} else 1].append(key)
+                count = max(map(len, sides.values()), default=0)
+                agent_columns = max(1, round(math.sqrt(count * .5)))
+                column = index % column_count
+                if index // column_count % 2:
+                    column = column_count - column - 1
+                column_left[column] = max(column_left[column], min(len(sides[-1]), agent_columns) * 200)
+                column_right[column] = max(column_right[column], min(len(sides[1]), agent_columns) * 200)
+                slots[node] = (column, sides, agent_columns)
+            column_x = [sum(column_left[:index]) + sum(column_right[:index]) + index * 32 + column_left[index]
+                        for index in range(column_count)]
+            local = {}
+            base = 34
+            for start in range(0, len(ordered), column_count):
+                row_nodes = ordered[start:start + column_count]
+                row_height = 112
                 for node in row_nodes:
-                    x, y = 225 + levels[node] * 320, base
-                    positions["node:" + node] = (x, y)
-                    for index, key in enumerate(by_node[node]):
-                        side = -1 if agents[key]["roles"] == {"consumer"} else 1
-                        positions[key] = (x + side * 120, y + 85 + index * 65)
-                base += 160 + max((len(by_node[node]) for node in row_nodes), default=0) * 65
-            base += 70
-        idle_base = max((y for x, y in positions.values()), default=-35) + 100
-        for index, node in enumerate(idle_nodes):
-            positions["node:" + node] = (100 + index % 3 * 240, idle_base + index // 3 * 130)
+                    column, sides, agent_columns = slots[node]
+                    x, y = column_x[column], base
+                    local["node:" + node] = (x, y)
+                    for side, keys in sides.items():
+                        for index, key in enumerate(keys):
+                            local[key] = (x + side * (100 + index % agent_columns * 200),
+                                          y + 96 + index // agent_columns * 56)
+                        if keys:
+                            row_height = max(row_height, 156 + (math.ceil(len(keys) / agent_columns) - 1) * 56)
+                base += row_height
+            bounds = [box for key, point in local.items() for box in _station_boxes(key, point, agents)]
+            left, top = min(box[0] for box in bounds), min(box[1] for box in bounds)
+            width = max(box[2] for box in bounds) - left + 32
+            height = max(box[3] for box in bounds) - top + 32
+            blocks.append((width, height, root, {key: (x - left + 16, y - top + 16)
+                                                 for key, (x, y) in local.items()}))
+        # Pack disconnected components together instead of stacking them in one tall column.
+        total_area = sum((width + 32) * (height + 32) for width, height, _, _ in blocks)
+        target_width = max(max((block[0] for block in blocks), default=480), math.sqrt(total_area * 2.2))
+        shelves = []
+        positions = {}
+        for width, height, _, local in sorted(blocks, key=lambda block: (-block[1], -block[0], block[2])):
+            shelf = next((item for item in shelves if item[0] + width <= target_width and height <= item[2]), None)
+            if shelf is None:
+                shelf = [0, sum(item[2] + 32 for item in shelves), height]
+                shelves.append(shelf)
+            for key, (x, y) in local.items():
+                positions[key] = (x + shelf[0], y + shelf[1])
+            shelf[0] += width + 32
         lanes = defaultdict(list)
         for route in sorted(routes, key=lambda r: r["id"]):
-            stations = _stations(route)
-            for index, (left, right) in enumerate(zip(stations, stations[1:])):
-                lanes[tuple(sorted((left, right)))].append((route["id"], index))
-        # Leave room for the widest count-encoded line without relaying out on refresh.
-        offsets = {track: (index - (len(tracks) - 1) / 2) * 22
-                   for tracks in lanes.values() for index, track in enumerate(tracks)}
+            for left, right in zip(_stations(route), _stations(route)[1:]):
+                lanes[tuple(sorted((left, right)))].append(route["id"])
+        router = _FlowRouter(positions, agents, min(4, max(map(len, lanes.values()), default=1))) if routes else None
         polylines = {}
-        for route in routes:
+        for route in sorted(routes, key=lambda route: route["id"]):
             stations = _stations(route)
-            segments = []
-            for index, (left, right) in enumerate(zip(stations, stations[1:])):
-                offset = offsets[route["id"], index]
-                x1, y1 = positions[left]
-                x2, y2 = positions[right]
-                if x1 == x2:
-                    bend = x1 + 38 + offset
-                    points = [(x1, y1), (bend, y1), (bend, y2), (x2, y2)]
-                else:
-                    bend = (x1 + x2) / 2 + offset
-                    points = [(x1, y1), (x1, y1 + offset), (bend, y1 + offset),
-                              (bend, y2 + offset), (x2, y2 + offset), (x2, y2)]
-                segments.append(points)
-            polylines[route["id"]] = segments
+            polylines[route["id"]] = [router.path(left, right, positions)
+                                     for left, right in zip(stations, stations[1:])]
         all_points = [point for segments in polylines.values() for points in segments for point in points]
-        shift_x = max(0, 35 - min((x for x, y in all_points), default=35))
-        shift_y = max(0, 35 - min((y for x, y in all_points), default=35))
+        bounds = [box for key, point in positions.items() for box in _station_boxes(key, point, agents)]
+        min_x = min([box[0] for box in bounds] + [x for x, y in all_points], default=0)
+        min_y = min([box[1] for box in bounds] + [y for x, y in all_points], default=0)
+        shift_x, shift_y = 24 - min_x, 24 - min_y
         positions = {key: (x + shift_x, y + shift_y) for key, (x, y) in positions.items()}
-        width = max(max((x for x, y in positions.values()), default=480) + 215,
-                    max((x + shift_x for x, y in all_points), default=0) + 35)
-        height = max(max((y for x, y in positions.values()), default=100) + 85,
-                     max((y + shift_y for x, y in all_points), default=0) + 35)
+        width = max([box[2] for box in bounds] + [x for x, y in all_points], default=480) + shift_x + 24
+        height = max([box[3] for box in bounds] + [y for x, y in all_points], default=100) + shift_y + 24
         paths = {key: " ".join(_rounded_path([(x + shift_x, y + shift_y) for x, y in points])
                               for points in segments) for key, segments in polylines.items()}
         return positions, agents, paths, width, height
@@ -375,5 +514,5 @@ class FlowMapRenderer:
             ET.SubElement(station, "title").text = title
             label = ET.SubElement(station, "text", {"x": "0", "y": "46" if key.startswith("node:") else "25",
                                                     "text-anchor": "middle", "class": "flow-label"})
-            label.text = name if len(name) <= 25 else name[:22] + "…"
+            label.text = _label(name)[0]
         return ET.tostring(svg, encoding="unicode")

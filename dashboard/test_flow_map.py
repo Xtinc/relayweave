@@ -2,7 +2,7 @@
 import unittest
 import xml.etree.ElementTree as ET
 
-from flow_map import FlowCollection, FlowMapRenderer, validate_relays
+from flow_map import FlowCollection, FlowMapRenderer, _FlowRouter, _station_boxes, validate_relays
 
 
 def single(uuid=1, service="ssh", protocol="tcp", consumer="192.0.2.10:123", producer="[2001:db8::1]:456"):
@@ -265,6 +265,60 @@ class FlowMapTest(unittest.TestCase):
         self.assertNotIn("<script>", svg)
         self.assertIn("&lt;script&gt;", svg)
         self.assertIn("…", svg)
+
+    def test_disconnected_nodes_pack_into_a_balanced_map(self):
+        for count in (4, 12, 60):
+            renderer = FlowMapRenderer()
+            renderer.render(FlowCollection().snapshot(True), topology={"nodes": [
+                {"node_id": f"Node-{index:02}", "available": .5} for index in range(count)]})
+            width, height = renderer._geometry[-2:]
+            self.assertGreater(width / height, .9)
+            self.assertLess(width / height, 3)
+
+    def test_many_agents_use_multiple_columns_without_label_overlap(self):
+        reports = {"a": [single(index, consumer=f"192.0.2.{index}:123", producer=f"198.51.100.{index}:456")
+                         for index in range(1, 17)]}
+        renderer = FlowMapRenderer()
+        renderer.render(collect(reports).snapshot(True))
+        positions, agents, _, width, height = renderer._geometry
+        self.assertGreater(width / height, 1)
+        self.assertLess(width / height, 3)
+        labels = [_station_boxes(key, point, agents)[1] for key, point in positions.items()]
+        for index, (left, top, right, bottom) in enumerate(labels):
+            for other_left, other_top, other_right, other_bottom in labels[index + 1:]:
+                self.assertFalse(left < other_right and other_left < right
+                                 and top < other_bottom and other_top < bottom)
+
+    def test_paths_avoid_labels_and_unrelated_stations(self):
+        reports = {"a": [half("ingress", index, path=["a", f"node-{index}"])
+                         for index in range(1, 7)]}
+        reports.update({f"node-{index}": [half("egress", index)] for index in range(1, 7)})
+        view = collect(reports).snapshot(True)
+        renderer = FlowMapRenderer()
+        renderer.render(view)
+        positions, agents, _, _, _ = renderer._geometry
+        router = _FlowRouter(positions, agents, 2)
+        endpoints = sorted(positions)
+        for left, right in zip(endpoints, endpoints[1:]):
+            points = router.path(left, right, positions)
+            for key, position in positions.items():
+                boxes = _station_boxes(key, position, agents)
+                for low_x, low_y, high_x, high_y in (boxes[1:] if key in {left, right} else boxes):
+                    for (x1, y1), (x2, y2) in zip(points, points[1:]):
+                        intersects = (low_y < y1 < high_y and min(x1, x2) < high_x and max(x1, x2) > low_x
+                                      if y1 == y2 else
+                                      low_x < x1 < high_x and min(y1, y2) < high_y and max(y1, y2) > low_y)
+                        self.assertFalse(intersects, (left, right, key, points))
+
+    def test_route_order_does_not_change_geometry(self):
+        view = collect({"a": [single(1), single(2, protocol="udp"), single(3, consumer="192.0.2.11:123")]}).snapshot(True)
+        before = FlowMapRenderer().render(view)["svg"]
+        view["routes"].reverse()
+        after = FlowMapRenderer().render(view)["svg"]
+        ns = {"s": "http://www.w3.org/2000/svg"}
+        paths = lambda svg: {line.get("data-route"): line.find("s:path", ns).get("d")
+                             for line in ET.fromstring(svg).findall(".//s:g[@class='flow-line']", ns)}
+        self.assertEqual(paths(before), paths(after))
 
 
 if __name__ == "__main__":

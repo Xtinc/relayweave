@@ -131,6 +131,14 @@ pixel scale for business connection count. The maximum is about 8.7px, smaller
 than the 14px Agent squares. Parallel tracks reserve space for the maximum
 width, so count updates do not move other routes.
 
+Connected Nodes use a compact grid in breadth-first order, and disconnected
+groups share rows to avoid a long, narrow map. Agent groups use extra columns
+as they grow. Label widths reserve space for long names, including wide Unicode
+characters; shortened labels retain their full name in the hover title.
+Orthogonal routes avoid labels and unrelated station symbols and prefer unused
+corridors to reduce overlapping tracks. Layout depends on topology rather than
+changing connection counts or capacity values.
+
 Each station has a fixed-size ring showing bandwidth used (`1 - available`),
 with the estimated remaining percentage in its center. Headroom is green at
 30% or above, amber from 10% to 30%, and red below 10%; missing or expired
@@ -154,7 +162,9 @@ endpoints, path and minimum Node headroom; protocol UUIDs, epochs and Flow IDs
 remain available in the API but are not displayed. The entire map automatically
 fits the available area without scrollbars. Zoom buttons, directional buttons
 and Fit adjust the view explicitly; hovering, dragging and the mouse wheel do
-not change the map view. Count and capacity refreshes preserve the current view;
+not change the map view. Default fitting caps enlargement at 125% so small maps
+keep comfortable Node and text sizes; resizing refits the available area.
+Count and capacity refreshes preserve the current view;
 topology changes fit the new map. Flow data is only held in memory
 and is not added to SQLite history.
 

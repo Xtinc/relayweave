@@ -567,8 +567,24 @@ let flowSvgText = null;
 let flowView = null;
 let flowGeometryKey = null;
 function applyFlowView(){
-  const svg = $("flow-viewport").querySelector("svg");
-  if(svg && flowView){
+  const viewport = $("flow-viewport"), svg = viewport.querySelector("svg");
+  if(svg && flowView && viewport.clientWidth){
+    const {content} = flowView;
+    const styles = getComputedStyle(svg);
+    const scale = Math.min(1.25, viewport.clientWidth / content.width, parseFloat(styles.maxHeight) / content.height);
+    const displayHeight = Math.max(parseFloat(styles.minHeight), content.height * scale);
+    const fittedWidth = viewport.clientWidth / scale, fittedHeight = displayHeight / scale;
+    const nextBounds = {x:content.x + (content.width - fittedWidth) / 2,
+      y:content.y + (content.height - fittedHeight) / 2, width:fittedWidth, height:fittedHeight};
+    const previous = flowView.bounds;
+    if(previous){
+      flowView.x += (previous.width - nextBounds.width) / flowView.zoom / 2;
+      flowView.y += (previous.height - nextBounds.height) / flowView.zoom / 2;
+    }else{
+      flowView.x = nextBounds.x; flowView.y = nextBounds.y;
+    }
+    flowView.bounds = nextBounds;
+    svg.style.height = `${displayHeight}px`;
     const {bounds, zoom} = flowView;
     const width = bounds.width / zoom, height = bounds.height / zoom;
     flowView.x = Math.max(bounds.x, Math.min(flowView.x, bounds.x + bounds.width - width));
@@ -583,6 +599,7 @@ function applyFlowView(){
       : action === "fit" ? false : flowView.zoom <= 1);
   });
 }
+new ResizeObserver(() => applyFlowView()).observe($("flow-viewport"));
 $("flow-controls").addEventListener("click", event => {
   const button = event.target.closest("button[data-flow-view]");
   if(!button || button.disabled || !flowView) return;
@@ -666,8 +683,8 @@ function renderFlowMap(map){
       const geometryKey = JSON.stringify([map.routes.map(route => route.id), map.nodes.map(node => node.node_id)]);
       if(geometryKey !== flowGeometryKey){
         const scene = viewport.querySelector(".flow-scene").getBBox();
-        const bounds = {x:scene.x - 28, y:scene.y - 28, width:scene.width + 56, height:scene.height + 56};
-        flowView = {bounds, x:bounds.x, y:bounds.y, zoom:1};
+        const content = {x:scene.x - 28, y:scene.y - 28, width:scene.width + 56, height:scene.height + 56};
+        flowView = {content, bounds:null, zoom:1};
         flowGeometryKey = geometryKey;
       }
       if(focused) viewport.querySelector(focused)?.focus({preventScroll:true});
