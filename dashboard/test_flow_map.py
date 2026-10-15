@@ -2,7 +2,8 @@
 import unittest
 import xml.etree.ElementTree as ET
 
-from flow_map import FlowCollection, FlowMapRenderer, _metro_path, _rounded_path, _station_boxes, validate_relays
+from flow_map import (FlowCollection, FlowMapRenderer, _metro_path, _rounded_path,
+                      _station_boxes, _track_overlap, _visible_segments, validate_relays)
 
 
 def single(uuid=1, service="ssh", protocol="tcp", consumer="192.0.2.10:123", producer="[2001:db8::1]:456"):
@@ -278,6 +279,26 @@ class FlowMapTest(unittest.TestCase):
         self.assertIs(renderer._geometry, geometry)
         self.assertTrue(all(track["width"] <= 3 + .8 * 50**.5 for track in changed["shared_tracks"]))
 
+    def test_unrelated_agent_connections_do_not_share_visible_corridors(self):
+        ingress_a = half("ingress", 1, path=["aliyun-1", "awsyun-1"])
+        ingress_a["agent_peer"] = "219.140.92.118:6347"
+        ingress_b = half("ingress", 2, path=["llyun-1", "awsyun-1"])
+        ingress_b["agent_peer"] = "219.140.92.118:40076"
+        reports = {"aliyun-1": [ingress_a, single(3)],
+                   "awsyun-1": [half("egress", 1), half("egress", 2)],
+                   "llyun-1": [ingress_b, single(4), single(5, producer="219.140.92.118:14070")],
+                   "txyun-1": [single(6)]}
+        renderer = FlowMapRenderer()
+        rendered = renderer.render(collect(reports).snapshot(True))
+        positions = renderer._geometry[0]
+        nodes = [point for key, point in positions.items() if key.startswith("node:")]
+        occupied = []
+        for pair, (_, points) in renderer._geometry[3].items():
+            visible = _visible_segments(points, nodes)
+            self.assertAlmostEqual(_track_overlap(visible, occupied)[0], 0, msg=str(pair))
+            occupied.extend(visible)
+        self.assertTrue(any(len(track["routes"]) == 2 for track in rendered["shared_tracks"]))
+
     def test_text_is_escaped_and_labels_are_truncated(self):
         peer = '<script>alert("x")</script>' * 3
         view = collect({"<node>": [single(service="<ssh>", consumer=peer)]}).snapshot(True)
@@ -309,6 +330,12 @@ class FlowMapTest(unittest.TestCase):
             for other_left, other_top, other_right, other_bottom in labels[index + 1:]:
                 self.assertFalse(left < other_right and other_left < right
                                  and top < other_bottom and other_top < bottom)
+        occupied = []
+        nodes = [point for key, point in positions.items() if key.startswith("node:")]
+        for pair, (_, points) in renderer._geometry[3].items():
+            visible = _visible_segments(points, nodes)
+            self.assertAlmostEqual(_track_overlap(visible, occupied)[0], 0, msg=str(pair))
+            occupied.extend(visible)
 
     def test_metro_tracks_are_orthogonal_with_every_turn_rounded(self):
         for start, end in (((0, 0), (300, 0)), ((100, 100), (100, 400)), ((50, 60), (400, 350))):

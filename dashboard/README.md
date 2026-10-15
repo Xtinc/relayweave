@@ -147,13 +147,18 @@ rounded corners. Each hop prefers a simple track with few turns; redundant
 collinear points and short spurs are removed before rounding every real turn.
 Routes sharing the same pair of stations use the same track, without parallel
 offsets or separation bends; paths favor clear station symbols.
+Distinct station pairs reserve their own visible corridors, with separate
+approaches at shared stations. Only a merged shared track may occupy the same
+visible centerline. More crowded maps use additional clear corridors while
+retaining rounded turns and fixed station coordinates.
 They do not detour around labels; text keeps its background-colored outline
 where paths pass behind it.
 
-Each station has a light outline and a thin outer ring showing bandwidth used
+Each station uses a compact 20px-radius capacity ring showing bandwidth used
 (`1 - available`), with the estimated remaining percentage in its center.
-The ring uses a faint status-colored track and rounded arc ends; a small halo
-keeps route lines clear of the station edge. Headroom is green at
+The ring uses a single 2.5px status-colored track with rounded arc ends;
+the center has no outline or shadow. A small halo keeps route lines clear
+of the station edge. Headroom is green at
 30% or above, amber from 10% to 30%, and red below 10%; missing or expired
 capacity has a gray ring and a dash. The Node-provided `available` ratio is
 already in `topology.snapshot`; Dashboard retains it in `topology.nodes` and

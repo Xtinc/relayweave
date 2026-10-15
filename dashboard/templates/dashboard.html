@@ -329,18 +329,18 @@
   .flow-line:focus-visible { outline:2px solid var(--series-1); outline-offset:5px; }
   .flow-node-halo { fill:var(--flow-bg); }
   .flow-node, .flow-agent { fill:var(--flow-node-bg); stroke:var(--flow-ring); stroke-width:1.25; }
-  .flow-node { filter:drop-shadow(0 1px 2px rgba(25,45,65,.07)); }
+  .flow-node { stroke:none; }
   .flow-agent { stroke:var(--flow-muted); stroke-width:1.6; }
   .flow-station text { fill:var(--flow-ink); font-size:12px; paint-order:stroke; stroke:var(--flow-bg); stroke-width:4; stroke-linejoin:round; }
   .flow-node-station { --station-color:var(--flow-ring); }
   .flow-node-station.good { --station-color:var(--flow-good); }
   .flow-node-station.warning { --station-color:var(--flow-warning); }
   .flow-node-station.critical { --station-color:var(--flow-critical); }
-  .flow-capacity-track { fill:none; stroke:var(--station-color); stroke-width:3; opacity:.20; }
-  .flow-node-station .flow-capacity { fill:none; stroke:var(--station-color); stroke-width:3; stroke-linecap:round; }
+  .flow-capacity-track { fill:none; stroke:var(--station-color); stroke-width:2.5; opacity:.20; }
+  .flow-node-station .flow-capacity { fill:none; stroke:var(--station-color); stroke-width:2.5; stroke-linecap:round; }
   .flow-node-station .flow-label { font-weight:600; font-size:11.5px; letter-spacing:.015em; }
   .flow-agent-station .flow-label { fill:var(--flow-muted); font-size:10.5px; }
-  .flow-station .flow-headroom { fill:var(--flow-ink); font-weight:650; font-size:12.5px; font-variant-numeric:tabular-nums; letter-spacing:-.35px; stroke:none; }
+  .flow-station .flow-headroom { fill:var(--flow-ink); font-weight:600; font-size:11px; font-variant-numeric:tabular-nums; letter-spacing:-.3px; stroke:none; }
   .flow-key { color:var(--flow-muted); font-size:11px; margin:12px 0 0; line-height:1.6; }
   .flow-status { color:var(--flow-muted); font-size:12px; margin:8px 0 10px; }
   .flow-legend { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }

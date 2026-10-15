@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import hashlib
+import heapq
 import json
 import math
 import threading
@@ -249,7 +250,8 @@ def _rounded_path(points: list[tuple[float, float]], offset: float = 0) -> str:
 
 
 def _metro_path(start: tuple[float, float], end: tuple[float, float],
-                obstacles: list[tuple[float, float, float]]) -> tuple[str, list[tuple[float, float]]]:
+                obstacles: list[tuple[float, float, float]], *, occupied=(), nodes=(),
+                start_node=False, end_node=False) -> tuple[str, list[tuple[float, float]]]:
     """Prefer one simple metro track; avoid symbols without detouring around text."""
     x1, y1 = start
     x2, y2 = end
@@ -284,7 +286,151 @@ def _metro_path(start: tuple[float, float], end: tuple[float, float],
         candidates = [horizontal(bend) for bend in xs] + [vertical(bend) for bend in ys]
         points = min([points, *candidates], key=lambda candidate: (collisions(candidate), len(candidate),
                      sum(math.dist(a, b) for a, b in zip(candidate, candidate[1:]))))
+    if occupied and _track_overlap(_visible_segments(points, nodes), occupied)[1]:
+        def ports(point, other, is_node):
+            x, y = point
+            options = []
+            for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                for lane in ((0, -12, 12, -6, 6, -18, 18, -21, 21) if is_node else (0,)):
+                    bend = (x - dy * lane, y + dx * lane)
+                    port = (bend[0] + dx * (32 if is_node else 14), bend[1] + dy * (32 if is_node else 14))
+                    prefix = _compact_path([point, bend, port])
+                    if not _track_overlap(_visible_segments(prefix, nodes), occupied)[0]:
+                        options.append((math.dist(port, other), abs(lane), prefix))
+            return [item[2] for item in sorted(options)]
+
+        all_starts, all_ends = ports(start, end, start_node), ports(end, start, end_node)
+        starts, ends = all_starts[:6], all_ends[:6]
+        candidates = {tuple(points)}
+        for prefix in starts:
+            for suffix in ends:
+                a, b = prefix[-1], suffix[-1]
+                xs = {(a[0] + b[0]) / 2, a[0], b[0], min(a[0], b[0]) - 48, max(a[0], b[0]) + 48}
+                ys = {(a[1] + b[1]) / 2, a[1], b[1], min(a[1], b[1]) - 48, max(a[1], b[1]) + 48}
+                for first, second in occupied:
+                    if first[0] == second[0]:
+                        xs.update((first[0] - 12, first[0] + 12))
+                    else:
+                        ys.update((first[1] - 12, first[1] + 12))
+                xs = sorted(xs, key=lambda x: (abs(x - (a[0] + b[0]) / 2), x))[:10]
+                ys = sorted(ys, key=lambda y: (abs(y - (a[1] + b[1]) / 2), y))[:10]
+                for x in xs:
+                    candidates.add(tuple(_compact_path([*prefix, (x, a[1]), (x, b[1]), *reversed(suffix)])))
+                for y in ys:
+                    candidates.add(tuple(_compact_path([*prefix, (a[0], y), (b[0], y), *reversed(suffix)])))
+        best_score = None
+        for candidate in sorted(candidates, key=lambda p: (len(p), sum(math.dist(a, b) for a, b in zip(p, p[1:])), p)):
+            exact, nearby = _track_overlap(_visible_segments(candidate, nodes), occupied)
+            symbols = collisions(candidate)
+            score = (bool(exact) + bool(symbols), exact + symbols * 1000, nearby, len(candidate),
+                     sum(math.dist(a, b) for a, b in zip(candidate, candidate[1:])))
+            if best_score is None or score < best_score:
+                points, best_score = list(candidate), score
+            if not exact and not nearby and not symbols:
+                break
+        if _track_overlap(_visible_segments(points, nodes), occupied)[0]:
+            routed = _corridor_path(all_starts, all_ends, occupied,
+                                    [*obstacles, (*start, 24 if start_node else 8),
+                                     (*end, 24 if end_node else 8)])
+            if routed is not None:
+                points = routed
     return _rounded_path(points), points
+
+
+def _corridor_path(starts, ends, occupied, obstacles):
+    """Find a clear corridor when a simple two-turn track is insufficient."""
+    if not starts or not ends:
+        return None
+    boxes = [(x - r, y - r, x + r, y + r) for x, y, r in obstacles]
+    xs = {x for path in [*starts, *ends] for x, y in path}
+    ys = {y for path in [*starts, *ends] for x, y in path}
+    for left, top, right, bottom in boxes:
+        xs.update((left, right)); ys.update((top, bottom))
+    for a, b in occupied:
+        xs.update((a[0], b[0], a[0] - 12, a[0] + 12))
+        ys.update((a[1], b[1], a[1] - 12, a[1] + 12))
+    xs.update((min(xs) - 48, max(xs) + 48))
+    ys.update((min(ys) - 48, max(ys) + 48))
+    xs, ys = sorted(xs), sorted(ys)
+    xi, yi = {x: i for i, x in enumerate(xs)}, {y: i for i, y in enumerate(ys)}
+    rows = [[(left, right) for left, top, right, bottom in boxes if top < y < bottom] +
+            [(a[0], b[0]) for a, b in occupied if a[1] == b[1] == y] for y in ys]
+    columns = [[(top, bottom) for left, top, right, bottom in boxes if left < x < right] +
+               [(a[1], b[1]) for a, b in occupied if a[0] == b[0] == x] for x in xs]
+    goals = {(xi[path[-1][0]], yi[path[-1][1]]): path for path in ends}
+    min_x, max_x = min(path[-1][0] for path in ends), max(path[-1][0] for path in ends)
+    min_y, max_y = min(path[-1][1] for path in ends), max(path[-1][1] for path in ends)
+    queue, costs, previous, roots = [], {}, {}, {}
+    for path in starts:
+        x, y = path[-1]
+        axis = int(path[-2][0] == x)
+        state = (xi[x], yi[y], axis)
+        cost = sum(math.dist(a, b) for a, b in zip(path, path[1:])) + 64 * (len(path) - 2)
+        costs[state], roots[state], previous[state] = cost, path, None
+        heapq.heappush(queue, (cost, cost, state))
+    while queue:
+        _, cost, current = heapq.heappop(queue)
+        if cost != costs[current]:
+            continue
+        ix, iy, direction = current
+        if (ix, iy) in goals:
+            suffix = goals[ix, iy]
+            points = []
+            while previous[current] is not None:
+                points.append((xs[current[0]], ys[current[1]]))
+                current = previous[current]
+            return _compact_path([*roots[current], *reversed(points), *reversed(suffix)])
+        for nx, ny, axis in ((ix - 1, iy, 0), (ix + 1, iy, 0), (ix, iy - 1, 1), (ix, iy + 1, 1)):
+            if not (0 <= nx < len(xs) and 0 <= ny < len(ys)):
+                continue
+            midpoint = (ys[iy] + ys[ny]) / 2 if axis else (xs[ix] + xs[nx]) / 2
+            if any(low < midpoint < high for low, high in (columns[ix] if axis else rows[iy])):
+                continue
+            neighbor = (nx, ny, axis)
+            candidate = cost + abs(xs[nx] - xs[ix]) + abs(ys[ny] - ys[iy]) + (64 if axis != direction else 0)
+            if candidate < costs.get(neighbor, math.inf):
+                costs[neighbor], previous[neighbor] = candidate, current
+                heuristic = max(min_x - xs[nx], 0, xs[nx] - max_x) + max(min_y - ys[ny], 0, ys[ny] - max_y)
+                heapq.heappush(queue, (candidate + heuristic, candidate, neighbor))
+    return None
+
+
+def _visible_segments(points, nodes):
+    """Only station interiors may hide the join between independent tracks."""
+    segments = []
+    for a, b in zip(points, points[1:]):
+        horizontal = a[1] == b[1]
+        fixed = a[1] if horizontal else a[0]
+        intervals = [(min(a[0], b[0]), max(a[0], b[0])) if horizontal else (min(a[1], b[1]), max(a[1], b[1]))]
+        for x, y in nodes:
+            distance = abs(fixed - (y if horizontal else x))
+            if distance >= 24:
+                continue
+            extent = math.sqrt(24**2 - distance**2)
+            low, high = (x if horizontal else y) - extent, (x if horizontal else y) + extent
+            intervals = [(left, right) for start, end in intervals
+                         for left, right in ((start, min(end, low)), (max(start, high), end)) if right > left]
+        segments.extend((((low, fixed), (high, fixed)) if horizontal else ((fixed, low), (fixed, high)))
+                        for low, high in intervals)
+    return segments
+
+
+def _track_overlap(segments, occupied):
+    exact = nearby = 0
+    for a, b in segments:
+        horizontal = a[1] == b[1]
+        axis = 0 if horizontal else 1
+        for c, d in occupied:
+            if horizontal != (c[1] == d[1]):
+                continue
+            gap = abs(a[1 - axis] - c[1 - axis])
+            if gap >= 10:
+                continue
+            overlap = max(0, min(b[axis], d[axis]) - max(a[axis], c[axis]))
+            if gap < 1e-6:
+                exact += overlap
+            nearby += overlap * (10 - gap) / 10
+    return exact, nearby
 
 
 class FlowMapRenderer:
@@ -403,11 +549,16 @@ class FlowMapRenderer:
                  for left, right in zip(_stations(route), _stations(route)[1:])}
         hops = {}
         all_points = []
+        occupied = []
+        node_centers = [point for key, point in positions.items() if key.startswith("node:")]
         for left, right in sorted(pairs):
             obstacles = [(x, y, 36 if key.startswith("node:") else 18)
                          for key, (x, y) in positions.items() if key not in {left, right}]
-            path, points = _metro_path(positions[left], positions[right], obstacles)
+            path, points = _metro_path(positions[left], positions[right], obstacles, occupied=occupied,
+                                       nodes=node_centers, start_node=left.startswith("node:"),
+                                       end_node=right.startswith("node:"))
             hops[left, right] = (path, points)
+            occupied.extend(_visible_segments(points, node_centers))
             all_points.extend(points)
         bounds = [box for key, point in positions.items() for box in _station_boxes(key, point, agents)]
         width = max([box[2] for box in bounds] + [x for x, y in all_points], default=480) + 28
@@ -460,12 +611,12 @@ class FlowMapRenderer:
                 station.set("data-node", name)
                 station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom")
                 station.set("class", f"flow-station flow-node-station {state}")
-                ET.SubElement(station, "circle", {"r": "31", "class": "flow-node-halo"})
-                ET.SubElement(station, "circle", {"r": "24", "class": "flow-node"})
-                ET.SubElement(station, "circle", {"r": "27", "class": "flow-capacity-track"})
+                ET.SubElement(station, "circle", {"r": "24", "class": "flow-node-halo"})
+                ET.SubElement(station, "circle", {"r": "18", "class": "flow-node"})
+                ET.SubElement(station, "circle", {"r": "20", "class": "flow-capacity-track"})
                 if available is not None:
-                    circumference = 2 * math.pi * 27
-                    ET.SubElement(station, "circle", {"r": "27", "class": "flow-capacity",
+                    circumference = 2 * math.pi * 20
+                    ET.SubElement(station, "circle", {"r": "20", "class": "flow-capacity",
                                                       "transform": "rotate(-90)",
                                                       "stroke-dasharray": f"{circumference * (1 - available):.3f} {circumference:.3f}"})
                 ET.SubElement(station, "text", {"y": "4", "text-anchor": "middle",
@@ -479,7 +630,7 @@ class FlowMapRenderer:
                                                 "rx": "3", "class": "flow-agent"})
                 title = f'Agent {name} · {agent["node"]} · {" / ".join(sorted(agent["roles"]))}'
             ET.SubElement(station, "title").text = title
-            label = ET.SubElement(station, "text", {"x": "0", "y": "46" if key.startswith("node:") else "25",
+            label = ET.SubElement(station, "text", {"x": "0", "y": "38" if key.startswith("node:") else "25",
                                                     "text-anchor": "middle", "class": "flow-label"})
             label.text = _label(name)[0]
         return ET.tostring(svg, encoding="unicode")
