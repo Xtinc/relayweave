@@ -149,7 +149,7 @@ class FlowMapTest(unittest.TestCase):
         rendered = renderer.render(view)
         svg = ET.fromstring(rendered["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
-        self.assertEqual(len(svg.findall(".//s:circle", ns)), 2)
+        self.assertEqual(len(svg.findall(".//s:circle[@class='flow-node']", ns)), 2)
         self.assertEqual(len(svg.findall(".//s:g[@class='flow-line']", ns)), 3)
         self.assertIn("consumer / producer", rendered["svg"])
         self.assertEqual(renderer.render(view, protocol="udp")["visible_route_count"], 0)
@@ -244,18 +244,39 @@ class FlowMapTest(unittest.TestCase):
         self.assertNotIn("min-width", svg.get("style", ""))
         self.assertEqual(svg.get("preserveAspectRatio"), "xMidYMid meet")
 
-    def test_shared_horizontal_edges_use_distinct_rounded_tracks(self):
+    def test_shared_hops_use_the_same_track_without_parallel_offsets(self):
         view = collect({"a": [half("ingress", 1, path=["a", "c"]),
                               half("ingress", 2, path=["a", "c"], protocol="udp")],
                         "c": [half("egress", 1), half("egress", 2, protocol="udp")]}).snapshot(True)
         renderer = FlowMapRenderer()
         renderer.render(view)
-        positions, agents, paths, width, height = renderer._geometry
+        positions, agents, paths, _, width, height = renderer._geometry
         tracks = list(paths.values())
-        self.assertNotEqual(tracks[0], tracks[1])
+        self.assertEqual(tracks[0], tracks[1])
         self.assertTrue(all(" Q" in track and " C" not in track for track in tracks))
         self.assertEqual(positions["node:a"][1], positions["node:c"][1])
         self.assertTrue(all(0 < x < width and 0 < y < height for x, y in positions.values()))
+
+    def test_shared_track_width_and_color_bands_use_summed_connections(self):
+        view = collect({"a": [single(1), single(2), single(3), single(4, protocol="udp")]}).snapshot(True)
+        renderer = FlowMapRenderer()
+        rendered = renderer.render(view)
+        geometry = renderer._geometry
+        for track in rendered["shared_tracks"]:
+            self.assertEqual(track["count"], 4)
+            self.assertAlmostEqual(track["width"], 3 + .8 * 4**.5)
+            self.assertEqual(sorted(route["share"] for route in track["routes"]), [.25, .75])
+        svg = ET.fromstring(rendered["svg"])
+        ns = {"s": "http://www.w3.org/2000/svg"}
+        for track in svg.findall(".//s:g[@class='flow-shared-track']", ns):
+            width = float(track.find("s:path[@class='flow-track']", ns).get("stroke-width"))
+            bands = sorted(float(band.get("stroke-width")) for band in track.findall("s:path[@class='flow-band']", ns))
+            self.assertAlmostEqual(sum(bands), width, places=5)
+            self.assertAlmostEqual(bands[1] / bands[0], 3, places=5)
+        view["routes"][0]["count"] = 100
+        changed = renderer.render(view)
+        self.assertIs(renderer._geometry, geometry)
+        self.assertTrue(all(track["width"] <= 3 + .8 * 50**.5 for track in changed["shared_tracks"]))
 
     def test_text_is_escaped_and_labels_are_truncated(self):
         peer = '<script>alert("x")</script>' * 3
@@ -280,7 +301,7 @@ class FlowMapTest(unittest.TestCase):
                          for index in range(1, 17)]}
         renderer = FlowMapRenderer()
         renderer.render(collect(reports).snapshot(True))
-        positions, agents, _, width, height = renderer._geometry
+        positions, agents, _, _, width, height = renderer._geometry
         self.assertGreater(width / height, 1)
         self.assertLess(width / height, 3)
         labels = [_station_boxes(key, point, agents)[1] for key, point in positions.items()]
@@ -291,7 +312,7 @@ class FlowMapTest(unittest.TestCase):
 
     def test_metro_tracks_are_orthogonal_with_every_turn_rounded(self):
         for start, end in (((0, 0), (300, 0)), ((100, 100), (100, 400)), ((50, 60), (400, 350))):
-            path, points = _metro_path(start, end, 14, [])
+            path, points = _metro_path(start, end, [])
             self.assertNotIn(" C", path)
             self.assertEqual(path.count(" Q"), len(points) - 2)
             self.assertTrue(all(a[0] == b[0] or a[1] == b[1] for a, b in zip(points, points[1:])))
@@ -308,7 +329,7 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(_rounded_path(clean).count(" Q"), 1)
 
     def test_metro_tracks_pass_around_unrelated_node_symbols(self):
-        _, points = _metro_path((0, 0), (300, 0), 0, [(150, 0, 36)])
+        _, points = _metro_path((0, 0), (300, 0), [(150, 0, 36)])
         for a, b in zip(points, points[1:]):
             x = max(min(150, max(a[0], b[0])), min(a[0], b[0]))
             y = max(min(0, max(a[1], b[1])), min(a[1], b[1]))

@@ -283,41 +283,75 @@
   }
   .footer-note { color: var(--text-muted); font-size: 12px; margin-top: 24px; }
   .stale { opacity: 0.5; transition: opacity 0.3s; }
-  .flow-card { margin-bottom:24px; }
-  .flow-viewport { overflow:hidden; background:var(--surface-1); border-radius:8px; }
+  .flow-card {
+    --flow-bg:#f8fafb; --flow-node-bg:#fff; --flow-ink:#2b3b50; --flow-muted:#64748b;
+    --flow-ring:#cfdae5; --flow-grid:rgba(105,125,148,.10);
+    --flow-good:#429c87; --flow-warning:#c99743; --flow-critical:#c96570;
+    margin-bottom:24px;
+  }
+  @media (prefers-color-scheme:dark) {
+    :root:not([data-theme="light"]) .flow-card {
+      --flow-bg:#171d25; --flow-node-bg:#222b36; --flow-ink:#e1e8f1; --flow-muted:#97a6b9;
+      --flow-ring:#45576d; --flow-grid:rgba(155,176,203,.10);
+      --flow-good:#67baa5; --flow-warning:#d9b16a; --flow-critical:#df8992;
+    }
+  }
+  :root[data-theme="dark"] .flow-card {
+    --flow-bg:#171d25; --flow-node-bg:#222b36; --flow-ink:#e1e8f1; --flow-muted:#97a6b9;
+    --flow-ring:#45576d; --flow-grid:rgba(155,176,203,.10);
+    --flow-good:#67baa5; --flow-warning:#d9b16a; --flow-critical:#df8992;
+  }
+  .flow-viewport {
+    overflow:hidden; background-color:var(--flow-bg); border:1px solid var(--border); border-radius:10px;
+    background-image:radial-gradient(var(--flow-grid) .7px, transparent .7px); background-size:24px 24px;
+  }
   .flow-svg { width:100%; height:auto; min-height:240px; max-height:540px; display:block; }
-  .flow-controls { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:8px; margin:8px 0; }
-  .flow-controls button { width:32px; height:32px; border:1px solid var(--border); border-radius:5px; background:var(--surface-1); color:var(--text-primary); font:inherit; cursor:pointer; }
+  .flow-controls { display:flex; flex-wrap:wrap; align-items:center; justify-content:flex-end; gap:6px; margin:0 0 10px; }
+  .flow-controls button { width:28px; height:28px; border:1px solid var(--border); border-radius:6px; background:var(--surface-2); color:var(--flow-ink); font:inherit; font-size:12px; cursor:pointer; }
+  .flow-controls button:hover:not(:disabled) { background:var(--flow-bg); border-color:var(--flow-ring); }
+  .flow-controls button:focus-visible { outline:2px solid var(--series-1); outline-offset:2px; }
   .flow-controls button:disabled { opacity:.35; cursor:default; }
   .flow-controls button[data-flow-view="fit"] { width:auto; padding:0 10px; }
-  .flow-pan { display:grid; grid-template-columns:repeat(3,32px); grid-template-rows:repeat(2,32px); gap:3px; }
+  .flow-pan { display:grid; grid-template-columns:repeat(3,28px); grid-template-rows:repeat(2,28px); gap:3px; }
   .flow-pan button[data-flow-view="up"] { grid-column:2; }
   .flow-pan button[data-flow-view="left"] { grid-column:1; grid-row:2; }
   .flow-pan button[data-flow-view="down"] { grid-column:2; grid-row:2; }
   .flow-pan button[data-flow-view="right"] { grid-column:3; grid-row:2; }
   .flow-track { fill:none; stroke-linejoin:round; stroke-linecap:round; }
+  .flow-band { fill:none; stroke-linejoin:round; stroke-linecap:butt; }
+  .flow-shared-track { pointer-events:none; }
+  .flow-shared-track.dimmed { opacity:.18; }
+  .flow-shared-track.selected .flow-band.muted, .flow-shared-track.selected .flow-track { opacity:.18; }
   .flow-hit { fill:none; stroke:transparent; stroke-width:20; cursor:pointer; }
   .flow-line { cursor:pointer; }
   .flow-line.dimmed { opacity:.18; }
-  .flow-line.selected .flow-track, .flow-line:focus .flow-track { filter:drop-shadow(0 0 2px var(--text-muted)); }
+  .flow-line.selected .flow-track, .flow-line:focus .flow-track { filter:drop-shadow(0 0 2px var(--flow-ring)); }
   .flow-line:focus-visible { outline:2px solid var(--series-1); outline-offset:5px; }
-  .flow-node, .flow-agent { fill:var(--surface-1); stroke:var(--text-primary); stroke-width:2; }
-  .flow-station text { fill:var(--text-secondary); font-size:12px; paint-order:stroke; stroke:var(--surface-2); stroke-width:4; stroke-linejoin:round; }
-  .flow-node-station .flow-node { stroke:var(--baseline); stroke-width:5; }
-  .flow-node-station .flow-capacity { fill:none; stroke-width:5; }
-  .flow-node-station.good .flow-capacity { stroke:var(--status-good); }
-  .flow-node-station.warning .flow-capacity { stroke:var(--status-warning); }
-  .flow-node-station.critical .flow-capacity { stroke:var(--status-critical); }
-  .flow-station .flow-headroom { fill:var(--text-primary); font-weight:600; stroke:none; }
-  .flow-key { color:var(--text-secondary); font-size:12px; margin:10px 0 0; }
-  .flow-status { color:var(--text-secondary); font-size:12px; margin:8px 0 12px; }
-  .flow-legend { display:flex; flex-wrap:wrap; gap:7px; margin:12px 0; }
+  .flow-node-halo { fill:var(--flow-bg); }
+  .flow-node, .flow-agent { fill:var(--flow-node-bg); stroke:var(--flow-ring); stroke-width:1.25; }
+  .flow-node { filter:drop-shadow(0 1px 2px rgba(25,45,65,.07)); }
+  .flow-agent { stroke:var(--flow-muted); stroke-width:1.6; }
+  .flow-station text { fill:var(--flow-ink); font-size:12px; paint-order:stroke; stroke:var(--flow-bg); stroke-width:4; stroke-linejoin:round; }
+  .flow-node-station { --station-color:var(--flow-ring); }
+  .flow-node-station.good { --station-color:var(--flow-good); }
+  .flow-node-station.warning { --station-color:var(--flow-warning); }
+  .flow-node-station.critical { --station-color:var(--flow-critical); }
+  .flow-capacity-track { fill:none; stroke:var(--station-color); stroke-width:3; opacity:.20; }
+  .flow-node-station .flow-capacity { fill:none; stroke:var(--station-color); stroke-width:3; stroke-linecap:round; }
+  .flow-node-station .flow-label { font-weight:600; font-size:11.5px; letter-spacing:.015em; }
+  .flow-agent-station .flow-label { fill:var(--flow-muted); font-size:10.5px; }
+  .flow-station .flow-headroom { fill:var(--flow-ink); font-weight:650; font-size:12.5px; font-variant-numeric:tabular-nums; letter-spacing:-.35px; stroke:none; }
+  .flow-key { color:var(--flow-muted); font-size:11px; margin:12px 0 0; line-height:1.6; }
+  .flow-status { color:var(--flow-muted); font-size:12px; margin:8px 0 10px; }
+  .flow-legend { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }
   .flow-legend button {
-    background:var(--surface-1); border:1px solid var(--border); border-left:5px solid;
-    border-radius:7px; padding:6px 10px; color:var(--text-primary);
-    cursor:pointer; font:inherit; font-size:12px;
+    display:inline-flex; align-items:center; gap:7px; background:var(--surface-2); border:1px solid var(--border);
+    border-radius:6px; padding:5px 9px; color:var(--flow-ink);
+    cursor:pointer; font:inherit; font-size:11px;
   }
-  .flow-legend button[aria-pressed="true"] { background:var(--surface-2); outline:2px solid var(--baseline); }
+  .flow-legend button::before { content:""; width:18px; height:3px; border-radius:2px; background:var(--route-color); }
+  .flow-legend button:hover, .flow-legend button[aria-pressed="true"] { background:var(--flow-bg); border-color:var(--flow-ring); }
+  .flow-legend button[aria-pressed="true"] { box-shadow:0 0 0 1px var(--flow-ring); }
   .flow-details { font-size:13px; color:var(--text-secondary); line-height:1.7; overflow-wrap:anywhere; border-top:1px solid var(--border); padding-top:10px; }
   .flow-details strong { color:var(--text-primary); }
   .flow-details dl { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:2px 14px; margin:8px 0; }
@@ -363,7 +397,7 @@
       <div class="flow-viewport" id="flow-viewport" aria-label="Current Flow map">
         <div class="flow-empty">Waiting for reports</div>
       </div>
-      <p class="flow-key">Node rings: bandwidth used · center: headroom · line width: connections (capped at 50) · squares: Agents</p>
+      <p class="flow-key">Node rings: bandwidth used · center: headroom · line width: total connections (capped at 50) · color share: connections per route · squares: Agents</p>
       <div class="flow-legend" id="flow-legend" aria-label="Active routes"></div>
       <div class="flow-details" id="flow-details" aria-live="polite">Select a route for details.</div>
     </section>
@@ -650,8 +684,17 @@ function renderFlowSelection(){
     line.classList.toggle("selected", selected);
     line.classList.toggle("dimmed", !!route && !selected);
     line.setAttribute("aria-pressed", String(selected));
+    if(selected) line.parentElement.append(line);
   });
   $("flow-legend").querySelectorAll("button").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.route === flowSelected)));
+  $("flow-viewport").querySelectorAll(".flow-shared-track").forEach(track => {
+    const selected = JSON.parse(track.dataset.routes).includes(flowSelected);
+    track.classList.toggle("selected", selected);
+    track.classList.toggle("dimmed", !!route && !selected);
+    track.querySelectorAll(".flow-band").forEach(band => {
+      band.classList.toggle("muted", !!route && band.dataset.route !== flowSelected);
+    });
+  });
   const details = $("flow-details");
   details.replaceChildren();
   if(!route){ details.textContent = "Select a route for details. Traffic is bidirectional."; return; }
@@ -703,7 +746,7 @@ function renderFlowMap(map){
   const legend = $("flow-legend"); legend.replaceChildren();
   map.routes.forEach(route => {
     const button = document.createElement("button"); button.type="button"; button.dataset.route=route.id;
-    button.style.borderLeftColor=route.color;
+    button.style.setProperty("--route-color", route.color);
     button.textContent=`${route.service} / ${route.protocol.toUpperCase()} · ${route.count} connections`;
     button.title=`${route.consumer.peer} → ${route.path.join(" → ")} → ${route.producer.peer}`;
     button.addEventListener("click", ()=>selectFlow(route.id)); legend.append(button);

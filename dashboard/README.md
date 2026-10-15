@@ -127,8 +127,14 @@ Agents, service, protocol and ordered Node path merge and list every business ID
 Agent stations are identified by attachment Node plus control IP:port; Nodes
 share stations. Initial placement and colors are deterministic; existing stations
 retain coordinates as routes, Agents and membership change. Line width uses a fixed `3 + 0.8 * sqrt(min(count, 50))`
-pixel scale for business connection count. The maximum is about 8.7px, smaller
-than the 14px Agent squares. Count updates do not change route geometry.
+pixel scale for the total business connection count on a shared station-to-station
+track. The maximum is about 8.7px, smaller than the 14px Agent squares.
+Within the merged track, each route's color band occupies its connection count
+divided by the total: three connections and one connection produce 75% and 25%
+bands. Counts above 50 keep the capped overall width while their actual ratios
+still determine the color shares. Count updates preserve the track centerline
+and station coordinates. `flow_map.shared_tracks` exposes totals, widths and
+per-route counts and shares.
 
 Nodes receive stable grid slots as they appear; new arrivals never move existing
 stations. Removed Nodes retain their reservations for the lifetime of the
@@ -139,12 +145,15 @@ characters; shortened labels retain their full name in the hover title.
 Connections retain the metro-map style: horizontal and vertical tracks with
 rounded corners. Each hop prefers a simple track with few turns; redundant
 collinear points and short spurs are removed before rounding every real turn.
-Parallel tracks use gentle offsets, and paths favor clear station symbols.
+Routes sharing the same pair of stations use the same track, without parallel
+offsets or separation bends; paths favor clear station symbols.
 They do not detour around labels; text keeps its background-colored outline
 where paths pass behind it.
 
-Each station has a fixed-size ring showing bandwidth used (`1 - available`),
-with the estimated remaining percentage in its center. Headroom is green at
+Each station has a light outline and a thin outer ring showing bandwidth used
+(`1 - available`), with the estimated remaining percentage in its center.
+The ring uses a faint status-colored track and rounded arc ends; a small halo
+keeps route lines clear of the station edge. Headroom is green at
 30% or above, amber from 10% to 30%, and red below 10%; missing or expired
 capacity has a gray ring and a dash. The Node-provided `available` ratio is
 already in `topology.snapshot`; Dashboard retains it in `topology.nodes` and
@@ -158,6 +167,11 @@ the displayed businesses that traverse the Node once each, including intermediat
 Nodes; it does not sum both incident hops. Pending or disconnected collections
 have unknown counts, and partial rounds expose known counts as lower bounds.
 These counts describe businesses rather than physical NodeLinks.
+
+Routes use a restrained transit palette, matching line swatches in the legend.
+The map uses a subtle dot grid and theme-aware station, label and ring colors.
+Selecting a route emphasizes its color bands and dims other contributions without
+changing their proportions; stations remain above all tracks.
 
 Node stations show their name and capacity, without connection-count labels
 or click actions. The map preserves valid route selection and keyboard focus on refreshed

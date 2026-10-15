@@ -14,6 +14,10 @@ import threading
 import xml.etree.ElementTree as ET
 
 
+ROUTE_COLORS = ("#4389bd", "#7764b7", "#369b91", "#c68b42", "#bd6884", "#607eaa",
+                "#b87552", "#719b70", "#a56ca6", "#4f9caf", "#c47563", "#939044")
+
+
 def _identity(value: object) -> str:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 < value < 2**64:
         raise ValueError("relay identity must be a positive uint64")
@@ -166,7 +170,7 @@ class FlowCollection:
             route = routes.setdefault(key, {k: v for k, v in flow.items() if k != "business"})
             if "id" not in route:
                 digest = hashlib.sha256(key.encode()).hexdigest()
-                route.update(id=digest, color=f"hsl({int(digest[:8], 16) % 360} 65% 45%)", businesses=[])
+                route.update(id=digest, color=ROUTE_COLORS[int(digest[:8], 16) % len(ROUTE_COLORS)], businesses=[])
             route["businesses"].append(flow["business"])
         for route in routes.values():
             route["businesses"].sort(key=lambda item: json.dumps(item, sort_keys=True))
@@ -222,27 +226,33 @@ def _compact_path(points: list[tuple[float, float]]) -> list[tuple[float, float]
     return compact
 
 
-def _rounded_path(points: list[tuple[float, float]]) -> str:
+def _rounded_path(points: list[tuple[float, float]], offset: float = 0) -> str:
     """Round every actual turn after removing redundant points and tiny spurs."""
     points = _compact_path(points)
-    result = [f"M{points[0][0]},{points[0][1]}"]
-    for previous, corner, following in zip(points, points[1:], points[2:]):
+    normals = [(-(b[1] - a[1]) / math.dist(a, b), (b[0] - a[0]) / math.dist(a, b))
+               for a, b in zip(points, points[1:])]
+    start = tuple(points[0][i] + normals[0][i] * offset for i in (0, 1))
+    result = [f"M{start[0]},{start[1]}"]
+    for index, (previous, corner, following) in enumerate(zip(points, points[1:], points[2:])):
         before = math.dist(previous, corner)
         after = math.dist(corner, following)
         radius = min(24, before / 2, after / 2)
         entry = tuple(corner[i] + (previous[i] - corner[i]) * radius / before for i in (0, 1))
         leave = tuple(corner[i] + (following[i] - corner[i]) * radius / after for i in (0, 1))
-        result.append(f"L{entry[0]},{entry[1]} Q{corner[0]},{corner[1]} {leave[0]},{leave[1]}")
-    result.append(f"L{points[-1][0]},{points[-1][1]}")
+        entry = tuple(entry[i] + normals[index][i] * offset for i in (0, 1))
+        leave = tuple(leave[i] + normals[index + 1][i] * offset for i in (0, 1))
+        bend = tuple(corner[i] + (normals[index][i] + normals[index + 1][i]) * offset for i in (0, 1))
+        result.append(f"L{entry[0]},{entry[1]} Q{bend[0]},{bend[1]} {leave[0]},{leave[1]}")
+    end = tuple(points[-1][i] + normals[-1][i] * offset for i in (0, 1))
+    result.append(f"L{end[0]},{end[1]}")
     return " ".join(result)
 
 
-def _metro_path(start: tuple[float, float], end: tuple[float, float], offset: float,
+def _metro_path(start: tuple[float, float], end: tuple[float, float],
                 obstacles: list[tuple[float, float, float]]) -> tuple[str, list[tuple[float, float]]]:
     """Prefer one simple metro track; avoid symbols without detouring around text."""
     x1, y1 = start
     x2, y2 = end
-    offset = max(-96, min(96, offset))
 
     def horizontal(bend):
         return _compact_path([start, (bend, y1), (bend, y2), end])
@@ -251,13 +261,13 @@ def _metro_path(start: tuple[float, float], end: tuple[float, float], offset: fl
         return _compact_path([start, (x1, bend), (x2, bend), end])
 
     if y1 == y2:
-        points = vertical(y1 + offset)
+        points = vertical(y1)
     elif x1 == x2:
-        points = horizontal(x1 + offset)
+        points = horizontal(x1)
     elif abs(x2 - x1) >= abs(y2 - y1):
-        points = horizontal((x1 + x2) / 2 + offset)
+        points = horizontal((x1 + x2) / 2)
     else:
-        points = vertical((y1 + y2) / 2 + offset)
+        points = vertical((y1 + y2) / 2)
 
     def collisions(candidate):
         return sum(any(math.hypot(x - max(min(x, max(a[0], b[0])), min(a[0], b[0])),
@@ -266,8 +276,8 @@ def _metro_path(start: tuple[float, float], end: tuple[float, float], offset: fl
 
     hits = collisions(points)
     if hits:
-        xs = [min(x1, x2) - 48, (x1 + x2) / 2 + offset, max(x1, x2) + 48]
-        ys = [min(y1, y2) - 48, (y1 + y2) / 2 + offset, max(y1, y2) + 48]
+        xs = [min(x1, x2) - 48, (x1 + x2) / 2, max(x1, x2) + 48]
+        ys = [min(y1, y2) - 48, (y1 + y2) / 2, max(y1, y2) + 48]
         if obstacles:
             xs.extend((min(x - r for x, y, r in obstacles) - 24, max(x + r for x, y, r in obstacles) + 24))
             ys.extend((min(y - r for x, y, r in obstacles) - 24, max(y + r for x, y, r in obstacles) + 24))
@@ -310,10 +320,23 @@ class FlowMapRenderer:
             if signature != self._signature:
                 self._signature, self._geometry = signature, self._layout(routes, node_ids)
             geometry = self._geometry
+        shared = []
+        for (left, right), (path, points) in sorted(geometry[3].items()):
+            contributions = [route for route in sorted(routes, key=lambda route: route["id"]) if (left, right) in {
+                tuple(sorted(pair)) for pair in zip(_stations(route), _stations(route)[1:])}]
+            count = sum(route["count"] for route in contributions)
+            width = 3 + .8 * math.sqrt(min(count, 50))
+            shared.append({"id": hashlib.sha256(json.dumps([left, right]).encode()).hexdigest()[:16],
+                           "count": count, "width": width, "path": path, "points": points,
+                           "routes": [{"id": route["id"], "color": route["color"], "count": route["count"],
+                                       "share": route["count"] / count} for route in contributions]})
         return {**snapshot, "routes": routes, "visible_route_count": len(routes),
                 "visible_flow_count": sum(route["count"] for route in routes),
                 "services": sorted({route["service"] for route in snapshot["routes"]}),
-                "nodes": stations, "svg": self._svg(routes, geometry, stations)}
+                "nodes": stations,
+                "shared_tracks": [{key: value for key, value in track.items() if key not in {"points", "path"}}
+                                  for track in shared],
+                "svg": self._svg(routes, geometry, stations, shared)}
 
     def _layout(self, routes: list[dict], node_ids=()) -> tuple:
         agents = {}
@@ -376,47 +399,55 @@ class FlowMapRenderer:
                     radius += 1
         self._known_agents = agents
         positions = {key: self._positions[key] for key in [*("node:" + node for node in node_ids), *agents]}
-        lanes = defaultdict(list)
-        for route in sorted(routes, key=lambda route: route["id"]):
-            stations = _stations(route)
-            for index, (left, right) in enumerate(zip(stations, stations[1:])):
-                lanes[tuple(sorted((left, right)))].append((route["id"], index))
-        segments = defaultdict(dict)
+        pairs = {tuple(sorted((left, right))) for route in routes
+                 for left, right in zip(_stations(route), _stations(route)[1:])}
+        hops = {}
         all_points = []
-        for (left, right), tracks in sorted(lanes.items()):
+        for left, right in sorted(pairs):
             obstacles = [(x, y, 36 if key.startswith("node:") else 18)
                          for key, (x, y) in positions.items() if key not in {left, right}]
-            for lane, (route_id, index) in enumerate(tracks):
-                path, points = _metro_path(positions[left], positions[right], (lane - (len(tracks) - 1) / 2) * 14,
-                                           obstacles)
-                segments[route_id][index] = path
-                all_points.extend(points)
+            path, points = _metro_path(positions[left], positions[right], obstacles)
+            hops[left, right] = (path, points)
+            all_points.extend(points)
         bounds = [box for key, point in positions.items() for box in _station_boxes(key, point, agents)]
         width = max([box[2] for box in bounds] + [x for x, y in all_points], default=480) + 28
         height = max([box[3] for box in bounds] + [y for x, y in all_points], default=100) + 28
-        paths = {key: " ".join(path for _, path in sorted(parts.items())) for key, parts in segments.items()}
-        return positions, agents, paths, width, height
+        paths = {route["id"]: " ".join(hops[tuple(sorted((left, right)))][0]
+                                      for left, right in zip(_stations(route), _stations(route)[1:]))
+                 for route in routes}
+        return positions, agents, paths, hops, width, height
 
     @staticmethod
-    def _svg(routes: list[dict], geometry: tuple, stations: list[dict]) -> str:
-        positions, agents, paths, width, height = geometry
+    def _svg(routes: list[dict], geometry: tuple, stations: list[dict], shared: list[dict]) -> str:
+        positions, agents, paths, hops, width, height = geometry
         nodes = {station["node_id"]: station for station in stations}
         svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "class": "flow-svg",
                                  "viewBox": f"0 0 {width} {height}", "width": str(width), "height": str(height),
                                  "preserveAspectRatio": "xMidYMid meet", "role": "group",
                                  "aria-label": "Current relay routes and Node bandwidth headroom"})
         layer = ET.SubElement(svg, "g", {"class": "flow-scene"})
+        tracks = ET.SubElement(layer, "g", {"class": "flow-routes"})
+        for track in shared:
+            group = ET.SubElement(tracks, "g", {"class": "flow-shared-track", "data-track": track["id"],
+                                                "data-routes": json.dumps([route["id"] for route in track["routes"]])})
+            ET.SubElement(group, "title").text = f'{track["count"]} connections across {len(track["routes"])} routes'
+            ET.SubElement(group, "path", {"d": track["path"], "class": "flow-track",
+                                           "stroke": "var(--flow-ring)", "stroke-width": f'{track["width"]:.6f}'})
+            cursor = -track["width"] / 2
+            for contribution in track["routes"]:
+                band_width = track["width"] * contribution["share"]
+                ET.SubElement(group, "path", {"d": _rounded_path(track["points"], cursor + band_width / 2),
+                                               "class": "flow-band", "data-route": contribution["id"],
+                                               "stroke": contribution["color"], "stroke-width": f"{band_width:.6f}"})
+                cursor += band_width
         for route in routes:
-            line = ET.SubElement(layer, "g", {"class": "flow-line", "data-route": route["id"],
+            line = ET.SubElement(tracks, "g", {"class": "flow-line", "data-route": route["id"],
                                                "tabindex": "0", "role": "button",
                                                "aria-label": f'{route["service"]} {route["protocol"]}: {route["count"]} connections'})
             ET.SubElement(line, "title").text = (
                 f'{route["service"]} / {route["protocol"].upper()} · {route["count"]} connections\n'
                 + route["consumer"]["peer"] + " → " + " → ".join(route["path"]) + " → " + route["producer"]["peer"])
             ET.SubElement(line, "path", {"d": paths[route["id"]], "class": "flow-hit"})
-            stroke_width = 3 + .8 * math.sqrt(min(route["count"], 50))
-            ET.SubElement(line, "path", {"d": paths[route["id"]], "stroke": route["color"],
-                                        "stroke-width": f"{stroke_width:.2f}", "class": "flow-track"})
         for key, (x, y) in sorted(positions.items()):
             station = ET.SubElement(layer, "g", {"class": "flow-station", "transform": f"translate({x} {y})"})
             if key.startswith("node:"):
@@ -429,20 +460,23 @@ class FlowMapRenderer:
                 station.set("data-node", name)
                 station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom")
                 station.set("class", f"flow-station flow-node-station {state}")
+                ET.SubElement(station, "circle", {"r": "31", "class": "flow-node-halo"})
                 ET.SubElement(station, "circle", {"r": "24", "class": "flow-node"})
+                ET.SubElement(station, "circle", {"r": "27", "class": "flow-capacity-track"})
                 if available is not None:
-                    circumference = 2 * math.pi * 24
-                    ET.SubElement(station, "circle", {"r": "24", "class": "flow-capacity",
+                    circumference = 2 * math.pi * 27
+                    ET.SubElement(station, "circle", {"r": "27", "class": "flow-capacity",
                                                       "transform": "rotate(-90)",
                                                       "stroke-dasharray": f"{circumference * (1 - available):.3f} {circumference:.3f}"})
                 ET.SubElement(station, "text", {"y": "4", "text-anchor": "middle",
                                                 "class": "flow-headroom"}).text = headroom
                 title = f"Node {name}\nBandwidth headroom: {headroom}"
             else:
+                station.set("class", "flow-station flow-agent-station")
                 agent = agents[key]
                 name = agent["peer"]
                 ET.SubElement(station, "rect", {"x": "-7", "y": "-7", "width": "14", "height": "14",
-                                                "rx": "4", "class": "flow-agent"})
+                                                "rx": "3", "class": "flow-agent"})
                 title = f'Agent {name} · {agent["node"]} · {" / ".join(sorted(agent["roles"]))}'
             ET.SubElement(station, "title").text = title
             label = ET.SubElement(station, "text", {"x": "0", "y": "46" if key.startswith("node:") else "25",
