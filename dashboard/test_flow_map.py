@@ -1,9 +1,10 @@
 """Business snapshot and metro geometry regressions, without live sockets."""
 import unittest
+import random
 import xml.etree.ElementTree as ET
 
 from flow_map import (FlowCollection, FlowMapRenderer, _metro_path, _rounded_path,
-                      _station_boxes, validate_relays)
+                      _station_boxes, _corridor_overlap, _symbol_collisions, validate_relays)
 
 
 def single(uuid=1, service="ssh", protocol="tcp", consumer="192.0.2.10:123", producer="[2001:db8::1]:456"):
@@ -160,11 +161,11 @@ class FlowMapTest(unittest.TestCase):
         first = collect({"a": [single()]}).snapshot(True)
         before = renderer.render(first)
         geometry = renderer._geometry
-        second = collect({"a": [single(), single(2)]}).snapshot(True)
+        second = collect({"a": [single(index) for index in range(1, 11)]}).snapshot(True)
         after = renderer.render(second)
         self.assertIs(renderer._geometry, geometry)
         self.assertEqual(before["routes"][0]["id"], after["routes"][0]["id"])
-        self.assertIn("2 connections", after["svg"])
+        self.assertIn("10 connections", after["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
         width = lambda result: float(ET.fromstring(result["svg"]).find(".//s:path[@class='flow-track']", ns).get("stroke-width"))
         self.assertGreater(width(after), width(before))
@@ -216,20 +217,23 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(result["nodes"][0]["connection_count"], 1)
         self.assertTrue(result["nodes"][0]["partial"])
 
-    def test_line_width_uses_square_root_scale_capped_at_50_connections(self):
+    def test_line_width_increases_once_per_ten_connections_and_caps_at_50(self):
         view = collect({"a": [single()]}).snapshot(True)
         renderer = FlowMapRenderer()
-        widths = []
-        for count in (1, 10, 49, 50, 51, 100, 10000):
+        geometry = None
+        for count, expected in ((1, 3), (9, 3), (10, 4), (19, 4), (20, 5), (29, 5),
+                                (30, 6), (39, 6), (40, 7), (49, 7), (50, 8), (51, 8), (10000, 8)):
             view["routes"][0]["count"] = count
             result = renderer.render(view)
+            widths = {track["width"] for track in result["shared_tracks"]}
+            self.assertEqual(widths, {expected}, msg=f"{count} connections")
+            if geometry is not None:
+                self.assertIs(renderer._geometry, geometry)
+            geometry = renderer._geometry
+            svg = ET.fromstring(result["svg"])
             ns = {"s": "http://www.w3.org/2000/svg"}
-            widths.append(float(ET.fromstring(result["svg"]).find(".//s:path[@class='flow-track']", ns).get("stroke-width")))
-            self.assertAlmostEqual(widths[-1], 3 + .8 * min(count, 50)**.5, places=2)
-        self.assertEqual(widths, sorted(widths))
-        self.assertGreater(widths[3], widths[2])
-        self.assertEqual(widths[3:], [widths[3]] * 4)
-        self.assertLess(widths[-1], 14)  # Keep tracks narrower than Agent stations.
+            self.assertTrue(all(float(track.get("stroke-width")) == expected
+                                for track in svg.findall(".//s:path[@class='flow-track']", ns)))
 
     def test_nodes_show_name_and_capacity_without_interactive_counts(self):
         result = FlowMapRenderer().render(collect({"a": [single()]}).snapshot(True),
@@ -265,7 +269,7 @@ class FlowMapTest(unittest.TestCase):
         geometry = renderer._geometry
         for track in rendered["shared_tracks"]:
             self.assertEqual(track["count"], 4)
-            self.assertAlmostEqual(track["width"], 3 + .8 * 4**.5)
+            self.assertEqual(track["width"], 3)
             self.assertEqual(sorted(route["share"] for route in track["routes"]), [.25, .75])
         svg = ET.fromstring(rendered["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
@@ -274,10 +278,15 @@ class FlowMapTest(unittest.TestCase):
             bands = sorted(float(band.get("stroke-width")) for band in track.findall("s:path[@class='flow-band']", ns))
             self.assertAlmostEqual(sum(bands), width, places=5)
             self.assertAlmostEqual(bands[1] / bands[0], 3, places=5)
+        for route in view["routes"]:
+            route["count"] = 6
+        merged = renderer.render(view)
+        self.assertTrue(all(track["count"] == 12 and track["width"] == 4
+                            for track in merged["shared_tracks"]))
         view["routes"][0]["count"] = 100
         changed = renderer.render(view)
         self.assertIs(renderer._geometry, geometry)
-        self.assertTrue(all(track["width"] <= 3 + .8 * 50**.5 for track in changed["shared_tracks"]))
+        self.assertTrue(all(track["width"] <= 8 for track in changed["shared_tracks"]))
 
     def test_overlapping_tracks_are_merged_instead_of_drawn_on_top_of_each_other(self):
         ingress_a = half("ingress", 1, path=["aliyun-1", "awsyun-1"])
@@ -291,6 +300,12 @@ class FlowMapTest(unittest.TestCase):
         renderer = FlowMapRenderer()
         rendered = renderer.render(collect(reports).snapshot(True))
         self.assert_tracks_are_merged(renderer)
+        hops = list(renderer._geometry[3].items())
+        for index, (pair, (_, points)) in enumerate(hops):
+            for other_pair, (_, other) in hops[index + 1:]:
+                if not set(pair) & set(other_pair):
+                    self.assertEqual(_corridor_overlap(points, list(zip(other, other[1:]))), 0,
+                                     msg=str((pair, other_pair)))
         self.assertTrue(any(len(track["routes"]) >= 2 for track in rendered["shared_tracks"]))
 
     def test_text_is_escaped_and_labels_are_truncated(self):
@@ -375,20 +390,114 @@ class FlowMapTest(unittest.TestCase):
         shared = next(track for track in rendered["shared_tracks"] if len(track["routes"]) == 3)
         self.assertEqual(shared["count"], 5)  # Never count the consumer and producer hop twice.
         self.assertEqual(sorted(route["share"] for route in shared["routes"]), [.2, .2, .6])
-        self.assertAlmostEqual(shared["width"], 3 + .8 * 5**.5)
+        self.assertEqual(shared["width"], 3)
         self.assert_tracks_are_merged(renderer)
 
-    def test_capacity_ring_is_smaller_and_has_no_extra_outline(self):
+    def test_lower_agents_branch_from_one_axis_without_a_second_shared_spine(self):
+        view = collect({"llyun-1": [single(1, consumer="219.140.92.118:40076", producer="192.229.85.177:41132"),
+                                      single(2, consumer="219.140.92.118:40076", producer="219.140.92.118:14070")]}).snapshot(True)
+        renderer = FlowMapRenderer()
+        renderer._positions = {"node:llyun-1": (240, 320),
+                               'agent:["llyun-1", "219.140.92.118:40076"]': (140, 528),
+                               'agent:["llyun-1", "192.229.85.177:41132"]': (340, 416),
+                               'agent:["llyun-1", "219.140.92.118:14070"]': (340, 472)}
+        renderer.render(view)
+        center = (240, 320)
+        for pair, (path, points) in renderer._geometry[3].items():
+            agent = renderer._positions[pair[0]]
+            self.assertEqual(points, [agent, (240, agent[1]), center])
+            self.assertEqual(path.count(" Q"), 1)
+        self.assert_tracks_are_merged(renderer)
+
+    def test_txyun_agent_connection_uses_one_meaningful_bend(self):
+        source = half("ingress", 1, path=["other", "txyun-1"])
+        target = half("egress", 1)
+        target["agent_peer"] = "219.140.92.118:4699"
+        renderer = FlowMapRenderer()
+        renderer._positions = {"node:other": (240, 320), "node:txyun-1": (480, 320),
+                               'agent:["txyun-1", "219.140.92.118:4699"]': (580, 416)}
+        renderer.render(collect({"other": [source], "txyun-1": [target]}).snapshot(True))
+        path, points = renderer._geometry[3]['agent:["txyun-1", "219.140.92.118:4699"]', 'node:txyun-1']
+        self.assertEqual(points, [(580, 416), (480, 416), (480, 320)])
+        self.assertEqual(path.count(" Q"), 1)
+
+    def test_dense_maps_keep_unrelated_tracks_and_symbols_clear(self):
+        for node_count, route_count, seed, trials in ((4, 8, 731, 10), (8, 12, 947, 5)):
+            rng = random.Random(seed)
+            for trial in range(trials):
+                with self.subTest(nodes=node_count, trial=trial):
+                    reports = {f"node-{index}": [] for index in range(node_count)}
+                    for index in range(route_count):
+                        first, last = rng.sample(list(reports), 2)
+                        ingress = half("ingress", index + 1, path=[first, last])
+                        ingress["agent_peer"] = f"source-{index}"
+                        egress = half("egress", index + 1)
+                        egress["agent_peer"] = f"target-{index}"
+                        reports[first].append(ingress)
+                        reports[last].append(egress)
+                    renderer = FlowMapRenderer()
+                    renderer.render(collect(reports).snapshot(True))
+                    geometry = renderer._geometry
+                    hops = list(geometry.hops.items())
+                    for index, (pair, (_, points)) in enumerate(hops):
+                        self.assertEqual(points[0], geometry.positions[pair[0]])
+                        self.assertEqual(points[-1], geometry.positions[pair[1]])
+                        self.assertTrue(all(a[0] == b[0] or a[1] == b[1]
+                                            for a, b in zip(points, points[1:])))
+                        obstacles = [(x, y, 22 if key.startswith("node:") else 12)
+                                     for key, (x, y) in geometry.positions.items() if key not in pair]
+                        self.assertEqual(_symbol_collisions(points, obstacles), 0, msg=str(pair))
+                        for other_pair, (_, other) in hops[index + 1:]:
+                            if not set(pair) & set(other_pair):
+                                self.assertEqual(_corridor_overlap(points, list(zip(other, other[1:]))), 0,
+                                                 msg=str((pair, other_pair)))
+                    self.assert_tracks_are_merged(renderer)
+
+    def test_perpendicular_crossings_do_not_merge_route_counts(self):
+        a = half("ingress", 1, path=["a", "b"])
+        c = half("ingress", 2, path=["c", "d"])
+        renderer = FlowMapRenderer()
+        renderer._positions = {"node:a": (200, 200), "node:b": (600, 200),
+                               "node:c": (400, 80), "node:d": (400, 360)}
+        renderer.render(collect({"a": [a], "b": [half("egress", 1)],
+                                 "c": [c], "d": [half("egress", 2)]}).snapshot(True))
+        crossing = []
+        for pieces, ids in renderer._tracks:
+            if any(piece[0] == "L" and
+                   min(piece[1][0], piece[-1][0]) <= 400 <= max(piece[1][0], piece[-1][0]) and
+                   min(piece[1][1], piece[-1][1]) <= 200 <= max(piece[1][1], piece[-1][1])
+                   for piece in pieces):
+                crossing.append(ids)
+        self.assertEqual(len(crossing), 2)
+        self.assertTrue(all(len(ids) == 1 for ids in crossing))
+        self.assertNotEqual(crossing[0], crossing[1])
+
+    def test_blocked_approach_port_does_not_force_a_track_through_an_agent(self):
+        renderer = FlowMapRenderer()
+        renderer._positions = {"node:a": (240, 320), "node:b": (480, 480),
+                               'agent:["a", "source-a"]': (140, 416),
+                               'agent:["a", "target-a"]': (540, 480),
+                               'agent:["b", "source-b"]': (380, 576),
+                               'agent:["b", "target-b"]': (780, 480)}
+        renderer.render(collect({"a": [single(1, consumer="source-a", producer="target-a")],
+                                 "b": [single(2, consumer="source-b", producer="target-b")]}).snapshot(True))
+        _, points = renderer._geometry.hops['agent:["b", "target-b"]', 'node:b']
+        self.assertEqual(_symbol_collisions(points, [(540, 480, 12)]), 0)
+        self.assertEqual(points[0], (780, 480))
+        self.assertEqual(points[-1], (480, 480))
+        self.assert_tracks_are_merged(renderer)
+
+    def test_capacity_ring_has_medium_radius_and_no_extra_outline(self):
         rendered = FlowMapRenderer().render(collect({"a": [single()]}).snapshot(True),
                                             topology={"nodes": [{"node_id": "a", "available": .64}]})
         ns = {"s": "http://www.w3.org/2000/svg"}
         station = ET.fromstring(rendered["svg"]).find(".//s:g[@data-node='a']", ns)
         for class_name in ("flow-capacity", "flow-capacity-track"):
-            self.assertEqual(float(station.find(f"s:circle[@class='{class_name}']", ns).get("r")), 14)
-        self.assertLess(float(station.find("s:circle[@class='flow-node']", ns).get("r")), 14)
+            self.assertEqual(float(station.find(f"s:circle[@class='{class_name}']", ns).get("r")), 17)
+        self.assertLess(float(station.find("s:circle[@class='flow-node']", ns).get("r")), 17)
         arc = station.find("s:circle[@class='flow-capacity']", ns)
         used, circumference = map(float, arc.get("stroke-dasharray").split())
-        self.assertAlmostEqual(circumference, 2 * 3.141592653589793 * 14, places=3)
+        self.assertAlmostEqual(circumference, 2 * 3.141592653589793 * 17, places=3)
         self.assertAlmostEqual(used / circumference, .36, places=4)
 
     def test_metro_tracks_are_orthogonal_with_every_turn_rounded(self):

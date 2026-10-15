@@ -8,14 +8,55 @@ from __future__ import annotations
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 import hashlib
+import heapq
 import json
 import math
 import threading
+from typing import NamedTuple
 import xml.etree.ElementTree as ET
 
 
 ROUTE_COLORS = ("#4389bd", "#7764b7", "#369b91", "#c68b42", "#bd6884", "#607eaa",
                 "#b87552", "#719b70", "#a56ca6", "#4f9caf", "#c47563", "#939044")
+
+# Geometry is expressed in SVG units; zoom scales stations and tracks together.
+TRACK_BASE_WIDTH = 3
+TRACK_CONNECTION_STEP = 10
+TRACK_WIDTH_STEP = 1
+TRACK_CONNECTION_CAP = 50
+TRACK_MAX_WIDTH = TRACK_BASE_WIDTH + TRACK_WIDTH_STEP * (TRACK_CONNECTION_CAP // TRACK_CONNECTION_STEP)
+TURN_RADIUS = 24
+NODE_RING_RADIUS = 17
+NODE_RING_WIDTH = 2
+NODE_HALO_RADIUS = NODE_RING_RADIUS + 4
+NODE_CENTER_RADIUS = NODE_RING_RADIUS - 1.5
+NODE_PORT_LENGTH = 64
+AGENT_VERTICAL_BIAS = .6
+AGENT_SIZE = 14
+AGENT_OUTLINE_WIDTH = 1.6
+CORRIDOR_GAP = TRACK_MAX_WIDTH + 4
+
+
+def _symbol_radius(key):
+    body = (NODE_RING_RADIUS + NODE_RING_WIDTH / 2 if key.startswith("node:")
+            else (AGENT_SIZE + AGENT_OUTLINE_WIDTH) / 2)
+    clearance = body + TRACK_MAX_WIDTH / 2
+    # Reserve clearance for both straight strokes and the inward cut of a
+    # quadratic corner fillet; count changes cannot invalidate the corridor.
+    return math.ceil(max(clearance + 1, TURN_RADIUS / 4 + clearance / math.sqrt(2) + 1))
+
+
+class MetroGeometry(NamedTuple):
+    positions: dict
+    agents: dict
+    paths: dict
+    hops: dict
+    width: float
+    height: float
+
+
+class MetroRoutingError(ValueError):
+    """A requested pair of ports has no valid corridor."""
 
 
 def _identity(value: object) -> str:
@@ -190,6 +231,11 @@ def _stations(route: dict) -> list[str]:
             _agent_key(route["producer"])]
 
 
+def _route_hops(route):
+    stations = _stations(route)
+    return [tuple(sorted((left, right))) for left, right in zip(stations, stations[1:])]
+
+
 def _label(name: str) -> tuple[str, float]:
     """Bound labels by display width, including wide Unicode Node names."""
     text, width = "", 0
@@ -250,7 +296,7 @@ def _path_primitives(points):
     cursor = point(cursor)
     for previous, corner, following in zip(points, points[1:], points[2:]):
         before, after = math.dist(previous, corner), math.dist(corner, following)
-        radius = min(24, before / 2, after / 2)
+        radius = min(TURN_RADIUS, before / 2, after / 2)
         entry = tuple(corner[i] + (previous[i] - corner[i]) * radius / before for i in (0, 1))
         leave = point(tuple(corner[i] + (following[i] - corner[i]) * radius / after for i in (0, 1)))
         line(entry)
@@ -268,9 +314,8 @@ def _merge_tracks(hops, routes):
     """Union coincident geometry, counting a business once on each visible piece."""
     memberships = defaultdict(set)
     for route in routes:
-        stations = _stations(route)
-        for left, right in zip(stations, stations[1:]):
-            memberships[tuple(sorted((left, right)))].add(route["id"])
+        for pair in _route_hops(route):
+            memberships[pair].add(route["id"])
     lines, merged = defaultdict(list), defaultdict(set)
     for pair, (_, points) in sorted(hops.items()):
         for piece in _path_primitives(points):
@@ -341,18 +386,93 @@ def _primitive_path(pieces, offset=0):
     return " ".join(commands)
 
 
-def _station_port(key, point, other):
+def _station_port(key, point, other, other_key):
     if not key.startswith("node:"):
         return point
     dx, dy = other[0] - point[0], other[1] - point[1]
     # Nearby Agents below a Node join its south trunk instead of adding side lanes.
-    vertical = abs(dy) >= abs(dx) * .6
+    vertical = abs(dy) >= abs(dx) * (1 if other_key.startswith("node:") else AGENT_VERTICAL_BIAS)
     direction = ((0, 1 if dy >= 0 else -1) if vertical else (1 if dx >= 0 else -1, 0))
-    return tuple(point[i] + 64 * direction[i] for i in (0, 1))
+    return tuple(point[i] + NODE_PORT_LENGTH * direction[i] for i in (0, 1))
+
+
+def _track_width(count):
+    return TRACK_BASE_WIDTH + TRACK_WIDTH_STEP * (min(count, TRACK_CONNECTION_CAP) // TRACK_CONNECTION_STEP)
+
+
+def _symbol_collisions(points, obstacles):
+    return sum(any(math.hypot(x - max(min(x, max(a[0], b[0])), min(a[0], b[0])),
+                              y - max(min(y, max(a[1], b[1])), min(a[1], b[1]))) < radius
+                   for a, b in zip(points, points[1:])) for x, y, radius in obstacles)
+
+
+def _corridor_overlap(points, occupied):
+    overlap = 0
+    for a, b in zip(points, points[1:]):
+        axis = int(a[0] == b[0])
+        low, high = sorted((a[axis], b[axis]))
+        for c, d in occupied:
+            if axis != int(c[0] == d[0]) or a[1 - axis] != c[1 - axis]:
+                continue
+            left, right = sorted((c[axis], d[axis]))
+            overlap += max(0, min(high, right) - max(low, left))
+    return overlap
+
+
+def _clear_corridor(start, end, obstacles, occupied):
+    """Find a valid orthogonal path, minimizing turns and then distance.
+
+    Parallel occupied segments are forbidden; perpendicular crossings are allowed.
+    Search coordinates come from symbol boundaries and clear lanes beside tracks,
+    so this fallback is independent of connection counts and screen dimensions.
+    """
+    boxes = [(x - radius, y - radius, x + radius, y + radius) for x, y, radius in obstacles]
+    xs, ys = {start[0], end[0]}, {start[1], end[1]}
+    for left, top, right, bottom in boxes:
+        xs.update((left, right)); ys.update((top, bottom))
+    for a, b in occupied:
+        xs.update((a[0], b[0], a[0] - CORRIDOR_GAP, a[0] + CORRIDOR_GAP))
+        ys.update((a[1], b[1], a[1] - CORRIDOR_GAP, a[1] + CORRIDOR_GAP))
+    xs.update((min(xs) - TURN_RADIUS * 2, max(xs) + TURN_RADIUS * 2))
+    ys.update((min(ys) - TURN_RADIUS * 2, max(ys) + TURN_RADIUS * 2))
+    xs, ys = sorted(xs), sorted(ys)
+    xi, yi = {x: i for i, x in enumerate(xs)}, {y: i for i, y in enumerate(ys)}
+    rows = [[(left, right) for left, top, right, bottom in boxes if top < y < bottom] +
+            [tuple(sorted((a[0], b[0]))) for a, b in occupied if a[1] == b[1] == y] for y in ys]
+    columns = [[(top, bottom) for left, top, right, bottom in boxes if left < x < right] +
+               [tuple(sorted((a[1], b[1]))) for a, b in occupied if a[0] == b[0] == x] for x in xs]
+    costs, previous, queue = {}, {}, []
+    for axis in (0, 1):
+        state = (xi[start[0]], yi[start[1]], axis)
+        costs[state], previous[state] = (0, 0), None
+        heapq.heappush(queue, (0, 0, state))
+    while queue:
+        turns, distance, state = heapq.heappop(queue)
+        if costs[state] != (turns, distance):
+            continue
+        ix, iy, direction = state
+        if (xs[ix], ys[iy]) == end:
+            points = []
+            while state is not None:
+                points.append((xs[state[0]], ys[state[1]]))
+                state = previous[state]
+            return _compact_path(list(reversed(points)))
+        for nx, ny, axis in ((ix - 1, iy, 0), (ix + 1, iy, 0), (ix, iy - 1, 1), (ix, iy + 1, 1)):
+            if not (0 <= nx < len(xs) and 0 <= ny < len(ys)):
+                continue
+            midpoint = (ys[iy] + ys[ny]) / 2 if axis else (xs[ix] + xs[nx]) / 2
+            if any(low < midpoint < high for low, high in (columns[ix] if axis else rows[iy])):
+                continue
+            neighbor = (nx, ny, axis)
+            cost = (turns + (direction != axis), distance + abs(xs[nx] - xs[ix]) + abs(ys[ny] - ys[iy]))
+            if cost < costs.get(neighbor, (math.inf, math.inf)):
+                costs[neighbor], previous[neighbor] = cost, state
+                heapq.heappush(queue, (*cost, neighbor))
+    raise MetroRoutingError("No clear metro corridor between station ports")
 
 
 def _metro_path(start: tuple[float, float], end: tuple[float, float],
-                obstacles: list[tuple[float, float, float]]) -> tuple[str, list[tuple[float, float]]]:
+                obstacles: list[tuple[float, float, float]], *, occupied=()) -> tuple[str, list[tuple[float, float]]]:
     """Prefer one simple metro track; avoid symbols without detouring around text."""
     x1, y1 = start
     x2, y2 = end
@@ -372,22 +492,79 @@ def _metro_path(start: tuple[float, float], end: tuple[float, float],
     else:
         points = vertical((y1 + y2) / 2)
 
-    def collisions(candidate):
-        return sum(any(math.hypot(x - max(min(x, max(a[0], b[0])), min(a[0], b[0])),
-                                  y - max(min(y, max(a[1], b[1])), min(a[1], b[1]))) < radius
-                       for a, b in zip(candidate, candidate[1:])) for x, y, radius in obstacles)
-
-    hits = collisions(points)
-    if hits:
-        xs = [min(x1, x2) - 48, (x1 + x2) / 2, max(x1, x2) + 48]
-        ys = [min(y1, y2) - 48, (y1 + y2) / 2, max(y1, y2) + 48]
+    candidates = [_compact_path([start, (x1, y2), end]),
+                  _compact_path([start, (x2, y1), end]), points]
+    if all(_symbol_collisions(candidate, obstacles) or _corridor_overlap(candidate, occupied)
+           for candidate in candidates):
+        xs = [min(x1, x2) - TURN_RADIUS * 2, (x1 + x2) / 2, max(x1, x2) + TURN_RADIUS * 2]
+        ys = [min(y1, y2) - TURN_RADIUS * 2, (y1 + y2) / 2, max(y1, y2) + TURN_RADIUS * 2]
         if obstacles:
-            xs.extend((min(x - r for x, y, r in obstacles) - 24, max(x + r for x, y, r in obstacles) + 24))
-            ys.extend((min(y - r for x, y, r in obstacles) - 24, max(y + r for x, y, r in obstacles) + 24))
-        candidates = [horizontal(bend) for bend in xs] + [vertical(bend) for bend in ys]
-        points = min([points, *candidates], key=lambda candidate: (collisions(candidate), len(candidate),
-                     sum(math.dist(a, b) for a, b in zip(candidate, candidate[1:]))))
+            xs.extend((min(x - r for x, y, r in obstacles) - TURN_RADIUS,
+                       max(x + r for x, y, r in obstacles) + TURN_RADIUS))
+            ys.extend((min(y - r for x, y, r in obstacles) - TURN_RADIUS,
+                       max(y + r for x, y, r in obstacles) + TURN_RADIUS))
+        for a, b in occupied:
+            if a[0] == b[0]:
+                xs.extend((a[0] - CORRIDOR_GAP, a[0] + CORRIDOR_GAP))
+            else:
+                ys.extend((a[1] - CORRIDOR_GAP, a[1] + CORRIDOR_GAP))
+        candidates.extend([horizontal(bend) for bend in xs] + [vertical(bend) for bend in ys])
+    points = min(candidates, key=lambda candidate: (_symbol_collisions(candidate, obstacles),
+                 _corridor_overlap(candidate, occupied), len(candidate),
+                 sum(math.dist(a, b) for a, b in zip(candidate, candidate[1:]))))
+    if _symbol_collisions(points, obstacles) or _corridor_overlap(points, occupied):
+        points = _clear_corridor(start, end, obstacles, occupied)
     return _rounded_path(points), points
+
+
+def _route_hop(left, right, positions, hops):
+    """Route station geometry first; counts and colors never choose a corridor."""
+    start, end = positions[left], positions[right]
+    entry = _station_port(left, start, end, right)
+    exit_port = _station_port(right, end, start, left)
+    # Sharing requires a common station, not merely a coincident screen position.
+    occupied = [segment for pair, (_, previous) in hops.items() if not set(pair) & {left, right}
+                for segment in zip(previous, previous[1:])]
+    unrelated = [(x, y, _symbol_radius(key)) for key, (x, y) in positions.items() if key not in {left, right}]
+
+    # All clear Node–Agent branches on a side use the same station axis, with
+    # one rounded bend at the target's row/column; never add an intermediate spine.
+    if left.startswith("node:") != right.startswith("node:"):
+        node, agent, port = ((start, end, entry) if left.startswith("node:") else (end, start, exit_port))
+        bend = (node[0], agent[1]) if port[0] == node[0] else (agent[0], node[1])
+        direct = _compact_path([node, bend, agent])
+        if not _symbol_collisions(direct, unrelated) and not _corridor_overlap(direct, occupied):
+            points = direct if left.startswith("node:") else list(reversed(direct))
+            return _rounded_path(points), points
+
+    obstacles = [*unrelated, *((*positions[key], _symbol_radius(key))
+                               for key in (left, right) if key.startswith("node:"))]
+    try:
+        _, middle = _metro_path(entry, exit_port, obstacles, occupied=occupied)
+        points = _compact_path([start, *middle, end])
+    except MetroRoutingError:
+        # A long approach arm can be blocked while the station itself remains
+        # reachable. Search from its center rather than emit an invalid track.
+        points = _clear_corridor(start, end, unrelated, occupied)
+    # Validate the whole path, including approach arms outside the port search.
+    if _symbol_collisions(points, unrelated) or _corridor_overlap(points, occupied):
+        points = _clear_corridor(start, end, unrelated, occupied)
+    return _rounded_path(points), points
+
+
+def _weighted_tracks(tracks, routes):
+    """Apply current counts once to cached geometry and deduplicated route IDs."""
+    result = []
+    by_id = {route["id"]: route for route in routes}
+    for pieces, route_ids in tracks:
+        contributions = [by_id[route_id] for route_id in route_ids]
+        count = sum(route["count"] for route in contributions)
+        result.append({"id": hashlib.sha256(json.dumps(pieces).encode()).hexdigest()[:16],
+                       "count": count, "width": _track_width(count),
+                       "path": _primitive_path(pieces), "pieces": pieces,
+                       "routes": [{"id": route["id"], "color": route["color"], "count": route["count"],
+                                   "share": route["count"] / count} for route in contributions]})
+    return result
 
 
 class FlowMapRenderer:
@@ -423,19 +600,10 @@ class FlowMapRenderer:
         with self._lock:
             if signature != self._signature:
                 self._geometry = self._layout(routes, node_ids)
-                self._tracks = _merge_tracks(self._geometry[3], routes)
+                self._tracks = _merge_tracks(self._geometry.hops, routes)
                 self._signature = signature
             geometry, tracks = self._geometry, self._tracks
-        shared = []
-        by_id = {route["id"]: route for route in routes}
-        for pieces, route_ids in tracks:
-            contributions = [by_id[route_id] for route_id in route_ids]
-            count = sum(route["count"] for route in contributions)
-            width = 3 + .8 * math.sqrt(min(count, 50))
-            shared.append({"id": hashlib.sha256(json.dumps(pieces).encode()).hexdigest()[:16],
-                           "count": count, "width": width, "path": _primitive_path(pieces), "pieces": pieces,
-                           "routes": [{"id": route["id"], "color": route["color"], "count": route["count"],
-                                       "share": route["count"] / count} for route in contributions]})
+        shared = _weighted_tracks(tracks, routes)
         return {**snapshot, "routes": routes, "visible_route_count": len(routes),
                 "visible_flow_count": sum(route["count"] for route in routes),
                 "services": sorted({route["service"] for route in snapshot["routes"]}),
@@ -444,7 +612,7 @@ class FlowMapRenderer:
                                   for track in shared],
                 "svg": self._svg(routes, geometry, stations, shared)}
 
-    def _layout(self, routes: list[dict], node_ids=()) -> tuple:
+    def _layout(self, routes: list[dict], node_ids=()) -> MetroGeometry:
         agents = {}
         for route in routes:
             for role in ("consumer", "producer"):
@@ -505,30 +673,19 @@ class FlowMapRenderer:
                     radius += 1
         self._known_agents = agents
         positions = {key: self._positions[key] for key in [*("node:" + node for node in node_ids), *agents]}
-        pairs = {tuple(sorted((left, right))) for route in routes
-                 for left, right in zip(_stations(route), _stations(route)[1:])}
+        pairs = {pair for route in routes for pair in _route_hops(route)}
         hops = {}
-        all_points = []
         for left, right in sorted(pairs):
-            start, end = positions[left], positions[right]
-            entry, exit_port = _station_port(left, start, end), _station_port(right, end, start)
-            obstacles = [(x, y, 22 if key.startswith("node:") else 12)
-                         for key, (x, y) in positions.items()
-                         if key not in {left, right} or key.startswith("node:")]
-            _, middle = _metro_path(entry, exit_port, obstacles)
-            points = _compact_path([start, *middle, end])
-            hops[left, right] = (_rounded_path(points), points)
-            all_points.extend(points)
+            hops[left, right] = _route_hop(left, right, positions, hops)
+        all_points = [point for _, points in hops.values() for point in points]
         bounds = [box for key, point in positions.items() for box in _station_boxes(key, point, agents)]
         width = max([box[2] for box in bounds] + [x for x, y in all_points], default=480) + 28
         height = max([box[3] for box in bounds] + [y for x, y in all_points], default=100) + 28
-        paths = {route["id"]: " ".join(hops[tuple(sorted((left, right)))][0]
-                                      for left, right in zip(_stations(route), _stations(route)[1:]))
-                 for route in routes}
-        return positions, agents, paths, hops, width, height
+        paths = {route["id"]: " ".join(hops[pair][0] for pair in _route_hops(route)) for route in routes}
+        return MetroGeometry(positions, agents, paths, hops, width, height)
 
     @staticmethod
-    def _svg(routes: list[dict], geometry: tuple, stations: list[dict], shared: list[dict]) -> str:
+    def _svg(routes: list[dict], geometry: MetroGeometry, stations: list[dict], shared: list[dict]) -> str:
         positions, agents, paths, hops, width, height = geometry
         nodes = {station["node_id"]: station for station in stations}
         svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "class": "flow-svg",
@@ -570,26 +727,30 @@ class FlowMapRenderer:
                 station.set("data-node", name)
                 station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom")
                 station.set("class", f"flow-station flow-node-station {state}")
-                ET.SubElement(station, "circle", {"r": "18", "class": "flow-node-halo"})
-                ET.SubElement(station, "circle", {"r": "12.5", "class": "flow-node"})
-                ET.SubElement(station, "circle", {"r": "14", "class": "flow-capacity-track"})
+                ET.SubElement(station, "circle", {"r": str(NODE_HALO_RADIUS), "class": "flow-node-halo"})
+                ET.SubElement(station, "circle", {"r": str(NODE_CENTER_RADIUS), "class": "flow-node"})
+                ET.SubElement(station, "circle", {"r": str(NODE_RING_RADIUS), "stroke-width": str(NODE_RING_WIDTH),
+                                                      "class": "flow-capacity-track"})
                 if available is not None and available < 1:
-                    circumference = 2 * math.pi * 14
-                    ET.SubElement(station, "circle", {"r": "14", "class": "flow-capacity",
+                    circumference = 2 * math.pi * NODE_RING_RADIUS
+                    ET.SubElement(station, "circle", {"r": str(NODE_RING_RADIUS), "stroke-width": str(NODE_RING_WIDTH),
+                                                      "class": "flow-capacity",
                                                       "transform": "rotate(-90)",
                                                       "stroke-dasharray": f"{circumference * (1 - available):.3f} {circumference:.3f}"})
-                ET.SubElement(station, "text", {"y": "3", "text-anchor": "middle",
+                ET.SubElement(station, "text", {"y": "3.5", "text-anchor": "middle",
                                                 "class": "flow-headroom"}).text = headroom
                 title = f"Node {name}\nBandwidth headroom: {headroom}"
             else:
                 station.set("class", "flow-station flow-agent-station")
                 agent = agents[key]
                 name = agent["peer"]
-                ET.SubElement(station, "rect", {"x": "-7", "y": "-7", "width": "14", "height": "14",
+                ET.SubElement(station, "rect", {"x": str(-AGENT_SIZE / 2), "y": str(-AGENT_SIZE / 2),
+                                                "width": str(AGENT_SIZE), "height": str(AGENT_SIZE),
+                                                "stroke-width": str(AGENT_OUTLINE_WIDTH),
                                                 "rx": "3", "class": "flow-agent"})
                 title = f'Agent {name} · {agent["node"]} · {" / ".join(sorted(agent["roles"]))}'
             ET.SubElement(station, "title").text = title
-            label = ET.SubElement(station, "text", {"x": "0", "y": "29" if key.startswith("node:") else "25",
+            label = ET.SubElement(station, "text", {"x": "0", "y": str(NODE_HALO_RADIUS + 13) if key.startswith("node:") else "25",
                                                     "text-anchor": "middle", "class": "flow-label"})
             label.text = _label(name)[0]
         return ET.tostring(svg, encoding="unicode")

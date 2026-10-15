@@ -125,44 +125,79 @@ count, business/route counts, route details, Node station summaries and escaped 
 Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
 Agents, service, protocol and ordered Node path merge and list every business ID.
 Agent stations are identified by attachment Node plus control IP:port; Nodes
-share stations. Initial placement and colors are deterministic; existing stations
-retain coordinates as routes, Agents and membership change. Line width uses a fixed `3 + 0.8 * sqrt(min(count, 50))`
-pixel scale for the total business connection count on each merged geometric
-track segment. The maximum is about 8.7px, smaller than the 14px Agent squares.
-Within the merged track, each route's color band occupies its connection count
-divided by the total: three connections and one connection produce 75% and 25%
-bands. Counts above 50 keep the capped overall width while their actual ratios
-still determine the color shares. Count updates preserve the track centerline
-and station coordinates. `flow_map.shared_tracks` exposes totals, widths and
-per-route counts and shares.
+share stations. Geometry is undirected: reversing a route does not create a
+parallel line between the same stations.
 
-Nodes receive stable grid slots as they appear; new arrivals never move existing
-stations. Removed Nodes retain their reservations for the lifetime of the
-Dashboard process, so returning Nodes recover their positions. Active Agents
-also retain their positions; new Agents use nearby free space. Label widths
-reserve space for long names, including wide Unicode
-characters; shortened labels retain their full name in the hover title.
-Connections retain the metro-map style: horizontal and vertical tracks with
-rounded corners. Each hop prefers a simple track with few turns; redundant
-collinear points and short spurs are removed before rounding every real turn.
-Each Node has at most four approaches, centered on its north, south, east and
-west axes. Connections on the same side share a trunk and split at rounded
-branches farther from the station. Coincident straight sections and matching
-curves are rendered once, including overlaps between different station pairs.
-Every merged section recomputes its width and color shares from the distinct
-routes using it; a route using two overlapping incident hops contributes its
-connections once. Perpendicular crossings remain crossings. Count updates keep
-the geometry fixed, including the shared trunks and their branch points.
-They do not detour around labels; text keeps its background-colored outline
-where paths pass behind it.
+### Map drawing rules
 
-Each station uses a compact 14px-radius capacity ring showing bandwidth used
-(`1 - available`), with the estimated remaining percentage in its center.
-The ring uses a single 2px status-colored track with rounded arc ends;
-the center has no outline or shadow. At 100% headroom no used-capacity arc is drawn. A small halo keeps route lines clear
-of the station edge. Headroom is green at
-30% or above, amber from 10% to 30%, and red below 10%; missing or expired
-capacity has a gray ring and a dash. The Node-provided `available` ratio is
+The constants and routing helpers in [`flow_map.py`](flow_map.py) are the source
+of geometry and width policy. The pipeline is fixed: stable station placement →
+station-to-station routing → union of shared geometry → connection weighting →
+SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
+
+1. **Stable placement.** Nodes occupy deterministic grid slots. Removed Nodes
+   reserve their slots for the Dashboard process lifetime; active Agents also
+   retain coordinates. New stations use free space, reserving symbol and label
+   bounds. Connection counts, capacity values, route order and viewport size
+   do not move existing stations. Geometry changes only when route IDs or Node
+   membership change; count and capacity refreshes reuse it.
+2. **Four approaches.** Nodes use their north/south/east/west center axes, without
+   parallel approach offsets. Node–Node hops prefer the dominant displacement
+   axis, with vertical ties. Node–Agent hops prefer vertical when
+   `abs(dy) >= 0.6 * abs(dx)`, so lower Agents join a south trunk. A clear
+   Node–Agent hop branches from that axis at the Agent's row/column with one
+   rounded turn; it does not introduce an intermediate shared spine.
+3. **Valid metro corridors.** Tracks are horizontal/vertical. Routing first tries
+   clear simple candidates, preferring fewer turns and then shorter distance.
+   Normal approach arms extend 64 units from Nodes. If these candidates are
+   blocked, a coordinate-grid search finds a valid corridor with the fewest turns,
+   then shortest distance for those ports. A blocked approach port triggers a
+   search from the station center instead. Obstacle and unrelated-track rules
+   take precedence over the preferred approach; the renderer never deliberately
+   accepts an obstructed candidate. Clearances reserve room for the maximum
+   capped stroke and rounded corners, independently of current counts.
+4. **Shared trunks, not accidental connections.** Hops incident to a common
+   station may use the same centerline. Unrelated station pairs may cross
+   perpendicularly but cannot share a collinear interval. Coincident straight
+   sections are split at overlap boundaries and rendered once; identical rounded
+   curves are also rendered once. A perpendicular crossing does not join routes
+   or combine their counts. Redundant points and short collinear spurs are removed
+   before rounding; turn radius is at most 24 units and half either adjacent leg.
+   Text does not cause route detours.
+5. **Count once, then compute width.** Each merged section uses the sum of its
+   distinct routes' business counts. If both incident hops of one route use the
+   same section, that route contributes once. Width is
+   `3 + min(floor(count / 10), 5)` SVG units:
+
+   | Connections on the section | Width |
+   |---|---|
+   | 1–9 | 3 |
+   | 10–19 | 4 |
+   | 20–29 | 5 |
+   | 30–39 | 6 |
+   | 40–49 | 7 |
+   | 50 or more | 8 |
+
+   Counts are summed **before** applying the rule: two routes of six connections
+   produce 12 connections and width 4, rather than adding their individual widths.
+   The cap keeps tracks narrower than the 14-unit Agent squares.
+6. **Proportional color bands.** Each route receives
+   `track_width * route_count / total_count`, ordered by stable route ID. Three
+   connections and one connection yield 75% and 25% bands. Counts above 50 keep
+   the width capped while their actual counts determine color shares. Selection
+   changes opacity only. `flow_map.shared_tracks` exposes the same totals,
+   widths, route counts and shares used by SVG.
+7. **Station size and capacity.** Nodes use a 17-unit-radius capacity ring with
+   a 2-unit track. It shows bandwidth used (`1 - available`); the center shows
+   estimated remaining capacity. The center has no outline or shadow. No used
+   arc is drawn at 100% headroom. Status is green at 30% or above, amber from
+   10% to 30%, red below 10%, and gray with a dash for unknown capacity. Agent
+   squares are 14 units. All dimensions scale together when zoomed.
+
+Shortened station labels retain their full names in hover titles. The map uses
+background-colored label outlines where tracks pass behind text.
+
+The Node-provided `available` ratio is
 already in `topology.snapshot`; Dashboard retains it in `topology.nodes` and
 `flow_map.nodes`. This is remaining configured Node bandwidth, not measured
 NodeLink capacity or an absolute Mbps value. Snapshot/source-report ages of
