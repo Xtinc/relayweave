@@ -125,19 +125,21 @@ count, business/route counts, route details, Node station summaries and escaped 
 Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
 Agents, service, protocol and ordered Node path merge and list every business ID.
 Agent stations are identified by attachment Node plus control IP:port; Nodes
-share stations. Geometry and colors are deterministic; count and capacity updates
-retain coordinates. Line width uses a fixed `3 + 0.8 * sqrt(min(count, 50))`
+share stations. Initial placement and colors are deterministic; existing stations
+retain coordinates as routes, Agents and membership change. Line width uses a fixed `3 + 0.8 * sqrt(min(count, 50))`
 pixel scale for business connection count. The maximum is about 8.7px, smaller
-than the 14px Agent squares. Parallel tracks reserve space for the maximum
-width, so count updates do not move other routes.
+than the 14px Agent squares. Count updates do not change route geometry.
 
-Connected Nodes use a compact grid in breadth-first order, and disconnected
-groups share rows to avoid a long, narrow map. Agent groups use extra columns
-as they grow. Label widths reserve space for long names, including wide Unicode
+Nodes receive stable grid slots as they appear; new arrivals never move existing
+stations. Removed Nodes retain their reservations for the lifetime of the
+Dashboard process, so returning Nodes recover their positions. Active Agents
+also retain their positions; new Agents use nearby free space. Label widths
+reserve space for long names, including wide Unicode
 characters; shortened labels retain their full name in the hover title.
-Orthogonal routes avoid labels and unrelated station symbols and prefer unused
-corridors to reduce overlapping tracks. Layout depends on topology rather than
-changing connection counts or capacity values.
+Each hop uses a single cubic curve with bounded curvature and forward progress,
+without orthogonal elbows, hooks or label-avoidance detours. Parallel hops use
+gentle offsets; curves favor arcs that miss unrelated station symbols. Text
+keeps its background-colored outline where paths pass behind labels.
 
 Each station has a fixed-size ring showing bandwidth used (`1 - available`),
 with the estimated remaining percentage in its center. Headroom is green at
@@ -159,13 +161,15 @@ Node stations show their name and capacity, without connection-count labels
 or click actions. The map preserves valid route selection and keyboard focus on refreshed
 routes. Click a route or legend entry for service, connection count, Agent
 endpoints, path and minimum Node headroom; protocol UUIDs, epochs and Flow IDs
-remain available in the API but are not displayed. The entire map automatically
-fits the available area without scrollbars. Zoom buttons, directional buttons
+remain available in the API but are not displayed. The initial map automatically
+fits the available area without scrollbars, reserving room for Agents when only
+idle Nodes are present. Zoom buttons, directional buttons
 and Fit adjust the view explicitly; hovering, dragging and the mouse wheel do
 not change the map view. Default fitting caps enlargement at 125% so small maps
 keep comfortable Node and text sizes; resizing refits the available area.
-Count and capacity refreshes preserve the current view;
-topology changes fit the new map. Flow data is only held in memory
+All snapshot refreshes preserve the current view, including route and membership
+changes. Fit explicitly reframes all current stations and routes, including new
+endpoints outside the existing view. Flow data is only held in memory
 and is not added to SQLite history.
 
 Age includes query and page-assembly time and uses a monotonic clock. This topology is observational only and is

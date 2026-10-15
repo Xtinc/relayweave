@@ -2,7 +2,7 @@
 import unittest
 import xml.etree.ElementTree as ET
 
-from flow_map import FlowCollection, FlowMapRenderer, _FlowRouter, _station_boxes, validate_relays
+from flow_map import FlowCollection, FlowMapRenderer, _curve_path, _station_boxes, validate_relays
 
 
 def single(uuid=1, service="ssh", protocol="tcp", consumer="192.0.2.10:123", producer="[2001:db8::1]:456"):
@@ -253,7 +253,7 @@ class FlowMapTest(unittest.TestCase):
         positions, agents, paths, width, height = renderer._geometry
         tracks = list(paths.values())
         self.assertNotEqual(tracks[0], tracks[1])
-        self.assertTrue(all(" Q" in track for track in tracks))
+        self.assertTrue(all(" C" in track and " Q" not in track and " L" not in track for track in tracks))
         self.assertEqual(positions["node:a"][1], positions["node:c"][1])
         self.assertTrue(all(0 < x < width and 0 < y < height for x, y in positions.values()))
 
@@ -289,26 +289,44 @@ class FlowMapTest(unittest.TestCase):
                 self.assertFalse(left < other_right and other_left < right
                                  and top < other_bottom and other_top < bottom)
 
-    def test_paths_avoid_labels_and_unrelated_stations(self):
-        reports = {"a": [half("ingress", index, path=["a", f"node-{index}"])
-                         for index in range(1, 7)]}
-        reports.update({f"node-{index}": [half("egress", index)] for index in range(1, 7)})
-        view = collect(reports).snapshot(True)
+    def test_hops_are_single_smooth_curves_without_backtracking(self):
+        for start, end in (((0, 0), (300, 0)), ((100, 100), (100, 400)), ((50, 60), (400, 350))):
+            path, points = _curve_path(start, end, 14, [])
+            self.assertEqual(path.count(" C"), 1)
+            self.assertNotIn(" L", path)
+            self.assertNotIn(" Q", path)
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            projected = [(x - start[0]) * dx + (y - start[1]) * dy for x, y in points]
+            self.assertEqual(projected, sorted(projected))
+            self.assertEqual(points[0], start)
+            self.assertEqual(points[-1], end)
+
+    def test_curves_pass_around_unrelated_node_symbols(self):
+        _, points = _curve_path((0, 0), (300, 0), 0, [(150, 0, 32)])
+        for step in range(41):
+            t = step / 40
+            weights = ((1 - t)**3, 3 * (1 - t)**2 * t, 3 * (1 - t) * t**2, t**3)
+            x = sum(weight * point[0] for weight, point in zip(weights, points))
+            y = sum(weight * point[1] for weight, point in zip(weights, points))
+            self.assertGreater((x - 150)**2 + y**2, 32**2)
+
+    def test_node_positions_survive_route_agent_and_membership_changes(self):
         renderer = FlowMapRenderer()
-        renderer.render(view)
-        positions, agents, _, _, _ = renderer._geometry
-        router = _FlowRouter(positions, agents, 2)
-        endpoints = sorted(positions)
-        for left, right in zip(endpoints, endpoints[1:]):
-            points = router.path(left, right, positions)
-            for key, position in positions.items():
-                boxes = _station_boxes(key, position, agents)
-                for low_x, low_y, high_x, high_y in (boxes[1:] if key in {left, right} else boxes):
-                    for (x1, y1), (x2, y2) in zip(points, points[1:]):
-                        intersects = (low_y < y1 < high_y and min(x1, x2) < high_x and max(x1, x2) > low_x
-                                      if y1 == y2 else
-                                      low_x < x1 < high_x and min(y1, y2) < high_y and max(y1, y2) > low_y)
-                        self.assertFalse(intersects, (left, right, key, points))
+        idle = collect({"a": [], "b": [], "c": []}).snapshot(True)
+        topology = {"nodes": [{"node_id": name, "available": .5} for name in ("a", "b", "c")]}
+        renderer.render(idle, topology=topology)
+        original = dict(renderer._geometry[0])
+        active = collect({"a": [half("ingress", 1, path=["a", "c"])], "b": [], "c": [half("egress", 1)]}).snapshot(True)
+        renderer.render(active, topology=topology)
+        self.assertTrue(all(renderer._geometry[0][key] == point for key, point in original.items()))
+        agent_positions = {key: point for key, point in renderer._geometry[0].items() if key.startswith("agent:")}
+        active["routes"][0]["id"] = "another-service-route"
+        renderer.render(active, topology=topology)
+        self.assertTrue(all(renderer._geometry[0][key] == point for key, point in {**original, **agent_positions}.items()))
+        renderer.render(idle, topology={"nodes": [{"node_id": "a", "available": .5}]})
+        topology["nodes"].append({"node_id": "d", "available": .5})
+        renderer.render(idle, topology=topology)
+        self.assertTrue(all(renderer._geometry[0][key] == point for key, point in original.items()))
 
     def test_route_order_does_not_change_geometry(self):
         view = collect({"a": [single(1), single(2, protocol="udp"), single(3, consumer="192.0.2.11:123")]}).snapshot(True)

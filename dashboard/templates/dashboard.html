@@ -565,7 +565,13 @@ let flowSelected = null;
 let flowMapData = null;
 let flowSvgText = null;
 let flowView = null;
-let flowGeometryKey = null;
+function resetFlowView(reserveAgents=false){
+  const scene = $("flow-viewport").querySelector(".flow-scene").getBBox();
+  const content = reserveAgents
+    ? {x:scene.x - 200, y:scene.y - 96, width:scene.width + 400, height:scene.height + 256}
+    : {x:scene.x - 28, y:scene.y - 28, width:scene.width + 56, height:scene.height + 56};
+  flowView = {content, bounds:null, zoom:1};
+}
 function applyFlowView(){
   const viewport = $("flow-viewport"), svg = viewport.querySelector("svg");
   if(svg && flowView && viewport.clientWidth){
@@ -606,7 +612,7 @@ $("flow-controls").addEventListener("click", event => {
   const {bounds, zoom} = flowView;
   const action = button.dataset.flowView;
   if(action === "fit"){
-    Object.assign(flowView, {x:bounds.x, y:bounds.y, zoom:1});
+    resetFlowView();
   }else if(action === "in" || action === "out"){
     const nextZoom = Math.max(1, Math.min(4, zoom * (action === "in" ? 1.25 : .8)));
     flowView.x += bounds.width / zoom / 2 - bounds.width / nextZoom / 2;
@@ -680,19 +686,12 @@ function renderFlowMap(map){
       const focused = viewport.contains(active) && (active.dataset.route
         ? `[data-route="${CSS.escape(active.dataset.route)}"]` : null);
       viewport.innerHTML = map.svg; flowSvgText = map.svg;
-      const geometryKey = JSON.stringify([map.routes.map(route => route.id), map.nodes.map(node => node.node_id)]);
-      if(geometryKey !== flowGeometryKey){
-        const scene = viewport.querySelector(".flow-scene").getBBox();
-        const content = {x:scene.x - 28, y:scene.y - 28, width:scene.width + 56, height:scene.height + 56};
-        flowView = {content, bounds:null, zoom:1};
-        flowGeometryKey = geometryKey;
-      }
+      if(!flowView) resetFlowView(!map.routes.length);
       if(focused) viewport.querySelector(focused)?.focus({preventScroll:true});
     }
   }else{
     flowSvgText = null;
     flowView = null;
-    flowGeometryKey = null;
     const empty = document.createElement("div"); empty.className = "flow-empty";
     empty.textContent = map.state === "disconnected" ? "Collection disconnected"
       : map.state === "pending" ? "Waiting for current Flow reports"
