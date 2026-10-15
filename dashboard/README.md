@@ -127,8 +127,8 @@ Agents, service, protocol and ordered Node path merge and list every business ID
 Agent stations are identified by attachment Node plus control IP:port; Nodes
 share stations. Initial placement and colors are deterministic; existing stations
 retain coordinates as routes, Agents and membership change. Line width uses a fixed `3 + 0.8 * sqrt(min(count, 50))`
-pixel scale for the total business connection count on a shared station-to-station
-track. The maximum is about 8.7px, smaller than the 14px Agent squares.
+pixel scale for the total business connection count on each merged geometric
+track segment. The maximum is about 8.7px, smaller than the 14px Agent squares.
 Within the merged track, each route's color band occupies its connection count
 divided by the total: three connections and one connection produce 75% and 25%
 bands. Counts above 50 keep the capped overall width while their actual ratios
@@ -145,19 +145,21 @@ characters; shortened labels retain their full name in the hover title.
 Connections retain the metro-map style: horizontal and vertical tracks with
 rounded corners. Each hop prefers a simple track with few turns; redundant
 collinear points and short spurs are removed before rounding every real turn.
-Routes sharing the same pair of stations use the same track, without parallel
-offsets or separation bends; paths favor clear station symbols.
-Distinct station pairs reserve their own visible corridors, with separate
-approaches at shared stations. Only a merged shared track may occupy the same
-visible centerline. More crowded maps use additional clear corridors while
-retaining rounded turns and fixed station coordinates.
+Each Node has at most four approaches, centered on its north, south, east and
+west axes. Connections on the same side share a trunk and split at rounded
+branches farther from the station. Coincident straight sections and matching
+curves are rendered once, including overlaps between different station pairs.
+Every merged section recomputes its width and color shares from the distinct
+routes using it; a route using two overlapping incident hops contributes its
+connections once. Perpendicular crossings remain crossings. Count updates keep
+the geometry fixed, including the shared trunks and their branch points.
 They do not detour around labels; text keeps its background-colored outline
 where paths pass behind it.
 
-Each station uses a compact 20px-radius capacity ring showing bandwidth used
+Each station uses a compact 14px-radius capacity ring showing bandwidth used
 (`1 - available`), with the estimated remaining percentage in its center.
-The ring uses a single 2.5px status-colored track with rounded arc ends;
-the center has no outline or shadow. A small halo keeps route lines clear
+The ring uses a single 2px status-colored track with rounded arc ends;
+the center has no outline or shadow. At 100% headroom no used-capacity arc is drawn. A small halo keeps route lines clear
 of the station edge. Headroom is green at
 30% or above, amber from 10% to 30%, and red below 10%; missing or expired
 capacity has a gray ring and a dash. The Node-provided `available` ratio is
