@@ -136,10 +136,12 @@ Dashboard process, so returning Nodes recover their positions. Active Agents
 also retain their positions; new Agents use nearby free space. Label widths
 reserve space for long names, including wide Unicode
 characters; shortened labels retain their full name in the hover title.
-Each hop uses a single cubic curve with bounded curvature and forward progress,
-without orthogonal elbows, hooks or label-avoidance detours. Parallel hops use
-gentle offsets; curves favor arcs that miss unrelated station symbols. Text
-keeps its background-colored outline where paths pass behind labels.
+Connections retain the metro-map style: horizontal and vertical tracks with
+rounded corners. Each hop prefers a simple track with few turns; redundant
+collinear points and short spurs are removed before rounding every real turn.
+Parallel tracks use gentle offsets, and paths favor clear station symbols.
+They do not detour around labels; text keeps its background-colored outline
+where paths pass behind it.
 
 Each station has a fixed-size ring showing bandwidth used (`1 - available`),
 with the estimated remaining percentage in its center. Headroom is green at

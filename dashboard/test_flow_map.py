@@ -2,7 +2,7 @@
 import unittest
 import xml.etree.ElementTree as ET
 
-from flow_map import FlowCollection, FlowMapRenderer, _curve_path, _station_boxes, validate_relays
+from flow_map import FlowCollection, FlowMapRenderer, _metro_path, _rounded_path, _station_boxes, validate_relays
 
 
 def single(uuid=1, service="ssh", protocol="tcp", consumer="192.0.2.10:123", producer="[2001:db8::1]:456"):
@@ -253,7 +253,7 @@ class FlowMapTest(unittest.TestCase):
         positions, agents, paths, width, height = renderer._geometry
         tracks = list(paths.values())
         self.assertNotEqual(tracks[0], tracks[1])
-        self.assertTrue(all(" C" in track and " Q" not in track and " L" not in track for track in tracks))
+        self.assertTrue(all(" Q" in track and " C" not in track for track in tracks))
         self.assertEqual(positions["node:a"][1], positions["node:c"][1])
         self.assertTrue(all(0 < x < width and 0 < y < height for x, y in positions.values()))
 
@@ -289,26 +289,30 @@ class FlowMapTest(unittest.TestCase):
                 self.assertFalse(left < other_right and other_left < right
                                  and top < other_bottom and other_top < bottom)
 
-    def test_hops_are_single_smooth_curves_without_backtracking(self):
+    def test_metro_tracks_are_orthogonal_with_every_turn_rounded(self):
         for start, end in (((0, 0), (300, 0)), ((100, 100), (100, 400)), ((50, 60), (400, 350))):
-            path, points = _curve_path(start, end, 14, [])
-            self.assertEqual(path.count(" C"), 1)
-            self.assertNotIn(" L", path)
-            self.assertNotIn(" Q", path)
+            path, points = _metro_path(start, end, 14, [])
+            self.assertNotIn(" C", path)
+            self.assertEqual(path.count(" Q"), len(points) - 2)
+            self.assertTrue(all(a[0] == b[0] or a[1] == b[1] for a, b in zip(points, points[1:])))
+            self.assertEqual(points[0], start)
+            self.assertEqual(points[-1], end)
             dx, dy = end[0] - start[0], end[1] - start[1]
             projected = [(x - start[0]) * dx + (y - start[1]) * dy for x, y in points]
             self.assertEqual(projected, sorted(projected))
-            self.assertEqual(points[0], start)
-            self.assertEqual(points[-1], end)
 
-    def test_curves_pass_around_unrelated_node_symbols(self):
-        _, points = _curve_path((0, 0), (300, 0), 0, [(150, 0, 32)])
-        for step in range(41):
-            t = step / 40
-            weights = ((1 - t)**3, 3 * (1 - t)**2 * t, 3 * (1 - t) * t**2, t**3)
-            x = sum(weight * point[0] for weight, point in zip(weights, points))
-            y = sum(weight * point[1] for weight, point in zip(weights, points))
-            self.assertGreater((x - 150)**2 + y**2, 32**2)
+    def test_redundant_points_and_short_spurs_do_not_create_corners(self):
+        clean = [(0, 0), (100, 0), (100, 100)]
+        redundant = [(0, 0), (10, 0), (20, 0), (10, 0), (100, 0), (100, 25), (100, 100)]
+        self.assertEqual(_rounded_path(clean), _rounded_path(redundant))
+        self.assertEqual(_rounded_path(clean).count(" Q"), 1)
+
+    def test_metro_tracks_pass_around_unrelated_node_symbols(self):
+        _, points = _metro_path((0, 0), (300, 0), 0, [(150, 0, 36)])
+        for a, b in zip(points, points[1:]):
+            x = max(min(150, max(a[0], b[0])), min(a[0], b[0]))
+            y = max(min(0, max(a[1], b[1])), min(a[1], b[1]))
+            self.assertGreater((x - 150)**2 + y**2, 36**2)
 
     def test_node_positions_survive_route_agent_and_membership_changes(self):
         renderer = FlowMapRenderer()

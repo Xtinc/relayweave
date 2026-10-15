@@ -210,48 +210,71 @@ def _station_boxes(key: str, point: tuple[float, float], agents: dict) -> list[t
             (x - half_width, label_y - 21, x + half_width, label_y + 10)]
 
 
-def _curve_path(start: tuple[float, float], end: tuple[float, float], offset: float,
+def _compact_path(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
+    compact = []
+    for point in points:
+        if compact and point == compact[-1]:
+            continue
+        while len(compact) >= 2 and (compact[-2][0] == compact[-1][0] == point[0]
+                                     or compact[-2][1] == compact[-1][1] == point[1]):
+            compact.pop()
+        compact.append(point)
+    return compact
+
+
+def _rounded_path(points: list[tuple[float, float]]) -> str:
+    """Round every actual turn after removing redundant points and tiny spurs."""
+    points = _compact_path(points)
+    result = [f"M{points[0][0]},{points[0][1]}"]
+    for previous, corner, following in zip(points, points[1:], points[2:]):
+        before = math.dist(previous, corner)
+        after = math.dist(corner, following)
+        radius = min(24, before / 2, after / 2)
+        entry = tuple(corner[i] + (previous[i] - corner[i]) * radius / before for i in (0, 1))
+        leave = tuple(corner[i] + (following[i] - corner[i]) * radius / after for i in (0, 1))
+        result.append(f"L{entry[0]},{entry[1]} Q{corner[0]},{corner[1]} {leave[0]},{leave[1]}")
+    result.append(f"L{points[-1][0]},{points[-1][1]}")
+    return " ".join(result)
+
+
+def _metro_path(start: tuple[float, float], end: tuple[float, float], offset: float,
                 obstacles: list[tuple[float, float, float]]) -> tuple[str, list[tuple[float, float]]]:
-    """One smooth, forward-moving arc per hop; never introduce routing elbows."""
-    dx, dy = end[0] - start[0], end[1] - start[1]
-    distance = math.hypot(dx, dy)
-    normal = (-dy / distance, dx / distance) if distance else (0, 1)
-    limit = min(120, distance * .4)
-    offset = max(-limit, min(limit, offset))
+    """Prefer one simple metro track; avoid symbols without detouring around text."""
+    x1, y1 = start
+    x2, y2 = end
+    offset = max(-96, min(96, offset))
 
-    def curve(bend):
-        return [start, (start[0] + dx / 3 + normal[0] * bend, start[1] + dy / 3 + normal[1] * bend),
-                (end[0] - dx / 3 + normal[0] * bend, end[1] - dy / 3 + normal[1] * bend), end]
+    def horizontal(bend):
+        return _compact_path([start, (bend, y1), (bend, y2), end])
 
-    def collisions(points):
-        hits = 0
-        for x, y, radius in obstacles:
-            # Ignore remote stations before sampling the curve.
-            if not (min(point[0] for point in points) - radius < x < max(point[0] for point in points) + radius
-                    and min(point[1] for point in points) - radius < y < max(point[1] for point in points) + radius):
-                continue
-            for index in range(1, 40):
-                t = index / 40
-                weights = ((1 - t)**3, 3 * (1 - t)**2 * t, 3 * (1 - t) * t**2, t**3)
-                px = sum(weight * point[0] for weight, point in zip(weights, points))
-                py = sum(weight * point[1] for weight, point in zip(weights, points))
-                if math.hypot(px - x, py - y) < radius:
-                    hits += 1
-                    break
-        return hits
+    def vertical(bend):
+        return _compact_path([start, (x1, bend), (x2, bend), end])
 
-    points = curve(offset)
-    score = collisions(points)
-    if score:
-        for bend in sorted({-limit, -limit / 2, limit / 2, limit}, key=lambda value: (abs(value - offset), value)):
-            candidate = curve(bend)
-            candidate_score = collisions(candidate)
-            if candidate_score < score:
-                points, score = candidate, candidate_score
-            if not score:
-                break
-    return (f"M{start[0]},{start[1]} C{points[1][0]},{points[1][1]} "
-            f"{points[2][0]},{points[2][1]} {end[0]},{end[1]}", points)
+    if y1 == y2:
+        points = vertical(y1 + offset)
+    elif x1 == x2:
+        points = horizontal(x1 + offset)
+    elif abs(x2 - x1) >= abs(y2 - y1):
+        points = horizontal((x1 + x2) / 2 + offset)
+    else:
+        points = vertical((y1 + y2) / 2 + offset)
+
+    def collisions(candidate):
+        return sum(any(math.hypot(x - max(min(x, max(a[0], b[0])), min(a[0], b[0])),
+                                  y - max(min(y, max(a[1], b[1])), min(a[1], b[1]))) < radius
+                       for a, b in zip(candidate, candidate[1:])) for x, y, radius in obstacles)
+
+    hits = collisions(points)
+    if hits:
+        xs = [min(x1, x2) - 48, (x1 + x2) / 2 + offset, max(x1, x2) + 48]
+        ys = [min(y1, y2) - 48, (y1 + y2) / 2 + offset, max(y1, y2) + 48]
+        if obstacles:
+            xs.extend((min(x - r for x, y, r in obstacles) - 24, max(x + r for x, y, r in obstacles) + 24))
+            ys.extend((min(y - r for x, y, r in obstacles) - 24, max(y + r for x, y, r in obstacles) + 24))
+        candidates = [horizontal(bend) for bend in xs] + [vertical(bend) for bend in ys]
+        points = min([points, *candidates], key=lambda candidate: (collisions(candidate), len(candidate),
+                     sum(math.dist(a, b) for a, b in zip(candidate, candidate[1:]))))
+    return _rounded_path(points), points
 
 
 class FlowMapRenderer:
@@ -361,10 +384,10 @@ class FlowMapRenderer:
         segments = defaultdict(dict)
         all_points = []
         for (left, right), tracks in sorted(lanes.items()):
-            obstacles = [(x, y, 32 if key.startswith("node:") else 14)
+            obstacles = [(x, y, 36 if key.startswith("node:") else 18)
                          for key, (x, y) in positions.items() if key not in {left, right}]
             for lane, (route_id, index) in enumerate(tracks):
-                path, points = _curve_path(positions[left], positions[right], (lane - (len(tracks) - 1) / 2) * 14,
+                path, points = _metro_path(positions[left], positions[right], (lane - (len(tracks) - 1) / 2) * 14,
                                            obstacles)
                 segments[route_id][index] = path
                 all_points.extend(points)
