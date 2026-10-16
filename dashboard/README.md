@@ -186,8 +186,8 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
 6. **Proportional color bands.** Each route receives
    `track_width * route_count / total_count`, ordered by stable route ID. Three
    connections and one connection yield 75% and 25% bands. Counts above 100 keep
-   the width capped while their actual counts determine color shares. Selection
-   changes opacity only. `flow_map.shared_tracks` exposes the same totals,
+   the width capped while their actual counts determine color shares.
+   `flow_map.shared_tracks` exposes the same totals,
    widths, route counts and shares used by SVG.
 7. **Station size and capacity.** Nodes use a 17-unit-radius capacity ring with
    a 2-unit track. It shows bandwidth used (`1 - available`); the center shows
@@ -214,14 +214,14 @@ These counts describe businesses rather than physical NodeLinks.
 
 Routes use a restrained transit palette, matching line swatches in the legend.
 The map uses a subtle dot grid and theme-aware station, label and ring colors.
-Selecting a route emphasizes its color bands and dims other contributions without
-changing their proportions; stations remain above all tracks.
+Stations remain above all tracks. The map and legend are display-only: clicking
+routes, stations or legend entries does not select, highlight or open details.
+Route geometry has no transparent click targets or keyboard button roles. Legend
+labels retain endpoint/path hover titles.
 
 Node stations show their name and capacity, without connection-count labels
-or click actions. The map preserves valid route selection and keyboard focus on refreshed
-routes. Click a route or legend entry for service, connection count, Agent
-endpoints, path and minimum Node headroom; protocol UUIDs, epochs and Flow IDs
-remain available in the API but are not displayed. The initial map automatically
+or click actions. Route details, protocol UUIDs, epochs and Flow IDs remain
+available in the API. The initial map automatically
 fits the available area without scrollbars, reserving room for Agents when only
 idle Nodes are present. Zoom buttons, directional buttons
 and Fit adjust the view explicitly; hovering, dragging and the mouse wheel do

@@ -152,7 +152,7 @@ class FlowMapTest(unittest.TestCase):
         svg = ET.fromstring(rendered["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
         self.assertEqual(len(svg.findall(".//s:circle[@class='flow-node']", ns)), 2)
-        self.assertEqual(len(svg.findall(".//s:g[@class='flow-line']", ns)), 3)
+        self.assertEqual(rendered["visible_route_count"], 3)
         self.assertIn("consumer / producer", rendered["svg"])
         self.assertEqual(renderer.render(view, protocol="udp")["visible_route_count"], 0)
 
@@ -250,6 +250,12 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(station.find("s:text[@class='flow-headroom']", ns).text, "64%")
         self.assertNotIn("min-width", svg.get("style", ""))
         self.assertEqual(svg.get("preserveAspectRatio"), "xMidYMid meet")
+        self.assertEqual(svg.get("role"), "img")
+        self.assertEqual(svg.get("focusable"), "false")
+        self.assertFalse(svg.findall(".//*[@tabindex]"))
+        self.assertFalse(svg.findall(".//*[@role='button']"))
+        self.assertFalse(svg.findall(".//s:path[@class='flow-hit']", ns))
+
 
     def test_shared_hops_use_the_same_track_without_parallel_offsets(self):
         view = collect({"a": [half("ingress", 1, path=["a", "c"]),
@@ -257,12 +263,15 @@ class FlowMapTest(unittest.TestCase):
                         "c": [half("egress", 1), half("egress", 2, protocol="udp")]}).snapshot(True)
         renderer = FlowMapRenderer()
         renderer.render(view)
-        positions, agents, paths, _, width, height = renderer._geometry
-        tracks = list(paths.values())
-        self.assertEqual(tracks[0], tracks[1])
-        self.assertTrue(all(" Q" in track and " C" not in track for track in tracks))
-        self.assertEqual(positions["node:a"][1], positions["node:c"][1])
-        self.assertTrue(all(0 < x < width and 0 < y < height for x, y in positions.values()))
+        geometry = renderer._geometry
+        self.assertEqual(len(geometry.hops), 3)
+        self.assertTrue(all(len(route_ids) == 2 for _, route_ids in renderer._tracks))
+        tracks = [path for path, _ in geometry.hops.values()]
+        self.assertTrue(any(" Q" in path for path in tracks))
+        self.assertTrue(all(" C" not in path for path in tracks))
+        self.assertEqual(geometry.positions["node:a"][1], geometry.positions["node:c"][1])
+        self.assertTrue(all(0 < x < geometry.width and 0 < y < geometry.height
+                            for x, y in geometry.positions.values()))
 
     def test_shared_track_width_and_color_bands_use_summed_connections(self):
         view = collect({"a": [single(1), single(2), single(3), single(4, protocol="udp")]}).snapshot(True)
@@ -303,7 +312,7 @@ class FlowMapTest(unittest.TestCase):
         renderer = FlowMapRenderer()
         rendered = renderer.render(collect(reports).snapshot(True))
         self.assert_tracks_are_merged(renderer)
-        hops = list(renderer._geometry[3].items())
+        hops = list(renderer._geometry.hops.items())
         for index, (pair, (_, points)) in enumerate(hops):
             for other_pair, (_, other) in hops[index + 1:]:
                 if not set(pair) & set(other_pair):
@@ -334,7 +343,7 @@ class FlowMapTest(unittest.TestCase):
                          for index in range(1, 17)]}
         renderer = FlowMapRenderer()
         renderer.render(collect(reports).snapshot(True))
-        positions, agents, _, _, width, height = renderer._geometry
+        positions, agents, _, width, height = renderer._geometry
         self.assertGreater(width / height, 1)
         self.assertLess(width / height, 3)
         labels = [_station_boxes(key, point, agents)[1] for key, point in positions.items()]
@@ -345,7 +354,7 @@ class FlowMapTest(unittest.TestCase):
         self.assert_tracks_are_merged(renderer)
         # Even with 32 Agents, every approach remains on one of the Node's four axes.
         center = positions["node:a"]
-        for (_, points) in renderer._geometry[3].values():
+        for (_, points) in renderer._geometry.hops.values():
             neighbor = points[-2] if points[-1] == center else points[1]
             self.assertTrue(neighbor[0] == center[0] or neighbor[1] == center[1])
 
@@ -406,7 +415,7 @@ class FlowMapTest(unittest.TestCase):
                                'agent:["llyun-1", "219.140.92.118:14070"]': (340, 472)}
         renderer.render(view)
         center = (240, 320)
-        for pair, (path, points) in renderer._geometry[3].items():
+        for pair, (path, points) in renderer._geometry.hops.items():
             agent = renderer._positions[pair[0]]
             self.assertEqual(points, [agent, (240, agent[1]), center])
             self.assertEqual(path.count(" Q"), 1)
@@ -420,7 +429,7 @@ class FlowMapTest(unittest.TestCase):
         renderer._positions = {"node:other": (240, 320), "node:txyun-1": (480, 320),
                                'agent:["txyun-1", "219.140.92.118:4699"]': (580, 416)}
         renderer.render(collect({"other": [source], "txyun-1": [target]}).snapshot(True))
-        path, points = renderer._geometry[3]['agent:["txyun-1", "219.140.92.118:4699"]', 'node:txyun-1']
+        path, points = renderer._geometry.hops['agent:["txyun-1", "219.140.92.118:4699"]', 'node:txyun-1']
         self.assertEqual(points, [(580, 416), (480, 416), (480, 320)])
         self.assertEqual(path.count(" Q"), 1)
 
@@ -533,28 +542,25 @@ class FlowMapTest(unittest.TestCase):
         idle = collect({"a": [], "b": [], "c": []}).snapshot(True)
         topology = {"nodes": [{"node_id": name, "available": .5} for name in ("a", "b", "c")]}
         renderer.render(idle, topology=topology)
-        original = dict(renderer._geometry[0])
+        original = dict(renderer._geometry.positions)
         active = collect({"a": [half("ingress", 1, path=["a", "c"])], "b": [], "c": [half("egress", 1)]}).snapshot(True)
         renderer.render(active, topology=topology)
-        self.assertTrue(all(renderer._geometry[0][key] == point for key, point in original.items()))
-        agent_positions = {key: point for key, point in renderer._geometry[0].items() if key.startswith("agent:")}
+        self.assertTrue(all(renderer._geometry.positions[key] == point for key, point in original.items()))
+        agent_positions = {key: point for key, point in renderer._geometry.positions.items() if key.startswith("agent:")}
         active["routes"][0]["id"] = "another-service-route"
         renderer.render(active, topology=topology)
-        self.assertTrue(all(renderer._geometry[0][key] == point for key, point in {**original, **agent_positions}.items()))
+        self.assertTrue(all(renderer._geometry.positions[key] == point for key, point in {**original, **agent_positions}.items()))
         renderer.render(idle, topology={"nodes": [{"node_id": "a", "available": .5}]})
         topology["nodes"].append({"node_id": "d", "available": .5})
         renderer.render(idle, topology=topology)
-        self.assertTrue(all(renderer._geometry[0][key] == point for key, point in original.items()))
+        self.assertTrue(all(renderer._geometry.positions[key] == point for key, point in original.items()))
 
     def test_route_order_does_not_change_geometry(self):
         view = collect({"a": [single(1), single(2, protocol="udp"), single(3, consumer="192.0.2.11:123")]}).snapshot(True)
         before = FlowMapRenderer().render(view)["svg"]
         view["routes"].reverse()
         after = FlowMapRenderer().render(view)["svg"]
-        ns = {"s": "http://www.w3.org/2000/svg"}
-        paths = lambda svg: {line.get("data-route"): line.find("s:path", ns).get("d")
-                             for line in ET.fromstring(svg).findall(".//s:g[@class='flow-line']", ns)}
-        self.assertEqual(paths(before), paths(after))
+        self.assertEqual(before, after)
 
 
 if __name__ == "__main__":

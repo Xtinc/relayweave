@@ -48,7 +48,6 @@ def _symbol_radius(key):
 class MetroGeometry(NamedTuple):
     positions: dict
     agents: dict
-    paths: dict
     hops: dict
     width: float
     height: float
@@ -609,7 +608,7 @@ class FlowMapRenderer:
                 "nodes": stations,
                 "shared_tracks": [{key: value for key, value in track.items() if key not in {"pieces", "path"}}
                                   for track in shared],
-                "svg": self._svg(routes, geometry, stations, shared)}
+                "svg": self._svg(geometry, stations, shared)}
 
     def _layout(self, routes: list[dict], node_ids=()) -> MetroGeometry:
         agents = {}
@@ -680,16 +679,15 @@ class FlowMapRenderer:
         bounds = [box for key, point in positions.items() for box in _station_boxes(key, point, agents)]
         width = max([box[2] for box in bounds] + [x for x, y in all_points], default=480) + 28
         height = max([box[3] for box in bounds] + [y for x, y in all_points], default=100) + 28
-        paths = {route["id"]: " ".join(hops[pair][0] for pair in _route_hops(route)) for route in routes}
-        return MetroGeometry(positions, agents, paths, hops, width, height)
+        return MetroGeometry(positions, agents, hops, width, height)
 
     @staticmethod
-    def _svg(routes: list[dict], geometry: MetroGeometry, stations: list[dict], shared: list[dict]) -> str:
-        positions, agents, paths, hops, width, height = geometry
+    def _svg(geometry: MetroGeometry, stations: list[dict], shared: list[dict]) -> str:
+        positions, agents, hops, width, height = geometry
         nodes = {station["node_id"]: station for station in stations}
         svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "class": "flow-svg",
                                  "viewBox": f"0 0 {width} {height}", "width": str(width), "height": str(height),
-                                 "preserveAspectRatio": "xMidYMid meet", "role": "group",
+                                 "preserveAspectRatio": "xMidYMid meet", "role": "img", "focusable": "false",
                                  "aria-label": "Current relay routes and Node bandwidth headroom"})
         layer = ET.SubElement(svg, "g", {"class": "flow-scene"})
         tracks = ET.SubElement(layer, "g", {"class": "flow-routes"})
@@ -706,14 +704,6 @@ class FlowMapRenderer:
                                                "class": "flow-band", "data-route": contribution["id"],
                                                "stroke": contribution["color"], "stroke-width": f"{band_width:.6f}"})
                 cursor += band_width
-        for route in routes:
-            line = ET.SubElement(tracks, "g", {"class": "flow-line", "data-route": route["id"],
-                                               "tabindex": "0", "role": "button",
-                                               "aria-label": f'{route["service"]} {route["protocol"]}: {route["count"]} connections'})
-            ET.SubElement(line, "title").text = (
-                f'{route["service"]} / {route["protocol"].upper()} · {route["count"]} connections\n'
-                + route["consumer"]["peer"] + " → " + " → ".join(route["path"]) + " → " + route["producer"]["peer"])
-            ET.SubElement(line, "path", {"d": paths[route["id"]], "class": "flow-hit"})
         for key, (x, y) in sorted(positions.items()):
             station = ET.SubElement(layer, "g", {"class": "flow-station", "transform": f"translate({x} {y})"})
             if key.startswith("node:"):

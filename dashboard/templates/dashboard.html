@@ -320,13 +320,7 @@
   .flow-track { fill:none; stroke-linejoin:round; stroke-linecap:round; }
   .flow-band { fill:none; stroke-linejoin:round; stroke-linecap:butt; }
   .flow-shared-track { pointer-events:none; }
-  .flow-shared-track.dimmed { opacity:.18; }
-  .flow-shared-track.selected .flow-band.muted, .flow-shared-track.selected .flow-track { opacity:.18; }
-  .flow-hit { fill:none; stroke:transparent; stroke-width:20; cursor:pointer; }
-  .flow-line { cursor:pointer; }
-  .flow-line.dimmed { opacity:.18; }
-  .flow-line.selected .flow-track, .flow-line:focus .flow-track { filter:drop-shadow(0 0 2px var(--flow-ring)); }
-  .flow-line:focus-visible { outline:2px solid var(--series-1); outline-offset:5px; }
+  .flow-svg, .flow-legend { cursor:default; user-select:none; -webkit-user-select:none; }
   .flow-node-halo { fill:var(--flow-bg); }
   .flow-node, .flow-agent { fill:var(--flow-node-bg); stroke:var(--flow-ring); }
   .flow-node { stroke:none; }
@@ -344,21 +338,14 @@
   .flow-key { color:var(--flow-muted); font-size:11px; margin:12px 0 0; line-height:1.6; }
   .flow-status { color:var(--flow-muted); font-size:12px; margin:8px 0 10px; }
   .flow-legend { display:flex; flex-wrap:wrap; gap:6px; margin:12px 0; }
-  .flow-legend button {
+  .flow-legend-item {
     display:inline-flex; align-items:center; gap:7px; background:var(--surface-2); border:1px solid var(--border);
     border-radius:6px; padding:5px 9px; color:var(--flow-ink);
-    cursor:pointer; font:inherit; font-size:11px;
+    font:inherit; font-size:11px;
   }
-  .flow-legend button::before { content:""; width:18px; height:3px; border-radius:2px; background:var(--route-color); }
-  .flow-legend button:hover, .flow-legend button[aria-pressed="true"] { background:var(--flow-bg); border-color:var(--flow-ring); }
-  .flow-legend button[aria-pressed="true"] { box-shadow:0 0 0 1px var(--flow-ring); }
-  .flow-details { font-size:13px; color:var(--text-secondary); line-height:1.7; overflow-wrap:anywhere; border-top:1px solid var(--border); padding-top:10px; }
-  .flow-details strong { color:var(--text-primary); }
-  .flow-details dl { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:2px 14px; margin:8px 0; }
-  .flow-details dt { color:var(--text-secondary); }
-  .flow-details dd { margin:0; color:var(--text-primary); }
+  .flow-legend-item::before { content:""; width:18px; height:3px; border-radius:2px; background:var(--route-color); }
   .flow-empty { display:grid; place-items:center; height:100%; padding:24px; text-align:center; box-sizing:border-box; color:var(--text-muted); }
-  @media (pointer:coarse) { .flow-legend button, .flow-controls button { min-width:44px; min-height:44px; } .flow-pan { grid-template-columns:repeat(3,44px); grid-template-rows:repeat(2,44px); } }
+  @media (pointer:coarse) { .flow-controls button { min-width:44px; min-height:44px; } .flow-pan { grid-template-columns:repeat(3,44px); grid-template-rows:repeat(2,44px); } }
   @media (max-width:700px) { .flow-svg { max-height:420px; } }
 </style>
 </head>
@@ -399,7 +386,6 @@
       </div>
       <p class="flow-key">Node rings: bandwidth used · center: headroom · line width: square root of total connections (capped at 100) · color share: connections per route · squares: Agents</p>
       <div class="flow-legend" id="flow-legend" aria-label="Active routes"></div>
-      <div class="flow-details" id="flow-details" aria-live="polite">Select a route for details.</div>
     </section>
 
     <div class="section-head">
@@ -595,8 +581,6 @@ function setChartView(cid, start, end){
 // The compound key keeps same-named services on different nodes distinct.
 let bandwidthSelection = null;
 let selectedNodeKey = null;
-let flowSelected = null;
-let flowMapData = null;
 let flowSvgText = null;
 let flowView = null;
 function resetFlowView(reserveAgents=false){
@@ -660,59 +644,7 @@ $("flow-controls").addEventListener("click", event => {
   }
   applyFlowView();
 });
-function selectFlow(id){
-  flowSelected = flowSelected === id ? null : id;
-  renderFlowSelection();
-}
-function fmtHeadroom(value){
-  return value === null || value === undefined ? "—" : `${Math.round(value*100)}%`;
-}
-function appendFlowFields(details, fields){
-  const list = document.createElement("dl");
-  fields.forEach(([label, value]) => {
-    const term = document.createElement("dt"), definition = document.createElement("dd");
-    term.textContent = label; definition.textContent = value;
-    list.append(term, definition);
-  });
-  details.append(list);
-}
-function renderFlowSelection(){
-  const route = flowMapData?.routes.find(item => item.id === flowSelected);
-  if(!route) flowSelected = null;
-  $("flow-viewport").querySelectorAll(".flow-line").forEach(line => {
-    const selected = line.dataset.route === flowSelected;
-    line.classList.toggle("selected", selected);
-    line.classList.toggle("dimmed", !!route && !selected);
-    line.setAttribute("aria-pressed", String(selected));
-    if(selected) line.parentElement.append(line);
-  });
-  $("flow-legend").querySelectorAll("button").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.route === flowSelected)));
-  $("flow-viewport").querySelectorAll(".flow-shared-track").forEach(track => {
-    const selected = JSON.parse(track.dataset.routes).includes(flowSelected);
-    track.classList.toggle("selected", selected);
-    track.classList.toggle("dimmed", !!route && !selected);
-    track.querySelectorAll(".flow-band").forEach(band => {
-      band.classList.toggle("muted", !!route && band.dataset.route !== flowSelected);
-    });
-  });
-  const details = $("flow-details");
-  details.replaceChildren();
-  if(!route){ details.textContent = "Select a route for details. Traffic is bidirectional."; return; }
-  const heading = document.createElement("strong");
-  heading.textContent = `${route.service} / ${route.protocol.toUpperCase()} · ${route.count} connections`;
-  details.append(heading);
-  const pathNodes = route.path.map(id => flowMapData.nodes.find(item => item.node_id === id));
-  const headroom = pathNodes.every(item => item && item.available !== null)
-    ? Math.min(...pathNodes.map(item => item.available)) : null;
-  appendFlowFields(details, [
-    ["Consumer Agent", `${route.consumer.peer} @ ${route.consumer.node}`],
-    ["Node path", route.path.join(" → ")],
-    ["Producer Agent", `${route.producer.peer} @ ${route.producer.node}`],
-    ["Minimum Node headroom", fmtHeadroom(headroom)],
-  ]);
-}
 function renderFlowMap(map){
-  flowMapData = map;
   const collected = map.state === "ready" || map.state === "partial";
   const messages = collected
     ? [`${map.partial ? "≥ " : ""}${map.flow_count} connections · ${map.route_count} routes · ${map.nodes.length} Nodes`]
@@ -725,12 +657,8 @@ function renderFlowMap(map){
   const viewport = $("flow-viewport");
   if(map.routes.length || map.nodes.length){
     if(flowSvgText !== map.svg){
-      const active = document.activeElement;
-      const focused = viewport.contains(active) && (active.dataset.route
-        ? `[data-route="${CSS.escape(active.dataset.route)}"]` : null);
       viewport.innerHTML = map.svg; flowSvgText = map.svg;
       if(!flowView) resetFlowView(!map.routes.length);
-      if(focused) viewport.querySelector(focused)?.focus({preventScroll:true});
     }
   }else{
     flowSvgText = null;
@@ -745,26 +673,13 @@ function renderFlowMap(map){
   applyFlowView();
   const legend = $("flow-legend"); legend.replaceChildren();
   map.routes.forEach(route => {
-    const button = document.createElement("button"); button.type="button"; button.dataset.route=route.id;
-    button.style.setProperty("--route-color", route.color);
-    button.textContent=`${route.service} / ${route.protocol.toUpperCase()} · ${route.count} connections`;
-    button.title=`${route.consumer.peer} → ${route.path.join(" → ")} → ${route.producer.peer}`;
-    button.addEventListener("click", ()=>selectFlow(route.id)); legend.append(button);
+    const item = document.createElement("span"); item.className="flow-legend-item";
+    item.style.setProperty("--route-color", route.color);
+    item.textContent=`${route.service} / ${route.protocol.toUpperCase()} · ${route.count} connections`;
+    item.title=`${route.consumer.peer} → ${route.path.join(" → ")} → ${route.producer.peer}`;
+    legend.append(item);
   });
-  renderFlowSelection();
 }
-$("flow-viewport").addEventListener("click", event=>{
-  const line=event.target.closest("[data-route]");
-  if(line) selectFlow(line.dataset.route);
-});
-$("flow-viewport").addEventListener("keydown", event=>{
-  if(event.key !== "Enter" && event.key !== " ") return;
-  const line=event.target.closest("[data-route]");
-  if(line){
-    event.preventDefault();
-    selectFlow(line.dataset.route);
-  }
-});
 
 function windowHistory(hist, domain){
   return hist.filter(point => point.t >= domain.start && point.t <= domain.end);
