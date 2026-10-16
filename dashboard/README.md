@@ -198,10 +198,9 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    `flow_map.shared_tracks` exposes the same totals,
    widths, route counts and shares used by SVG.
 7. **Station size and capacity.** Nodes use an 18-unit-radius capacity ring with
-   a 7-unit track. A separate 2-unit station outline surrounds it with a 0.5-unit
-   inner gap; its radius follows the capacity-ring dimensions (currently 23).
-   Incoming tracks continue directly under this outer outline, without a blank
-   halo separating the tracks from the station. The inner ring shows bandwidth
+   a 7-unit track. The station body has no outer outline or blank halo; its
+   radius matches the capacity ring's outer edge (currently 21.5). Incoming
+   tracks meet that edge directly. The capacity ring shows bandwidth
    used (`1 - available`); the center shows estimated remaining capacity. No used
    arc is drawn at 100% headroom. Status is green at 30% or above, amber from
    10% to 30%, red below 10%, and gray with a dash for unknown capacity. Agent

@@ -501,7 +501,7 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(points[-1], (480, 480))
         self.assert_tracks_are_merged(renderer)
 
-    def test_capacity_ring_is_thick_inside_a_track_connected_station_outline(self):
+    def test_capacity_ring_is_thick_without_a_separate_station_outline(self):
         rendered = FlowMapRenderer().render(collect({"a": [single()]}).snapshot(True),
                                             topology={"nodes": [{"node_id": "a", "available": .64}]})
         ns = {"s": "http://www.w3.org/2000/svg"}
@@ -510,10 +510,9 @@ class FlowMapTest(unittest.TestCase):
             ring = station.find(f"s:circle[@class='{class_name}']", ns)
             self.assertEqual(float(ring.get("r")), 18)
             self.assertEqual(float(ring.get("stroke-width")), 7)
-        outline = station.find("s:circle[@class='flow-node']", ns)
-        self.assertEqual(float(outline.get("r")), 23)
-        self.assertEqual(float(outline.get("stroke-width")), 2)
-        self.assertEqual(float(outline.get("r")) - float(outline.get("stroke-width")) / 2 - (18 + 7 / 2), .5)
+        body = station.find("s:circle[@class='flow-node']", ns)
+        self.assertEqual(float(body.get("r")), 18 + 7 / 2)
+        self.assertEqual(body.get("stroke"), "none")
         self.assertIsNone(station.find("s:circle[@class='flow-node-halo']", ns))
         arc = station.find("s:circle[@class='flow-capacity']", ns)
         used, circumference = map(float, arc.get("stroke-dasharray").split())
