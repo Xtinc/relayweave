@@ -26,9 +26,10 @@ TRACK_CONNECTION_CAP = 100
 TRACK_MAX_WIDTH = TRACK_BASE_WIDTH + TRACK_WIDTH_SCALE * math.sqrt(TRACK_CONNECTION_CAP)
 TURN_RADIUS = 24
 NODE_RING_RADIUS = 18
-NODE_RING_WIDTH = 5
-NODE_HALO_RADIUS = NODE_RING_RADIUS + 4
-NODE_CENTER_RADIUS = NODE_RING_RADIUS - 1.5
+NODE_RING_WIDTH = 7
+NODE_OUTLINE_WIDTH = 2
+NODE_OUTLINE_GAP = .5
+NODE_OUTLINE_RADIUS = NODE_RING_RADIUS + NODE_RING_WIDTH / 2 + NODE_OUTLINE_WIDTH / 2 + NODE_OUTLINE_GAP
 NODE_PORT_LENGTH = 64
 AGENT_VERTICAL_BIAS = .6
 AGENT_SIZE = 14
@@ -37,7 +38,7 @@ CORRIDOR_GAP = TRACK_MAX_WIDTH + 4
 
 
 def _symbol_radius(key):
-    body = (NODE_RING_RADIUS + NODE_RING_WIDTH / 2 if key.startswith("node:")
+    body = (NODE_OUTLINE_RADIUS + NODE_OUTLINE_WIDTH / 2 if key.startswith("node:")
             else (AGENT_SIZE + AGENT_OUTLINE_WIDTH) / 2)
     clearance = body + TRACK_MAX_WIDTH / 2
     # Reserve clearance for both straight strokes and the inward cut of a
@@ -729,8 +730,10 @@ class FlowMapRenderer:
                 station.set("data-node", name)
                 station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom")
                 station.set("class", f"flow-station flow-node-station {state}")
-                ET.SubElement(station, "circle", {"r": str(NODE_HALO_RADIUS), "class": "flow-node-halo"})
-                ET.SubElement(station, "circle", {"r": str(NODE_CENTER_RADIUS), "class": "flow-node"})
+                # The station body covers the tracks only inside its outline.
+                # No extra halo: approach strokes meet the outer ring directly.
+                ET.SubElement(station, "circle", {"r": str(NODE_OUTLINE_RADIUS),
+                                                  "stroke-width": str(NODE_OUTLINE_WIDTH), "class": "flow-node"})
                 ET.SubElement(station, "circle", {"r": str(NODE_RING_RADIUS), "stroke-width": str(NODE_RING_WIDTH),
                                                       "class": "flow-capacity-track"})
                 if available is not None and available < 1:
@@ -752,7 +755,7 @@ class FlowMapRenderer:
                                                 "rx": "3", "class": "flow-agent"})
                 title = f'Agent {name} · {agent["node"]} · {" / ".join(sorted(agent["roles"]))}'
             ET.SubElement(station, "title").text = title
-            label = ET.SubElement(station, "text", {"x": "0", "y": str(NODE_HALO_RADIUS + 13) if key.startswith("node:") else "25",
+            label = ET.SubElement(station, "text", {"x": "0", "y": str(NODE_OUTLINE_RADIUS + 17) if key.startswith("node:") else "25",
                                                     "text-anchor": "middle", "class": "flow-label"})
             label.text = _label(name)[0]
         return ET.tostring(svg, encoding="unicode")
