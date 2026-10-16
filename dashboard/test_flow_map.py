@@ -217,12 +217,13 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(result["nodes"][0]["connection_count"], 1)
         self.assertTrue(result["nodes"][0]["partial"])
 
-    def test_line_width_uses_square_root_scale_and_caps_at_50(self):
+    def test_line_width_uses_square_root_scale_and_caps_at_100(self):
         view = collect({"a": [single()]}).snapshot(True)
         renderer = FlowMapRenderer()
         geometry = None
         for count, expected in ((1, 3.8), (4, 4.6), (9, 5.4), (10, 5.529822128),
-                                (49, 8.6), (50, 8.656854249), (51, 8.656854249), (10000, 8.656854249)):
+                                (49, 8.6), (50, 8.656854249), (51, 8.713142743),
+                                (99, 10.959899497), (100, 11), (101, 11), (10000, 11)):
             view["routes"][0]["count"] = count
             result = renderer.render(view)
             widths = {track["width"] for track in result["shared_tracks"]}
@@ -288,7 +289,7 @@ class FlowMapTest(unittest.TestCase):
         view["routes"][0]["count"] = 100
         changed = renderer.render(view)
         self.assertIs(renderer._geometry, geometry)
-        self.assertTrue(all(track["width"] <= 8.656855 for track in changed["shared_tracks"]))
+        self.assertTrue(all(track["width"] <= 11 for track in changed["shared_tracks"]))
 
     def test_overlapping_tracks_are_merged_instead_of_drawn_on_top_of_each_other(self):
         ingress_a = half("ingress", 1, path=["aliyun-1", "awsyun-1"])

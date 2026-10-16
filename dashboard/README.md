@@ -167,7 +167,7 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
 5. **Count once, then compute width.** Each merged section uses the sum of its
    distinct routes' business counts. If both incident hops of one route use the
    same section, that route contributes once. Width is
-   `3 + 0.8 * sqrt(min(count, 50))` SVG units:
+   `3 + 0.8 * sqrt(min(count, 100))` SVG units:
 
    | Connections on the section | Width |
    |---|---|
@@ -176,14 +176,16 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    | 20 | 6.58 |
    | 30 | 7.38 |
    | 40 | 8.06 |
-   | 50 or more | 8.66 |
+   | 50 | 8.66 |
+   | 75 | 9.93 |
+   | 100 or more | 11.00 |
 
    Counts are summed **before** applying the rule: two routes of six connections
    produce 12 connections and width approximately 5.77, rather than adding their individual widths.
    The cap keeps tracks narrower than the 14-unit Agent squares.
 6. **Proportional color bands.** Each route receives
    `track_width * route_count / total_count`, ordered by stable route ID. Three
-   connections and one connection yield 75% and 25% bands. Counts above 50 keep
+   connections and one connection yield 75% and 25% bands. Counts above 100 keep
    the width capped while their actual counts determine color shares. Selection
    changes opacity only. `flow_map.shared_tracks` exposes the same totals,
    widths, route counts and shares used by SVG.

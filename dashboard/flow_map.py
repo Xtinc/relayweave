@@ -22,7 +22,7 @@ ROUTE_COLORS = ("#4389bd", "#7764b7", "#369b91", "#c68b42", "#bd6884", "#607eaa"
 # Geometry is expressed in SVG units; zoom scales stations and tracks together.
 TRACK_BASE_WIDTH = 3
 TRACK_WIDTH_SCALE = .8
-TRACK_CONNECTION_CAP = 50
+TRACK_CONNECTION_CAP = 100
 TRACK_MAX_WIDTH = TRACK_BASE_WIDTH + TRACK_WIDTH_SCALE * math.sqrt(TRACK_CONNECTION_CAP)
 TURN_RADIUS = 24
 NODE_RING_RADIUS = 17
