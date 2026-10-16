@@ -21,10 +21,9 @@ ROUTE_COLORS = ("#4389bd", "#7764b7", "#369b91", "#c68b42", "#bd6884", "#607eaa"
 
 # Geometry is expressed in SVG units; zoom scales stations and tracks together.
 TRACK_BASE_WIDTH = 3
-TRACK_CONNECTION_STEP = 10
-TRACK_WIDTH_STEP = 1
+TRACK_WIDTH_SCALE = .8
 TRACK_CONNECTION_CAP = 50
-TRACK_MAX_WIDTH = TRACK_BASE_WIDTH + TRACK_WIDTH_STEP * (TRACK_CONNECTION_CAP // TRACK_CONNECTION_STEP)
+TRACK_MAX_WIDTH = TRACK_BASE_WIDTH + TRACK_WIDTH_SCALE * math.sqrt(TRACK_CONNECTION_CAP)
 TURN_RADIUS = 24
 NODE_RING_RADIUS = 17
 NODE_RING_WIDTH = 2
@@ -397,7 +396,7 @@ def _station_port(key, point, other, other_key):
 
 
 def _track_width(count):
-    return TRACK_BASE_WIDTH + TRACK_WIDTH_STEP * (min(count, TRACK_CONNECTION_CAP) // TRACK_CONNECTION_STEP)
+    return TRACK_BASE_WIDTH + TRACK_WIDTH_SCALE * math.sqrt(min(count, TRACK_CONNECTION_CAP))
 
 
 def _symbol_collisions(points, obstacles):

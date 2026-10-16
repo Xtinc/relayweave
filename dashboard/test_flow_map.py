@@ -217,23 +217,24 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(result["nodes"][0]["connection_count"], 1)
         self.assertTrue(result["nodes"][0]["partial"])
 
-    def test_line_width_increases_once_per_ten_connections_and_caps_at_50(self):
+    def test_line_width_uses_square_root_scale_and_caps_at_50(self):
         view = collect({"a": [single()]}).snapshot(True)
         renderer = FlowMapRenderer()
         geometry = None
-        for count, expected in ((1, 3), (9, 3), (10, 4), (19, 4), (20, 5), (29, 5),
-                                (30, 6), (39, 6), (40, 7), (49, 7), (50, 8), (51, 8), (10000, 8)):
+        for count, expected in ((1, 3.8), (4, 4.6), (9, 5.4), (10, 5.529822128),
+                                (49, 8.6), (50, 8.656854249), (51, 8.656854249), (10000, 8.656854249)):
             view["routes"][0]["count"] = count
             result = renderer.render(view)
             widths = {track["width"] for track in result["shared_tracks"]}
-            self.assertEqual(widths, {expected}, msg=f"{count} connections")
+            self.assertEqual(len(widths), 1)
+            self.assertAlmostEqual(next(iter(widths)), expected, places=6, msg=f"{count} connections")
             if geometry is not None:
                 self.assertIs(renderer._geometry, geometry)
             geometry = renderer._geometry
             svg = ET.fromstring(result["svg"])
             ns = {"s": "http://www.w3.org/2000/svg"}
-            self.assertTrue(all(float(track.get("stroke-width")) == expected
-                                for track in svg.findall(".//s:path[@class='flow-track']", ns)))
+            for track in svg.findall(".//s:path[@class='flow-track']", ns):
+                self.assertAlmostEqual(float(track.get("stroke-width")), expected, places=5)
 
     def test_nodes_show_name_and_capacity_without_interactive_counts(self):
         result = FlowMapRenderer().render(collect({"a": [single()]}).snapshot(True),
@@ -269,7 +270,7 @@ class FlowMapTest(unittest.TestCase):
         geometry = renderer._geometry
         for track in rendered["shared_tracks"]:
             self.assertEqual(track["count"], 4)
-            self.assertEqual(track["width"], 3)
+            self.assertAlmostEqual(track["width"], 4.6)
             self.assertEqual(sorted(route["share"] for route in track["routes"]), [.25, .75])
         svg = ET.fromstring(rendered["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
@@ -281,12 +282,13 @@ class FlowMapTest(unittest.TestCase):
         for route in view["routes"]:
             route["count"] = 6
         merged = renderer.render(view)
-        self.assertTrue(all(track["count"] == 12 and track["width"] == 4
-                            for track in merged["shared_tracks"]))
+        for track in merged["shared_tracks"]:
+            self.assertEqual(track["count"], 12)
+            self.assertAlmostEqual(track["width"], 5.771281292, places=6)
         view["routes"][0]["count"] = 100
         changed = renderer.render(view)
         self.assertIs(renderer._geometry, geometry)
-        self.assertTrue(all(track["width"] <= 8 for track in changed["shared_tracks"]))
+        self.assertTrue(all(track["width"] <= 8.656855 for track in changed["shared_tracks"]))
 
     def test_overlapping_tracks_are_merged_instead_of_drawn_on_top_of_each_other(self):
         ingress_a = half("ingress", 1, path=["aliyun-1", "awsyun-1"])
@@ -390,7 +392,7 @@ class FlowMapTest(unittest.TestCase):
         shared = next(track for track in rendered["shared_tracks"] if len(track["routes"]) == 3)
         self.assertEqual(shared["count"], 5)  # Never count the consumer and producer hop twice.
         self.assertEqual(sorted(route["share"] for route in shared["routes"]), [.2, .2, .6])
-        self.assertEqual(shared["width"], 3)
+        self.assertAlmostEqual(shared["width"], 4.788854382, places=6)
         self.assert_tracks_are_merged(renderer)
 
     def test_lower_agents_branch_from_one_axis_without_a_second_shared_spine(self):
