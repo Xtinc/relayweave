@@ -419,6 +419,8 @@ class FlowMapTest(unittest.TestCase):
             agent = renderer._positions[pair[0]]
             self.assertEqual(points, [agent, (240, agent[1]), center])
             self.assertEqual(path.count(" Q"), 1)
+        route_ids = {route["id"] for route in view["routes"]}
+        self.assertEqual(sum(set(ids) == route_ids for _, ids in renderer._tracks), 1)
         self.assert_tracks_are_merged(renderer)
 
     def test_txyun_agent_connection_uses_one_meaningful_bend(self):
@@ -506,12 +508,12 @@ class FlowMapTest(unittest.TestCase):
         station = ET.fromstring(rendered["svg"]).find(".//s:g[@data-node='a']", ns)
         for class_name in ("flow-capacity", "flow-capacity-track"):
             ring = station.find(f"s:circle[@class='{class_name}']", ns)
-            self.assertEqual(float(ring.get("r")), 17)
-            self.assertEqual(float(ring.get("stroke-width")), 3.5)
-        self.assertLess(float(station.find("s:circle[@class='flow-node']", ns).get("r")), 17)
+            self.assertEqual(float(ring.get("r")), 18)
+            self.assertEqual(float(ring.get("stroke-width")), 5)
+        self.assertLess(float(station.find("s:circle[@class='flow-node']", ns).get("r")), 18)
         arc = station.find("s:circle[@class='flow-capacity']", ns)
         used, circumference = map(float, arc.get("stroke-dasharray").split())
-        self.assertAlmostEqual(circumference, 2 * 3.141592653589793 * 17, places=3)
+        self.assertAlmostEqual(circumference, 2 * 3.141592653589793 * 18, places=3)
         self.assertAlmostEqual(used / circumference, .36, places=4)
 
     def test_metro_tracks_are_orthogonal_with_every_turn_rounded(self):

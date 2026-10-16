@@ -25,8 +25,8 @@ TRACK_WIDTH_SCALE = .8
 TRACK_CONNECTION_CAP = 100
 TRACK_MAX_WIDTH = TRACK_BASE_WIDTH + TRACK_WIDTH_SCALE * math.sqrt(TRACK_CONNECTION_CAP)
 TURN_RADIUS = 24
-NODE_RING_RADIUS = 17
-NODE_RING_WIDTH = 3.5
+NODE_RING_RADIUS = 18
+NODE_RING_WIDTH = 5
 NODE_HALO_RADIUS = NODE_RING_RADIUS + 4
 NODE_CENTER_RADIUS = NODE_RING_RADIUS - 1.5
 NODE_PORT_LENGTH = 64
@@ -332,7 +332,8 @@ def _merge_tracks(hops, routes):
                 continue
             a, b = ((low, fixed), (high, fixed)) if axis == 0 else ((fixed, low), (fixed, high))
             merged["L", a, b].update(ids)
-    # Keep smooth bends together and stop at actual branch points or a change in contributions.
+    # Keep a trunk continuous through side branches when its contributions stay
+    # the same. Otherwise independent butt caps leave a hairline across it.
     adjacent = defaultdict(list)
     for piece in merged:
         adjacent[piece[1]].append(piece)
@@ -347,11 +348,19 @@ def _merge_tracks(hops, routes):
         for front in (False, True):
             while True:
                 joint = chain[0][1] if front else chain[-1][-1]
-                if len(adjacent[joint]) != 2:
+                current = chain[0] if front else chain[-1]
+                current_key = min(current, _reverse_piece(current))
+                options = [piece for piece in adjacent[joint] if piece != current_key and merged[piece] == ids]
+                if len(options) != 1 or options[0] not in remaining:
                     break
-                following = next((piece for piece in adjacent[joint] if piece in remaining), None)
-                if following is None or merged[following] != ids:
-                    break
+                following = options[0]
+                if len(adjacent[joint]) > 2:
+                    def tangent(piece):
+                        neighbor = piece[2] if piece[1] == joint else piece[-2]
+                        return neighbor[0] - joint[0], neighbor[1] - joint[1]
+                    a, b = tangent(current), tangent(following)
+                    if a[0] * b[1] != a[1] * b[0] or a[0] * b[0] + a[1] * b[1] >= 0:
+                        break
                 remaining.remove(following)
                 if front:
                     chain.appendleft(following if following[-1] == joint else _reverse_piece(following))
@@ -691,7 +700,11 @@ class FlowMapRenderer:
                                  "aria-label": "Current relay routes and Node bandwidth headroom"})
         layer = ET.SubElement(svg, "g", {"class": "flow-scene"})
         tracks = ET.SubElement(layer, "g", {"class": "flow-routes"})
-        for track in shared:
+        # Lay branches down first, then let the wider trunk cover their inner
+        # ends. The branch becomes visible at the trunk's edge rather than
+        # painting a short colored stub across its center. Counts break ties
+        # when both strokes have reached the width cap.
+        for track in sorted(shared, key=lambda track: (track["width"], track["count"], track["id"])):
             group = ET.SubElement(tracks, "g", {"class": "flow-shared-track", "data-track": track["id"],
                                                 "data-routes": json.dumps([route["id"] for route in track["routes"]])})
             ET.SubElement(group, "title").text = f'{track["count"]} connections across {len(track["routes"])} routes'

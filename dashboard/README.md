@@ -165,6 +165,11 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    before rounding; turn radius is at most 24 units and half either adjacent leg.
    Segments use flush end caps at joins, preventing the neutral track underlay
    from forming little arrow-shaped protrusions over neighboring color bands.
+   A straight trunk with unchanged route contributions remains one continuous
+   painted path through side branches. Narrow branches are painted before wider
+   trunks, so their inner ends disappear under the trunk and visibly meet its
+   edge. When widths are both capped, the greater connection total is painted
+   on top; stable track ID breaks remaining ties.
    Turns remain rounded; there are no directional arrows. Text does not cause
    route detours.
 5. **Count once, then compute width.** Each merged section uses the sum of its
@@ -192,8 +197,8 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    the width capped while their actual counts determine color shares.
    `flow_map.shared_tracks` exposes the same totals,
    widths, route counts and shares used by SVG.
-7. **Station size and capacity.** Nodes use a 17-unit-radius capacity ring with
-   a 3.5-unit track. It shows bandwidth used (`1 - available`); the center shows
+7. **Station size and capacity.** Nodes use an 18-unit-radius capacity ring with
+   a 5-unit track. It shows bandwidth used (`1 - available`); the center shows
    estimated remaining capacity. The center has no outline or shadow. No used
    arc is drawn at 100% headroom. Status is green at 30% or above, amber from
    10% to 30%, red below 10%, and gray with a dash for unknown capacity. Agent
