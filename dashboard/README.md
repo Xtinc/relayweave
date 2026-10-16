@@ -163,7 +163,10 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    curves are also rendered once. A perpendicular crossing does not join routes
    or combine their counts. Redundant points and short collinear spurs are removed
    before rounding; turn radius is at most 24 units and half either adjacent leg.
-   Text does not cause route detours.
+   Segments use flush end caps at joins, preventing the neutral track underlay
+   from forming little arrow-shaped protrusions over neighboring color bands.
+   Turns remain rounded; there are no directional arrows. Text does not cause
+   route detours.
 5. **Count once, then compute width.** Each merged section uses the sum of its
    distinct routes' business counts. If both incident hops of one route use the
    same section, that route contributes once. Width is
@@ -190,7 +193,7 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    `flow_map.shared_tracks` exposes the same totals,
    widths, route counts and shares used by SVG.
 7. **Station size and capacity.** Nodes use a 17-unit-radius capacity ring with
-   a 2-unit track. It shows bandwidth used (`1 - available`); the center shows
+   a 3.5-unit track. It shows bandwidth used (`1 - available`); the center shows
    estimated remaining capacity. The center has no outline or shadow. No used
    arc is drawn at 100% headroom. Status is green at 30% or above, amber from
    10% to 30%, red below 10%, and gray with a dash for unknown capacity. Agent

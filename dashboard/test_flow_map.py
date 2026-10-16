@@ -505,7 +505,9 @@ class FlowMapTest(unittest.TestCase):
         ns = {"s": "http://www.w3.org/2000/svg"}
         station = ET.fromstring(rendered["svg"]).find(".//s:g[@data-node='a']", ns)
         for class_name in ("flow-capacity", "flow-capacity-track"):
-            self.assertEqual(float(station.find(f"s:circle[@class='{class_name}']", ns).get("r")), 17)
+            ring = station.find(f"s:circle[@class='{class_name}']", ns)
+            self.assertEqual(float(ring.get("r")), 17)
+            self.assertEqual(float(ring.get("stroke-width")), 3.5)
         self.assertLess(float(station.find("s:circle[@class='flow-node']", ns).get("r")), 17)
         arc = station.find("s:circle[@class='flow-capacity']", ns)
         used, circumference = map(float, arc.get("stroke-dasharray").split())
