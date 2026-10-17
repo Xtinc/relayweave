@@ -160,6 +160,7 @@ class PayloadPool : public std::pmr::memory_resource
 
 struct Frame
 {
+    // Logical charge for frame management; not a measurement of allocator or socket memory.
     static constexpr std::size_t buffer_overhead = 128;
     LnkFrameHeader header;
     PooledBuffer payload;
@@ -171,6 +172,7 @@ struct Frame
         return buffer_overhead + PayloadPool::allocation_size(payload.allocation_size());
     }
 };
+static_assert(sizeof(Frame) <= Frame::buffer_overhead, "review frame management charge after changing Frame layout");
 
 struct LinkSpec
 {

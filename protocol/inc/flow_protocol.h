@@ -124,7 +124,6 @@ struct FlowState
             std::uint64_t received_bytes = 0;
             std::uint64_t released_bytes = 0;
             std::uint64_t receive_limit = 0;
-            Clock::time_point credit_deadline = Clock::time_point::max();
             bool finished = false;
         };
 
@@ -225,9 +224,9 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
                       std::optional<lnk::PooledBuffer> &data);
         void reset(const std::shared_ptr<lnk::FlowState> &flow, bool reverse, std::string reason);
         void receive_credit(const lnk::NodeLink &link, const LnkFrameHeader &header);
+        void publish_credit(const std::shared_ptr<lnk::FlowState> &flow);
         void publish_credit(const std::shared_ptr<lnk::FlowState> &flow, bool reverse);
         void release_buffer(const std::shared_ptr<lnk::FlowState> &flow, bool reverse, std::size_t bytes, bool data);
-        Clock::time_point poll(const std::shared_ptr<lnk::FlowState> &flow, Clock::time_point now);
         void close_port(const std::shared_ptr<lnk::FlowStream> &port, std::string reason);
         void reset_port(const std::shared_ptr<lnk::FlowStream> &port, std::string reason);
 
@@ -273,6 +272,7 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     asio::awaitable<void> run();
     void request_stop(std::string reason);
     void schedule_monitor(Clock::time_point deadline);
+    Clock::time_point poll(Clock::time_point now);
     asio::awaitable<void> monitor();
     asio::any_io_executor executor_;
     // Business deliveries may retain their storage after the protocol has stopped.
@@ -292,6 +292,8 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
 
     // Lifecycle state belongs to cluster_data_io.
     asio::steady_timer monitor_timer_;
+    // All Flow directions share one batch deadline; idle nodes have none.
+    Clock::time_point credit_deadline_ = Clock::time_point::max();
     AsyncEvent tasks_done_;
     std::size_t tasks_ = 0;
     bool activated_ = false;

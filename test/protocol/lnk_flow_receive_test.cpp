@@ -101,7 +101,7 @@ struct Fixture
     void send(std::uint8_t value = 1)
     {
         asio::post(data, [this, value] {
-            check(test_flow::send(channel, {7, 101, false, LnkFrType::Data, {value, 2, 3}}) == FlowSendStatus::Queued,
+            check(test_flow::try_send_data(channel, 101, false, {value, 2, 3}),
                   "could not enqueue fixture data");
         });
         pump();
@@ -236,7 +236,7 @@ int main()
             Fixture f;
             auto incoming = f.receive();
             asio::post(f.data, [&f] {
-                check(test_flow::send(f.channel, {7, 101, true, LnkFrType::Fin, {}}) == FlowSendStatus::Queued,
+                check(test_flow::try_finish(f.channel, 101, true),
                       "could not finish only the incoming direction");
             });
             f.pump();
@@ -262,9 +262,9 @@ int main()
             Fixture f;
             const BytesBuf chunk(32768, 1);
             asio::post(f.data, [&f, &chunk] {
-                for (int i = 0; i < 15; ++i)
+                for (std::size_t i = 0; i < test_flow::window_bytes / (chunk.size() + lnk::Frame::buffer_overhead); ++i)
                 {
-                    check(test_flow::send(f.channel, {7, 101, false, LnkFrType::Data, chunk}) == FlowSendStatus::Queued,
+                    check(test_flow::try_send_data(f.channel, 101, false, chunk),
                           "could not fill Flow for peer cancellation");
                 }
             });
@@ -482,7 +482,7 @@ int main()
             });
             auto pending = f.receive();
             asio::post(f.data, [&f] {
-                check(test_flow::send(f.channel, {7, 101, false, LnkFrType::Data, {5, 6, 7}}) == FlowSendStatus::Queued,
+                check(test_flow::try_send_data(f.channel, 101, false, {5, 6, 7}),
                       "threaded fixture could not send");
             });
             check(pending.wait_for(1s) == std::future_status::ready, "threaded receive remained suspended");

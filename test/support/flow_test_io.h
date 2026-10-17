@@ -4,55 +4,13 @@
 #include "flow_test_state.h"
 #include <variant>
 
-enum class FlowSendStatus
-{
-    Queued,
-    WouldBlock,
-    Dropped,
-    Closed,
-    Invalid
-};
-
-// Fixture-only request/result envelope; production endpoints carry bytes and EOF.
-struct FlowFrame
-{
-    std::uint64_t epoch = 0;
-    std::uint64_t flow_id = 0;
-    bool reverse = false;
-    LnkFrType kind = LnkFrType::Data;
-    BytesBuf payload;
-    std::string reason;
-    [[nodiscard]] bool validate() const noexcept;
-};
-
-inline bool FlowFrame::validate() const noexcept
-{
-    if (!epoch || !flow_id)
-    {
-        return false;
-    }
-    switch (kind)
-    {
-    case LnkFrType::Data:
-        return reason.empty() && payload.size() <= LnkFrameHeader::maximum_payload;
-    case LnkFrType::Fin:
-        return payload.empty() && reason.empty();
-    case LnkFrType::Reset:
-        return payload.empty() && reason.size() <= LnkFrameHeader::maximum_reason;
-    default:
-        return false;
-    }
-}
-
 TEST_MEMBER(FlowProtocol, stream_)
 TEST_MEMBER(FlowProtocol, datagram_)
 TEST_MEMBER(FlowProtocol, payload_pool_)
 TEST_MEMBER(LnkChannel, node_id_)
 using FlowStream = lnk::FlowStream;
 using FlowDatagram = lnk::FlowDatagram;
-TEST_MEMBER(FlowStream, send_finished_)
-TEST_MEMBER(FlowStream, reverse_)
-TEST_MEMBER(FlowDatagram, reverse_)
+TEST_MEMBER(FlowProtocol, require_endpoint_flow)
 
 namespace test_flow
 {
@@ -116,16 +74,9 @@ inline asio::awaitable<Port> port(std::shared_ptr<FlowProtocol> channel, std::ui
         [channel, epoch, id, reverse, transfer]() -> asio::awaitable<Port> {
             const auto &flows = test_access::FlowProtocol_flows_(*channel);
             const auto it = flows.find(id);
-            if (it == flows.end() || it->second->epoch != epoch || it->second->phase != lnk::FlowState::Phase::Active)
-            {
-                throw std::runtime_error("flow is not active");
-            }
-            const auto flow = it->second;
-            const bool direction = reverse.value_or(flow->previous != 0);
-            if ((direction ? flow->next : flow->previous) != 0)
-            {
-                throw std::invalid_argument("invalid endpoint direction");
-            }
+            const auto transport = it == flows.end() ? RelayProtocol::Tcp : it->second->transport;
+            const bool direction = reverse.value_or(it != flows.end() && it->second->previous != 0);
+            const auto flow = test_access::FlowProtocol_require_endpoint_flow(*channel, epoch, id, direction, transport);
             if (flow->transport == RelayProtocol::Tcp)
             {
                 if (flow->stream->port)
@@ -142,132 +93,109 @@ inline asio::awaitable<Port> port(std::shared_ptr<FlowProtocol> channel, std::ui
         }, asio::use_awaitable);
 }
 
-inline FlowSendStatus send(std::shared_ptr<FlowProtocol> channel, FlowFrame frame)
+// Same-executor admission probes are only for tests that fill a window without yielding.
+// They call production admission directly; endpoint validation belongs to bind_*_flow.
+inline bool try_send_data(std::shared_ptr<FlowProtocol> channel, std::uint64_t id, bool reverse, BytesBuf payload)
 {
-    const auto &flows = test_access::FlowProtocol_flows_(*channel);
-    const auto it = flows.find(frame.flow_id);
-    if (it == flows.end() || it->second->epoch != frame.epoch || it->second->phase != lnk::FlowState::Phase::Active)
-    {
-        return FlowSendStatus::Closed;
-    }
-    const auto flow = it->second;
-    if (!frame.validate() || (frame.reverse ? flow->next : flow->previous) ||
-        (flow->transport == RelayProtocol::Tcp ? (flow->stream->directions[std::size_t(frame.reverse)].finished && frame.kind != LnkFrType::Reset)
-                      : frame.kind != LnkFrType::Data))
-    {
-        return FlowSendStatus::Invalid;
-    }
+    const auto flow = test_access::FlowProtocol_flows_(*channel).at(id);
+    lnk::PooledBuffer data(test_access::FlowProtocol_payload_pool_(*channel), payload);
     if (flow->transport == RelayProtocol::Udp)
     {
-        lnk::PooledBuffer data(test_access::FlowProtocol_payload_pool_(*channel), frame.payload);
-        return test_access::FlowProtocol_datagram_(*channel).try_send(flow, frame.reverse, data)
-                   ? FlowSendStatus::Queued : FlowSendStatus::Dropped;
+        return test_access::FlowProtocol_datagram_(*channel).try_send(flow, reverse, data);
     }
-    if (frame.kind == LnkFrType::Reset)
-    {
-        test_access::FlowProtocol_stream_(*channel).reset(flow, frame.reverse, std::move(frame.reason));
-        return FlowSendStatus::Queued;
-    }
-    auto data = frame.kind == LnkFrType::Data
-        ? std::optional<lnk::PooledBuffer>(lnk::PooledBuffer(test_access::FlowProtocol_payload_pool_(*channel), frame.payload))
-        : std::nullopt;
-    return test_access::FlowProtocol_stream_(*channel).try_send(flow, frame.reverse, data)
-               ? FlowSendStatus::Queued : FlowSendStatus::WouldBlock;
+    std::optional<lnk::PooledBuffer> chunk(std::move(data));
+    return test_access::FlowProtocol_stream_(*channel).try_send(flow, reverse, chunk);
 }
 
-inline asio::awaitable<FlowSendStatus> submit(std::shared_ptr<FlowProtocol> channel, FlowFrame frame)
+inline bool try_finish(std::shared_ptr<FlowProtocol> channel, std::uint64_t id, bool reverse)
 {
-    if (!frame.validate())
+    const auto flow = test_access::FlowProtocol_flows_(*channel).at(id);
+    std::optional<lnk::PooledBuffer> eof;
+    return test_access::FlowProtocol_stream_(*channel).try_send(flow, reverse, eof);
+}
+
+inline asio::awaitable<bool> send_data(std::shared_ptr<FlowProtocol> channel, std::uint64_t epoch,
+                                      std::uint64_t id, bool reverse, BytesBuf payload)
+{
+    auto endpoint = co_await port(channel, epoch, id, reverse);
+    if (auto *stream = std::get_if<std::shared_ptr<lnk::FlowStream>>(&endpoint))
     {
-        co_return FlowSendStatus::Invalid;
-    }
-    std::optional<Port> endpoint;
-    try
-    {
-        endpoint = co_await port(channel, frame.epoch, frame.flow_id, frame.reverse);
-    }
-    catch (const std::invalid_argument &)
-    {
-        co_return FlowSendStatus::Invalid;
-    }
-    catch (const std::runtime_error &)
-    {
-        co_return FlowSendStatus::Closed;
-    }
-    if (auto *stream = std::get_if<std::shared_ptr<lnk::FlowStream>>(&*endpoint))
-    {
-        co_return co_await asio::co_spawn((*stream)->executor(),
-            [stream = *stream, frame = std::move(frame)]() mutable -> asio::awaitable<FlowSendStatus> {
-                if (frame.kind == LnkFrType::Reset)
-                {
-                    stream->reset(std::move(frame.reason));
-                    co_return FlowSendStatus::Queued;
-                }
-                if (test_access::FlowStream_send_finished_(*stream))
-                {
-                    co_return FlowSendStatus::Invalid;
-                }
-                if (frame.kind == LnkFrType::Fin)
-                {
-                    co_await stream->finish_send();
-                }
-                else
-                {
-                co_await stream->send(stream->copy_payload(frame.payload));
-                }
-                co_return FlowSendStatus::Queued;
+        co_await asio::co_spawn((*stream)->executor(),
+            [stream = *stream, payload = std::move(payload)]() -> asio::awaitable<void> {
+                co_await stream->send(stream->copy_payload(payload));
             }, asio::use_awaitable);
+        co_return true;
     }
-    if (frame.kind != LnkFrType::Data)
-    {
-        co_return FlowSendStatus::Invalid;
-    }
-    const auto datagram = std::get<std::shared_ptr<lnk::FlowDatagram>>(*endpoint);
+    const auto datagram = std::get<std::shared_ptr<lnk::FlowDatagram>>(endpoint);
     co_return co_await asio::co_spawn(datagram->executor(),
-        [datagram, payload = std::move(frame.payload)]() mutable -> asio::awaitable<FlowSendStatus> {
-            co_return datagram->try_send(payload) ? FlowSendStatus::Queued : FlowSendStatus::Dropped;
+        [datagram, payload = std::move(payload)]() -> asio::awaitable<bool> {
+            co_return datagram->try_send(payload);
         }, asio::use_awaitable);
 }
 
-inline asio::awaitable<FlowSendStatus> submit_data(std::shared_ptr<FlowProtocol> channel,
-                                                 std::uint64_t epoch, std::uint64_t id, bool reverse,
-                                                 std::span<const std::uint8_t> payload)
+inline asio::awaitable<void> finish(std::shared_ptr<FlowProtocol> channel, std::uint64_t epoch,
+                                   std::uint64_t id, bool reverse)
 {
-    co_return co_await submit(channel, {epoch, id, reverse, LnkFrType::Data, BytesBuf(payload.begin(), payload.end())});
+    const auto stream = std::get<std::shared_ptr<lnk::FlowStream>>(co_await port(channel, epoch, id, reverse));
+    co_await asio::co_spawn(stream->executor(), stream->finish_send(), asio::use_awaitable);
 }
 
-inline asio::awaitable<FlowFrame> receive(std::shared_ptr<FlowProtocol> channel, std::uint64_t epoch,
-                                         std::uint64_t id, bool complete = true)
+inline asio::awaitable<void> reset(std::shared_ptr<FlowProtocol> channel, std::uint64_t epoch,
+                                  std::uint64_t id, bool reverse, std::string reason = {})
+{
+    const auto stream = std::get<std::shared_ptr<lnk::FlowStream>>(co_await port(channel, epoch, id, reverse));
+    co_await asio::co_spawn(stream->executor(),
+        [stream, reason = std::move(reason)]() mutable -> asio::awaitable<void> {
+            stream->reset(std::move(reason));
+            co_return;
+        }, asio::use_awaitable);
+}
+
+// Copy bytes for assertions and preserve the production distinction between empty DATA and EOF.
+inline asio::awaitable<std::optional<BytesBuf>> receive(std::shared_ptr<FlowProtocol> channel, std::uint64_t epoch,
+                                                       std::uint64_t id, bool complete = true)
 {
     auto endpoint = co_await port(channel, epoch, id);
     if (auto *stream = std::get_if<std::shared_ptr<lnk::FlowStream>>(&endpoint))
     {
         co_return co_await asio::co_spawn((*stream)->executor(),
-            [stream = *stream, complete, epoch, id]() -> asio::awaitable<FlowFrame> {
+            [stream = *stream, complete]() -> asio::awaitable<std::optional<BytesBuf>> {
                 auto data = co_await stream->receive();
-                FlowFrame frame{epoch, id, !test_access::FlowStream_reverse_(*stream),
-                                data ? LnkFrType::Data : LnkFrType::Fin};
-                if (data)
+                if (!data)
                 {
-                    const auto bytes = data->bytes();
-                    frame.payload.assign(bytes.begin(), bytes.end());
+                    co_return std::nullopt;
                 }
-                if (complete && data)
+                const auto bytes = data->bytes();
+                BytesBuf payload(bytes.begin(), bytes.end());
+                if (complete)
                 {
                     data.reset();
                     stream->complete_receive();
                 }
-                co_return frame;
+                co_return payload;
             }, asio::use_awaitable);
     }
     const auto datagram = std::get<std::shared_ptr<lnk::FlowDatagram>>(endpoint);
     co_return co_await asio::co_spawn(datagram->executor(),
-        [datagram, epoch, id]() -> asio::awaitable<FlowFrame> {
+        [datagram]() -> asio::awaitable<std::optional<BytesBuf>> {
             auto data = co_await datagram->receive();
             const auto bytes = data.bytes();
-            co_return FlowFrame{epoch, id, !test_access::FlowDatagram_reverse_(*datagram),
-                                LnkFrType::Data, BytesBuf(bytes.begin(), bytes.end())};
+            co_return BytesBuf(bytes.begin(), bytes.end());
         }, asio::use_awaitable);
+}
+
+template <class Exception, class T>
+asio::awaitable<bool> throws(asio::awaitable<T> operation)
+{
+    try
+    {
+        co_await std::move(operation);
+    }
+    catch (const Exception &)
+    {
+        co_return true;
+    }
+    co_return false;
 }
 } // namespace test_flow
 #endif

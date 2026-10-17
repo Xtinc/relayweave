@@ -81,18 +81,20 @@ void flow_integration()
             oversized_path.push_back("extra");
             invalid = co_await test_node::open_flow(nodes[0], oversized_path, RelayProtocol::Tcp);
             require_flow(!invalid && invalid.id == 0 && invalid.stage == "open", "nine-node path accepted");
-            auto queued = [&](std::size_t node, const FlowResult &s, bool reverse, BytesBuf payload,
-                              LnkFrType kind = LnkFrType::Data) -> asio::awaitable<void> {
-                auto result =
-                    co_await test_node::send_flow(nodes[node], {s.epoch, s.id, reverse, kind, std::move(payload), {}});
-                require_flow(result == FlowSendStatus::Queued, "flow send failed");
+            auto queued = [&](std::size_t node, const FlowResult &s, bool reverse,
+                              BytesBuf payload) -> asio::awaitable<void> {
+                require_flow(co_await test_node::send_data(nodes[node], s.epoch, s.id, reverse, std::move(payload)),
+                             "flow send failed");
             };
-            auto receive = [&](std::size_t node, const FlowResult &s, bool reverse,
+            auto receive = [&](std::size_t node, const FlowResult &s,
                                BytesBuf expected) -> asio::awaitable<void> {
-                auto f = co_await test_node::receive_flow(nodes[node], s.epoch, s.id);
-                require_flow(f.epoch == s.epoch && f.flow_id == s.id && f.reverse == reverse &&
-                                 f.kind == LnkFrType::Data && f.payload == expected,
-                             "flow data crossed path/direction");
+                auto data = co_await test_node::receive_flow(nodes[node], s.epoch, s.id);
+                require_flow(data == expected, "flow data crossed path/direction");
+            };
+            auto finish = [&](std::size_t node, const FlowResult &s, bool reverse) -> asio::awaitable<void> {
+                const auto stream = std::get<std::shared_ptr<lnk::FlowStream>>(
+                    co_await test_node::port(nodes[node], s.epoch, s.id, reverse));
+                co_await asio::co_spawn(stream->executor(), stream->finish_send(), asio::use_awaitable);
             };
             FlowResult warm;
             for (int i = 0; i < 100; ++i)
@@ -113,9 +115,9 @@ void flow_integration()
             test_node::cluster(nodes[1]).send("master", CtrlMessage("flow.close.request",
                 njson{{"epoch", warm.epoch}, {"flow_id", cancelled_id}}));
             co_await delay_flow(100ms);
-            const auto cancelled_send = co_await test_node::send_flow(nodes[1],
-                {warm.epoch, cancelled_id, false, LnkFrType::Data, {34}, {}});
-            require_flow(cancelled_send == FlowSendStatus::Closed, "cancelled remote flow was resurrected");
+            require_flow(co_await test_flow::throws<std::runtime_error>(
+                             test_node::port(nodes[1], warm.epoch, cancelled_id, false)),
+                         "cancelled remote flow was resurrected");
             FlowResult full_path;
             for (int i = 0; i < 100; ++i)
             {
@@ -128,9 +130,9 @@ void flow_integration()
             }
             require_flow(bool(full_path), "eight-node path did not become Ready");
             co_await queued(0, full_path, false, {8});
-            co_await receive(7, full_path, false, {8});
+            co_await receive(7, full_path, {8});
             co_await queued(7, full_path, true, {9});
-            co_await receive(0, full_path, true, {9});
+            co_await receive(0, full_path, {9});
             co_await test_node::close_flow(nodes[0], full_path.epoch, full_path.id);
             for (auto transport : {RelayProtocol::Tcp, RelayProtocol::Udp})
             {
@@ -163,13 +165,13 @@ void flow_integration()
                 const auto remote = co_await test_node::open_flow(nodes[1], {"a", "b", "c"}, transport);
                 require_flow(bool(remote), "ingress Flow request failed");
                 co_await queued(1, remote, false, {31});
-                co_await receive(3, remote, false, {31});
+                co_await receive(3, remote, {31});
                 co_await queued(3, remote, true, {32});
-                co_await receive(1, remote, true, {32});
+                co_await receive(1, remote, {32});
                 co_await test_node::close_flow(nodes[1], remote.epoch, remote.id);
-                const auto closed = co_await test_node::send_flow(nodes[1],
-                    {remote.epoch, remote.id, false, LnkFrType::Data, {33}, {}});
-                require_flow(closed == FlowSendStatus::Closed, "remote close retained the local flow");
+                require_flow(co_await test_flow::throws<std::runtime_error>(
+                                 test_node::port(nodes[1], remote.epoch, remote.id, false)),
+                             "remote close retained the local flow");
                 asio::experimental::channel<void(asio::error_code, FlowResult)> opened(control, 2);
                 auto open = [&](std::vector<std::string> path) -> asio::awaitable<void> {
                     auto s = co_await test_node::open_flow(nodes[0], std::move(path), transport);
@@ -206,10 +208,10 @@ void flow_integration()
                 }
                 for (std::uint8_t i = 0; i < 12; ++i)
                 {
-                    co_await receive(3, s1, false, {1, i, 0, 255});
-                    co_await receive(4, s2, false, {2, i, 0, 255});
-                    co_await receive(1, s1, true, {3, i});
-                    co_await receive(1, s2, true, {4, i});
+                    co_await receive(3, s1, {1, i, 0, 255});
+                    co_await receive(4, s2, {2, i, 0, 255});
+                    co_await receive(1, s1, {3, i});
+                    co_await receive(1, s2, {4, i});
                 }
                 BytesBuf large(LnkFrameHeader::maximum_payload);
                 for (std::size_t i = 0; i < large.size(); ++i)
@@ -220,10 +222,10 @@ void flow_integration()
                 co_await queued(1, s2, false, large);
                 co_await queued(3, s1, true, large);
                 co_await queued(4, s2, true, large);
-                co_await receive(3, s1, false, large);
-                co_await receive(4, s2, false, large);
-                co_await receive(1, s1, true, large);
-                co_await receive(1, s2, true, large);
+                co_await receive(3, s1, large);
+                co_await receive(4, s2, large);
+                co_await receive(1, s1, large);
+                co_await receive(1, s2, large);
                 require_flow(test_node::links(nodes[middle_index]).protocol().take_forwarded_bytes() ==
                                  144 + 4 * large.size(), "Transit bandwidth counted payloads incorrectly");
                 require_flow(test_node::links(nodes[1]).protocol().take_forwarded_bytes() ==
@@ -232,40 +234,38 @@ void flow_integration()
                                  test_node::links(nodes[4]).protocol().take_forwarded_bytes() == 48 + large.size(),
                              "Tail bandwidth did not count only incoming payloads");
                 co_await queued(1, s1, false, {});
-                co_await receive(3, s1, false, {});
-                auto wrong = co_await test_node::send_flow(nodes[middle_index],
-                    {s1.epoch, s1.id, false, LnkFrType::Data, {5}, {}});
-                require_flow(wrong == FlowSendStatus::Invalid, "middle Node injected data");
-                wrong = co_await test_node::send_flow(nodes[1], {s1.epoch + 1, s1.id, false, LnkFrType::Data, {6}, {}});
-                require_flow(wrong == FlowSendStatus::Closed, "old epoch accepted");
+                co_await receive(3, s1, {});
+                require_flow(co_await test_flow::throws<std::invalid_argument>(
+                                 test_node::port(nodes[middle_index], s1.epoch, s1.id, false)),
+                             "middle Node bound an endpoint");
+                require_flow(co_await test_flow::throws<std::runtime_error>(
+                                 test_node::port(nodes[1], s1.epoch + 1, s1.id, false)),
+                             "old epoch accepted");
                 if (transport == RelayProtocol::Tcp)
                 {
                     co_await queued(1, s1, false, {9});
-                    co_await queued(1, s1, false, {}, LnkFrType::Fin);
-                    co_await receive(3, s1, false, {9});
+                    co_await finish(1, s1, false);
+                    co_await receive(3, s1, {9});
                     auto fin = co_await test_node::receive_flow(nodes[3], s1.epoch, s1.id);
-                    require_flow(fin.kind == LnkFrType::Fin, "FIN did not follow DATA");
-                    wrong = co_await test_node::send_flow(nodes[1], {s1.epoch, s1.id, false, LnkFrType::Data, {7}, {}});
-                    require_flow(wrong == FlowSendStatus::Invalid, "DATA after FIN accepted");
-                    wrong = co_await test_node::send_flow(nodes[1], {s1.epoch, s1.id, false, LnkFrType::Fin, {}, {}});
-                    require_flow(wrong == FlowSendStatus::Invalid, "duplicate FIN accepted");
+                    require_flow(!fin, "FIN did not follow DATA");
+                    require_flow(co_await test_flow::throws<std::runtime_error>(
+                                     test_node::send_data(nodes[1], s1.epoch, s1.id, false, {7})),
+                                 "DATA after FIN accepted");
+                    require_flow(co_await test_flow::throws<std::runtime_error>(finish(1, s1, false)),
+                                 "duplicate FIN accepted");
                     co_await queued(3, s1, true, {8});
-                    co_await receive(1, s1, true, {8});
+                    co_await receive(1, s1, {8});
                 }
                 else
                 {
-                    for (const auto kind : {LnkFrType::Fin, LnkFrType::Reset})
-                    {
-                        wrong = co_await test_node::send_flow(nodes[1], {s1.epoch, s1.id, false, kind, {}, {}});
-                        require_flow(wrong == FlowSendStatus::Invalid, "UDP accepted FIN or RESET");
-                    }
+                    // Datagram ports expose only packet send/receive, with no FIN or RESET operation.
                     co_await queued(1, s1, false, {8});
-                    co_await receive(3, s1, false, {8});
+                    co_await receive(3, s1, {8});
                 }
                 co_await test_node::close_flow(nodes[0], s1.epoch, s1.id);
                 co_await test_node::close_flow(nodes[0], s1.epoch, s1.id);
                 co_await queued(1, s2, false, {10});
-                co_await receive(4, s2, false, {10});
+                co_await receive(4, s2, {10});
                 auto reused = co_await test_node::ensure_link(nodes[0], middle, "a", transport);
                 require_flow(reused.id == shared.id, "closing flow destroyed shared NodeLink");
                 // Node ID order reverses the forward path on every edge.
@@ -274,16 +274,15 @@ void flow_integration()
                 auto reversed = co_await test_node::open_flow(nodes[0], reversed_path, transport);
                 require_flow(bool(reversed), "reverse path failed");
                 co_await queued(3, reversed, false, {11});
-                co_await receive(1, reversed, false, {11});
+                co_await receive(1, reversed, {11});
                 co_await test_node::close_flow(nodes[0], reversed.epoch, reversed.id);
                 // A slow endpoint must preserve its Flow and reverse direction.
                 auto crowded = co_await test_node::open_flow(nodes[0], path1, transport);
                 const auto congested_frames = transport == RelayProtocol::Tcp ? 136 : 24;
                 for (int i = 0; i < congested_frames; ++i)
                 {
-                    auto result = co_await test_node::send_flow(nodes[1],
-                        {crowded.epoch, crowded.id, false, LnkFrType::Data, {12}, {}});
-                    if (result == FlowSendStatus::Closed || result == FlowSendStatus::Dropped)
+                    auto result = co_await test_node::send_data(nodes[1], crowded.epoch, crowded.id, false, {12});
+                    if (!result)
                     {
                         break;
                     }
@@ -291,12 +290,12 @@ void flow_integration()
                 }
                 co_await delay_flow(100ms);
                 auto blocked =
-                    co_await test_node::send_flow(nodes[3], {crowded.epoch, crowded.id, true, LnkFrType::Data, {13}, {}});
-                require_flow(blocked == FlowSendStatus::Queued, "slow endpoint closed the reverse direction");
-                co_await receive(1, crowded, true, {13});
+                    co_await test_node::send_data(nodes[3], crowded.epoch, crowded.id, true, {13});
+                require_flow(blocked, "slow endpoint closed the reverse direction");
+                co_await receive(1, crowded, {13});
                 co_await test_node::close_flow(nodes[0], crowded.epoch, crowded.id);
                 co_await queued(1, s2, false, {14});
-                co_await receive(4, s2, false, {14});
+                co_await receive(4, s2, {14});
                 reused = co_await test_node::ensure_link(nodes[0], "a", middle, transport);
                 require_flow(reused.id == shared.id, "flow congestion closed shared NodeLink");
                 if (transport == RelayProtocol::Tcp)
@@ -316,8 +315,9 @@ void flow_integration()
                     };
                     // Start the receiver first on the shared data executor, before RESET can remove the Flow.
                     using namespace asio::experimental::awaitable_operators;
-                    co_await asio::co_spawn(data, receive_reset() && queued(1, reset, false, {}, LnkFrType::Reset),
-                                            asio::use_awaitable);
+                    co_await asio::co_spawn(data,
+                        receive_reset() && test_flow::reset(test_node::links(nodes[1]).protocol().shared_from_this(),
+                                                           reset.epoch, reset.id, false), asio::use_awaitable);
                 }
                 co_await test_node::close_flow(nodes[0], s2.epoch, s2.id);
             }
@@ -328,15 +328,15 @@ void flow_integration()
                 const auto left = std::size_t(std::ranges::find(names, path.front()) - names.begin());
                 const auto right = std::size_t(std::ranges::find(names, path.back()) - names.begin());
                 co_await queued(left, s, false, {15});
-                co_await receive(right, s, false, {15});
+                co_await receive(right, s, {15});
                 co_await queued(right, s, true, {16});
-                co_await receive(left, s, true, {16});
+                co_await receive(left, s, {16});
                 co_await test_node::close_flow(nodes[0], s.epoch, s.id);
             }
             auto healthy = co_await test_node::open_flow(nodes[0], {"a", "b", "d"}, RelayProtocol::Tcp);
             co_await delay_flow(21500ms); // Idle Flows remain active while control and NodeLinks are healthy.
             co_await queued(1, healthy, false, {17});
-            co_await receive(4, healthy, false, {17});
+            co_await receive(4, healthy, {17});
             auto broken = co_await test_node::open_flow(nodes[0], {"a", "b", "c"}, RelayProtocol::Tcp);
             auto edge = co_await test_node::ensure_link(nodes[0], "b", "c", RelayProtocol::Tcp);
             co_await test_node::close_link(nodes[0], edge.id);
@@ -352,7 +352,7 @@ void flow_integration()
             }
             require_flow(failed, "broken NodeLink left a flow active");
             co_await queued(1, healthy, false, {18});
-            co_await receive(4, healthy, false, {18});
+            co_await receive(4, healthy, {18});
             co_await test_node::close_flow(nodes[0], healthy.epoch, healthy.id);
         };
         asio::co_spawn(control, scenario(), asio::use_future).get();

@@ -13,16 +13,19 @@ using lnk::PooledBuffer;
 namespace
 {
 constexpr std::size_t max_flows = 1000;
-constexpr std::size_t flow_window_bytes = 512 * 1024;
+constexpr std::size_t flow_window_bytes = 320 * 1024;
 constexpr std::size_t flow_buffer_budget_bytes = 256 * 1024 * 1024;
 constexpr std::size_t datagram_queue_capacity = 16;
 constexpr std::size_t frame_overhead = Frame::buffer_overhead;
 constexpr auto retired_flow_ttl = std::chrono::seconds(10);
 
-std::size_t flow_reservation(bool stream)
+std::size_t flow_reservation(RelayProtocol transport)
 {
-    return stream ? 2 * (flow_window_bytes + frame_overhead)
-                  : 2 * (datagram_queue_capacity * (65536 + frame_overhead) + frame_overhead);
+    // TCP reserves DATA plus one ordered FIN per direction. UDP reserves packet slots only.
+    const auto direction_capacity = transport == RelayProtocol::Tcp
+        ? flow_window_bytes + frame_overhead
+        : datagram_queue_capacity * (lnk::PayloadPool::allocation_size(LnkFrameHeader::maximum_payload) + frame_overhead);
+    return 2 * direction_capacity;
 }
 
 } // namespace
@@ -341,45 +344,62 @@ void FlowProtocol::schedule_monitor(Clock::time_point deadline)
     }
 }
 
+FlowProtocol::Clock::time_point FlowProtocol::poll(Clock::time_point now)
+{
+    auto next_deadline = links_.poll(now);
+    const bool refresh_credit = now >= credit_deadline_;
+    if (refresh_credit)
+    {
+        credit_deadline_ = Clock::time_point::max();
+    }
+    // A failed Link may have closed Flows and added retirement deadlines above.
+    for (auto it = flows_.begin(); it != flows_.end();)
+    {
+        auto flow = (it++)->second;
+        if (flow->phase == FlowState::Phase::Prepared)
+        {
+            if (now >= flow->prepare_deadline)
+            {
+                fail_flow(flow, "prepare", "flow preparation expired");
+                continue;
+            }
+            next_deadline = std::min(next_deadline, flow->prepare_deadline);
+        }
+        else if (refresh_credit && flow->phase == FlowState::Phase::Active && flow->transport == RelayProtocol::Tcp)
+        {
+            stream_.publish_credit(flow);
+        }
+    }
+    for (auto it = retired_.begin(); it != retired_.end();)
+    {
+        if (it->second <= now)
+        {
+            it = retired_.erase(it);
+        }
+        else
+        {
+            next_deadline = std::min(next_deadline, it->second);
+            ++it;
+        }
+    }
+    return std::min(next_deadline, credit_deadline_);
+}
+
 asio::awaitable<void> FlowProtocol::monitor()
 {
-    while (!stopping_)
+    if (stopping_)
     {
-        const auto now = Clock::now();
-        auto next_deadline = links_.poll(now);
-        // A failed Link may have closed Flows and added retirement deadlines above.
-        for (auto it = flows_.begin(); it != flows_.end();)
-        {
-            auto flow = (it++)->second;
-            if (flow->phase == FlowState::Phase::Prepared)
-            {
-                if (now >= flow->prepare_deadline)
-                {
-                    fail_flow(flow, "prepare", "flow preparation expired");
-                    continue;
-                }
-                next_deadline = std::min(next_deadline, flow->prepare_deadline);
-            }
-            else if (flow->phase == FlowState::Phase::Active && flow->transport == RelayProtocol::Tcp)
-            {
-                next_deadline = std::min(next_deadline, stream_.poll(flow, now));
-            }
-        }
-        for (auto it = retired_.begin(); it != retired_.end();)
-        {
-            if (it->second <= now)
-            {
-                it = retired_.erase(it);
-            }
-            else
-            {
-                next_deadline = std::min(next_deadline, it->second);
-                ++it;
-            }
-        }
-        monitor_timer_.expires_at(next_deadline);
+        co_return;
+    }
+    monitor_timer_.expires_at(poll(Clock::now()));
+    for (;;)
+    {
         auto [error] = co_await monitor_timer_.async_wait(use_nothrow_awaitable);
-        // Deadline changes wake this wait without cancelling the coroutine.
+        if (stopping_)
+        {
+            co_return;
+        }
+        // schedule_monitor already installed the earlier deadline. Re-wait without scanning.
         if (error == asio::error::operation_aborted &&
             (co_await asio::this_coro::cancellation_state).cancelled() == asio::cancellation_type::none)
         {
@@ -389,6 +409,7 @@ asio::awaitable<void> FlowProtocol::monitor()
         {
             throw asio::system_error(error, "Node link monitor timer failed");
         }
+        monitor_timer_.expires_at(poll(Clock::now()));
     }
 }
 
@@ -404,6 +425,7 @@ void FlowProtocol::request_stop(std::string reason)
         close_flow(flows_.begin()->first, reason);
     }
     retired_.clear();
+    credit_deadline_ = Clock::time_point::max();
     events_.cancel();
     events_.close();
     links_.close_all();
@@ -423,8 +445,9 @@ asio::awaitable<void> FlowProtocol::stop()
 }
 
 lnk::FlowState::Stream::Stream(asio::any_io_executor executor, bool endpoint)
-    : receive_queue(executor, endpoint ? flow_window_bytes / frame_overhead + 2 : 0)
+    : receive_queue(executor, endpoint ? flow_window_bytes / frame_overhead + 1 : 0)
 {
+    // At most W/h empty DATA frames and one FIN, including arrivals before endpoint binding.
 }
 
 lnk::FlowState::Datagram::Datagram(asio::any_io_executor executor, bool endpoint)
@@ -466,7 +489,7 @@ void FlowProtocol::prepare_flow(lnk::FlowSpec spec)
     }
 
     const auto transport = spec.transport;
-    const auto reservation = flow_reservation(transport == RelayProtocol::Tcp);
+    const auto reservation = flow_reservation(transport);
     auto s = std::make_shared<FlowState>(executor_, spec);
     if (flows_.size() + retired_.size() >= max_flows || retired_.contains(id))
     {
@@ -519,13 +542,10 @@ void FlowProtocol::commit_flow(std::uint64_t id)
         s->phase = FlowState::Phase::Active;
         if (s->transport == RelayProtocol::Tcp)
         {
-            for (bool reverse : {false, true})
+            stream_.publish_credit(s);
+            if (s->phase == FlowState::Phase::Closed)
             {
-                stream_.publish_credit(s, reverse);
-                if (s->phase == FlowState::Phase::Closed)
-                {
-                    return;
-                }
+                return;
             }
         }
     }
@@ -560,7 +580,7 @@ void FlowProtocol::close_flow(std::uint64_t id, std::string reason)
         links_.discard(link_id, s);
     }
     flows_.erase(it);
-    reserved_bytes_ -= flow_reservation(s->transport == RelayProtocol::Tcp);
+    reserved_bytes_ -= flow_reservation(s->transport);
 
     retired_[id] = Clock::now() + retired_flow_ttl;
     schedule_monitor(retired_.at(id));
@@ -877,6 +897,18 @@ void FlowProtocol::Stream::receive_credit(const NodeLink &link, const LnkFrameHe
     flush(flow, header.reverse);
 }
 
+void FlowProtocol::Stream::publish_credit(const std::shared_ptr<FlowState> &flow)
+{
+    for (bool reverse : {false, true})
+    {
+        publish_credit(flow, reverse);
+        if (flow->phase == FlowState::Phase::Closed)
+        {
+            return;
+        }
+    }
+}
+
 void FlowProtocol::Stream::publish_credit(const std::shared_ptr<FlowState> &flow, bool reverse)
 {
     const auto input = reverse ? flow->next : flow->previous;
@@ -889,10 +921,13 @@ void FlowProtocol::Stream::publish_credit(const std::shared_ptr<FlowState> &flow
     auto &direction = flow->stream->directions[std::size_t(reverse)];
     // release_buffer checks overflow before advancing released; the initial limit is just window.
     const auto limit = direction.released_bytes + flow_window_bytes;
+    if (limit == direction.receive_limit)
+    {
+        return;
+    }
     const auto &link = protocol_.links_.connections_.at(input);
     // Link closure synchronously closes adjacent Flows before removing the Link.
     direction.receive_limit = limit;
-    direction.credit_deadline = Clock::time_point::max();
     if (!protocol_.links_.enqueue(*link, Frame{{LnkFrType::Credit, reverse, 0, flow->epoch, flow->id, limit}}))
     {
         protocol_.fail_flow(flow, "credit", "node link control capacity violated");
@@ -922,10 +957,10 @@ void FlowProtocol::Stream::release_buffer(const std::shared_ptr<FlowState> &flow
         {
             publish_credit(flow, reverse);
         }
-        else if (direction.credit_deadline == Clock::time_point::max())
+        else if (protocol_.credit_deadline_ == Clock::time_point::max())
         {
-            direction.credit_deadline = Clock::now() + std::chrono::milliseconds(2);
-            protocol_.schedule_monitor(direction.credit_deadline);
+            protocol_.credit_deadline_ = Clock::now() + std::chrono::milliseconds(20);
+            protocol_.schedule_monitor(protocol_.credit_deadline_);
         }
     }
     const auto &port = flow->stream->port;
@@ -951,26 +986,6 @@ void FlowProtocol::Stream::reset_port(const std::shared_ptr<lnk::FlowStream> &po
     {
         reset(it->second, port->reverse_, std::move(reason));
     }
-}
-
-FlowProtocol::Clock::time_point FlowProtocol::Stream::poll(
-    const std::shared_ptr<FlowState> &flow, Clock::time_point now)
-{
-    auto deadline = Clock::time_point::max();
-    for (bool reverse : {false, true})
-    {
-        auto &direction = flow->stream->directions[std::size_t(reverse)];
-        if (now >= direction.credit_deadline)
-        {
-            publish_credit(flow, reverse);
-            if (flow->phase == FlowState::Phase::Closed)
-            {
-                return Clock::time_point::max();
-            }
-        }
-        deadline = std::min(deadline, direction.credit_deadline);
-    }
-    return deadline;
 }
 
 asio::awaitable<void> FlowProtocol::Stream::run(std::shared_ptr<FlowState> flow)

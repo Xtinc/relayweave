@@ -159,6 +159,47 @@ void pool_reuse()
     require_buffer(upstream.valid_deallocations && upstream.live.empty(), "pool retained storage after destruction");
 }
 
+// Verify the shared pool's hard capacity and idle-block reclamation independently of Flow credit.
+void pool_capacity()
+{
+    CountingResource upstream;
+    auto retained_bytes = [&] {
+        std::size_t bytes = 0;
+        for (const auto &[memory, allocation] : upstream.live) bytes += allocation.first;
+        return bytes;
+    };
+    {
+        lnk::PayloadPool pool(4096, &upstream);
+        for (int round = 0; round < 64; ++round)
+        {
+            {
+                PooledBuffer first(pool, 2048);
+                PooledBuffer second(pool, 2048);
+                require_buffer(retained_bytes() == 4096, "pool did not charge rounded blocks");
+            }
+            {
+                PooledBuffer small(pool, 255);
+                bool rejected = false;
+                try
+                {
+                    PooledBuffer large(pool, 3072);
+                }
+                catch (const std::bad_alloc &)
+                {
+                    rejected = true;
+                }
+                require_buffer(rejected, "pool exceeded hard live budget");
+            }
+            {
+                PooledBuffer large(pool, 3072);
+                require_buffer(retained_bytes() == 4096, "pool failed to reclaim idle blocks");
+            }
+            require_buffer(retained_bytes() <= 4096, "pool retained unbounded storage");
+        }
+    }
+    require_buffer(upstream.valid_deallocations && upstream.live.empty(), "capacity test leaked pool storage");
+}
+
 void shared_resource_lifetime()
 {
     CountingResource upstream;
@@ -188,6 +229,7 @@ int main()
         ownership();
         channel_transfer();
         pool_reuse();
+        pool_capacity();
         shared_resource_lifetime();
         std::cout << "[PASS] exclusive ownership, offset views and asynchronous channel transfers\n";
     }

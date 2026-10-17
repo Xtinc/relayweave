@@ -34,11 +34,19 @@ inline asio::awaitable<void> close_flow(std::shared_ptr<RelayNode> node, std::ui
 {
     co_await links(node).close_flow(epoch, id);
 }
-inline asio::awaitable<FlowSendStatus> send_flow(std::shared_ptr<RelayNode> node, FlowFrame frame)
+inline asio::awaitable<bool> send_data(std::shared_ptr<RelayNode> node, std::uint64_t epoch,
+                                      std::uint64_t id, bool reverse, BytesBuf payload)
 {
-    co_return co_await test_flow::submit(links(node).protocol().shared_from_this(), std::move(frame));
+    co_return co_await test_flow::send_data(links(node).protocol().shared_from_this(), epoch, id, reverse,
+                                          std::move(payload));
 }
-inline asio::awaitable<FlowFrame> receive_flow(std::shared_ptr<RelayNode> node, std::uint64_t epoch, std::uint64_t id)
+inline asio::awaitable<test_flow::Port> port(std::shared_ptr<RelayNode> node, std::uint64_t epoch,
+                                          std::uint64_t id, bool reverse)
+{
+    co_return co_await test_flow::port(links(node).protocol().shared_from_this(), epoch, id, reverse);
+}
+inline asio::awaitable<std::optional<BytesBuf>> receive_flow(std::shared_ptr<RelayNode> node, std::uint64_t epoch,
+                                                           std::uint64_t id)
 {
     co_return co_await test_flow::receive(links(node).protocol().shared_from_this(), epoch, id);
 }

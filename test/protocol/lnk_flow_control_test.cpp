@@ -6,11 +6,10 @@
 
 using namespace std::chrono_literals;
 TEST_MEMBER(FlowProtocol, reserved_bytes_)
+TEST_MEMBER(FlowProtocol, credit_deadline_)
+TEST_MEMBER(FlowProtocol, poll)
 TEST_MEMBER(LnkChannel, connections_)
-using PayloadPool = lnk::PayloadPool;
 using lnk::PooledBuffer;
-TEST_MEMBER(PayloadPool, live_)
-TEST_MEMBER(PayloadPool, retained_)
 
 static void check(bool value, const char *reason)
 {
@@ -63,12 +62,12 @@ struct LocalFixture
         }
         return ports.at(id);
     }
-    FlowSendStatus send(std::uint64_t id, const BytesBuf &payload)
+    bool send(std::uint64_t id, const BytesBuf &payload)
     {
-        auto status = FlowSendStatus::Invalid;
-        asio::post(data, [&] { status = test_flow::send(channel, {7, id, false, LnkFrType::Data, payload}); });
+        bool accepted = false;
+        asio::post(data, [&] { accepted = test_flow::try_send_data(channel, id, false, payload); });
         pump();
-        return status;
+        return accepted;
     }
     std::future<void> submit(std::uint64_t id, BytesBuf payload, asio::cancellation_slot slot = {}, bool run = true)
     {
@@ -81,7 +80,7 @@ struct LocalFixture
         }
         return result;
     }
-    FlowFrame receive(std::uint64_t id)
+    std::optional<BytesBuf> receive(std::uint64_t id)
     {
         static_cast<void>(port(id));
         auto result = asio::co_spawn(caller, test_flow::receive(channel, 7, id, false), asio::use_future);
@@ -108,16 +107,16 @@ struct LocalFixture
     }
 };
 
-static void local_tests()
+static void stream_admission_tests()
 {
-    const auto reservation = 2 * (test_flow::window_bytes + lnk::Frame::buffer_overhead);
     const BytesBuf payload(32768, 0x5a);
+    const auto frames_per_window = test_flow::window_bytes / (payload.size() + lnk::Frame::buffer_overhead);
     {
         LocalFixture fixture;
         fixture.prepare(1);
-        for (int index = 0; index < 15; ++index)
+        for (std::size_t index = 0; index < frames_per_window; ++index)
         {
-            check(fixture.send(1, payload) == FlowSendStatus::Queued, "could not fill window");
+            check(fixture.send(1, payload), "could not fill window");
         }
         auto staged = fixture.submit(1, payload);
         check(staged.wait_for(0s) == std::future_status::ready, "handoff did not take ownership of staged frame");
@@ -126,16 +125,16 @@ static void local_tests()
         check(pending.wait_for(0s) != std::future_status::ready, "next handoff ignored full window");
         const auto held = test_access::flow_buffered_bytes(*fixture.channel);
         auto frame = fixture.receive(1);
-        check(frame.payload == payload, "queued payload changed");
+        check(frame == payload, "queued payload changed");
         check(test_access::flow_buffered_bytes(*fixture.channel) == held, "dequeue prematurely returned credit");
         frame = {};
         fixture.complete(1);
         check(pending.wait_for(0s) == std::future_status::ready, "write completion did not resume handoff");
         pending.get();
-        for (int index = 0; index < 16; ++index)
+        for (std::size_t index = 0; index < frames_per_window + 1; ++index)
         {
             frame = fixture.receive(1);
-            check(frame.payload == payload, "resumed stream lost bytes");
+            check(frame == payload, "resumed stream lost bytes");
             frame = {};
             fixture.complete(1);
         }
@@ -145,9 +144,9 @@ static void local_tests()
     {
         LocalFixture fixture;
         fixture.prepare(2);
-        for (int index = 0; index < 15; ++index)
+        for (std::size_t index = 0; index < frames_per_window; ++index)
         {
-            check(fixture.send(2, payload) == FlowSendStatus::Queued, "could not fill cancellation window");
+            check(fixture.send(2, payload), "could not fill cancellation window");
         }
         auto staged = fixture.submit(2, BytesBuf(32768, 0x6a));
         staged.get();
@@ -166,10 +165,10 @@ static void local_tests()
             cancelled = error.code() == asio::error::operation_aborted;
         }
         check(cancelled, "submission cancellation lost its cause");
-        for (int index = 0; index < 16; ++index)
+        for (std::size_t index = 0; index < frames_per_window + 1; ++index)
         {
             auto frame = fixture.receive(2);
-            check(frame.payload.front() == (index == 15 ? 0x6a : 0x5a), "cancelled frame reached the stream");
+            check(frame && !frame->empty() && frame->front() == (index == frames_per_window ? 0x6a : 0x5a), "cancelled frame reached the stream");
             frame = {};
             fixture.complete(2);
         }
@@ -182,9 +181,9 @@ static void local_tests()
     {
         LocalFixture fixture;
         fixture.prepare(3);
-        for (int index = 0; index < 15; ++index)
+        for (std::size_t index = 0; index < frames_per_window; ++index)
         {
-            check(fixture.send(3, payload) == FlowSendStatus::Queued, "could not fill closing window");
+            check(fixture.send(3, payload), "could not fill closing window");
         }
         fixture.submit(3, payload).get();
         auto pending = fixture.submit(3, payload);
@@ -204,14 +203,31 @@ static void local_tests()
     }
     {
         LocalFixture fixture;
+        test_access::FlowProtocol_payload_pool_(*fixture.channel) = std::make_shared<lnk::PayloadPool>(256);
+        fixture.prepare(251);
+        check(fixture.send(251, {1}), "could not fill reset test pool");
+        const auto port = std::get<std::shared_ptr<lnk::FlowStream>>(fixture.port(251));
+        asio::post(fixture.caller, [port] { port->reset("pool full"); });
+        fixture.pump();
+        check(!test_access::FlowProtocol_flows_(*fixture.channel).contains(251), "full pool prevented Flow reset");
+    }
+}
+
+static void reservation_tests()
+{
+    const auto reservation = 2 * (test_flow::window_bytes + lnk::Frame::buffer_overhead);
+    const BytesBuf payload(32768, 0x5a);
+    {
+        LocalFixture fixture;
         const auto capacity = test_flow::buffer_budget_bytes / reservation;
+        check(capacity >= 100, "defaults cannot admit 100 TCP Flows");
         for (std::uint64_t id = 10; id < 10 + capacity; ++id)
         {
             fixture.prepare(id);
         }
         fixture.prepare(1000);
         check(test_access::FlowProtocol_flows_(*fixture.channel).size() == capacity, "prepare overcommitted reservations");
-        check(fixture.send(10, payload) == FlowSendStatus::Queued, "budget test could not send");
+        check(fixture.send(10, payload), "budget test could not send");
         auto frame = fixture.receive(10);
         fixture.close(10);
         check(test_access::FlowProtocol_reserved_bytes_(*fixture.channel) == (capacity - 1) * reservation,
@@ -223,28 +239,27 @@ static void local_tests()
         check(test_access::FlowProtocol_reserved_bytes_(*fixture.channel) == capacity * reservation,
               "late completion changed reservation accounting");
     }
-    {
-        LocalFixture fixture;
-        for (std::uint64_t id = 100; id < 200; ++id)
-        {
-            fixture.prepare(id);
-        }
-        check(test_access::FlowProtocol_flows_(*fixture.channel).size() == 100, "defaults cannot admit 100 TCP Flows");
-    }
+}
+
+static void datagram_admission_tests()
+{
     {
         LocalFixture fixture;
         fixture.prepare(200, RelayProtocol::Udp);
+        constexpr auto udp_reservation = 2 * 16 * (65536 + lnk::Frame::buffer_overhead);
+        check(test_access::FlowProtocol_reserved_bytes_(*fixture.channel) == udp_reservation,
+              "UDP reservation included a TCP FIN slot or omitted packet capacity");
         for (int index = 0; index < 16; ++index)
         {
-            check(fixture.send(200, {9}) == FlowSendStatus::Queued, "UDP burst was rejected early");
+            check(fixture.send(200, {9}), "UDP burst was rejected early");
         }
-        check(fixture.send(200, {10}) == FlowSendStatus::Dropped, "full UDP queue did not drop packet");
+        check(!fixture.send(200, {10}), "full UDP queue did not drop packet");
         check(fixture.channel->take_dropped_datagrams() == 1, "UDP overload was not counted");
         check(!test_access::FlowProtocol_flows_(*fixture.channel).at(200)->stream, "UDP created stream flow state");
         auto frame = fixture.receive(200);
-        check(frame.payload == BytesBuf{9}, "UDP payload changed");
-        check(fixture.send(200, {11}) == FlowSendStatus::Queued, "UDP dequeue did not free capacity");
-        check(fixture.receive(200).payload == BytesBuf{9}, "UDP incorrectly requires consumption confirmation");
+        check(frame == BytesBuf{9}, "UDP payload changed");
+        check(fixture.send(200, {11}), "UDP dequeue did not free capacity");
+        check(fixture.receive(200) == BytesBuf{9}, "UDP incorrectly requires consumption confirmation");
         const auto port = std::get<std::shared_ptr<lnk::FlowDatagram>>(fixture.port(200));
         int accepted = 0;
         asio::post(fixture.caller, [&] {
@@ -277,46 +292,312 @@ static void local_tests()
         });
         fixture.pump();
     }
+
+}
+
+namespace credit_tests
+{
+using Clock = lnk::Clock;
+constexpr auto expected_batch_interval = 20ms; // Fixed policy expectation, independent of production constants.
+constexpr std::size_t chunk_size = 32768;
+constexpr std::size_t chunk_charge = chunk_size + lnk::Frame::buffer_overhead;
+constexpr auto threshold_frames = (test_flow::window_bytes / 4 + chunk_charge - 1) / chunk_charge;
+
+// A real endpoint and its owned tasks, with a synthetic upstream Link whose outgoing
+// CREDIT map we can inspect before a physical writer consumes it. No monitor runs:
+// poll is driven at exact deadline boundaries, so tests never rely on scheduler timing.
+struct CreditFixture
+{
+    asio::io_context io{1};
+    std::shared_ptr<FlowProtocol> protocol = std::make_shared<FlowProtocol>(
+        io.get_executor(), io.get_executor(), "sink", "127.0.0.1", 0, "127.0.0.1", 0);
+    std::shared_ptr<lnk::NodeLink> upstream;
+    std::shared_ptr<lnk::FlowState> flow;
+    std::shared_ptr<lnk::FlowStream> endpoint;
+
+    void pump()
     {
-        LocalFixture fixture;
-        test_access::FlowProtocol_payload_pool_(*fixture.channel) = std::make_shared<lnk::PayloadPool>(256);
-        fixture.prepare(251);
-        check(fixture.send(251, {1}) == FlowSendStatus::Queued, "could not fill reset test pool");
-        const auto port = std::get<std::shared_ptr<lnk::FlowStream>>(fixture.port(251));
-        asio::post(fixture.caller, [port] { port->reset("pool full"); });
-        fixture.pump();
-        check(!test_access::FlowProtocol_flows_(*fixture.channel).contains(251), "full pool prevented Flow reset");
+        io.restart();
+        io.poll();
     }
+    decltype(auto) direction()
     {
-        lnk::PayloadPool pool(4096);
-        for (int round = 0; round < 64; ++round)
+        return (flow->stream->directions[0]);
+    }
+    explicit CreditFixture(bool bind = true)
+    {
+        upstream = std::make_shared<lnk::NodeLink>(io.get_executor(),
+            lnk::LinkSpec{1, 7, RelayProtocol::Tcp, "upstream", "127.0.0.2", "test", 0, 0, false});
+        upstream->phase = lnk::NodeLink::Phase::Ready;
+        test_access::LnkChannel_connections_(protocol->links()).emplace(1, upstream);
+        lnk::FlowSpec spec{10, 7, RelayProtocol::Tcp};
+        spec.previous = 1;
+        spec.previous_peer = "upstream";
+        protocol->prepare_flow(std::move(spec));
+        protocol->commit_flow(10);
+        flow = test_access::FlowProtocol_flows_(*protocol).at(10);
+        check(upstream->credits.size() == 1 && credit() == test_flow::window_bytes,
+              "commit did not immediately publish the initial window");
+        check(deadline() == Clock::time_point::max(), "initial credit waited for merging");
+        upstream->credits.clear();
+        if (bind)
         {
-            {
-                PooledBuffer first(pool, 2048);
-                PooledBuffer second(pool, 2048);
-                check(test_access::PayloadPool_live_(pool) == 4096, "pool did not charge rounded blocks");
-            }
-            {
-                PooledBuffer small(pool, 255);
-                bool rejected = false;
-                try
-                {
-                    PooledBuffer large(pool, 3072);
-                }
-                catch (const std::bad_alloc &)
-                {
-                    rejected = true;
-                }
-                check(rejected, "pool exceeded hard live budget");
-            }
-            {
-                PooledBuffer large(pool, 3072);
-                check(test_access::PayloadPool_live_(pool) == 4096 && test_access::PayloadPool_retained_(pool) <= 4096, "pool failed to reclaim idle blocks");
-            }
-            check(test_access::PayloadPool_live_(pool) == 0 && test_access::PayloadPool_retained_(pool) <= 4096, "pool retained unbounded storage");
+            endpoint = protocol->bind_stream_flow(7, 10, true, io.get_executor());
+            pump();
         }
     }
+    Clock::time_point deadline() const
+    {
+        return test_access::FlowProtocol_credit_deadline_(*protocol);
+    }
+    std::uint64_t credit(std::uint64_t id = 10, bool reverse = false) const
+    {
+        return upstream->credits.at({id, reverse}).sequence;
+    }
+    void feed(std::size_t count, std::size_t size = chunk_size)
+    {
+        const auto pool = test_access::FlowProtocol_payload_pool_(*protocol);
+        for (std::size_t index = 0; index < count; ++index)
+        {
+            test_access::FlowProtocol_stream_(*protocol).receive(flow,
+                lnk::Frame{{LnkFrType::Data, false, static_cast<std::uint32_t>(size), 7, 10},
+                           lnk::PooledBuffer(pool, size)});
+        }
+        pump();
+    }
+    std::optional<lnk::PooledBuffer> receive()
+    {
+        auto received = asio::co_spawn(io, endpoint->receive(), asio::use_future);
+        pump();
+        check(received.wait_for(0s) == std::future_status::ready, "buffered DATA was not delivered");
+        return received.get();
+    }
+    void complete()
+    {
+        endpoint->complete_receive();
+        pump();
+    }
+    void poll(Clock::time_point now)
+    {
+        test_access::FlowProtocol_poll(*protocol, now);
+    }
+    ~CreditFixture()
+    {
+        auto stopped = asio::co_spawn(io, protocol->stop(), asio::use_future);
+        pump();
+        stopped.get();
+    }
+};
+
+void deadline_and_release()
+{
+    CreditFixture f;
+    f.feed(test_flow::window_bytes / chunk_charge);
+    const auto admitted = f.direction().buffered_bytes;
+    auto data = f.receive();
+    check(data && data->size() == chunk_size, "DATA payload changed");
+    check(f.direction().buffered_bytes == admitted && f.direction().released_bytes == 0,
+          "endpoint dequeue returned credit before downstream completion");
+    data.reset();
+    check(f.direction().buffered_bytes == admitted && f.upstream->credits.empty(),
+          "returning a pool block returned credit without completion");
+    const auto before = Clock::now();
+    f.complete();
+    const auto after = Clock::now();
+    const auto deadline = f.deadline();
+    check(deadline >= before + expected_batch_interval && deadline <= after + expected_batch_interval,
+          "small release did not use the selected coalescing delay");
+    check(f.direction().buffered_bytes == admitted - chunk_charge && f.direction().released_bytes == chunk_charge,
+          "coalescing delayed local capacity release");
+    check(f.direction().receive_limit == test_flow::window_bytes && f.upstream->credits.empty(),
+          "small release published credit immediately");
+    const auto remaining = f.direction().receive_limit - f.direction().received_bytes;
+    check(remaining > 0 && remaining < chunk_charge, "fixture did not leave a nonzero unusable credit tail");
+    f.poll(deadline - 1ns);
+    check(f.upstream->credits.empty(), "credit published before its deadline");
+    f.poll(deadline);
+    check(f.credit() == test_flow::window_bytes + chunk_charge &&
+          f.deadline() == Clock::time_point::max(),
+          "deadline did not publish the cumulative released credit");
+    // Leave the earlier CREDIT queued: a later update replaces it by key.
+    for (int i = 0; i < 2; ++i)
+    {
+        auto next = f.receive();
+        next.reset();
+        f.complete();
+    }
+    f.poll(f.deadline());
+    check(f.upstream->credits.size() == 1 && f.credit() == test_flow::window_bytes + 3 * chunk_charge,
+          "pending CREDIT did not coalesce to the latest absolute limit");
+    const auto published = f.credit();
+    f.poll(deadline + 1ms);
+    check(f.credit() == published, "already published credit was counted twice");
 }
+
+void threshold_publishes_before_batch()
+{
+    CreditFixture f;
+    f.feed(threshold_frames);
+    Clock::time_point first_deadline;
+    for (std::size_t i = 1; i <= threshold_frames; ++i)
+    {
+        auto data = f.receive();
+        data.reset();
+        f.complete();
+        if (i == 1) first_deadline = f.deadline();
+        if (i < threshold_frames)
+        {
+            check(f.upstream->credits.empty(), "sub-threshold release published immediately");
+            check(f.deadline() == first_deadline, "later release changed the shared batch deadline");
+        }
+    }
+    check(f.credit() == test_flow::window_bytes + threshold_frames * chunk_charge,
+          "W/4 release did not preempt the merge timer");
+    // Another Flow may still need this node-wide batch. An empty batch clears it.
+    check(f.deadline() == first_deadline, "immediate update changed the shared batch deadline");
+    f.upstream->credits.clear();
+    f.poll(first_deadline);
+    check(f.deadline() == Clock::time_point::max() && f.upstream->credits.empty(),
+          "threshold update was published again or left periodic idle scanning");
+}
+
+void flows_share_one_batch(bool close_first)
+{
+    CreditFixture f;
+    f.feed(threshold_frames);
+    auto first = f.receive();
+    first.reset();
+    f.complete();
+    const auto deadline = f.deadline();
+
+    // Opposite DATA direction on another endpoint, released after the batch starts.
+    lnk::FlowSpec spec{11, 7, RelayProtocol::Tcp};
+    spec.next = 1;
+    spec.next_peer = "upstream";
+    f.protocol->prepare_flow(std::move(spec));
+    f.protocol->commit_flow(11);
+    const auto other = test_access::FlowProtocol_flows_(*f.protocol).at(11);
+    auto endpoint = f.protocol->bind_stream_flow(7, 11, false, f.io.get_executor());
+    f.upstream->credits.clear();
+    const auto pool = test_access::FlowProtocol_payload_pool_(*f.protocol);
+    test_access::FlowProtocol_stream_(*f.protocol).receive(other,
+        lnk::Frame{{LnkFrType::Data, true, chunk_size, 7, 11}, lnk::PooledBuffer(pool, chunk_size)});
+    auto received = asio::co_spawn(f.io, endpoint->receive(), asio::use_future);
+    f.pump();
+    check(received.wait_for(0s) == std::future_status::ready, "second Flow did not receive DATA");
+    auto payload = received.get();
+    payload.reset();
+    endpoint->complete_receive();
+    f.pump();
+    check(f.deadline() == deadline, "second Flow created its own credit deadline");
+    check(f.upstream->credits.empty(), "second Flow published before the node batch");
+
+    // An immediate refresh or close must preserve the other Flow's batch.
+    if (close_first)
+    {
+        f.protocol->close_flow(10);
+        f.pump();
+    }
+    else
+    {
+        for (std::size_t i = 1; i < threshold_frames; ++i)
+        {
+            auto data = f.receive();
+            data.reset();
+            f.complete();
+        }
+        check(f.credit() == test_flow::window_bytes + threshold_frames * chunk_charge,
+              "immediate refresh did not publish the first Flow");
+    }
+    check(f.deadline() == deadline, "one Flow cancelled another Flow's batch");
+    f.upstream->credits.clear();
+    f.poll(deadline - 1ns);
+    check(f.upstream->credits.empty(), "batch ran before its shared deadline");
+    f.poll(deadline);
+    check(f.upstream->credits.size() == 1 && f.credit(11, true) == test_flow::window_bytes + chunk_charge,
+          "batch missed the later Flow or republished an already refreshed Flow");
+    check(f.deadline() == Clock::time_point::max(), "completed batch kept a periodic timer alive");
+    f.upstream->credits.clear();
+    f.poll(deadline + 1ms);
+    check(f.upstream->credits.empty(), "idle poll repeated credit or the initial window");
+}
+
+void full_data_window_retains_one_fin_slot()
+{
+    CreditFixture f(false); // All frames must fit before any endpoint can dequeue them.
+    constexpr auto data_frames = test_flow::window_bytes / lnk::Frame::buffer_overhead;
+    f.feed(data_frames, 0);
+    for (int duplicate = 0; duplicate < 2; ++duplicate)
+    {
+        test_access::FlowProtocol_stream_(*f.protocol).receive(f.flow,
+            lnk::Frame{{LnkFrType::Fin, false, 0, 7, 10}});
+    }
+    check(f.flow->phase == lnk::FlowState::Phase::Active &&
+          f.direction().received_bytes == test_flow::window_bytes &&
+          f.direction().buffered_bytes == test_flow::window_bytes + lnk::Frame::buffer_overhead,
+          "full DATA window did not retain exactly one FIN position");
+    f.endpoint = f.protocol->bind_stream_flow(7, 10, true, f.io.get_executor());
+    f.pump();
+    for (std::size_t index = 0; index < data_frames; ++index)
+    {
+        auto data = f.receive();
+        check(data && data->size() == 0, "FIN overtook empty DATA");
+        data.reset();
+        f.complete();
+        if (index == 0)
+        {
+            check(f.credit() == test_flow::window_bytes + lnk::Frame::buffer_overhead &&
+                  f.deadline() == Clock::time_point::max(),
+                  "exhausted window waited for a small-release deadline");
+        }
+    }
+    check(!f.receive(), "FIN was lost behind a full DATA window");
+    check(f.direction().buffered_bytes == 0 && f.direction().released_bytes == test_flow::window_bytes,
+          "FIN created DATA credit or retained buffer charge");
+}
+
+void fin_and_close()
+{
+    {
+        CreditFixture f;
+        test_access::FlowProtocol_stream_(*f.protocol).receive(f.flow,
+            lnk::Frame{{LnkFrType::Fin, false, 0, 7, 10}});
+        f.pump();
+        check(!f.receive(), "FIN did not become EOF");
+        check(f.direction().buffered_bytes == 0 && f.direction().released_bytes == 0 &&
+              f.deadline() == Clock::time_point::max() && f.upstream->credits.empty(),
+              "FIN created DATA credit or a merge deadline");
+    }
+    {
+        CreditFixture f;
+        f.feed(1);
+        auto data = f.receive();
+        data.reset();
+        f.complete();
+        check(f.deadline() != Clock::time_point::max(), "close fixture did not arm credit");
+        const auto released = f.direction().released_bytes;
+        f.protocol->close_flow(10);
+        f.pump();
+        f.endpoint->complete_receive(); // Late downstream notification after close.
+        f.pump();
+        const auto deadline = f.deadline();
+        f.poll(deadline);
+        check(f.deadline() == Clock::time_point::max() &&
+              f.upstream->credits.empty() && f.direction().released_bytes == released &&
+              !test_access::FlowProtocol_flows_(*f.protocol).contains(10),
+              "close or late completion published stale credit");
+    }
+}
+void run()
+{
+    deadline_and_release();
+    threshold_publishes_before_batch();
+    flows_share_one_batch(false);
+    flows_share_one_batch(true);
+    full_data_window_retains_one_fin_slot();
+    fin_and_close();
+}
+} // namespace credit_tests
 
 static asio::awaitable<void> pause(std::chrono::milliseconds duration)
 {
@@ -392,13 +673,13 @@ static void wire_tests()
         install(2);
         const auto window = test_flow::window_bytes;
         const auto used = 32768 + lnk::Frame::buffer_overhead;
-        constexpr int count = 15;
+        const auto count = static_cast<int>(window / used);
         for (int index = 0; index < count; ++index)
         {
-            check(test_flow::send(channel, {7, 1, false, LnkFrType::Data, BytesBuf(32768, static_cast<std::uint8_t>(index))}) ==
-                      FlowSendStatus::Queued, "local queue rejected a peer-credit burst");
+            check(test_flow::try_send_data(channel, 1, false, BytesBuf(32768, static_cast<std::uint8_t>(index))),
+                  "local queue rejected a peer-credit burst");
         }
-        check(test_flow::send(channel, {7, 2, false, LnkFrType::Data, {99}}) == FlowSendStatus::Queued,
+        check(test_flow::try_send_data(channel, 2, false, {99}),
               "second Flow could not queue");
         co_await credit(1, window);
         for (int index = 0; index < count; ++index)
@@ -410,8 +691,8 @@ static void wire_tests()
         co_await pause(1ms); // Let the physical writer release local capacity; peer credit stays exhausted.
         for (int index = count; index < count + 3; ++index)
         {
-            check(test_flow::send(channel, {7, 1, false, LnkFrType::Data, BytesBuf(32768, static_cast<std::uint8_t>(index))}) ==
-                      FlowSendStatus::Queued, "local writer did not release capacity");
+            check(test_flow::try_send_data(channel, 1, false, BytesBuf(32768, static_cast<std::uint8_t>(index))),
+                  "local writer did not release capacity");
         }
         co_await credit(1, window); // Duplicate absolute limit cannot replenish the window.
         co_await credit(1, window - 1); // Old limit cannot replenish it either.
@@ -445,7 +726,8 @@ static void wire_tests()
         const BytesBuf excessive(LnkFrameHeader::maximum_payload, 0x44);
         const auto incoming = LnkFrameHeader{LnkFrType::Data, true,
             static_cast<std::uint32_t>(excessive.size()), 7, 4}.encode();
-        for (int index = 0; index < 16; ++index)
+        const auto excessive_charge = lnk::PayloadPool::allocation_size(excessive.size()) + lnk::Frame::buffer_overhead;
+        for (std::size_t index = 0; index <= window / excessive_charge; ++index)
         {
             const std::array<asio::const_buffer, 2> buffers{asio::buffer(incoming), asio::buffer(excessive)};
             co_await asio::async_write(socket, buffers, asio::use_awaitable);
@@ -457,7 +739,7 @@ static void wire_tests()
             failed = event.type() == CtrlCommand::FlowError && event.params->at("flow_id") == 4;
         }
         check(!test_access::FlowProtocol_flows_(*channel).contains(4), "over-window DATA remained active");
-        check(test_flow::send(channel, {7, 2, false, LnkFrType::Data, {100}}) == FlowSendStatus::Queued,
+        check(test_flow::try_send_data(channel, 2, false, {100}),
               "invalid credit closed shared Link or healthy Flow");
         check((co_await next_data()).header.id == 2, "healthy Flow could not progress after invalid credit");
         auto link = test_access::LnkChannel_connections_(channel->links()).at(1);
@@ -564,15 +846,14 @@ static void multihop_tests()
             for (int index = 0; index < 64; ++index)
             {
                 const BytesBuf payload(32768, static_cast<std::uint8_t>(index));
-                check(co_await test_flow::submit_data(nodes.front(), 7, 10, false, payload) == FlowSendStatus::Queued,
+                check(co_await test_flow::send_data(nodes.front(), 7, 10, false, payload),
                       "three-hop backpressure closed sender");
             }
-            check(co_await test_flow::submit(nodes.front(), {7, 10, false, LnkFrType::Fin}) == FlowSendStatus::Queued,
-                  "three-hop FIN was rejected");
+            co_await test_flow::finish(nodes.front(), 7, 10, false);
         };
         auto sent = asio::co_spawn(io, send(), asio::use_future);
         auto first = co_await test_flow::receive(nodes.back(), 7, 10, false);
-        check(first.payload.size() == 32768 && first.payload.front() == 0, "first three-hop payload changed");
+        check(first && first->size() == 32768 && first->front() == 0, "first three-hop payload changed");
         co_await pause(120ms); // End socket would still be writing this delivered frame.
         check(sent.wait_for(0s) != std::future_status::ready, "three-hop sender ignored stalled consumer");
         for (const auto &node : nodes)
@@ -580,10 +861,10 @@ static void multihop_tests()
             check(test_access::flow_buffered_bytes(*node) <= 4 * (window + lnk::Frame::buffer_overhead),
                   "three-hop queue grew beyond its reservations");
         }
-        check(co_await test_flow::submit(nodes.front(), {7, 11, false, LnkFrType::Data, {99}}) == FlowSendStatus::Queued,
+        check(co_await test_flow::send_data(nodes.front(), 7, 11, false, {99}),
               "healthy three-hop Flow could not send");
         auto small = co_await test_flow::receive(nodes.back(), 7, 11, false);
-        check(small.payload == BytesBuf{99}, "stalled Flow blocked healthy three-hop Flow");
+        check(small == BytesBuf{99}, "stalled Flow blocked healthy three-hop Flow");
         small = {};
         std::get<std::shared_ptr<lnk::FlowStream>>(co_await test_flow::port(nodes.back(), 7, 11))->complete_receive();
         first = {};
@@ -591,13 +872,13 @@ static void multihop_tests()
         for (int index = 1; index < 64; ++index)
         {
             auto frame = co_await test_flow::receive(nodes.back(), 7, 10, false);
-            check(frame.payload == BytesBuf(32768, static_cast<std::uint8_t>(index)),
+            check(frame == BytesBuf(32768, static_cast<std::uint8_t>(index)),
                   "resumed three-hop stream lost or reordered bytes");
             frame = {};
             std::get<std::shared_ptr<lnk::FlowStream>>(co_await test_flow::port(nodes.back(), 7, 10))->complete_receive();
         }
         auto fin = co_await test_flow::receive(nodes.back(), 7, 10, false);
-        check(fin.kind == LnkFrType::Fin, "three-hop FIN overtook or lost DATA");
+        check(!fin, "three-hop FIN overtook or lost DATA");
         check(sent.wait_for(0s) == std::future_status::ready, "drained sender did not complete");
         sent.get();
         for (const auto &node : nodes)
@@ -633,7 +914,10 @@ int main()
 {
     try
     {
-        local_tests();
+        stream_admission_tests();
+        reservation_tests();
+        datagram_admission_tests();
+        credit_tests::run();
         wire_tests();
         multihop_tests();
         std::cout << "Flow control checks passed\n";

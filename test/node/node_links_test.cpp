@@ -120,11 +120,9 @@ void integration()
                 for (std::uint64_t i = 1; i <= 12; ++i)
                 {
                     const auto &flow = flows[i % flows.size()];
-                    auto forward = co_await test_node::send_flow(nodes[0],
-                        {flow.epoch, flow.id, false, LnkFrType::Data, {0, 255, std::uint8_t(i)}, {}});
-                    auto reverse = co_await test_node::send_flow(nodes[1],
-                        {flow.epoch, flow.id, true, LnkFrType::Data, {std::uint8_t(i), 0}, {}});
-                    require(forward == FlowSendStatus::Queued && reverse == FlowSendStatus::Queued,
+                    auto forward = co_await test_node::send_data(nodes[0], flow.epoch, flow.id, false, {0, 255, std::uint8_t(i)});
+                    auto reverse = co_await test_node::send_data(nodes[1], flow.epoch, flow.id, true, {std::uint8_t(i), 0});
+                    require(forward && reverse,
                             "business flow send failed");
                 }
                 for (std::uint64_t i = 1; i <= 12; ++i)
@@ -132,11 +130,9 @@ void integration()
                     const auto &flow = flows[i % flows.size()];
                     auto from_master = co_await test_node::receive_flow(nodes[1], flow.epoch, flow.id);
                     auto from_slave = co_await test_node::receive_flow(nodes[0], flow.epoch, flow.id);
-                    require(from_master.flow_id == flow.id && !from_master.reverse &&
-                                from_master.payload == BytesBuf({0, 255, std::uint8_t(i)}),
+                    require(from_master == BytesBuf({0, 255, std::uint8_t(i)}),
                             "business flow data mixed on shared channel");
-                    require(from_slave.flow_id == flow.id && from_slave.reverse &&
-                                from_slave.payload == BytesBuf({std::uint8_t(i), 0}),
+                    require(from_slave == BytesBuf({std::uint8_t(i), 0}),
                             "reverse business flow data mixed");
                 }
                 for (const auto &flow : flows)
@@ -416,7 +412,7 @@ void data_failures()
                 asio::buffer(udp_link_header), asio::buffer(valid_header), asio::buffer(valid_payload)};
             co_await peer.async_send_to(valid_buffers, source, asio::use_awaitable);
             auto udp_received = co_await test_flow::receive(module, 7, 24);
-            require(udp_received.payload == BytesBuf{42}, "malformed maximum-size UDP frame entered the flow");
+            require(udp_received == BytesBuf{42}, "malformed maximum-size UDP frame entered the flow");
             module->close_flow(24);
             // Delay Pong 1 until Ping 2 has been sent. An older, unacknowledged Ping
             // still proves liveness; duplicate and unsent sequences must not renew it.
@@ -487,7 +483,7 @@ void data_failures()
                 // No yield between queueing and close: even a directly handed-off send item is still pending.
                 for (int i = 0; i < 3; ++i)
                 {
-                    require(test_flow::send(module, {7, id + 20, true, LnkFrType::Data, {43}, {}}) == FlowSendStatus::Queued,
+                    require(test_flow::try_send_data(module, id + 20, true, {43}),
                             "could not queue UDP frame before close");
                 }
                 module->links().close(id);
@@ -618,25 +614,25 @@ void data_failures()
             co_await send(6, 21, false, {97});
             co_await send(7, 21, false, payload);
             auto received = co_await test_flow::receive(module, 7, 21);
-            require(received.flow_id == 21 && !received.reverse && received.payload == payload,
+            require(received == payload,
                     "wrong direction, unknown identity or stale epoch entered the business flow");
             module->close_flow(21);
             co_await send(7, 21, false, {96});
             test_flow::prepare(module, flow);
             module->commit_flow(21);
-            require(test_flow::send(module, {7, 21, true, LnkFrType::Data, {1}, {}}) == FlowSendStatus::Closed,
+            require(co_await test_flow::throws<std::runtime_error>(test_flow::port(module, 7, 21, true)),
                     "retired identity was revived");
             flow["flow_id"] = flow["request_id"] = std::uint64_t(22);
             test_flow::prepare(module, flow);
             module->commit_flow(22);
             co_await send(7, 22, false, {42});
             received = co_await test_flow::receive(module, 7, 22);
-            require(received.flow_id == 22 && received.payload == BytesBuf{42}, "late data reached a new flow");
+            require(received == BytesBuf{42}, "late data reached a new flow");
             auto malformed = LnkFrameHeader{LnkFrType::Data, false, 0, 7, 1}.encode();
             malformed[4] = 0xff;
             co_await asio::async_write(socket, asio::buffer(malformed), asio::use_awaitable);
             co_await until_error(8);
-            require(test_flow::send(module, {7, 22, true, LnkFrType::Data, {1}, {}}) == FlowSendStatus::Closed,
+            require(co_await test_flow::throws<std::runtime_error>(test_flow::port(module, 7, 22, true)),
                     "malformed transport left its business flow alive");
             // Stop with a resolver/bootstrap task still in flight; Flow receiver cleanup is tested separately.
             auto pending = parameters(5, "udp", "127.0.0.2");
