@@ -5,6 +5,7 @@ import csv
 import json
 from pathlib import Path
 import platform
+import sys
 
 
 def case_summaries(directory):
@@ -106,8 +107,14 @@ def main():
     parser.add_argument("--plot", action="store_true", help="Export throughput curves using optional matplotlib")
     args = parser.parse_args()
     records = []
+    failures = []
     for path in case_summaries(args.directory):
         summary = json.loads(path.read_text())
+        if not (path.parent / "timeline.csv").exists() or "rates_mbps" not in summary:
+            failures.append(f"{path.parent.name}: {summary.get('failure', 'no measurement samples')}")
+            continue
+        if summary["status"] != "passed":
+            failures.append(f"{path.parent.name}: {summary.get('failure', 'measurement failed')}")
         network_path = path.parent / "network.json"
         network = json.loads(network_path.read_text()) if network_path.exists() else {}
         with (path.parent / "timeline.csv").open() as stream:
@@ -129,12 +136,20 @@ def main():
             record = {"case": path.parent.name, "status": summary["status"], "mode": summary["mode"],
                       "flows": summary["flows"], "directions": summary["directions"], "nodes": summary["nodes"], "chunk_bytes": summary["chunk_bytes"],
                       "per_hop_rtt_ms": network.get("per_hop_rtt_ms", ""), "phase": phase, "target_mbps": target,
-                      **metrics, "healthy_flows_with_progress": sum(value > 0 for value in healthy),
+                      **metrics,
+                      "jain_fairness": sum(healthy) ** 2 / (len(healthy) * sum(v * v for v in healthy))
+                          if healthy and any(healthy) else None,
+                      "healthy_min_mbps": min(healthy) * 8 / summary["phase_seconds"] / 1e6 if healthy else None,
+                      "healthy_max_mbps": max(healthy) * 8 / summary["phase_seconds"] / 1e6 if healthy else None,
+                      "healthy_flows_with_progress": sum(value > 0 for value in healthy),
                       "healthy_flows": len(healthy),
                       "peak_flow_cache_mib_by_node": "/".join(f"{value / 2**20:.2f}" for value in summary["peak_buffered_bytes_by_node"]),
                       "released_after_stop": summary["payloads_released_after_stop"]}
             record["healthy_mib_while_slow_flow_paused"] = summary["healthy_bytes_while_slow_flow_paused"] / 2**20
             records.append(record)
+    if not records and failures:
+        (args.directory / "flow-report.md").write_text("# Flow 测量失败\n\n" + "\n\n".join(failures) + "\n")
+        return 1
     if not records:
         parser.error("no measured phases found")
     with (args.directory / "phases.csv").open("w") as stream:
@@ -144,28 +159,11 @@ def main():
     environment_file = args.directory / "environment.json"
     environment = json.loads(environment_file.read_text()) if environment_file.exists() else {}
     measured_platform = environment.get("platform", "未记录；汇总机为 " + platform.platform())
-    findings = []
-    baseline = next((r for r in records if r["case"] == "baseline-3node-100flow"), None)
-    if baseline:
-        findings.append(f"三节点、百条 Flow、32 KiB 数据块的本机回环平均吞吐为 {baseline['mean_mbps'] / 1000:.2f} Gbps。")
-    sink = [r for r in records if r["case"] == "sink-speed-steps"]
-    if sink:
-        values = "、".join(f"{r['target_mbps']} → {r['steady_mbps']:.1f}" for r in sink)
-        findings.append(f"终点消费限速各阶段的目标 → 后半段实测为 {values} Mbps；" +
-                        f"统计收敛为 {min(r['convergence_s'] for r in sink if r['convergence_s'] is not None):.2f}–" +
-                        f"{max(r['convergence_s'] for r in sink if r['convergence_s'] is not None):.2f} s。")
-    network = [r for r in records if r["case"].startswith("network-100flow-rtt100") and r["target_mbps"] == 1000]
-    if network:
-        findings.append(f"每跳 RTT 100 ms 的三次百流调速测试中，1 Gbps 目标阶段平均吞吐为 " +
-                        f"{min(r['mean_mbps'] for r in network):.1f}–{max(r['mean_mbps'] for r in network):.1f} Mbps，未达到 1 Gbps。")
-        findings.append("TCP 状态显示共享连接使用 4 MiB 发送缓冲，并出现明显 sndbuf_limited；这支持发送缓存为瓶颈候选，尚未进行扩大缓存的对照验证。")
-    slow = next((r for r in records if r["case"] == "slow-consumer"), None)
-    if slow:
-        findings.append(f"一条流暂停消费 3 秒期间，其他流仍消费 {slow['healthy_mib_while_slow_flow_paused']:.2f} MiB；各方向缓存未越窗，停止后在用载荷归还。")
-    lines = ["# 多节点 Flow 流控性能实测", "", *findings, "",
+    lines = ["# 多跳 Flow 与拥塞控制测量", "",
+             *failures, "",
              f"执行环境：`{measured_platform}`。", "",
              f"设备：`{(environment.get('hardware') or '未记录').strip(chr(0))}`；CPU governor：`{environment.get('cpu_governor', '未记录')}`。", "",
-             "Release 构建；所有逻辑节点位于同一进程、同一 io_context、单线程。CPU 百分比以一个 CPU 核为 100%。",
+             "所有逻辑节点位于同一进程、同一 io_context、单线程；构建类型见各场景 metadata.json。CPU 百分比以一个 CPU 核为 100%。",
              "消费速度测试在终点使用生产 TokenBucket；网络测试在隔离命名空间对每条相邻 TCP 连接的两个方向分别用出口 HTB 调速、接收入口 IFB/netem 添加传播延迟，RTT 为每跳设置值。网络整形在 NodeLink 建立前生效。",
              "CLI 的速率为每个方向的聚合目标；表中吞吐为所有方向合计，双向测试的表中目标是 CLI 速率的两倍。",
              "测量对象为 FlowProtocol、共享 NodeLink 和 FlowStream，不包含 Agent、TLS 接入和控制面建路开销。", "",
@@ -182,6 +180,7 @@ def main():
               "该指标包含统计观察窗口，时间下限约 0.7 s。CSV 的 passed 只表示功能、预算与排空检查通过，性能是否达标另见 steady_within_10pct。",
               "网络调速的实际 qdisc 应用时间另存于各场景 network.json；切换多个方向需要少量执行时间。",
               "100 ms 吞吐尖峰和超额字节保留在 phases.csv；positive_sample_excess_mib 累加每个采样区间的正向超额，net_excess_mib 为整个阶段相对目标的有符号差额，二者均以业务载荷计。",
+              "phases.csv 同时记录每阶段健康流方向的 Jain 公平指数（1 表示等份）、最低与最高吞吐；暂停流从这些指标中排除。",
               "发送等待分位数为 logarithmic histogram 的微秒上界，见各场景 flows.csv；send 完成表示交接，吞吐以终点完成消费为准。", "",
               "| 场景 | 缓存峰值，按节点/MiB | 健康流方向有进展 | 暂停期间其他流消费/MiB | 停止后池载荷释放 | 功能结果 |",
               "|---|---|---:|---:|---|---|"]
@@ -201,9 +200,10 @@ def main():
     if args.plot:
         plot_rates(args.directory)
         lines += ["![动态调速吞吐曲线](dynamic-rate.png)", ""]
-    (args.directory / "报告.md").write_text("\n".join(lines))
-    print(f"Saved {args.directory}/{{phases.csv,报告.md}} ({len(records)} phases)")
+    (args.directory / "flow-report.md").write_text("\n".join(lines))
+    print(f"Saved {args.directory}/{{phases.csv,flow-report.md}} ({len(records)} phases)")
+    return int(bool(failures))
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

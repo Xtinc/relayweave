@@ -1,115 +1,87 @@
-# 性能基准
+# 关键通道 benchmark
 
-性能基准与功能 CTest 分开，手动运行；不以机器性能阈值判定功能测试是否通过。
+只保留五个性能研究入口，每个例子一个 `.cpp`。测量生产数据通道，避免用容器、路由算法、控制面或代理连接测试稀释重点。benchmark 手动运行，与功能 CTest 分开，不设置跨机器通用性能门槛。
 
-| 分组 / 目标 | 组件与用例 | 规模与指标 |
+| 文件 / 可执行目标 | 测量问题 | 关键指标 |
 |---|---|---|
-| 基础组件 `benchmark_common` | PayloadPool/PooledBuffer 复用与复制；NodeLink/UDP 帧头；控制消息 CBOR 编解码与分片重组；TokenBucket 准入、丢弃、预留和协程等待；TrafficCounter；LRUCache；channel 池载荷交接；AsyncEvent 广播 | 1400/4096/32768/65467 字节块、100 个预热池块、100/10000 缓存项、1/4 个计数线程、1/100 个等待者；ns/操作、操作/秒、复制 Mbps、限速实测速率、上游分配次数 |
-| 索引 `benchmark_dual_index_map` | 生产侵入式双索引与标准容器参考实现的插入、查找、更新次索引、删除 | 默认 200000 项，各阶段单独计时，相同校验和 |
-| 路由 `benchmark_routing` | RouteGraph 构建与分层路径搜索；LinkQuality 更新与评估；AgentRouting 接收快照与计算候选路径；Topology 快照校验 | 32/128/512/1024 节点，4/8 层、2 个入口、指数跨度有向边；100 条链路质量、5% 模拟丢失；耗时、操作/秒、可达节点数 |
-| Node `benchmark_node` | RegistryMgr 服务/会话查找、服务列表、流量采样与报告、会话退出并重建其服务 | 100 个会话、100/10000 个服务；查找速率、报告耗时、会话重建耗时 |
-| 传输 `benchmark_relay` | TCP 双向复制；TLS 1.2/1.3 握手和 TLS↔TLS、TCP↔TLS 复制；UDP 双向报文；TLSChannel 控制消息；HTTP CONNECT/SOCKS5 代理隧道与连接反复建立 | 真实本机 socket；1400/32768 字节流块、1400 字节 UDP；业务吞吐、握手/报文往返耗时、控制消息/秒、连接/秒 |
-| 多节点 `benchmark_flow` | FlowProtocol/NodeLink 的 TCP 每流信用、多路复用、中继、池载荷转移、动态调速、背压、多流隔离和双向传输 | 1/10/100 Flow、2–8 节点；吞吐、调速收敛、等待分布、CPU、RSS、信用与缓存占用 |
-| UDP Node `benchmark_udp_node` | mTLS 控制接入、Registry/DatagramMgr 业务链路、真实 UDP Relay 饱和或定速发送 | 发包率、转发率、丢包率、重复包、内容校验；默认 1400 字节报文 |
+| `tcp_relay_benchmark.cpp` / `benchmark_tcp_relay` | TCP relay 相对直连的转发成本；1400 B / 32 KiB 块 | 双向业务吞吐、块/秒、CPU 时间；直连使用相同生成与校验逻辑 |
+| `tls_relay_benchmark.cpp` / `benchmark_tls_relay` | TLS 1.2 / 1.3 的 TLS↔TLS 与 TCP↔TLS relay 成本 | 双向业务吞吐、CPU 时间；握手单独计时，记录协商版本和密码套件 |
+| `udp_relay_benchmark.cpp` / `benchmark_udp_relay` | UDP relay 的往返成本与持续双向发包能力；1400 B 业务报文 | RTT p50/p95/p99、发包/转发 pps、业务吞吐、各方向接收量、丢包率、乱序数 |
+| `flow_benchmark.cpp` / `benchmark_flow` | Flow 复用与多跳转发的开销 | 终点吞吐、每流发送等待 p50/p95/p99、CPU、RSS、各节点缓存与载荷池占用 |
+| `congestion_benchmark.cpp` / `benchmark_congestion` | 带宽降低、恢复与单流暂停时的信用流控及背压能力 | 稳态吞吐、收敛时间、超额字节、公平性、健康流进展、缓存上限与排空 |
 
-## 构建与产物目录
+`benchmark.h` 统一输出；`relay_workload.h` 复用 socket 建立、收发与完整性校验；`flow_workload.h` 复用真实 FlowProtocol/NodeLink 拓扑、采样与资源检查。实验入口负责定义各自的负载和默认参数。
 
-```console
+## 构建和运行
+
+```sh
 cmake -S . -B build-flow-perf -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DBUILD_BENCHMARKS=ON
 cmake --build build-flow-perf --target benchmarks --parallel 2
 
-# 短时验证；每个组件运行一次，Flow 各调速阶段 1 秒、UDP Node 1 秒。
+# 五个入口的短时正确性验证，不用于性能结论。
 python3 benchmark/run_benchmarks.py --build-dir build-flow-perf --quick
 
-# 组件各运行三次，Flow 各阶段 3 秒、UDP Node 3 秒。
+# Relay 各重复三次；Flow 预热 2 秒，吞吐测量 5 秒；调速各阶段 5 秒。
+# 拥塞入口另运行一次单流暂停实验（暂停 3 秒，测量 8 秒）。
 python3 benchmark/run_benchmarks.py --build-dir build-flow-perf
 
-# 只运行选定组件；单个目标默认有 120 秒超时。
-python3 benchmark/run_benchmarks.py --cases common routing node --quick
+# 只运行指定通道。
+python3 benchmark/run_benchmarks.py --build-dir build-flow-perf --cases tcp_relay tls_relay
 ```
 
-CSV、日志、曲线、运行参数和实测报告保存到构建目录下的 `benchmark/results/`，不进入 Git。
-`benchmark_flow` 的默认输出为该目录下的 `flow/`；多场景运行通过 `--output` 指定不同子目录。
-`benchmark/results/` 等源码目录内的本地输出目录也被忽略。
-统一 runner 为每次运行建立独立时间戳目录，保存 `environment.json`、各目标日志、逐次 JSON、
-中位数 `components.csv` 和 `报告.md`。记录主机、构建参数、Git 版本、本地修改状态、基准源码 SHA-256、实际命令、
-进程 CPU 时间与套件累计子进程峰值 RSS；异常和超时也写入记录并以非零状态退出。
-已存在的运行目录不能覆盖；需要再次运行时使用新目录。
-多配置生成器的可执行文件可能位于 `Debug/` 或 `Release/` 子目录。
+runner 为每次运行创建独立目录，默认位于 `<build-dir>/benchmark/results/<UTC 时间戳>/`，记录环境、构建参数、源码摘要、Git 状态、实际命令和日志。`relays.csv` 保存 Relay 各项中位数，`phases.csv` 保存 Flow/拥塞各阶段统计，`报告.md` 与 `flow-report.md` 便于查阅。失败或超时返回非零，原始记录仍保留。`--output DIRECTORY` 可指定新的运行目录，`--timeout-seconds` 默认 120 秒。
 
-## 组件用例
+三个 Relay 入口均支持 `--iterations N --repeats N --output FILE.json`。TCP/TLS 的 iterations 表示每个方向的业务块数，UDP 表示往返次数和饱和实验每方向的发包数；JSON 的 operations 分别为完成的方向块数、握手数、往返数或成功转发报文数。默认 TCP/TLS 为 4096，UDP 为 65536；默认重复三次。
 
-基础组件、索引、路由、Node 和传输目标使用相同参数：
-`--iterations N`、`--repeats N`、`--output FILE.json`。输出默认位于构建目录的
-`benchmark/results/<组件名>.json`。按案例记录总耗时、CPU 时间、ns/操作、操作/秒、载荷 Mbps 和校验和。
+## 多跳 Flow
 
-```console
-build-flow-perf/benchmark/benchmark_common --iterations 100000 --repeats 3
-build-flow-perf/benchmark/benchmark_dual_index_map --iterations 200000 --repeats 3
-build-flow-perf/benchmark/benchmark_routing --iterations 10 --repeats 3
-build-flow-perf/benchmark/benchmark_node --iterations 100000 --repeats 3
-build-flow-perf/benchmark/benchmark_relay --iterations 256 --repeats 3
-build-flow-perf/benchmark/benchmark_udp_node --duration-seconds 3 --rate-pps 50000
+```sh
+# A → B → C，100 条 Flow 复用两条真实 TCP NodeLink，不限速。
+build-flow-perf/benchmark/benchmark_flow --nodes 3 --flows 100 \
+  --warmup-seconds 2 --phase-seconds 5 --output build-flow-perf/benchmark/results/flow-3nodes
+
+# 对照：分别修改 --nodes 2/3/5，--flows 1/10/100，--chunk-bytes 4096/32768。
+# 每次只改一个变量并使用新的输出目录；--duplex 1 测量双向传输。
 ```
 
-`iterations` 在基础组件中表示基本操作次数，控制消息按体积分摊次数，限速等待每档最多 128 块，
-广播轮数为基本次数的千分之一。Node 的服务列表/报告次数为基本次数的千分之一，会话重建为百分之一。
-索引用例表示表项数；路由表示每种拓扑的查询次数，质量样本数为其千倍；传输表示每方向的数据块数、
-UDP 往返次数、控制请求数或代理连接重建次数。JSON 中的 `operations` 是每个用例实际使用的分母。
+支持 2–8 个节点、1–100 条 Flow、16–65467 B 数据块、1–120 秒测量阶段。`--nodes` 是端点在内的节点数，跳数为 nodes−1。吞吐按终点完成消费的字节计算，预热和排空不计入阶段吞吐。
 
-池块在计时前预热，复用和复制要求测量期间上游申请为零；队列交接保持池块所有权并校验序号。
-复制、帧和网络用例校验数据、顺序与结束位置；计数与注册表用例核对结果和状态。
-耗时包含该用例内的校验成本，不能把微基准的操作速率直接当作系统吞吐。
-独立组件测量不设置跨机器通用的性能通过阈值；非零退出代表校验、执行或资源条件失败。
+## 带宽拥塞与背压
 
-TCP/TLS 复制并行传输两个方向，载荷吞吐记录两方向总和；TLS 握手单独计时，证书加载和 socket 建立在计时外。
-UDP 复制用例一次只保留一个待响应报文，测量双向往返成本；饱和吞吐和丢包由 UDP Node 基准测量。
-UDP 没有信用流控，不引入 TCP 的等待或确认机制。代理用例使用 HTTP CONNECT 与 SOCKS5 IPv4，
-大块往返和短连接重建分别计时，均包含连接握手，不覆盖 HTTP 普通请求重写吞吐。
+```sh
+# 终点消费带宽：1 Gbps → 100 Mbps → 500 Mbps → 1 Gbps。
+build-flow-perf/benchmark/benchmark_congestion --nodes 3 --flows 100 \
+  --rates-mbps 1000,100,500,1000 --phase-seconds 5 \
+  --output build-flow-perf/benchmark/results/congestion-steps
 
-路由拓扑为固定的有向图，边跨越 1/2/4/8 等节点间隔，构建、路径搜索、快照接收、校验与候选计算分开计时。
-Agent 候选计算在计时前注入已有测试夹具的测量状态，不打开原始 ICMP socket；DNS、ICMP 的实际网络耗时不计入算法耗时。
-注册表借用未启动的 TLS 会话对象，单独测量索引和报告成本；真实控制连接由传输和 UDP Node 用例覆盖。
+# 单条流暂停，其余流继续；观察背压隔离及恢复。
+build-flow-perf/benchmark/benchmark_congestion --flows 100 --rates-mbps 0 \
+  --pause-flow-ms 3000 --phase-seconds 8 \
+  --output build-flow-perf/benchmark/results/congestion-slow-flow
 
-## 多节点 Flow 性能与调速记录
+# 真实网络瓶颈：每跳 RTT 100 ms，按阶段改变每条 NodeLink 两方向的带宽。
+python3 benchmark/run_congestion_network.py \
+  --benchmark build-flow-perf/benchmark/benchmark_congestion \
+  --nodes 3 --flows 100 --rtt-ms 100 --rates-mbps 1000,100,500,1000 \
+  --warmup-seconds 5 --phase-seconds 5 \
+  --output build-flow-perf/benchmark/results/congestion-network
 
-```console
-# 100 条 TCP Flow 共用 A → B → C 的两条相邻 NodeLink。
-# 终点消费速率按每流均分，使用生产 TokenBucket，分别降速、提速。
-build-flow-perf/benchmark/benchmark_flow --flows 100 --nodes 3 \
-  --rates-mbps 1000,100,500,1000 --phase-seconds 5 --output build-flow-perf/benchmark/results/sink-steps
-
-# 一条流暂停消费，其余流持续传输；窗口与载荷释放必须正确。
-build-flow-perf/benchmark/benchmark_flow --flows 100 --rates-mbps 1000 \
-  --pause-flow-ms 3000 --phase-seconds 8 --output build-flow-perf/benchmark/results/slow-flow
-
-# 真实 TCP 连接：每跳 RTT 100 ms，各方向带宽 1 Gbps → 100 Mbps → 500 Mbps。
-# runner 创建一次性 user/network namespace，出口 HTB 调速、接收入口 IFB/netem 模拟延迟。
-python3 benchmark/run_flow_network.py --flows 100 --nodes 3 --rtt-ms 100 \
-  --rates-mbps 1000,100,500 --warmup-seconds 5 --phase-seconds 5 --output build-flow-perf/benchmark/results/network-steps
-
-python3 benchmark/flow_report.py build-flow-perf/benchmark/results
-# 可选绘图，需要 matplotlib。
-python3 benchmark/flow_report.py build-flow-perf/benchmark/results --plot
-
-# 统一 runner 结果中的 Flow，或单个场景目录，也可直接绘图。
-python3 benchmark/flow_report.py build-flow-perf/benchmark/results/components-final/flow --plot
-python3 benchmark/flow_report.py build-flow-perf/benchmark/results/components-final/flow/sink-steps --plot
+# 单个实验目录或包含多个实验的父目录均可；--plot 额外需要 matplotlib。
+python3 benchmark/flow_report.py build-flow-perf/benchmark/results/congestion-steps --plot
 ```
 
-可通过 `--flows 1/10/100`、`--nodes 2/3`、`--chunk-bytes 4096/16384/32768` 比较复用与数据块开销，
-或使用 `--phase-seconds 120` 测量长期运行。网络 runner 要求 Linux、`ip`、`tc`、`ss`、允许用户命名空间及
-命名空间内的网络管理权限及 IFB 支持；失败会保存错误记录，不退回宿主网卡整形或伪造 RTT。
+终点消费实验使用生产 TokenBucket，按每流等分目标速率，观察应用层信用周转；它模拟下游消费速度，不代表物理链路拥塞。真实网络实验在一次性 user/network namespace 内用 HTB 调带宽、IFB/netem 加接收延迟，建链前即应用整形，保存实际切换时间、TCP 状态及 qdisc 统计。要求 Linux、`unshare`、`ip`、`tc`、`ss`、用户命名空间与 IFB 支持；不可用时明确失败，不操作宿主网卡。它测量 Flow 信用控制与内核 TCP 拥塞控制共同作用的结果。
 
-每个场景保存 100 ms 采样 `timeline.csv`、每流阶段统计 `flows.csv`、运行参数 `metadata.json` 和结果
-`summary.json`。网络场景增加实际调速时间、TCP 参数与 `qdisc` 统计。汇总生成 `phases.csv` 和 `报告.md`，
-记录稳态吞吐、降速/恢复收敛、发送等待、CPU、RSS、各节点缓存与池载荷占用。
-收敛判据为至少 500 ms 的滑动窗口连续三次进入目标 ±10%；未达到目标仍保留测量结果。
-绘图按实际场景目录生成子图，不依赖目录名称；输出 PNG 和 SVG，报告使用 PNG 预览。
+CLI 的 Mbps 是每方向聚合目标，0 表示不限速；双向实验的汇总吞吐和目标均为两个方向之和。每个实验输出 `timeline.csv`（100 ms 采样）、`flows.csv`（每流每阶段字节数和等待分位数）、`metadata.json`、`summary.json`。
 
-吞吐以终点完成消费为准；逐块检查完整数据与顺序，排空后核对字节总数。采样检查缓存窗口上限，
-停止后检查在用载荷全部归还。内存池保留空闲块是正常行为，RSS 不要求回到启动值。
-测试中的消费限速变化仅模拟下游速度，不增加生产限速器的动态配置接口；`bandwidth_mbps` 是节点容量统计参数。
-`--duplex 1` 同时传输两个方向；CLI 速率为每方向聚合值，CSV 吞吐和目标记录两个方向的总和。
-测量使用单进程、单执行器，不包含完整 Agent/Node 控制与接入链路；netem 结果须与真实跨机器吞吐验收区分。
-网络整形在 NodeLink 建立前配置，握手即使用预期 RTT，避免内核拥塞控制保留本机低延迟历史。
+排空预算为 10 秒加上预计传输时间的两倍，预计时间按未消费载荷（含每流一个可能尚未完成交接的数据块）和末阶段速率计算。网络模式取两个方向中较大的积压；消费限速模式按积压最多的流及其等分速率计算；不限速模式保留 10 秒。`drain.json` 在排空开始时发布预算，网络 runner 使用同一预算等待退出；`summary.json` 记录积压上界、超时预算和实际排空耗时。
+
+收敛定义为至少 500 ms 的滑动窗口连续三次进入目标 ±10%，包含约 0.7 秒的统计观察下限。后半阶段吞吐用于稳态比较；未达到目标保留原始结果，不等同于功能失败。`phases.csv` 另存正向超额字节、阶段净超额字节、Jain 公平指数（1 表示等份）及健康流最低/最高吞吐，`flows.csv` 的等待分位数为直方图微秒上界。
+
+## 测量边界
+
+- TCP/TLS 使用真实本机 socket，socket 建立、证书加载不计入转发时间；TLS 握手单列。业务吞吐排除 TLS/UDP 帧头。
+- UDP 往返只保留一个在途报文，不能视为饱和吞吐。饱和实验无逐包确认，独立并发发收，发完后留 200 ms 排空；吞吐和转发 pps 的计时包含排空，短跑会低估持续吞吐。丢包作为测量值记录，内容错误或重复序号使实验失败。
+- 每个入口都校验完整业务载荷、序号及方向；TCP/Flow 额外检查结束位置和排空字节数。Flow 采样检查每方向信用窗口，停止后检查在用池载荷全部归还，内存池保留空闲块属于正常行为。
+- 当前使用单进程、单 io_context、单线程。CPU 包含生成、复制与校验开销；TCP 直连对照用于识别这些开销。RSS 不含内核 socket/整形队列内存。
+- Flow 实验不包含 Agent、控制面建路或 TLS 接入。本机回环和 netem 数据用于比较通道成本，跨机器性能需在目标环境另测。

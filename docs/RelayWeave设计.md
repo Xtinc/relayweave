@@ -2575,9 +2575,10 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 - `agent_lifecycle`、`agent_reconnect`：重复启动/停止、可等待停止、断线重连取消以及停止后的对象释放。
 
 性能基准位于仓库根目录 `benchmark/`，由 `BUILD_BENCHMARKS` 独立启用，不注册为 CTest。
-用例覆盖缓冲池、编解码、限速与计数、索引与缓存、异步交接、路由与拓扑、注册表、TCP/TLS/UDP 复制、代理隧道及多节点 Flow。
-UDP Node 容量基准建立真实 mTLS 控制会话和 UDP Relay，再以原始 UDP socket 测量服务器数据路径；旧 UDP 集成测试内的环境变量压测分支已删除。
-组件用例、运行参数与记录格式见 [`benchmark/README.md`](../benchmark/README.md)，CSV、日志、曲线和实测报告保存在构建目录并由 Git 忽略。
+性能研究收敛为五个独立入口：TCP relay、TLS relay、UDP relay、多跳 Flow、带宽拥塞与背压。
+TCP 提供相同负载的直连对照，TLS 握手与转发分开计时，UDP 分别测量往返延迟和持续双向发包；
+Flow 的不限速吞吐与降速、恢复、单流暂停实验分开，真实链路整形通过隔离网络命名空间内的 HTB/IFB/netem 运行。
+测量目标、运行参数与记录格式见 [`benchmark/README.md`](../benchmark/README.md)，CSV、日志、曲线和实测报告保存在构建目录并由 Git 忽略。
 
 Dashboard 验证使用 Python 环境中的 Flask、cbor2、Waitress；部署测试仅使用标准库、临时目录、模拟 systemctl 和 dry-run，Linux 检测到 Python3 时自动注册到 CTest，
 不会修改主机配置或服务。双 Node smoke 启动真实 Node、发布/消费 Agent 与 Dashboard，验证 TCP/TLS、

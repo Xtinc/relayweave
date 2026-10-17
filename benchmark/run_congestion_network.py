@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run FlowProtocol with per-connection netem in a disposable user/network namespace."""
+"""Run the congestion benchmark with per-connection netem in a disposable user/network namespace."""
 import argparse
 import json
 import os
@@ -26,11 +26,11 @@ def wait_file(path, process, timeout=10):
 
 def arguments():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--benchmark", type=Path, default=Path("build-flow-perf/benchmark/benchmark_flow"))
+    p.add_argument("--benchmark", type=Path, default=Path("build-flow-perf/benchmark/benchmark_congestion"))
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--flows", type=int, choices=range(1, 101), default=100, metavar="1..100")
     p.add_argument("--nodes", type=int, choices=range(2, 9), default=3, metavar="2..8")
-    p.add_argument("--rates-mbps", default="1000,100,500")
+    p.add_argument("--rates-mbps", default="1000,100,500,1000")
     p.add_argument("--rtt-ms", type=float, default=100)
     p.add_argument("--phase-seconds", type=int, default=5)
     p.add_argument("--warmup-seconds", type=int, default=2)
@@ -44,6 +44,12 @@ def arguments():
     rates = [int(item) for item in args.rates_mbps.split(",")]
     if not rates or any(not 1 <= r <= 10000 for r in rates):
         p.error("network rates must be 1..10000 Mbps")
+    if not 1 <= len(rates) <= 16:
+        p.error("at most 16 rate phases")
+    if not 1 <= args.phase_seconds <= 120 or not 0 <= args.warmup_seconds <= 30:
+        p.error("phase duration must be 1..120 seconds; warmup must be 0..30 seconds")
+    if not 0 <= args.pause_flow_ms <= 10000:
+        p.error("pause must be 0..10000 ms")
     if not 0 <= args.rtt_ms <= 1000:
         p.error("RTT must be 0..1000 ms")
     return args, rates
@@ -51,8 +57,8 @@ def arguments():
 
 def main():
     args, rates = arguments()
-    args.output.mkdir(parents=True, exist_ok=True)
     if not args.inside:
+        args.output.mkdir(parents=True, exist_ok=False)
         # The outer process never touches a host interface or qdisc.
         invocation = ["unshare", "--user", "--map-root-user", "--net", sys.executable,
                       str(Path(__file__).resolve()), *sys.argv[1:], "--inside"]
@@ -79,6 +85,7 @@ def main():
     for name in ("listeners.json", "network_ready", "ready.json", "start"):
         (control / name).unlink(missing_ok=True)
     (args.output / "metadata.json").unlink(missing_ok=True)
+    (args.output / "drain.json").unlink(missing_ok=True)
     invocation = [str(args.benchmark), "--output", str(args.output), "--network-control", str(control),
                   "--flows", str(args.flows), "--nodes", str(args.nodes), "--rates-mbps", args.rates_mbps,
                   "--warmup-seconds", str(args.warmup_seconds), "--phase-seconds", str(args.phase_seconds),
@@ -151,7 +158,10 @@ def main():
             with (args.output / "tcp-states.txt").open("a") as stream:
                 stream.write(f"PHASE {len(rates) - 1} END monotonic_ns={time.monotonic_ns()}\n")
                 stream.write(command(["ss", "-tinm"]))
-            timeout = args.warmup_seconds + args.phase_seconds + 20
+            # Use the benchmark's backlog-based budget instead of cutting a valid drain short.
+            wait_file(args.output / "drain.json", process)
+            drain = json.loads((args.output / "drain.json").read_text())
+            timeout = drain["timeout_seconds"] + 5
             status = process.wait(timeout=timeout)
             statistics = "LO EGRESS / INGRESS\n" + command(["tc", "-s", "qdisc", "show", "dev", "lo"])
             statistics += "IFB RECEIVE DELAY\n" + command(["tc", "-s", "qdisc", "show", "dev", "ifb0"])

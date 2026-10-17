@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 
@@ -27,9 +28,17 @@ struct Timer
 {
     Clock::time_point wall = Clock::now();
     std::clock_t cpu = std::clock();
+    std::optional<Clock::time_point> wall_end;
+    std::clock_t cpu_end{};
+
+    void stop()
+    {
+        wall_end = Clock::now();
+        cpu_end = std::clock();
+    }
 };
 
-// Shared output only; workloads and their setup remain in each component benchmark.
+// Shared measurement output for the relay workloads.
 class Report
 {
   public:
@@ -72,8 +81,9 @@ class Report
     void add(std::string name, std::uint64_t operations, std::uint64_t payload_bytes, const Timer &start,
              std::uint64_t checksum, Json details = Json::object())
     {
-        const auto seconds = std::chrono::duration<double>(Clock::now() - start.wall).count();
-        const auto cpu_seconds = static_cast<double>(std::clock() - start.cpu) / CLOCKS_PER_SEC;
+        require(operations > 0, "no completed operations");
+        const auto seconds = std::chrono::duration<double>(start.wall_end.value_or(Clock::now()) - start.wall).count();
+        const auto cpu_seconds = static_cast<double>((start.wall_end ? start.cpu_end : std::clock()) - start.cpu) / CLOCKS_PER_SEC;
         samples_.push_back({{"case", std::move(name)}, {"operations", operations}, {"payload_bytes", payload_bytes},
                             {"seconds", seconds}, {"cpu_seconds", cpu_seconds},
                             {"ns_per_operation", seconds * 1e9 / operations}, {"operations_per_second", operations / seconds},

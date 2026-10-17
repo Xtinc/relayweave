@@ -203,6 +203,32 @@ systemctl status relayweave-proxy.service
 journalctl -u relayweave-proxy.service -e
 ```
 
+### 5.1 TCP 拥塞控制和收发缓冲
+
+在源码目录运行 `scripts/configure_tcp.py`，可持久化主机的 TCP 拥塞算法和收发缓冲上限。默认选择 CUBIC，TCP 发送、接收自动调优上限各为 32 MiB，保留原有最小值和初始值，并启用接收缓冲自动调优。通用 socket 收发缓冲上限至少提高到对应值；这些是按需使用的上限，不是每连接预分配内存。
+
+```console
+# 只预览，无需 root，不修改配置或运行参数。
+python3 scripts/configure_tcp.py --dry-run
+
+# 写入持久配置并立即加载、核对结果。
+sudo python3 scripts/configure_tcp.py
+
+# 自定义算法及发送、接收上限，单位 MiB。
+sudo python3 scripts/configure_tcp.py --congestion-control cubic \
+  --send-buffer-mib 32 --receive-buffer-mib 64
+```
+
+算法必须已出现在 `sysctl net.ipv4.tcp_available_congestion_control` 中。脚本写入 `/etc/sysctl.d/99-zz-relayweave-tcp.conf`，在标准 sysctl.d 加载顺序中晚于常见的 `99-bbr.conf`，不改变 qdisc。若另有更晚加载的自定义配置或服务修改相同参数，需要同步处理其覆盖关系。
+
+每次应用前，将本脚本配置文件的原内容和相关运行参数备份到 `/var/backups/relayweave/tcp/<时间戳>-<随机后缀>/snapshot.json`。加载或读回验证失败时自动回滚；手动恢复时使用脚本打印的备份目录，恢复操作本身也会先备份当前状态：
+
+```console
+sudo python3 scripts/configure_tcp.py --restore /var/backups/relayweave/tcp/<备份目录>
+```
+
+更换默认拥塞算法后，重新启动 benchmark 或 Node 进程以重建监听 socket 和 TCP 连接；已有连接不会自动切换算法。应用可自行设置 socket 参数，覆盖系统默认值。该脚本由管理员手动执行，安装包不自动修改系统网络参数。
+
 ## 6. 升级
 
 用 `apt install` 安装更高版本或更高 Debian revision 的本地包：
