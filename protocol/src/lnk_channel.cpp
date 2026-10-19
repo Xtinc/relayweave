@@ -76,10 +76,10 @@ bool lnk::PayloadPool::do_is_equal(const std::pmr::memory_resource &other) const
 
 namespace
 {
-using lnk::Frame;
-using lnk::PooledBuffer;
 using lnk::FlowState;
+using lnk::Frame;
 using lnk::NodeLink;
+using lnk::PooledBuffer;
 using LinkPhase = NodeLink::Phase;
 
 constexpr std::size_t udp_send_queue_capacity = 100;
@@ -125,8 +125,7 @@ std::string_view link_stage(LinkPhase state)
 } // namespace
 
 lnk::NodeLink::NodeLink(asio::any_io_executor executor, LinkSpec values)
-    : spec(std::move(values)), resolver(executor), writable(executor, 1),
-      deadline(Clock::now() + link_setup_timeout)
+    : spec(std::move(values)), resolver(executor), writable(executor, 1), deadline(Clock::now() + link_setup_timeout)
 {
     if (spec.transport == RelayProtocol::Tcp)
     {
@@ -136,10 +135,9 @@ lnk::NodeLink::NodeLink(asio::any_io_executor executor, LinkSpec values)
 
 LnkChannel::LnkChannel(FlowProtocol &protocol, asio::any_io_executor executor, std::string node_id,
                        std::string tcp_address, std::uint16_t tcp_port, std::string udp_address, std::uint16_t udp_port)
-    : protocol_(protocol), executor_(executor), node_id_(std::move(node_id)), acceptor_(executor), udp_socket_(executor),
-      tcp_address_(std::move(tcp_address)), udp_address_(std::move(udp_address)), tcp_port_(tcp_port),
-      udp_port_(udp_port),
-      udp_writes_(executor, udp_send_queue_capacity)
+    : protocol_(protocol), executor_(executor), node_id_(std::move(node_id)), acceptor_(executor),
+      udp_socket_(executor), tcp_address_(std::move(tcp_address)), udp_address_(std::move(udp_address)),
+      tcp_port_(tcp_port), udp_port_(udp_port), udp_writes_(executor, udp_send_queue_capacity)
 {
 }
 
@@ -177,11 +175,10 @@ void LnkChannel::rollback() noexcept
     udp_socket_.close(ignored);
 }
 
-void LnkChannel::notify(const NodeLink &link, lnk::EventKind kind,
-                        std::string reason, std::string_view stage)
+void LnkChannel::notify(const NodeLink &link, lnk::EventKind kind, std::string reason, std::string_view stage)
 {
-    protocol_.emit({kind, link.spec.epoch, link.spec.id,
-                    std::string(stage.empty() ? link_stage(link.phase) : stage), std::move(reason)});
+    protocol_.emit({kind, link.spec.epoch, link.spec.id, std::string(stage.empty() ? link_stage(link.phase) : stage),
+                    std::move(reason)});
 }
 
 void LnkChannel::fail(NodeLink &link, std::string reason, std::string_view stage)
@@ -206,8 +203,7 @@ void LnkChannel::close(std::uint64_t id)
     if (state == LinkPhase::Ready)
     {
         PROXY_INFO_PRINT("Node link [x] id=%llu transport=%s peer=%s", static_cast<unsigned long long>(id),
-                         relay_protocol_name(link->spec.transport).data(),
-                         link->spec.peer.c_str());
+                         relay_protocol_name(link->spec.transport).data(), link->spec.peer.c_str());
     }
     link->resolver.cancel();
     asio::error_code ignored;
@@ -258,8 +254,7 @@ asio::awaitable<void> LnkChannel::prepare_udp(std::shared_ptr<NodeLink> link)
     try
     {
         const auto endpoints = co_await link->resolver.async_resolve(
-            link->spec.peer_address,
-            std::to_string(link->spec.udp_port),
+            link->spec.peer_address, std::to_string(link->spec.udp_port),
             asio::cancel_after(link->deadline - Clock::now(), asio::use_awaitable));
         if (link->phase == LinkPhase::Closed)
         {
@@ -323,8 +318,7 @@ bool LnkChannel::matches(const NodeLink &link, const CtrlMessage &message) const
     }
     const auto &p = *message.params;
     return p.value("id", std::uint64_t(0)) == link.spec.id && p.value("epoch", std::uint64_t(0)) == link.spec.epoch &&
-           p.value("node", std::string{}) == link.spec.peer &&
-           p.value("token", std::string{}) == link.spec.token &&
+           p.value("node", std::string{}) == link.spec.peer && p.value("token", std::string{}) == link.spec.token &&
            config::require_unsigned(p, "data_version", true) == LnkFrameHeader::version;
 }
 
@@ -341,8 +335,7 @@ void LnkChannel::mark_ready(NodeLink &link)
     }
     link.phase = LinkPhase::Ready;
     PROXY_INFO_PRINT("Node link [+] id=%llu transport=%s peer=%s", static_cast<unsigned long long>(link.spec.id),
-                     relay_protocol_name(link.spec.transport).data(),
-                     link.spec.peer.c_str());
+                     relay_protocol_name(link.spec.transport).data(), link.spec.peer.c_str());
     link.last_response = link.last_ping = Clock::now();
     protocol_.schedule_monitor(link.last_ping + heartbeat_interval);
     notify(link, lnk::EventKind::LinkReady);
@@ -365,8 +358,9 @@ asio::awaitable<void> LnkChannel::establish(std::shared_ptr<NodeLink> link)
                 fail(*link, "UDP attach exceeds frame body limit");
                 co_return;
             }
-            if (!enqueue(*link, Frame{{LnkFrType::Attach, false, static_cast<std::uint32_t>(payload.size()), link->spec.epoch},
-                         PooledBuffer(protocol_.payload_pool_, payload)}))
+            if (!enqueue(*link,
+                         Frame{{LnkFrType::Attach, false, static_cast<std::uint32_t>(payload.size()), link->spec.epoch},
+                               PooledBuffer(protocol_.payload_pool_, payload)}))
             {
                 fail(*link, "UDP send queue full");
             }
@@ -463,8 +457,8 @@ asio::awaitable<void> LnkChannel::accept(std::shared_ptr<tcp::socket> socket)
                 co_return;
             }
             link = found->second;
-            if (link->spec.transport != RelayProtocol::Tcp || link->spec.initiator ||
-                link->attached || !matches(*link, message))
+            if (link->spec.transport != RelayProtocol::Tcp || link->spec.initiator || link->attached ||
+                !matches(*link, message))
             {
                 co_return;
             }
@@ -577,10 +571,10 @@ asio::awaitable<void> LnkChannel::tcp_run(NodeLink &link)
         co_return;
     }
     // A physical Link has no business half-close: any loop exit cancels and joins its peer.
-    auto [order, read_error, write_error] = co_await asio::experimental::make_parallel_group(
-        asio::co_spawn(executor_, tcp_read(link), asio::deferred),
-        asio::co_spawn(executor_, tcp_write(link), asio::deferred))
-        .async_wait(asio::experimental::wait_for_one(), asio::use_awaitable);
+    auto [order, read_error, write_error] =
+        co_await asio::experimental::make_parallel_group(asio::co_spawn(executor_, tcp_read(link), asio::deferred),
+                                                         asio::co_spawn(executor_, tcp_write(link), asio::deferred))
+            .async_wait(asio::experimental::wait_for_one(), asio::use_awaitable);
     if (link.phase == LinkPhase::Closed)
     {
         co_return;
@@ -739,9 +733,9 @@ asio::awaitable<void> LnkChannel::udp_read()
                         fail(*link, "UDP acknowledgement exceeds frame body limit");
                         continue;
                     }
-                    if (!enqueue(*link, Frame{
-                            {LnkFrType::Attached, false, static_cast<std::uint32_t>(response.size()), header.epoch},
-                            PooledBuffer(protocol_.payload_pool_, response)}))
+                    if (!enqueue(*link, Frame{{LnkFrType::Attached, false, static_cast<std::uint32_t>(response.size()),
+                                               header.epoch},
+                                              PooledBuffer(protocol_.payload_pool_, response)}))
                     {
                         fail(*link, "UDP send queue full");
                     }
