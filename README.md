@@ -3,7 +3,9 @@
 本文是项目的编码风格约束，适用于贡献者和 AI 编码工具。新增与修改代码应遵循本文，异步代码参考
 `protocol/src/xfr_channel.cpp` 和 `protocol/src/tls_channel.cpp` 的既有风格。
 
-设计、配置、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)，测试分组与运行入口见 [测试目录](test/README.md)。
+设计、配置、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)，测试分组与运行入口见 [测试目录](test/README.md)；
+Node 间与 Node-Agent 链路的执行域、内存分配和协程现状见
+[中继链路内存与协程盘点](docs/中继链路内存与协程盘点.md)。
 RelayNode 直接持有 node/nodelink_mgr，统一协调 NodeLink 建连与 NodeFlow 路径事务，层次与 Pipeline/DatagramMgr 一致。
 NodeLinkMgr 直接持有 protocol/FlowProtocol；协议服务持有 lnk_channel 的邻接 TCP/UDP 传输并统一管理 Flow。
 部件通过 FlowStream/FlowDatagram 收发，层次与接口见 [设计文档中的协议边界](docs/RelayWeave设计.md#51-flowprotocol端点与本地逻辑流状态)。

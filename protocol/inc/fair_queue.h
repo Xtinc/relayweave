@@ -40,8 +40,8 @@ template <class Tag, class T, class Hash = std::hash<Tag>> class FairQueue
                 [&](const Entry &entry) { return entry.tag == tag; });
             position = previous == entries_.rend() ? entries_.begin() : previous.base();
         }
-        std::unordered_set<Tag, Hash> seen;
-        while (position != entries_.end() && seen.insert(position->tag).second)
+        seen_.clear();
+        while (position != entries_.end() && seen_.insert(position->tag).second)
         {
             ++position;
         }
@@ -76,6 +76,7 @@ template <class Tag, class T, class Hash = std::hash<Tag>> class FairQueue
     {
         last_inserted_ = entries_.end();
         entries_.clear();
+        seen_.clear();
     }
     bool empty() const noexcept
     {
@@ -89,6 +90,7 @@ template <class Tag, class T, class Hash = std::hash<Tag>> class FairQueue
   private:
     std::list<Entry> entries_;
     typename std::list<Entry>::iterator last_inserted_ = entries_.end();
+    std::unordered_set<Tag, Hash> seen_; // Reuse buckets across insertion scans.
 };
 
 #endif

@@ -406,13 +406,46 @@ void data_failures()
                     asio::buffer(udp_link_header), asio::buffer(large_header), asio::buffer(malformed_payload)};
                 co_await peer.async_send_to(buffers, source, asio::use_awaitable);
             }
-            const auto valid_header = LnkFrameHeader{LnkFrType::Data, false, 1, 7, 24}.encode();
+            auto send_payload = [&](std::span<const std::uint8_t> payload) -> asio::awaitable<void> {
+                const auto header = LnkFrameHeader{
+                    LnkFrType::Data, false, static_cast<std::uint32_t>(payload.size()), 7, 24}.encode();
+                const std::array<asio::const_buffer, 3> buffers{
+                    asio::buffer(udp_link_header), asio::buffer(header), asio::buffer(payload.data(), payload.size())};
+                co_await peer.async_send_to(buffers, source, asio::use_awaitable);
+            };
             const std::array<std::uint8_t, 1> valid_payload{42};
-            const std::array<asio::const_buffer, 3> valid_buffers{
-                asio::buffer(udp_link_header), asio::buffer(valid_header), asio::buffer(valid_payload)};
-            co_await peer.async_send_to(valid_buffers, source, asio::use_awaitable);
-            auto udp_received = co_await test_flow::receive(module, 7, 24);
-            require(udp_received == BytesBuf{42}, "malformed maximum-size UDP frame entered the flow");
+            co_await send_payload(valid_payload);
+            auto port = std::get<std::shared_ptr<lnk::FlowDatagram>>(co_await test_flow::port(module, 7, 24));
+            auto udp_received = co_await port->receive();
+            require(std::ranges::equal(udp_received.bytes(), valid_payload),
+                    "malformed maximum-size UDP frame entered the flow");
+            require(udp_received.allocation_size() == valid_payload.size(),
+                    "small UDP payload retained a maximum-size receive block");
+            for (const auto length : {std::size_t{0}, std::size_t{64}, std::size_t{512}, LnkFrameHeader::maximum_payload})
+            {
+                const BytesBuf expected(length, 0x7b);
+                co_await send_payload(expected);
+                auto received = co_await port->receive();
+                require(std::ranges::equal(received.bytes(), expected) && received.allocation_size() == length,
+                        "UDP payload changed or was not allocated at its actual length");
+                require(std::ranges::equal(udp_received.bytes(), valid_payload),
+                        "reusing the UDP receive array overwrote an earlier delivery");
+            }
+            // Exhaust the payload pool, then use an empty packet as a receive-order barrier.
+            const auto original_pool = test_access::FlowProtocol_payload_pool_(*module);
+            auto small_pool = std::make_shared<lnk::PayloadPool>(256);
+            test_access::FlowProtocol_payload_pool_(*module) = small_pool;
+            lnk::PooledBuffer occupied(small_pool, 256);
+            co_await send_payload(valid_payload);
+            co_await send_payload({});
+            auto empty = co_await port->receive();
+            require(empty.size() == 0, "UDP pool exhaustion did not drop the packet");
+            occupied = {};
+            co_await send_payload(valid_payload);
+            auto recovered = co_await port->receive();
+            require(std::ranges::equal(recovered.bytes(), valid_payload),
+                    "UDP receiver did not recover after payload pool exhaustion");
+            test_access::FlowProtocol_payload_pool_(*module) = original_pool;
             module->close_flow(24);
             // Delay Pong 1 until Ping 2 has been sent. An older, unacknowledged Ping
             // still proves liveness; duplicate and unsent sequences must not renew it.

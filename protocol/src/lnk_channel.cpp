@@ -663,13 +663,9 @@ asio::awaitable<void> LnkChannel::tcp_write(NodeLink &link)
 
 asio::awaitable<void> LnkChannel::udp_read()
 {
-    PooledBuffer buffer(protocol_.payload_pool_, datagram_receive_size);
+    std::array<std::uint8_t, datagram_receive_size> buffer;
     for (;;)
     {
-        if (!buffer.data())
-        {
-            buffer = PooledBuffer(protocol_.payload_pool_, datagram_receive_size);
-        }
         udp::endpoint source;
         auto [error, size] = co_await udp_socket_.async_receive_from(asio::buffer(buffer.data(), buffer.size()), source,
                                                                      use_nothrow_awaitable);
@@ -685,7 +681,8 @@ asio::awaitable<void> LnkChannel::udp_read()
         {
             continue;
         }
-        auto id = DatagramHeader::decode(buffer.bytes().first(DatagramHeader::length));
+        const auto datagram = std::span(buffer).first(size);
+        auto id = DatagramHeader::decode(datagram.first(DatagramHeader::length));
         if (!id)
         {
             continue;
@@ -703,14 +700,13 @@ asio::awaitable<void> LnkChannel::udp_read()
         try
         {
             const auto header =
-                LnkFrameHeader::decode(buffer.bytes().subspan<DatagramHeader::length, LnkFrameHeader::length>());
+                LnkFrameHeader::decode(datagram.subspan<DatagramHeader::length, LnkFrameHeader::length>());
             if (header.epoch != link->spec.epoch ||
                 size != DatagramHeader::length + LnkFrameHeader::length + header.body_length)
             {
                 continue;
             }
-            const auto payload =
-                buffer.bytes().subspan(DatagramHeader::length + LnkFrameHeader::length, header.body_length);
+            const auto payload = datagram.subspan(DatagramHeader::length + LnkFrameHeader::length, header.body_length);
             if (header.kind == LnkFrType::Attach || header.kind == LnkFrType::Attached)
             {
                 const auto message = decode_ctrl_datagram(payload);
@@ -754,8 +750,7 @@ asio::awaitable<void> LnkChannel::udp_read()
                 }
                 if (header.body_length)
                 {
-                    buffer.slice(DatagramHeader::length + LnkFrameHeader::length, header.body_length);
-                    process(*link, header, std::move(buffer));
+                    process(*link, header, PooledBuffer(protocol_.payload_pool_, payload));
                 }
                 else
                 {
@@ -764,7 +759,7 @@ asio::awaitable<void> LnkChannel::udp_read()
             }
         }
         catch (const std::exception &)
-        { /* Invalid datagrams never mutate the link. */
+        { /* Invalid datagrams or exhausted payload capacity drop this packet. */
         }
     }
 }

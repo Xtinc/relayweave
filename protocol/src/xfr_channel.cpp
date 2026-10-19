@@ -190,7 +190,7 @@ static void log_transfer_end(const asio::error_code &error, const char *protocol
 static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, TokenBucket *limiter,
                                           TrafficCounter *traffic)
 {
-    std::array<std::uint8_t, 64 * 1024> buffer{};
+    std::array<std::uint8_t, 32 * 1024> buffer{};
     for (;;)
     {
         auto [er, nr] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
