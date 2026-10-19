@@ -164,7 +164,6 @@ int main()
                           "RESET left reverse direction alive");
 
             // Keep many short responses buffered together, as with a browser opening parallel connections.
-            install(300);
             for (std::uint64_t id = 400; id < 448; ++id)
             {
                 install(id);
@@ -176,10 +175,6 @@ int main()
                 }
                 check_channel(test_flow::try_finish(a, id, false),
                               "parallel response FIN was rejected");
-                // The shared FIFO marker proves this response is buffered before submitting the next one.
-                check_channel(test_flow::try_send_data(a, 300, false, {1}),
-                              "parallel response marker was rejected");
-                static_cast<void>(co_await test_flow::receive(b, 7, 300));
             }
             for (std::uint64_t id = 400; id < 448; ++id)
             {
@@ -202,8 +197,6 @@ int main()
                 a->close_flow(id);
                 b->close_flow(id);
             }
-            a->close_flow(300);
-            b->close_flow(300);
             check_channel(link_ready(), "parallel response bursts closed the shared NodeLink");
 
             install(207);
@@ -211,23 +204,35 @@ int main()
             for (int i = 0; i < 128; ++i)
             {
                 check_channel(test_flow::try_send_data(a, 207, false, {9}),
-                              "could not fill endpoint receive queue");
+                              "could not buffer DATA at the endpoint");
             }
-            // The marker uses the same TCP FIFO; receiving it proves all preceding frames reached the endpoint.
-            check_channel(test_flow::try_send_data(a, 208, false, {10}),
-                          "full-queue marker rejected");
-            static_cast<void>(co_await test_flow::receive(b, 7, 208));
-            co_await test_flow::reset(a, 7, 207, false, "reset with full receive queue");
+            // Another Flow can overtake these frames. Wait for this Flow's actual admission.
+            const auto buffered = test_access::FlowProtocol_flows_(*b).at(207);
+            const auto expected = 128 * (lnk::PayloadPool::allocation_size(1) + lnk::Frame::buffer_overhead);
+            const auto receive_deadline = lnk::Clock::now() + 1s;
+            while (buffered->stream->directions[0].received_bytes < expected && lnk::Clock::now() < receive_deadline)
+            {
+                co_await pause_channel(1ms);
+            }
+            check_channel(buffered->stream->directions[0].received_bytes == expected,
+                          "DATA did not reach the endpoint before RESET");
+            co_await test_flow::reset(a, 7, 207, false, "reset with buffered receive queue");
             check_channel(test_flow::try_send_data(a, 208, false, {11}),
-                          "RESET marker rejected");
-            static_cast<void>(co_await test_flow::receive(b, 7, 208));
-            co_await pause_channel(5ms);
-            check_channel(std::ranges::count_if(events,
-                                               [](const auto &message) {
-                                                   return message.type() == CtrlCommand::FlowError &&
-                                                          message.params->at("flow_id") == 207 &&
-                                                          message.params->at("reason") == "reset with full receive queue";
-                                               }) == 2,
+                          "healthy Flow was rejected after RESET");
+            check_channel((co_await test_flow::receive(b, 7, 208)) == BytesBuf{11},
+                          "healthy Flow lost data after RESET");
+            const auto reset_errors = [&] {
+                return std::ranges::count_if(events, [](const auto &message) {
+                    return message.type() == CtrlCommand::FlowError && message.params->at("flow_id") == 207 &&
+                           message.params->at("reason") == "reset with buffered receive queue";
+                });
+            };
+            const auto reset_deadline = lnk::Clock::now() + 1s;
+            while (reset_errors() < 2 && lnk::Clock::now() < reset_deadline)
+            {
+                co_await pause_channel(1ms);
+            }
+            check_channel(reset_errors() == 2,
                           "endpoint queue capacity replaced RESET reason");
             check_channel(link_ready(), "RESET closed shared NodeLink");
             a->close_flow(208);

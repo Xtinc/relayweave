@@ -69,9 +69,12 @@ build/test/tools/test_tls_channel_peer client localhost 18443
   批次检查直接驱动真实端点的 `poll(now)`，覆盖初始授信、20 ms 精确期限、跨 Flow/方向共享、阈值/耗尽即时刷新、待发合并与关闭，不依赖 sleep。
   满 DATA 窗口仍能排入唯一 FIN；预算场景覆盖百流准入、超额拒绝和关闭复用；三跳停读保持有界，恢复保持 DATA/FIN 顺序，健康流继续推进。
 - 缓冲池（`pooled_buffer`）：硬容量、空闲 size class 回收、独占移动与切片、资源跨线程生命周期；预热后 20,000 次取块归还不增加上游分配。
+  分配计数仅在该测试可执行文件中拦截全局分配，不向生产池注入测试分配器；UDP 拥塞通过拒绝准入和健康 Flow 继续收发验证。
 - 端点交付（`lnk_flow_receive`）：保持调用方执行器及载荷地址；socket 写完成通知后才归还信用；关闭、取消唤醒挂起交接并排空任务，迟到通知不复活 Flow，业务缓冲可晚于协议销毁。
   单向 FIN 保留反向传输；FIN 后对向错误保留真实原因，接收失败取消信用等待中的发送者。
 - 共享 Link（`lnk_channel_flows`、`node_links`）：并发响应、FIN/RESET、准备期限、Flow 隔离、物理 writer 失败取消 reader 并清理依赖 Flow。
+  跨流交错后按被测 Flow 的接收计数等待积压到达；Link 关闭检查本队列排空、相邻队列关联帧删除，以及健康 Flow 的帧和信用保留。
+- 公平队列（`fair_queue`）：三种候选与生产版本的独立模型对拍、穷举/随机轨迹、有限状态进展、只可移动数据、哈希冲突及 Frame 所有权；`lnk_flow_control` 的 wire 场景验证真实写出交错和关闭隔离。
 - 多节点 UDP：65467 字节载荷在共享 Link 和多跳路径中双向完整转发；65468 字节在接入时丢弃；最大长度的非法帧不会妨碍后续合法帧；各处队列满立即丢包，不创建 stream 状态或消费确认。
 - 单节点 TLS 和多节点 TCP/TLS：请求半关闭后，服务方仍能完整返回超过两个最大 DATA 载荷的连续字节流，并正常传递反向 EOF。
 - TLS 1.2/1.3：DATA/FIN 业务半关闭、反向排空、仅载荷流量计数；未收到业务 FIN 的异常截断及非法长度必须失败并排空对向。
@@ -83,3 +86,6 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 
 新增测试应验证可观察的业务结果、边界或真实故障，优先使用协议对端和公开接口。
 必要的状态构造或检查放在 `support/` 或测试翻译单元中；不为测试增加业务友元、开关或诊断接口。
+
+公平队列的手动 Release 容器对比见 [FairQueue](../docs/FairQueue.md)。`fair_queue_compare` 与
+`fair_queue_memory` 分离计时和分配计数，不加入 CTest 或既有五个通道 benchmark。

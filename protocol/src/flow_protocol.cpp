@@ -196,10 +196,6 @@ bool lnk::FlowDatagram::try_send(std::span<const std::uint8_t> payload)
     {
         // Pool exhaustion drops this packet without interrupting the shared UDP listener.
     }
-    if (auto channel = protocol_.lock())
-    {
-        channel->dropped_datagrams_.fetch_add(1, std::memory_order_relaxed);
-    }
     return false;
 }
 
@@ -926,7 +922,7 @@ void FlowProtocol::Stream::publish_credit(const std::shared_ptr<FlowState> &flow
         return;
     }
     const auto &link = protocol_.links_.connections_.at(input);
-    // Link closure synchronously closes adjacent Flows before removing the Link.
+    // Link removal and adjacent Flow closure run synchronously on the data executor.
     direction.receive_limit = limit;
     if (!protocol_.links_.enqueue(*link, Frame{{LnkFrType::Credit, reverse, 0, flow->epoch, flow->id, limit}}))
     {
@@ -1134,12 +1130,7 @@ bool FlowProtocol::Datagram::try_send(const std::shared_ptr<FlowState> &flow, bo
     assert(flow->phase == FlowState::Phase::Active && flow->transport == RelayProtocol::Udp);
     Frame packet{{LnkFrType::Data, reverse, static_cast<std::uint32_t>(data.size()), flow->epoch, flow->id},
                  std::move(data)};
-    if (!route(flow, packet))
-    {
-        protocol_.dropped_datagrams_.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
-    return true;
+    return route(flow, packet);
 }
 
 void FlowProtocol::Datagram::receive(const std::shared_ptr<FlowState> &flow, Frame frame)
@@ -1149,10 +1140,7 @@ void FlowProtocol::Datagram::receive(const std::shared_ptr<FlowState> &flow, Fra
         return;
     }
     protocol_.forwarded_bytes_.fetch_add(frame.payload.size(), std::memory_order_relaxed);
-    if (!route(flow, frame))
-    {
-        protocol_.dropped_datagrams_.fetch_add(1, std::memory_order_relaxed);
-    }
+    route(flow, frame); // Full output drops this packet without closing the Flow.
 }
 
 void FlowProtocol::Datagram::close_port(const std::shared_ptr<lnk::FlowDatagram> &port, std::string reason)

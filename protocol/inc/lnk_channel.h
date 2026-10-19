@@ -1,5 +1,6 @@
 #ifndef RELAYWEAVE_LNK_CHANNEL_H
 #define RELAYWEAVE_LNK_CHANNEL_H
+#include "fair_queue.h"
 #include "tls_channel.h"
 #include <algorithm>
 #include <array>
@@ -23,16 +24,15 @@ using Clock = std::chrono::steady_clock;
 struct FlowState;
 
 // Frame storage and its shared allocator belong together with the neighbour transport.
-// Exclusive, movable byte storage. Shared resources follow their buffers across executors;
-// borrowed resources must outlive the buffer. Bytes are not initialised.
+// Exclusive, movable byte storage. Shared resources follow their buffers across executors.
+// Bytes are not initialised.
 class PooledBuffer
 {
   private:
     struct Deleter
     {
-        std::pmr::memory_resource *resource = nullptr;
         std::size_t size = 0;
-        std::shared_ptr<std::pmr::memory_resource> owner;
+        std::shared_ptr<std::pmr::memory_resource> resource;
 
         void operator()(std::uint8_t *storage) const noexcept
         {
@@ -43,24 +43,9 @@ class PooledBuffer
   public:
     PooledBuffer() noexcept = default;
 
-    PooledBuffer(std::pmr::memory_resource &resource, std::size_t size)
-        : storage_(size ? static_cast<std::uint8_t *>(resource.allocate(size)) : nullptr, Deleter{&resource, size, {}}),
-          view_(storage_.get(), size)
-    {
-    }
-
-    PooledBuffer(std::pmr::memory_resource &resource, std::span<const std::uint8_t> bytes)
-        : PooledBuffer(resource, bytes.size())
-    {
-        if (!bytes.empty())
-        {
-            std::memcpy(data(), bytes.data(), bytes.size());
-        }
-    }
-
     PooledBuffer(std::shared_ptr<std::pmr::memory_resource> resource, std::size_t size)
         : storage_(size ? static_cast<std::uint8_t *>(resource->allocate(size)) : nullptr,
-                   Deleter{resource.get(), size, resource}),
+                   Deleter{size, resource}),
           view_(storage_.get(), size)
     {
     }
@@ -135,8 +120,7 @@ class PooledBuffer
 class PayloadPool : public std::pmr::memory_resource
 {
   public:
-    explicit PayloadPool(std::size_t budget, std::pmr::memory_resource *upstream = std::pmr::new_delete_resource())
-        : budget_(budget), upstream_(upstream)
+    explicit PayloadPool(std::size_t budget) : budget_(budget)
     {
     }
     ~PayloadPool() override;
@@ -151,11 +135,25 @@ class PayloadPool : public std::pmr::memory_resource
     void do_deallocate(void *block, std::size_t requested, std::size_t alignment) override;
     bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override;
     const std::size_t budget_;
-    std::pmr::memory_resource *const upstream_;
     std::mutex mutex_;
     std::size_t retained_ = 0;
     std::size_t live_ = 0;
     std::array<void *, 9> free_{};
+};
+
+struct FlowWriteTag
+{
+    const FlowState *flow;
+    bool reverse;
+    bool operator==(const FlowWriteTag &) const = default;
+};
+
+struct FlowWriteHash
+{
+    std::size_t operator()(const FlowWriteTag &tag) const noexcept
+    {
+        return std::hash<const FlowState *>{}(tag.flow) ^ std::size_t(tag.reverse);
+    }
 };
 
 struct Frame
@@ -208,7 +206,7 @@ struct NodeLink
     std::optional<asio::ip::tcp::socket> socket;
     asio::ip::tcp::resolver resolver;
     asio::experimental::channel<void(asio::error_code)> writable;
-    std::deque<Frame> writes;
+    FairQueue<FlowWriteTag, Frame, FlowWriteHash> writes;
     std::deque<Frame> controls;
     // Coalesced outgoing control frames, not a second set of Flow credit counters.
     std::map<std::pair<std::uint64_t, bool>, LnkFrameHeader> credits;

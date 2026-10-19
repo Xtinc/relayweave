@@ -190,10 +190,6 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     {
         return forwarded_bytes_.exchange(0, std::memory_order_relaxed);
     }
-    std::uint64_t take_dropped_datagrams() noexcept
-    {
-        return dropped_datagrams_.exchange(0, std::memory_order_relaxed);
-    }
 
     void prepare_flow(lnk::FlowSpec spec);
     void commit_flow(std::uint64_t id);
@@ -284,7 +280,6 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     std::map<std::uint64_t, Clock::time_point> retired_;
     std::size_t reserved_bytes_ = 0;
     std::atomic<std::uint64_t> forwarded_bytes_{0};
-    std::atomic<std::uint64_t> dropped_datagrams_{0};
 
     // Control notifications cross executors.
     asio::experimental::concurrent_channel<void(asio::error_code, lnk::ProtocolEvent)> events_;

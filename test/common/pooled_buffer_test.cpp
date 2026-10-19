@@ -2,6 +2,8 @@
 #include <asio.hpp>
 #include <asio/experimental/channel.hpp>
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <future>
 #include <iostream>
 #include <map>
@@ -9,6 +11,74 @@
 #include <vector>
 
 using lnk::PooledBuffer;
+
+// Allocation instrumentation belongs only to this test executable. Track pool
+// operations on each participating thread, excluding fixtures and thread setup.
+namespace allocation_count
+{
+struct Header
+{
+    void *base;
+    std::size_t bytes;
+    bool tracked;
+};
+thread_local bool enabled = false;
+std::atomic<std::size_t> allocations{0};
+std::atomic<std::size_t> live{0};
+
+struct Scope
+{
+    Scope() { enabled = true; }
+    ~Scope() { enabled = false; }
+};
+
+void *allocate(std::size_t bytes, std::size_t alignment)
+{
+    const auto base = std::malloc(bytes + alignment + sizeof(Header));
+    if (!base)
+    {
+        throw std::bad_alloc();
+    }
+    const auto start = reinterpret_cast<std::uintptr_t>(base) + sizeof(Header);
+    const auto address = (start + alignment - 1) & ~(alignment - 1);
+    const auto header = reinterpret_cast<Header *>(address) - 1;
+    *header = Header{base, bytes, enabled};
+    if (enabled)
+    {
+        ++allocations;
+        live += bytes;
+    }
+    return reinterpret_cast<void *>(address);
+}
+void release(void *memory) noexcept
+{
+    if (memory)
+    {
+        const auto header = static_cast<Header *>(memory) - 1;
+        if (header->tracked)
+        {
+            live -= header->bytes;
+        }
+        std::free(header->base);
+    }
+}
+} // namespace allocation_count
+
+void *operator new(std::size_t bytes) { return allocation_count::allocate(bytes, alignof(std::max_align_t)); }
+void *operator new[](std::size_t bytes) { return ::operator new(bytes); }
+void operator delete(void *p) noexcept { allocation_count::release(p); }
+void operator delete[](void *p) noexcept { ::operator delete(p); }
+void operator delete(void *p, std::size_t) noexcept { ::operator delete(p); }
+void operator delete[](void *p, std::size_t) noexcept { ::operator delete(p); }
+void *operator new(std::size_t bytes, std::align_val_t alignment)
+{
+    return allocation_count::allocate(bytes, static_cast<std::size_t>(alignment));
+}
+void *operator new[](std::size_t bytes, std::align_val_t alignment) { return ::operator new(bytes, alignment); }
+void operator delete(void *p, std::align_val_t) noexcept { ::operator delete(p); }
+void operator delete[](void *p, std::align_val_t) noexcept { ::operator delete(p); }
+void operator delete(void *p, std::size_t, std::align_val_t) noexcept { ::operator delete(p); }
+void operator delete[](void *p, std::size_t, std::align_val_t) noexcept { ::operator delete(p); }
 
 void require_buffer(bool condition, const char *reason)
 {
@@ -55,10 +125,10 @@ class CountingResource : public std::pmr::memory_resource
 
 void ownership()
 {
-    CountingResource resource;
+    auto resource = std::make_shared<CountingResource>();
     {
         PooledBuffer empty(resource, 0);
-        require_buffer(resource.allocations == 0, "empty control frame allocated storage");
+        require_buffer(resource->allocations == 0, "empty control frame allocated storage");
         PooledBuffer packet(resource, 128);
         auto storage = packet.data();
         packet.data()[40] = 17;
@@ -74,7 +144,7 @@ void ownership()
         require_buffer(assigned.data() == storage + 40 && assigned.size() == 24 && assigned.allocation_size() == 128 &&
                            assigned.bytes().front() == 17 && assigned.bytes().back() == 255,
                        "move copied or corrupted the payload view");
-        require_buffer(resource.allocations == 2 && resource.live.size() == 1,
+        require_buffer(resource->allocations == 2 && resource->live.size() == 1,
                        "move assignment allocated or retained the previous block");
         auto &same = assigned;
         assigned = std::move(same);
@@ -85,13 +155,13 @@ void ownership()
         require_buffer(std::equal(copied.bytes().begin(), copied.bytes().end(), external.begin()),
                        "public payload import changed bytes");
     }
-    require_buffer(resource.valid_deallocations && resource.live.empty(),
+    require_buffer(resource->valid_deallocations && resource->live.empty(),
                    "offset payload was not returned with its original address, size and alignment");
 }
 
 void channel_transfer()
 {
-    CountingResource resource;
+    auto resource = std::make_shared<CountingResource>();
     {
         asio::io_context io(1);
         asio::experimental::channel<void(asio::error_code, PooledBuffer)> queue(io, 1);
@@ -108,21 +178,23 @@ void channel_transfer()
         io.run();
         auto packet = pending.get();
         require_buffer(packet.data() == storage && packet.size() == 1 && packet.bytes().front() == 42 &&
-                           resource.allocations == 2,
+                           resource->allocations == 2,
                        "channel or coroutine transfer copied or reallocated payload storage");
     }
-    require_buffer(resource.valid_deallocations && resource.live.empty(), "queued buffer storage leaked");
+    require_buffer(resource->valid_deallocations && resource->live.empty(), "queued buffer storage leaked");
 }
 
 void pool_reuse()
 {
-    CountingResource upstream;
+    const auto initial_live = allocation_count::live.load();
+    const auto initial_allocations = allocation_count::allocations.load();
     {
         constexpr std::array<std::size_t, 4> sizes{64, 512, 4096, 4137};
-        auto pool = std::make_shared<lnk::PayloadPool>(4 * 1024 * 1024, &upstream);
+        auto pool = std::make_shared<lnk::PayloadPool>(4 * 1024 * 1024);
         {
             std::vector<PooledBuffer> warm;
             warm.reserve(400);
+            const allocation_count::Scope counting;
             for (auto size : sizes)
             {
                 for (int i = 0; i < 100; ++i)
@@ -131,16 +203,21 @@ void pool_reuse()
                 }
             }
         }
-        const auto warmed_allocations = upstream.allocations;
-        for (int i = 0; i < 10000; ++i)
+        const auto warmed_allocations = allocation_count::allocations.load();
+        require_buffer(warmed_allocations > initial_allocations, "allocation instrumentation missed the pool");
         {
-            PooledBuffer packet(pool, sizes[i % sizes.size()]);
-            packet.bytes().front() = 42;
-            packet.bytes().back() = 255;
+            const allocation_count::Scope counting;
+            for (int i = 0; i < 10000; ++i)
+            {
+                PooledBuffer packet(pool, sizes[i % sizes.size()]);
+                packet.bytes().front() = 42;
+                packet.bytes().back() = 255;
+            }
         }
-        require_buffer(upstream.allocations == warmed_allocations,
+        require_buffer(allocation_count::allocations == warmed_allocations,
                        "steady packet traffic kept allocating from the upstream heap after warmup");
         auto transfer = [pool, sizes] {
+            const allocation_count::Scope counting;
             for (int i = 0; i < 5000; ++i)
             {
                 PooledBuffer packet(pool, sizes[i % sizes.size()]);
@@ -152,24 +229,23 @@ void pool_reuse()
         std::thread second(transfer);
         first.join();
         second.join();
-        require_buffer(upstream.allocations == warmed_allocations,
+        require_buffer(allocation_count::allocations == warmed_allocations,
                        "cross-executor pool reuse kept allocating from the upstream heap");
         std::cout << "[PASS] 20000 pooled packets required 0 upstream allocations after warmup\n";
     }
-    require_buffer(upstream.valid_deallocations && upstream.live.empty(), "pool retained storage after destruction");
+    require_buffer(allocation_count::live == initial_live, "pool retained storage after destruction");
 }
 
 // Verify the shared pool's hard capacity and idle-block reclamation independently of Flow credit.
 void pool_capacity()
 {
-    CountingResource upstream;
+    const auto initial_live = allocation_count::live.load();
     auto retained_bytes = [&] {
-        std::size_t bytes = 0;
-        for (const auto &[memory, allocation] : upstream.live) bytes += allocation.first;
-        return bytes;
+        return allocation_count::live.load() - initial_live;
     };
     {
-        lnk::PayloadPool pool(4096, &upstream);
+        auto pool = std::make_shared<lnk::PayloadPool>(4096);
+        const allocation_count::Scope counting;
         for (int round = 0; round < 64; ++round)
         {
             {
@@ -197,17 +273,18 @@ void pool_capacity()
             require_buffer(retained_bytes() <= 4096, "pool retained unbounded storage");
         }
     }
-    require_buffer(upstream.valid_deallocations && upstream.live.empty(), "capacity test leaked pool storage");
+    require_buffer(allocation_count::live == initial_live, "capacity test leaked pool storage");
 }
 
 void shared_resource_lifetime()
 {
-    CountingResource upstream;
+    const auto initial_live = allocation_count::live.load();
     std::weak_ptr<lnk::PayloadPool> weak;
     PooledBuffer payload;
     {
-        auto pool = std::make_shared<lnk::PayloadPool>(65536, &upstream);
+        auto pool = std::make_shared<lnk::PayloadPool>(65536);
         weak = pool;
+        const allocation_count::Scope counting;
         payload = PooledBuffer(pool, 1024);
         payload.bytes().front() = 42;
         payload.slice(0, 1);
@@ -218,7 +295,7 @@ void shared_resource_lifetime()
         payload = {};
     });
     writer.join();
-    require_buffer(weak.expired() && upstream.valid_deallocations && upstream.live.empty(),
+    require_buffer(weak.expired() && allocation_count::live == initial_live,
                    "last business delivery did not release its shared allocator");
 }
 

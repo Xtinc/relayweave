@@ -1373,6 +1373,13 @@ FIN 只归还自身的管理占用，不增加 `R_i`；写入失败进入关闭�
 同一 Link 上尚未发出的同一 `(flow_id, reverse)` CREDIT 合并为最新绝对上限。
 物理 writer 优先处理控制帧，连续最多 16 个控制帧后允许已就绪 DATA 推进；普通控制 FIFO 与
 待发 CREDIT 表分别维护。相邻 TCP Link 启用 TCP_NODELAY。控制帧仍需等待当前 socket 写入和事件循环调度。
+
+TCP DATA/FIN 进入共享 `FairQueue`，标签由准确的 Flow 对象身份和方向组成。
+入队先找同标签最后一帧，再向后跳过一段标签不重复的帧，在首次重复之前插入；无同标签则从队首扫描。
+writer 仍只取队首，不维护轮次、每流子队列或调度游标；同方向 DATA/FIN 顺序不变。
+所有队列为空时等待原 writable 通知，取得信用和写完成后的缓存释放流程不变。
+这是近似帧公平，不保证字节等份或固定等待时间；算法、验证范围和容器比较见 [FairQueue](FairQueue.md)。
+
 首个小额释放的计划等待为 20 ms；批次内后续释放的计划等待为 0～20 ms。
 这是到批次的计划等待，不是 CREDIT 到达上游的时延上界。各节点独立形成批次，不要求时钟对齐。
 
@@ -1412,7 +1419,7 @@ c = 32768 + 128 = 32896
 足够再发送 3 帧，之后仍留下 31616 的零头。窗口按整帧准入，不因剩余空间非零就允许超额发送。
 
 共享 Link 的物理读循环继续解析其他 Flow 和控制帧，不在这条 Flow 的下游空间上挂起。
-有信用的其他 Flow 可以进入共享写队列；FIFO 排队和 TCP 丢包造成的队头阻塞仍存在。
+有信用的其他 Flow 可以进入共享队列并按标签交错；同流 FIFO、当前写入及 TCP 丢包造成的队头阻塞仍存在。
 这保证协议层不会因等待某条 Flow 的信用而停读整条 Link，不承诺各流的带宽份额或延迟上界。
 
 #### 5.6.6 节点容量承诺、实际占用与 UDP 边界
@@ -1469,7 +1476,7 @@ TCP 端点队列的最坏容量为 `W/h+1=2561` 项，允许窗口占满后再�
 | Link 申请 / 端点授权 | 各 1000 条 | 拒绝新申请 |
 | master 活动及关闭中 Flow | 合计 1000 条 | 拒绝新事务 |
 | FlowProtocol `flows_ + retired_` | 合计 1000 条；关闭身份短暂保留，禁止立即复用 | 拒绝 prepare |
-| 每 TCP Link DATA FIFO | 从各 Flow 方向的预留额度准入 | 缺信用帧留在本 Flow；共享 writer 不另设信用等待 |
+| 每 TCP Link DATA/FIN FairQueue | 从各 Flow 方向的预留额度准入 | 缺信用帧留在本 Flow；同流 FIFO、跨流交错，共享 writer 不另设信用等待 |
 | 每 TCP Link 一般控制 FIFO | 4096 条；CREDIT 另按 Flow/方向合并，项数受 Flow 身份容量约束 | 控制准入失败关闭相应 Flow 或 Link |
 | 每 UDP Flow 端点发送 / 接收队列 | 各 16 包 | 丢当前包，保留健康 Flow |
 | 共享 UDP 发送队列 | 100 项；其中业务最多 96 项 | 为保活留 4 项；业务超限丢包 |
@@ -1478,8 +1485,7 @@ TCP 端点队列的最坏容量为 `W/h+1=2561` 项，允许窗口占满后再�
 | Node 数据 TCP 握手接入 | 100 个 | 拒绝新 socket |
 
 UDP `try_send` 返回 false 表示当前包没有入队；出队立即释放位置，每个串行终点写循环可另持有一个在发包。
-UDP 不创建 Stream 状态，不发送 CREDIT，不等待空间，不做逐包消费确认；
-`take_dropped_datagrams` 可读取 Flow 准入、转发和终点缓存拥塞的丢包计数。
+UDP 不创建 Stream 状态，不发送 CREDIT，不等待空间，不做逐包消费确认。
 
 #### 5.6.7 窗口、信用周转时间与性能分析
 
@@ -1555,8 +1561,8 @@ W >= r × T_i / (8 × η_i)
 该估算不描述批次内其他方向的剩余等待，更不能直接预测整条路径的用户吞吐。
 τ 不改变 W、预留预算或缓存上界；节点级批次也不保证 RSS 下降。
 
-动态窗口、公平调度（如 DRR）和跨帧的有界批量写仍为待实现项。
-当前只有共享 FIFO、CREDIT 合并和有界控制优先；不提供端到端业务 ACK、逐流公平带宽或延迟保证。
+动态窗口、字节公平调度（如 DRR）和跨帧的有界批量写仍为待实现项。
+当前提供共享队列的标签交错、CREDIT 合并和有界控制优先；不提供端到端业务 ACK、逐流公平字节带宽或延迟保证。
 
 #### 5.6.8 失败边界、源码定位与验证
 
@@ -1583,13 +1589,14 @@ W >= r × T_i / (8 × η_i)
 | DATA 准入、队首信用检查和接收授信校验 | 同文件：`Stream::try_send`、`receive`、`flush`、`receive_credit` |
 | 写完成、信用刷新与期限 | 同文件：`written`、`Stream::release_buffer`、`publish_credit`、`poll` |
 | 首末交接与串行消费确认 | 同文件的 `Stream::send_loop/receive_loop`；[`pipeline_mgr.cpp`](../node/src/pipeline_mgr.cpp) 的 `read_remote_pair/write_remote_pair` |
-| 控制合并、共享 FIFO 与物理写完成 | [`lnk_channel.cpp`](../protocol/src/lnk_channel.cpp)：`enqueue`、`tcp_read`、`tcp_write` |
+| 控制合并、共享队列与物理写完成 | [`lnk_channel.cpp`](../protocol/src/lnk_channel.cpp)：`enqueue`、`tcp_read`、`tcp_write`；[`fair_queue.h`](../protocol/inc/fair_queue.h) 封装按标签排列与删除 |
 
 回归按组件职责归类，使用生产端点的异步发送、可选载荷/EOF、布尔 Datagram 准入和异常语义。
 
 | 测试 | 覆盖边界 |
 |---|---|
 | [`lnk_flow_control_test.cpp`](../test/protocol/lnk_flow_control_test.cpp) | 本地准入与取消、节点信用批次、阈值/耗尽刷新、满窗口 FIN、信用校验、预算退还、UDP 有界丢包及三跳停读恢复 |
+| [`fair_queue_test.cpp`](../test/protocol/fair_queue_test.cpp) | 独立参考模型、穷举/随机轨迹、有限状态进展、哈希冲突与 Frame 所有权；真实 writer 交错由上项 wire 场景验证 |
 | [`lnk_flow_receive_test.cpp`](../test/protocol/lnk_flow_receive_test.cpp) | 端点交付、载荷所有权、执行器、消费确认、取消和任务排空 |
 | [`lnk_channel_flows_test.cpp`](../test/protocol/lnk_channel_flows_test.cpp) | 真实共享 Link 的 Flow 生命周期、FIN/RESET、并发响应和隔离 |
 | [`pooled_buffer_test.cpp`](../test/common/pooled_buffer_test.cpp) | 池硬容量、空闲块回收、size class、复用和跨线程存储生命周期 |
@@ -1668,7 +1675,7 @@ H StreamPipeline::read_remote_pair
   → FlowProtocol::Stream::send_loop：接手最多一块未准入数据
   → Stream::try_send：窗口足够才移动池块到 Frame、计入 buffered_bytes
   → Stream::route：Frame 移入该方向 pending_frames
-  → Stream::flush：出边信用足够时移入 NodeLink::writes
+  → Stream::flush：出边信用足够时按 Flow/方向标签移入 NodeLink::writes（FairQueue）
   → LnkChannel::tcp_write：唯一 writer 写头与载荷
   → FlowProtocol::written：释放池块和本跳占用，唤醒本地发送者
 
@@ -1739,7 +1746,8 @@ PooledBuffer 保存池块的原分配地址、大小及 span 视图，切片不�
 在途写操作即使越过流表删除仍能持有原帧至完成，但关闭后的迟到 written 不归还信用。
 FlowProtocol、端口和业务池缓冲共享池的生命周期。PooledBuffer 的 deleter 持有资源引用，
 只保活分配器，不保活整个协议；stop 排空协议任务，已交付业务的缓冲可在协议停止、销毁后继续存活，
-最后一块缓冲或端口释放后池再销毁。借用 PMR resource 的构造方式仅由调用者保证其存活期限。
+最后一块缓冲或端口释放后池再销毁。缓冲只接受共享资源，不提供借用资源的构造路径。
+PayloadPool 固定使用标准堆作为上游；分配计数由测试可执行文件完成，生产类不保留测试注入参数。
 
 每次网络输入使用 std::map 查 Flow/Link，为 O(log F)/O(log L)；端点长期任务持有已绑定实例，
 逐帧不查流表。信用计算是常数次整数比较与加减，队列准入与移动摊销 O(1)，状态随 Flow 数线性增长。
@@ -2443,7 +2451,7 @@ RemotePair 使用 65467 字节的读取缓冲，从 Agent stream 读到多少就
 
 DATA/FIN 没有逐帧远端业务确认，交接完成只保证数据侧拥有载荷，不能解释为已经入队或末端应用已经收到。
 每跳可靠与顺序由该 TCP socket 提供。每 Flow 每方向有固定信用窗口，prepare 时预留全节点缓存预算。
-缺少出边信用的帧停留在本方向，取得信用后进入 Link FIFO；本地方向窗口满时异步提交挂起。
+缺少出边信用的帧停留在本方向，取得信用后进入 Link 的 FairQueue，按流标签交错、从队首写出；本地方向窗口满时异步提交挂起。
 中间节点向下游写完、终点向 Agent 写完并释放公开载荷后，才归还相邻入边信用。
 正常拥塞不关闭 Flow；越窗、格式错误与真实 I/O 失败仍有明确失败边界，
 数学模型见 5.6.2，背压实例见 5.6.5，容量与性能分析见 5.6.6、5.6.7。
@@ -3021,7 +3029,7 @@ Dashboard 的 HistoryStore 由应用创建和关闭，采集客户端只使用�
 | 扩展 | 合理位置 | 必须明确的语义 |
 |---|---|---|
 | 按需增长窗口 | FlowProtocol 的方向授信与全局预留账 | 已授出的额度不能立即收回，增长前必须取得预算 |
-| 公平调度 | NodeLink 物理写链之前 | 在有界逻辑流队列中选择下一帧，保持同方向 DATA/FIN 顺序 |
+| 按字节或权重公平调度 | NodeLink 物理写链之前 | 在已有标签交错基础上分配字节份额或权重，保持同方向 DATA/FIN 顺序 |
 | 多物理通道或连接池 | NodeLinkMgr 建连策略与 LnkChannel 安装映射 | 安装 Flow 时固定选中 Link，不能每帧任意换 socket |
 | 存量换路 | NodeLinkMgr 路径事务与 FlowProtocol 路由状态 | 需要路径代次、旧数据排空、确认和顺序保证，不能仅改目的索引 |
 | 更大 Node DATA / UDP 载荷 | LnkFrameHeader 与相关接入/队列预算 | 协调升级节点格式及上限、内存计费和超长报文测试，不缩小本地接收缓冲 |

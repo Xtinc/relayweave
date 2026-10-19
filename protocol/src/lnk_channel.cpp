@@ -20,7 +20,7 @@ void lnk::PayloadPool::reclaim(std::size_t target)
         {
             auto block = free_[index];
             free_[index] = *static_cast<void **>(block);
-            upstream_->deallocate(block, size);
+            std::pmr::new_delete_resource()->deallocate(block, size);
             retained_ -= size;
         }
     }
@@ -52,7 +52,7 @@ void *lnk::PayloadPool::do_allocate(std::size_t requested, std::size_t alignment
         {
             throw std::bad_alloc();
         }
-        block = upstream_->allocate(size);
+        block = std::pmr::new_delete_resource()->allocate(size);
         retained_ += size;
     }
     live_ += size;
@@ -83,7 +83,7 @@ using lnk::NodeLink;
 using LinkPhase = NodeLink::Phase;
 
 constexpr std::size_t udp_send_queue_capacity = 100;
-// Reserve admission capacity for control frames; the shared FIFO preserves DATA/FIN order.
+// Reserve admission capacity for control frames in the shared UDP send queue.
 constexpr std::size_t reserved_control_frames = 4;
 constexpr std::size_t control_queue_capacity = 4096;
 constexpr std::size_t max_pending_accepts = 100;
@@ -217,10 +217,12 @@ void LnkChannel::close(std::uint64_t id)
         link->writable.cancel();
         link->writable.close();
     }
-    protocol_.link_flows_closed(id);
+    // Drain this Link once; Flow closure only needs to discard from surviving Links.
     connections_.erase(found);
+    link->writes.clear();
     link->controls.clear();
     link->credits.clear();
+    protocol_.link_flows_closed(id);
     notify(*link, lnk::EventKind::LinkClosed, {}, link_stage(state));
 }
 
@@ -501,7 +503,8 @@ bool LnkChannel::enqueue(NodeLink &link, Frame frame)
         if (frame.header.kind == LnkFrType::Data || frame.header.kind == LnkFrType::Fin)
         {
             assert(frame.owner);
-            link.writes.push_back(std::move(frame));
+            const lnk::FlowWriteTag tag{frame.owner.get(), frame.header.reverse};
+            link.writes.push(tag, std::move(frame));
         }
         else if (frame.header.kind == LnkFrType::Credit)
         {
@@ -653,7 +656,7 @@ asio::awaitable<void> LnkChannel::tcp_write(NodeLink &link)
         else
         {
             queued = std::move(link.writes.front());
-            link.writes.pop_front();
+            link.writes.pop();
             control_run = 0;
         }
         const auto header = queued.header.encode();
@@ -875,7 +878,8 @@ void LnkChannel::discard(std::uint64_t link_id, const std::shared_ptr<FlowState>
         return;
     }
     auto &link = *found->second;
-    std::erase_if(link.writes, [&](const Frame &frame) { return frame.owner == flow; });
+    link.writes.erase({flow.get(), false});
+    link.writes.erase({flow.get(), true});
     link.credits.erase({flow->id, false});
     link.credits.erase({flow->id, true});
 }

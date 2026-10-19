@@ -254,12 +254,16 @@ static void datagram_admission_tests()
             check(fixture.send(200, {9}), "UDP burst was rejected early");
         }
         check(!fixture.send(200, {10}), "full UDP queue did not drop packet");
-        check(fixture.channel->take_dropped_datagrams() == 1, "UDP overload was not counted");
         check(!test_access::FlowProtocol_flows_(*fixture.channel).at(200)->stream, "UDP created stream flow state");
         auto frame = fixture.receive(200);
         check(frame == BytesBuf{9}, "UDP payload changed");
         check(fixture.send(200, {11}), "UDP dequeue did not free capacity");
         check(fixture.receive(200) == BytesBuf{9}, "UDP incorrectly requires consumption confirmation");
+        for (int index = 0; index < 14; ++index)
+        {
+            check(fixture.receive(200) == BytesBuf{9}, "UDP overload changed queued packets");
+        }
+        check(fixture.receive(200) == BytesBuf{11}, "UDP overload admitted the rejected packet or lost recovery data");
         const auto port = std::get<std::shared_ptr<lnk::FlowDatagram>>(fixture.port(200));
         int accepted = 0;
         asio::post(fixture.caller, [&] {
@@ -271,7 +275,6 @@ static void datagram_admission_tests()
         fixture.pump();
         // One packet is handed to the waiting consumer; the channel itself holds exactly 16 more.
         check(accepted == 17, "UDP cross-domain queue did not enforce fixed capacity");
-        check(fixture.channel->take_dropped_datagrams() >= 1, "UDP channel rejection was not counted");
         check(test_access::FlowProtocol_flows_(*fixture.channel).contains(200), "UDP overload closed healthy Flow");
     }
     {
@@ -284,8 +287,12 @@ static void datagram_admission_tests()
             check(!port->try_send(payload), "UDP pool exhaustion did not drop the packet");
         });
         fixture.pump();
-        check(fixture.channel->take_dropped_datagrams() == 1, "UDP pool exhaustion was not counted");
         check(test_access::FlowProtocol_flows_(*fixture.channel).contains(250), "UDP pool exhaustion closed Flow");
+        asio::post(fixture.caller, [port] {
+            check(port->try_send(std::array<std::uint8_t, 1>{42}), "UDP did not recover after pool exhaustion");
+        });
+        fixture.pump();
+        check(fixture.receive(250) == BytesBuf{42}, "UDP pool exhaustion changed the next packet");
         asio::post(fixture.caller, [port] {
             port->close();
             check(!port->try_send(std::array<std::uint8_t, 1>{1}), "closed UDP port accepted packet");
@@ -588,6 +595,54 @@ void fin_and_close()
               "close or late completion published stale credit");
     }
 }
+
+void link_close()
+{
+    CreditFixture f(false);
+    auto downstream = std::make_shared<lnk::NodeLink>(f.io.get_executor(),
+        lnk::LinkSpec{2, 7, RelayProtocol::Tcp, "downstream", "127.0.0.3", "test", 0, 0, false});
+    downstream->phase = lnk::NodeLink::Phase::Ready;
+    test_access::LnkChannel_connections_(f.protocol->links()).emplace(2, downstream);
+    lnk::FlowSpec transit{20, 7, RelayProtocol::Tcp};
+    transit.previous = 1;
+    transit.previous_peer = "upstream";
+    transit.next = 2;
+    transit.next_peer = "downstream";
+    f.protocol->prepare_flow(std::move(transit));
+    f.protocol->commit_flow(20);
+    lnk::FlowSpec healthy{30, 7, RelayProtocol::Tcp};
+    healthy.previous = 2;
+    healthy.previous_peer = "downstream";
+    f.protocol->prepare_flow(std::move(healthy));
+    f.protocol->commit_flow(30);
+    const auto &flows = test_access::FlowProtocol_flows_(*f.protocol);
+    const auto flow = flows.at(20);
+    const auto survivor = flows.at(30);
+    auto pool = std::make_shared<lnk::PayloadPool>(4096);
+    const std::weak_ptr<lnk::PayloadPool> payloads = pool;
+    // Hold both directions of a transit Flow on its two adjacent Links.
+    f.upstream->writes.push({flow.get(), true},
+        lnk::Frame{{LnkFrType::Data, true, 16, 7, 20}, PooledBuffer(pool, 16), flow});
+    downstream->writes.push({flow.get(), false},
+        lnk::Frame{{LnkFrType::Data, false, 16, 7, 20}, PooledBuffer(pool, 16), flow});
+    downstream->writes.push({survivor.get(), true}, lnk::Frame{{LnkFrType::Fin, true, 0, 7, 30}, {}, survivor});
+    f.upstream->controls.push_back(lnk::Frame{{LnkFrType::Ping, false, 0, 7}});
+    pool.reset();
+    check(!payloads.expired(), "close fixture did not retain queued payloads");
+
+    f.protocol->links().close(1);
+    check(f.upstream->phase == lnk::NodeLink::Phase::Closed &&
+          f.upstream->writes.empty() && f.upstream->controls.empty() && f.upstream->credits.empty(),
+          "closed Link retained queued traffic");
+    check(payloads.expired(), "Link closure retained dependent Flow payloads on an adjacent Link");
+    check(!flows.contains(10) && !flows.contains(20) && flows.contains(30),
+          "Link closure removed the wrong Flows");
+    check(downstream->phase == lnk::NodeLink::Phase::Ready && downstream->writes.size() == 1 &&
+          downstream->writes.front().owner == survivor && downstream->credits.size() == 1 &&
+          downstream->credits.contains({30, false}),
+          "Link closure changed a healthy Flow's queued traffic or credit");
+}
+
 void run()
 {
     deadline_and_release();
@@ -596,6 +651,7 @@ void run()
     flows_share_one_batch(true);
     full_data_window_retains_one_fin_slot();
     fin_and_close();
+    link_close();
 }
 } // namespace credit_tests
 
@@ -612,7 +668,7 @@ static asio::awaitable<lnk::Frame> read_frame(asio::ip::tcp::socket &socket)
     co_await asio::async_read(socket, asio::buffer(bytes), asio::use_awaitable);
     const auto header = LnkFrameHeader::decode(bytes);
     // Test peer owns ordinary storage; use a resource that outlives the returned test frame.
-    lnk::Frame frame{header, PooledBuffer(*std::pmr::new_delete_resource(), header.body_length)};
+    lnk::Frame frame{header, PooledBuffer(std::make_shared<lnk::PayloadPool>(65536), header.body_length)};
     if (header.body_length)
     {
         co_await asio::async_read(socket, asio::buffer(frame.payload.data(), frame.payload.size()), asio::use_awaitable);
@@ -699,7 +755,7 @@ static void wire_tests()
         co_await credit(2, window);
         auto small = co_await next_data();
         check(small.header.id == 2 && small.payload.size() == 1 && small.payload.data()[0] == 99,
-              "credit-starved Flow blocked another Flow on shared FIFO");
+              "credit-starved Flow blocked another Flow on shared Link");
         auto pending = asio::co_spawn(io, next_data(), asio::use_future);
         co_await pause(120ms);
         check(pending.wait_for(0s) != std::future_status::ready, "duplicate credit let sender overrun peer window");
@@ -743,6 +799,50 @@ static void wire_tests()
               "invalid credit closed shared Link or healthy Flow");
         check((co_await next_data()).header.id == 2, "healthy Flow could not progress after invalid credit");
         auto link = test_access::LnkChannel_connections_(channel->links()).at(1);
+        // Stage complete credited bursts without yielding to the physical writer.
+        // The peer checks observable DATA/FIN order, independently of queue storage.
+        for (const std::uint64_t id : {10, 20, 30})
+        {
+            install(id);
+            test_access::FlowProtocol_stream_(*channel).receive_credit(*link,
+                LnkFrameHeader{LnkFrType::Credit, false, 0, 7, id, window});
+            for (std::uint8_t index = 0; index < 3; ++index)
+            {
+                check(test_flow::try_send_data(channel, id, false, BytesBuf(index ? 4097 : 1, index)),
+                      "credited burst was rejected");
+            }
+            check(test_flow::try_finish(channel, id, false), "credited FIN was rejected");
+        }
+        auto next_business = [&]() -> asio::awaitable<lnk::Frame> {
+            for (;;)
+            {
+                auto frame = co_await read_frame(socket);
+                if (frame.header.kind == LnkFrType::Data || frame.header.kind == LnkFrType::Fin)
+                {
+                    co_return frame;
+                }
+            }
+        };
+        for (std::uint8_t index = 0; index < 4; ++index)
+        {
+            for (const std::uint64_t id : {10, 20, 30})
+            {
+                const auto frame = co_await next_business();
+                check(frame.header.id == id && frame.header.kind == (index == 3 ? LnkFrType::Fin : LnkFrType::Data),
+                      "shared writer did not interleave Flows or preserve FIN order");
+                check(index == 3 || (frame.payload.size() == (index ? 4097 : 1) && frame.payload.data()[0] == index),
+                      "interleaving changed the payload");
+            }
+        }
+        for (const std::uint64_t id : {40, 50})
+        {
+            install(id);
+            test_access::FlowProtocol_stream_(*channel).receive_credit(*link,
+                LnkFrameHeader{LnkFrType::Credit, false, 0, 7, id, window});
+            check(test_flow::try_send_data(channel, id, false, {0x5a}), "close fixture could not enqueue");
+        }
+        channel->close_flow(40);
+        check((co_await next_business()).header.id == 50, "closing a queued Flow removed or blocked a healthy Flow");
         const std::weak_ptr<lnk::NodeLink> owner = link;
         link->writable.close(); // Fail the writer while its sibling waits for the next header.
         link.reset();

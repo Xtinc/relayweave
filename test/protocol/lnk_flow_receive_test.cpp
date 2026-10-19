@@ -161,6 +161,15 @@ int main()
                 f.channel->prepare_flow(std::move(spec));
             });
             f.pump();
+            // poll() can quiesce before the OS reports even an already-due timer.
+            // Wait for the actual monitor event instead of assuming it was ready.
+            const auto timeout = lnk::Clock::now() + 1s;
+            while (test_access::FlowProtocol_flows_(*f.channel).contains(102) && lnk::Clock::now() < timeout)
+            {
+                f.data.restart();
+                f.data.run_one_for(10ms);
+                f.pump();
+            }
             check(!test_access::FlowProtocol_flows_(*f.channel).contains(102), "prepare timeout did not expire Flow");
             check(test_access::FlowProtocol_flows_(*f.channel).contains(101), "prepare timeout stopped healthy Flow");
             // A deadline change aborts the old timer wait without cancelling the monitor coroutine.
