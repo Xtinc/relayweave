@@ -208,7 +208,7 @@ int main()
             }
             // Another Flow can overtake these frames. Wait for this Flow's actual admission.
             const auto buffered = test_access::FlowProtocol_flows_(*b).at(207);
-            const auto expected = 128 * (lnk::PayloadPool::allocation_size(1) + lnk::Frame::buffer_overhead);
+            const auto expected = 128 * lnk::Frame::charge_for_payload(1);
             const auto receive_deadline = lnk::Clock::now() + 1s;
             while (buffered->stream->directions[0].received_bytes < expected && lnk::Clock::now() < receive_deadline)
             {

@@ -63,7 +63,7 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
     // An engaged value is DATA (including empty DATA); nullopt is an ordered FIN.
     using Queue = asio::experimental::concurrent_channel<void(asio::error_code, std::optional<PooledBuffer>)>;
     FlowStream(asio::any_io_executor transfer, asio::any_io_executor data, std::weak_ptr<FlowProtocol> protocol,
-               std::uint64_t id, bool reverse, std::shared_ptr<PayloadPool> pool);
+               std::uint64_t id, bool reverse, std::shared_ptr<std::pmr::synchronized_pool_resource> pool);
     const std::uint64_t id_;
     const bool reverse_;
     Queue send_queue_;
@@ -76,7 +76,7 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
     bool send_finished_ = false;
     std::string reason_;
     std::weak_ptr<FlowProtocol> protocol_;
-    const std::shared_ptr<PayloadPool> pool_;
+    const std::shared_ptr<std::pmr::synchronized_pool_resource> pool_;
 };
 
 // Datagram endpoints never wait for queue capacity and never acknowledge delivery.
@@ -96,7 +96,7 @@ class FlowDatagram : public std::enable_shared_from_this<FlowDatagram>
     friend struct FlowState;
     using Queue = asio::experimental::concurrent_channel<void(asio::error_code, PooledBuffer)>;
     FlowDatagram(asio::any_io_executor transfer, std::weak_ptr<FlowProtocol> protocol, std::uint64_t id, bool reverse,
-                 std::shared_ptr<Queue> received, std::shared_ptr<PayloadPool> pool);
+                 std::shared_ptr<Queue> received, std::shared_ptr<std::pmr::synchronized_pool_resource> pool);
     const std::uint64_t id_;
     const bool reverse_;
     Queue send_queue_;
@@ -105,7 +105,7 @@ class FlowDatagram : public std::enable_shared_from_this<FlowDatagram>
     bool closed_ = false;
     std::string reason_;
     std::weak_ptr<FlowProtocol> protocol_;
-    const std::shared_ptr<PayloadPool> pool_;
+    const std::shared_ptr<std::pmr::synchronized_pool_resource> pool_;
 };
 
 // Shared by Flow routing and outstanding Link writes. Endpoint APIs expose none of this state.
@@ -272,13 +272,12 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     asio::awaitable<void> monitor();
     asio::any_io_executor executor_;
     // Business deliveries may retain their storage after the protocol has stopped.
-    std::shared_ptr<lnk::PayloadPool> payload_pool_;
+    std::shared_ptr<std::pmr::synchronized_pool_resource> payload_pool_;
     LnkChannel links_;
     Stream stream_;
     Datagram datagram_;
     std::map<std::uint64_t, std::shared_ptr<lnk::FlowState>> flows_;
     std::map<std::uint64_t, Clock::time_point> retired_;
-    std::size_t reserved_bytes_ = 0;
     std::atomic<std::uint64_t> forwarded_bytes_{0};
 
     // Control notifications cross executors.

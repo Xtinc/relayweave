@@ -10,7 +10,6 @@ TEST_MEMBER(FlowProtocol, flows_)
 namespace test_flow
 {
 inline constexpr std::size_t window_bytes = 320 * 1024;
-inline constexpr std::size_t buffer_budget_bytes = 256 * 1024 * 1024;
 }
 
 namespace test_access

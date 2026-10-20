@@ -12,28 +12,16 @@ using lnk::PooledBuffer;
 
 namespace
 {
-constexpr std::size_t max_flows = 1000;
 constexpr std::size_t flow_window_bytes = 320 * 1024;
-constexpr std::size_t flow_buffer_budget_bytes = 256 * 1024 * 1024;
 constexpr std::size_t datagram_queue_capacity = 16;
 constexpr std::size_t frame_overhead = Frame::buffer_overhead;
 constexpr auto retired_flow_ttl = std::chrono::seconds(10);
-
-std::size_t flow_reservation(RelayProtocol transport)
-{
-    // TCP reserves DATA plus one ordered FIN per direction. UDP reserves packet slots only.
-    const auto direction_capacity = transport == RelayProtocol::Tcp
-        ? flow_window_bytes + frame_overhead
-        : datagram_queue_capacity * (lnk::PayloadPool::allocation_size(LnkFrameHeader::maximum_payload) + frame_overhead);
-    return 2 * direction_capacity;
-}
-
 } // namespace
 
 // Endpoint I/O runs on the transfer executor.
 lnk::FlowStream::FlowStream(asio::any_io_executor transfer, asio::any_io_executor data,
                             std::weak_ptr<FlowProtocol> channel, std::uint64_t flow_id, bool direction,
-                            std::shared_ptr<PayloadPool> pool)
+                            std::shared_ptr<std::pmr::synchronized_pool_resource> pool)
     : id_(flow_id), reverse_(direction), send_queue_(transfer, 0), receive_queue_(transfer, 1),
       receive_completed_(transfer, 1), send_space_(data, 1), protocol_(std::move(channel)), pool_(std::move(pool))
 {
@@ -169,7 +157,7 @@ void lnk::FlowStream::close(std::string close_reason)
 
 lnk::FlowDatagram::FlowDatagram(asio::any_io_executor transfer, std::weak_ptr<FlowProtocol> channel,
                                 std::uint64_t flow_id, bool direction, std::shared_ptr<Queue> queue,
-                                std::shared_ptr<PayloadPool> pool)
+                                std::shared_ptr<std::pmr::synchronized_pool_resource> pool)
     : id_(flow_id), reverse_(direction), send_queue_(transfer, datagram_queue_capacity),
       receive_queue_(std::move(queue)), protocol_(std::move(channel)), pool_(std::move(pool))
 {
@@ -194,7 +182,7 @@ bool lnk::FlowDatagram::try_send(std::span<const std::uint8_t> payload)
     }
     catch (const std::bad_alloc &)
     {
-        // Pool exhaustion drops this packet without interrupting the shared UDP listener.
+        // Allocation failure drops this packet without interrupting the shared UDP listener.
     }
     return false;
 }
@@ -243,8 +231,9 @@ void lnk::FlowDatagram::close(std::string close_reason)
 FlowProtocol::FlowProtocol(asio::any_io_executor executor, asio::any_io_executor event_executor, std::string node_id,
                            std::string tcp_address, std::uint16_t tcp_port, std::string udp_address,
                            std::uint16_t udp_port)
-    : executor_(executor), payload_pool_(std::make_shared<lnk::PayloadPool>(
-          flow_buffer_budget_bytes + max_flows * std::size_t{65536})),
+    : executor_(executor),
+      payload_pool_(std::make_shared<std::pmr::synchronized_pool_resource>(
+          std::pmr::pool_options{.largest_required_pool_block = 65536}, std::pmr::new_delete_resource())),
       links_(*this, executor, std::move(node_id), std::move(tcp_address), tcp_port, std::move(udp_address), udp_port),
       stream_(*this), datagram_(*this), events_(event_executor, 4096), monitor_timer_(executor), tasks_done_(executor)
 {
@@ -484,35 +473,30 @@ void FlowProtocol::prepare_flow(lnk::FlowSpec spec)
         return;
     }
 
-    const auto transport = spec.transport;
-    const auto reservation = flow_reservation(transport);
-    auto s = std::make_shared<FlowState>(executor_, spec);
-    if (flows_.size() + retired_.size() >= max_flows || retired_.contains(id))
+    const auto reject = [&](std::string reason) {
+        emit({lnk::EventKind::FlowError, spec.epoch, id, "prepare", std::move(reason)});
+    };
+    if (flows_.size() + retired_.size() >= lnk::max_flow_count || retired_.contains(id))
     {
-        notify_flow(s, lnk::EventKind::FlowError, "prepare", "flow capacity or retired identity");
+        reject("flow capacity or retired identity");
         return;
     }
 
     const auto check = [&](std::uint64_t link_id, const std::string &peer) {
         const auto it = links_.connections_.find(link_id);
         return it != links_.connections_.end() && it->second->phase == NodeLink::Phase::Ready &&
-               it->second->spec.epoch == s->epoch && it->second->spec.peer == peer &&
-               it->second->spec.transport == transport;
+               it->second->spec.epoch == spec.epoch && it->second->spec.peer == peer &&
+               it->second->spec.transport == spec.transport;
     };
     // Neighbour state can change while the validated descriptor crosses from control to data.
-    if ((s->previous && !check(s->previous, spec.previous_peer)) || (s->next && !check(s->next, spec.next_peer)))
+    if ((spec.previous && !check(spec.previous, spec.previous_peer)) ||
+        (spec.next && !check(spec.next, spec.next_peer)))
     {
-        notify_flow(s, lnk::EventKind::FlowError, "prepare", "flow adjacent link is not Ready or identity differs");
+        reject("flow adjacent link is not Ready or identity differs");
         return;
     }
 
-    if (reservation > flow_buffer_budget_bytes - reserved_bytes_)
-    {
-        notify_flow(s, lnk::EventKind::FlowError, "prepare", "flow buffer reservation budget exceeded");
-        return;
-    }
-    reserved_bytes_ += reservation;
-
+    auto s = std::make_shared<FlowState>(executor_, std::move(spec));
     flows_.emplace(id, s);
     schedule_monitor(s->prepare_deadline);
     notify_flow(s, lnk::EventKind::FlowPrepared, "prepare");
@@ -576,7 +560,6 @@ void FlowProtocol::close_flow(std::uint64_t id, std::string reason)
         links_.discard(link_id, s);
     }
     flows_.erase(it);
-    reserved_bytes_ -= flow_reservation(s->transport);
 
     retired_[id] = Clock::now() + retired_flow_ttl;
     schedule_monitor(retired_.at(id));
@@ -670,15 +653,15 @@ void FlowProtocol::invalidate_flows(std::string reason)
     }
 }
 
-std::shared_ptr<lnk::FlowStream> FlowProtocol::bind_stream_flow(
-    std::uint64_t epoch, std::uint64_t id, bool reverse, asio::any_io_executor transfer)
+std::shared_ptr<lnk::FlowStream> FlowProtocol::bind_stream_flow(std::uint64_t epoch, std::uint64_t id, bool reverse,
+                                                                asio::any_io_executor transfer)
 {
     auto flow = require_endpoint_flow(epoch, id, reverse, RelayProtocol::Tcp);
     return stream_.bind(flow, reverse, transfer);
 }
 
-std::shared_ptr<lnk::FlowDatagram> FlowProtocol::bind_datagram_flow(
-    std::uint64_t epoch, std::uint64_t id, bool reverse, asio::any_io_executor transfer)
+std::shared_ptr<lnk::FlowDatagram> FlowProtocol::bind_datagram_flow(std::uint64_t epoch, std::uint64_t id, bool reverse,
+                                                                    asio::any_io_executor transfer)
 {
     auto flow = require_endpoint_flow(epoch, id, reverse, RelayProtocol::Udp);
     return datagram_.bind(flow, reverse, transfer);
@@ -686,16 +669,16 @@ std::shared_ptr<lnk::FlowDatagram> FlowProtocol::bind_datagram_flow(
 
 // TCP protocol: credit, ordered DATA/FIN/RESET, and one joined endpoint task.
 
-std::shared_ptr<lnk::FlowStream> FlowProtocol::Stream::bind(
-    const std::shared_ptr<FlowState> &flow, bool reverse, asio::any_io_executor transfer)
+std::shared_ptr<lnk::FlowStream> FlowProtocol::Stream::bind(const std::shared_ptr<FlowState> &flow, bool reverse,
+                                                            asio::any_io_executor transfer)
 {
     auto &stream = *flow->stream;
     if (stream.port)
     {
         throw std::invalid_argument("invalid or duplicate flow endpoint binding");
     }
-    auto port =
-        std::shared_ptr<lnk::FlowStream>(new lnk::FlowStream(transfer, protocol_.executor_, protocol_.weak_from_this(), flow->id, reverse, protocol_.payload_pool_));
+    auto port = std::shared_ptr<lnk::FlowStream>(new lnk::FlowStream(
+        transfer, protocol_.executor_, protocol_.weak_from_this(), flow->id, reverse, protocol_.payload_pool_));
     stream.port = port;
     port->send_finished_ = stream.directions[std::size_t(reverse)].finished;
     protocol_.spawn(run(flow));
@@ -753,11 +736,11 @@ bool FlowProtocol::Stream::route(const std::shared_ptr<FlowState> &s, Frame &f)
 }
 
 bool FlowProtocol::Stream::try_send(const std::shared_ptr<FlowState> &flow, bool reverse,
-                                   std::optional<PooledBuffer> &data)
+                                    std::optional<PooledBuffer> &data)
 {
     assert(flow->phase == FlowState::Phase::Active && flow->transport == RelayProtocol::Tcp);
     auto &direction = flow->stream->directions[std::size_t(reverse)];
-    if (data && lnk::PayloadPool::allocation_size(data->allocation_size()) + frame_overhead >
+    if (data && Frame::charge_for_payload(data->allocation_size()) >
                     flow_window_bytes - std::min(direction.buffered_bytes, flow_window_bytes))
     {
         return false;
@@ -767,7 +750,7 @@ bool FlowProtocol::Stream::try_send(const std::shared_ptr<FlowState> &flow, bool
                  data ? std::move(*data) : PooledBuffer{}};
     if (!route(flow, packet))
     {
-        throw std::runtime_error("flow violated reserved send capacity");
+        throw std::runtime_error("flow send queue capacity violated");
     }
     return true;
 }
@@ -789,7 +772,7 @@ void FlowProtocol::Stream::reset(const std::shared_ptr<FlowState> &flow, bool re
     }
     catch (const std::bad_alloc &)
     {
-        // Pool exhaustion must still close this Flow; the control path propagates closure.
+        // Allocation failure must still close this Flow; the control path propagates closure.
     }
     protocol_.fail_flow(flow, "reset", reason.empty() ? "flow reset" : std::move(reason));
 }
@@ -821,7 +804,7 @@ void FlowProtocol::Stream::receive(const std::shared_ptr<FlowState> &flow, Frame
     }
     if (!route(flow, frame))
     {
-        protocol_.fail_flow(flow, "forward", "flow violated reserved receive capacity");
+        protocol_.fail_flow(flow, "forward", "flow receive queue capacity violated");
     }
     else if (reset)
     {
@@ -931,7 +914,7 @@ void FlowProtocol::Stream::publish_credit(const std::shared_ptr<FlowState> &flow
 }
 
 void FlowProtocol::Stream::release_buffer(const std::shared_ptr<FlowState> &flow, bool reverse, std::size_t bytes,
-                                         bool data)
+                                          bool data)
 {
     if (flow->phase == FlowState::Phase::Closed)
     {
@@ -992,10 +975,11 @@ asio::awaitable<void> FlowProtocol::Stream::run(std::shared_ptr<FlowState> flow)
     }
     auto &port = *flow->stream->port;
     // FIN completes only its direction. Errors cancel the peer and join it before Flow cleanup.
-    auto [order, send_error, receive_error] = co_await asio::experimental::make_parallel_group(
-        asio::co_spawn(protocol_.executor_, send_loop(flow, port), asio::deferred),
-        asio::co_spawn(protocol_.executor_, receive_loop(flow, port), asio::deferred))
-        .async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
+    auto [order, send_error, receive_error] =
+        co_await asio::experimental::make_parallel_group(
+            asio::co_spawn(protocol_.executor_, send_loop(flow, port), asio::deferred),
+            asio::co_spawn(protocol_.executor_, receive_loop(flow, port), asio::deferred))
+            .async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
     if (flow->phase == FlowState::Phase::Closed)
     {
         co_return;
@@ -1011,8 +995,7 @@ asio::awaitable<void> FlowProtocol::Stream::run(std::shared_ptr<FlowState> flow)
     }
 }
 
-asio::awaitable<void> FlowProtocol::Stream::send_loop(
-    const std::shared_ptr<FlowState> &flow, lnk::FlowStream &port)
+asio::awaitable<void> FlowProtocol::Stream::send_loop(const std::shared_ptr<FlowState> &flow, lnk::FlowStream &port)
 {
     // The local direction may have finished before binding; its state belongs to this executor.
     if (flow->stream->directions[std::size_t(port.reverse_)].finished)
@@ -1042,8 +1025,7 @@ asio::awaitable<void> FlowProtocol::Stream::send_loop(
     }
 }
 
-asio::awaitable<void> FlowProtocol::Stream::receive_loop(
-    const std::shared_ptr<FlowState> &flow, lnk::FlowStream &port)
+asio::awaitable<void> FlowProtocol::Stream::receive_loop(const std::shared_ptr<FlowState> &flow, lnk::FlowStream &port)
 {
     while (flow->phase == FlowState::Phase::Active)
     {
@@ -1083,16 +1065,16 @@ asio::awaitable<void> FlowProtocol::Stream::receive_loop(
 
 // UDP protocol: bounded packet admission and drops, without stream credit or acknowledgements.
 
-std::shared_ptr<lnk::FlowDatagram> FlowProtocol::Datagram::bind(
-    const std::shared_ptr<FlowState> &flow, bool reverse, asio::any_io_executor transfer)
+std::shared_ptr<lnk::FlowDatagram> FlowProtocol::Datagram::bind(const std::shared_ptr<FlowState> &flow, bool reverse,
+                                                                asio::any_io_executor transfer)
 {
     auto &datagram = flow->datagram;
     if (datagram.port)
     {
         throw std::invalid_argument("invalid or duplicate flow endpoint binding");
     }
-    auto port = std::shared_ptr<lnk::FlowDatagram>(
-        new lnk::FlowDatagram(transfer, protocol_.weak_from_this(), flow->id, reverse, datagram.receive_queue, protocol_.payload_pool_));
+    auto port = std::shared_ptr<lnk::FlowDatagram>(new lnk::FlowDatagram(
+        transfer, protocol_.weak_from_this(), flow->id, reverse, datagram.receive_queue, protocol_.payload_pool_));
     datagram.port = port;
     protocol_.spawn(run(flow));
     return port;
@@ -1124,8 +1106,7 @@ bool FlowProtocol::Datagram::route(const std::shared_ptr<FlowState> &s, Frame &f
     return s->datagram.receive_queue->try_send(asio::error_code{}, std::move(f.payload));
 }
 
-bool FlowProtocol::Datagram::try_send(const std::shared_ptr<FlowState> &flow, bool reverse,
-                                     PooledBuffer &data)
+bool FlowProtocol::Datagram::try_send(const std::shared_ptr<FlowState> &flow, bool reverse, PooledBuffer &data)
 {
     assert(flow->phase == FlowState::Phase::Active && flow->transport == RelayProtocol::Udp);
     Frame packet{{LnkFrType::Data, reverse, static_cast<std::uint32_t>(data.size()), flow->epoch, flow->id},

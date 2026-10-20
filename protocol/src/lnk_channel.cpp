@@ -5,75 +5,6 @@
 #include <chrono>
 #include <cstddef>
 
-lnk::PayloadPool::~PayloadPool()
-{
-    assert(live_ == 0);
-    reclaim(0);
-}
-
-void lnk::PayloadPool::reclaim(std::size_t target)
-{
-    for (std::size_t index = free_.size(); index-- > 0 && retained_ > target;)
-    {
-        const auto size = std::size_t{256} << index;
-        while (free_[index] && retained_ > target)
-        {
-            auto block = free_[index];
-            free_[index] = *static_cast<void **>(block);
-            std::pmr::new_delete_resource()->deallocate(block, size);
-            retained_ -= size;
-        }
-    }
-}
-
-void *lnk::PayloadPool::do_allocate(std::size_t requested, std::size_t alignment)
-{
-    const std::lock_guard lock(mutex_);
-    const auto size = allocation_size(requested);
-    if (!size || size > 65536 || alignment > alignof(std::max_align_t))
-    {
-        throw std::bad_alloc();
-    }
-    const auto index = std::countr_zero(size) - 8;
-    void *block;
-    if (free_[index])
-    {
-        block = free_[index];
-        free_[index] = *static_cast<void **>(block);
-    }
-    else
-    {
-        if (size > budget_)
-        {
-            throw std::bad_alloc();
-        }
-        reclaim(budget_ - size);
-        if (retained_ > budget_ - size)
-        {
-            throw std::bad_alloc();
-        }
-        block = std::pmr::new_delete_resource()->allocate(size);
-        retained_ += size;
-    }
-    live_ += size;
-    return block;
-}
-
-void lnk::PayloadPool::do_deallocate(void *block, std::size_t requested, std::size_t)
-{
-    const std::lock_guard lock(mutex_);
-    const auto size = allocation_size(requested);
-    const auto index = std::countr_zero(size) - 8;
-    live_ -= size;
-    *static_cast<void **>(block) = free_[index];
-    free_[index] = block;
-}
-
-bool lnk::PayloadPool::do_is_equal(const std::pmr::memory_resource &other) const noexcept
-{
-    return this == &other;
-}
-
 namespace
 {
 using lnk::FlowState;
@@ -759,7 +690,7 @@ asio::awaitable<void> LnkChannel::udp_read()
             }
         }
         catch (const std::exception &)
-        { /* Invalid datagrams or exhausted payload capacity drop this packet. */
+        { /* Invalid datagrams or allocation failure drop this packet. */
         }
     }
 }

@@ -53,7 +53,7 @@ NodeLinkMgr::NodeLinkMgr(asio::any_io_executor control, asio::any_io_executor da
                          std::string tcp_address, std::string udp_address, ClusterMgr &cluster, Topology &topology)
     : control_(control), config_(std::move(config)), cluster_(cluster), topology_(topology),
       protocol_(std::make_shared<FlowProtocol>(data, control, config_.node_id, std::move(tcp_address), config_.tcp_port,
-                                            std::move(udp_address), config_.udp_port)),
+                                               std::move(udp_address), config_.udp_port)),
       done_(control)
 {
     done_.expires_at(Clock::time_point::max());
@@ -395,10 +395,12 @@ void NodeLinkMgr::handle_link(CtrlMessage message)
                 }
                 link_endpoints_[id] = p;
                 asio::post(protocol_->executor(),
-                           [data = protocol_, spec = lnk::LinkSpec{
-                               id, epoch, transport, peer, p.at("peer_address").get<std::string>(),
-                               p.at("token").get<std::string>(), config_.tcp_port, config_.udp_port,
-                               config_.node_id == left}]() mutable { data->links().prepare(std::move(spec)); });
+                           [data = protocol_,
+                            spec = lnk::LinkSpec{id, epoch, transport, peer, p.at("peer_address").get<std::string>(),
+                                                 p.at("token").get<std::string>(), config_.tcp_port, config_.udp_port,
+                                                 config_.node_id == left}]() mutable {
+                               data->links().prepare(std::move(spec));
+                           });
             }
             else
             {
@@ -549,7 +551,6 @@ void NodeLinkMgr::members_changed()
     }
 }
 
-
 NodeLinkMgr::FlowRequest::FlowRequest(asio::any_io_executor executor, njson values)
     : params(std::move(values)), timeout(executor), completed_event(executor), released_event(executor)
 {
@@ -632,7 +633,7 @@ std::shared_ptr<NodeLinkMgr::FlowRequest> NodeLinkMgr::create_flow(std::vector<s
         }
         addresses.push_back(member->second);
     }
-    if (!topology_.epoch() || flow_requests_.size() + closing_flows_.size() >= 1000)
+    if (!topology_.epoch() || flow_requests_.size() + closing_flows_.size() >= lnk::max_flow_count)
     {
         throw std::runtime_error("membership unavailable or flow capacity exceeded");
     }
@@ -827,7 +828,7 @@ void NodeLinkMgr::handle_flow(CtrlMessage message)
                 }
                 else
                 {
-                    if (flow_endpoints_.size() >= 1000)
+                    if (flow_endpoints_.size() >= lnk::max_flow_count)
                     {
                         reject("flow endpoint capacity exceeded");
                         return;
@@ -1056,5 +1057,6 @@ void NodeLinkMgr::control_failed(std::string reason)
     fail_remote_flows(reason);
     // Drop authorization before data cleanup; its notifications must not target a lost control connection.
     flow_endpoints_.clear();
-    asio::post(protocol_->executor(), [data = protocol_, reason = std::move(reason)] { data->invalidate_flows(reason); });
+    asio::post(protocol_->executor(),
+               [data = protocol_, reason = std::move(reason)] { data->invalidate_flows(reason); });
 }

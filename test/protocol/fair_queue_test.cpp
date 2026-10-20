@@ -182,8 +182,8 @@ template <template <class, class, class> class Queue> static void verify()
     require(*value == 17 && movable.empty(), "move-only data was not transferred");
 
     Queue<int, lnk::Frame, std::hash<int>> frames;
-    auto pool = std::make_shared<lnk::PayloadPool>(4096);
-    const std::weak_ptr<lnk::PayloadPool> lifetime = pool;
+    auto pool = std::make_shared<std::pmr::synchronized_pool_resource>();
+    const std::weak_ptr<std::pmr::synchronized_pool_resource> lifetime = pool;
     frames.push(1, lnk::Frame{{LnkFrType::Data}, lnk::PooledBuffer(pool, 16)});
     pool.reset();
     require(!lifetime.expired(), "queued payload lost its allocator");
@@ -192,8 +192,8 @@ template <template <class, class, class> class Queue> static void verify()
     require(!lifetime.expired(), "dequeue released an in-flight payload");
     frame.payload = {};
     require(lifetime.expired(), "completed payload retained its allocator");
-    pool = std::make_shared<lnk::PayloadPool>(4096);
-    const std::weak_ptr<lnk::PayloadPool> erased = pool;
+    pool = std::make_shared<std::pmr::synchronized_pool_resource>();
+    const std::weak_ptr<std::pmr::synchronized_pool_resource> erased = pool;
     frames.push(1, lnk::Frame{{LnkFrType::Data}, lnk::PooledBuffer(pool, 16)});
     pool.reset();
     frames.erase(1);

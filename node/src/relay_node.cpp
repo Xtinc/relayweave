@@ -932,6 +932,17 @@ void RelayNode::handle_node_location(CtrlMessage message)
 
 void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
 {
+    const auto kind = relay->data_.index();
+    const auto capacity = std::holds_alternative<TcpPipeline *>(relay->data_) ? config_.tcp.max_relays
+                          : std::holds_alternative<TlsPipeline *>(relay->data_) ? config_.tls.max_relays
+                                                                               : config_.datagram.max_relays;
+    const auto count = std::ranges::count_if(relay_sessions_, [kind](const auto &active) {
+        return active->data_.index() == kind;
+    });
+    if (static_cast<std::size_t>(count) >= capacity)
+    {
+        throw std::runtime_error("relay capacity reached");
+    }
     relay_sessions_.push_back(relay);
     try
     {

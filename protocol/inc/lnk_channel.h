@@ -12,7 +12,6 @@
 #include <map>
 #include <memory>
 #include <memory_resource>
-#include <mutex>
 #include <set>
 #include <utility>
 
@@ -21,6 +20,7 @@ namespace lnk
 {
 enum class EventKind;
 using Clock = std::chrono::steady_clock;
+inline constexpr std::size_t max_flow_count = 1000;
 struct FlowState;
 
 // Frame storage and its shared allocator belong together with the neighbour transport.
@@ -44,8 +44,7 @@ class PooledBuffer
     PooledBuffer() noexcept = default;
 
     PooledBuffer(std::shared_ptr<std::pmr::memory_resource> resource, std::size_t size)
-        : storage_(size ? static_cast<std::uint8_t *>(resource->allocate(size)) : nullptr,
-                   Deleter{size, resource}),
+        : storage_(size ? static_cast<std::uint8_t *>(resource->allocate(size)) : nullptr, Deleter{size, resource}),
           view_(storage_.get(), size)
     {
     }
@@ -115,32 +114,6 @@ class PooledBuffer
     std::span<std::uint8_t> view_;
 };
 
-// One shared allocator for frame and endpoint buffers. Returned blocks are reused;
-// retained storage stays bounded and can be reclaimed when another size class needs space.
-class PayloadPool : public std::pmr::memory_resource
-{
-  public:
-    explicit PayloadPool(std::size_t budget) : budget_(budget)
-    {
-    }
-    ~PayloadPool() override;
-    static std::size_t allocation_size(std::size_t size)
-    {
-        return size ? std::bit_ceil(std::max(size, std::size_t{256})) : 0;
-    }
-
-  private:
-    void reclaim(std::size_t target);
-    void *do_allocate(std::size_t requested, std::size_t alignment) override;
-    void do_deallocate(void *block, std::size_t requested, std::size_t alignment) override;
-    bool do_is_equal(const std::pmr::memory_resource &other) const noexcept override;
-    const std::size_t budget_;
-    std::mutex mutex_;
-    std::size_t retained_ = 0;
-    std::size_t live_ = 0;
-    std::array<void *, 9> free_{};
-};
-
 struct FlowWriteTag
 {
     const FlowState *flow;
@@ -165,9 +138,14 @@ struct Frame
     // Shared Link writes can outlive map removal. Keep the exact Flow identity for completion.
     // Flow-owned queues leave this empty to avoid a self-reference.
     std::shared_ptr<FlowState> owner;
+    // Stable wire-credit units, independent of the allocator's actual block sizes.
+    static std::size_t charge_for_payload(std::size_t size) noexcept
+    {
+        return buffer_overhead + (size ? std::bit_ceil(std::max(size, std::size_t{256})) : 0);
+    }
     std::size_t charge() const noexcept
     {
-        return buffer_overhead + PayloadPool::allocation_size(payload.allocation_size());
+        return charge_for_payload(payload.allocation_size());
     }
 };
 static_assert(sizeof(Frame) <= Frame::buffer_overhead, "review frame management charge after changing Frame layout");
@@ -231,8 +209,8 @@ struct NodeLink
 class LnkChannel
 {
   public:
-    LnkChannel(FlowProtocol &protocol, asio::any_io_executor executor, std::string node_id,
-               std::string tcp_address, std::uint16_t tcp_port, std::string udp_address, std::uint16_t udp_port);
+    LnkChannel(FlowProtocol &protocol, asio::any_io_executor executor, std::string node_id, std::string tcp_address,
+               std::uint16_t tcp_port, std::string udp_address, std::uint16_t udp_port);
     void start();
     void rollback() noexcept;
     void prepare(lnk::LinkSpec spec);
@@ -254,8 +232,7 @@ class LnkChannel
     void discard(std::uint64_t link_id, const std::shared_ptr<lnk::FlowState> &flow);
     Clock::time_point poll(Clock::time_point now);
     void close_all();
-    void notify(const lnk::NodeLink &link, lnk::EventKind kind, std::string reason = {},
-                std::string_view stage = {});
+    void notify(const lnk::NodeLink &link, lnk::EventKind kind, std::string reason = {}, std::string_view stage = {});
     void fail(lnk::NodeLink &link, std::string reason, std::string_view stage = {});
     void mark_ready(lnk::NodeLink &link);
     bool matches(const lnk::NodeLink &link, const CtrlMessage &message) const;
@@ -287,6 +264,5 @@ class LnkChannel
     std::set<std::shared_ptr<tcp::socket>> accepting_;
     asio::experimental::channel<void(asio::error_code, DatagramWrite)> udp_writes_;
     std::size_t udp_pending_data_ = 0;
-
 };
 #endif

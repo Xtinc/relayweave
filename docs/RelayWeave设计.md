@@ -56,7 +56,7 @@ RelayWeave 由 `relayweave-node`、`relayweave-agent`、共享 protocol 与 rout
     - [5.6.3 从路径安装到完成写入的实际流程](#563-从路径安装到完成写入的实际流程)
     - [5.6.4 缓存释放、信用合并与控制帧调度](#564-缓存释放信用合并与控制帧调度)
     - [5.6.5 慢末端的背压、恢复与数值示例](#565-慢末端的背压恢复与数值示例)
-    - [5.6.6 节点容量承诺、实际占用与 UDP 边界](#566-节点容量承诺实际占用与-udp-边界)
+    - [5.6.6 数量准入、逐 Flow 边界与实际占用](#566-数量准入逐-flow-边界与实际占用)
     - [5.6.7 窗口、信用周转时间与性能分析](#567-窗口信用周转时间与性能分析)
     - [5.6.8 失败边界、源码定位与验证](#568-失败边界源码定位与验证)
     - [5.6.9 参数研究结论与扫描计数](#569-参数研究结论与扫描计数)
@@ -214,7 +214,7 @@ NodeLinkMgr 安装相邻 Link 与完整 Flow 路径，FlowProtocol 和本地数�
 | 业务与路径编排 | 业务授权、建立、激活与关闭 | AgentSession、NodeSession、Single/Multi、NodeLinkMgr | 接入票据、本地数据句柄、LinkSpec/FlowSpec |
 | 数据接入与逻辑流 | 本地配对、端点交接、方向与信用管理 | StreamPipeline、DatagramMgr、FlowProtocol、FlowStream/FlowDatagram | 已接手的池载荷、DATA/FIN、待发送的邻接帧 |
 | 邻接传输与通道 | 接入认证、顺序收发与连接存活检测 | LnkChannel、NodeLink、TLSChannel、XfrChannel | 实际 I/O 完成、协议事件、业务 EOF 或错误 |
-| 通用支撑 | 编解码、存储复用、限速与状态索引 | message、PooledBuffer/PayloadPool、TokenBucket、DualIndexMap | 值对象、存储所有权和有界资源操作 |
+| 通用支撑 | 编解码、存储复用、限速与状态索引 | message、PooledBuffer、标准同步池、TokenBucket、DualIndexMap | 值对象、存储所有权和有界资源操作 |
 
 Multi 通过 Flow 连接首末数据端点。Single 由数据 manager 在本 Node 配对，直接通过 XfrChannel 或 UDP 路由完成传输。
 TLSChannel 承载普通控制和集群控制，XfrChannel 承载 Agent 及 Node 的数据复制；两者为不同上层提供通道能力。
@@ -874,7 +874,7 @@ FlowProtocol 管理逻辑流，LnkChannel 管理邻接传输，本地数据 mana
 | `lnk::FlowDatagram` | 部件的 UDP 端点，有界报文收发，满则丢整包 |
 | `lnk::FlowState` | 内部流实例；transport 选择协议，私有 Stream/Direction 和 Datagram 归拢各协议数据 |
 | `lnk::NodeLink` | 内部邻接连接实例；Phase 表示建立及关闭进度，保存唯一物理读写状态 |
-| `lnk::PooledBuffer / PayloadPool` | 单块载荷所有者与共享分配器；两者同属 lnk，使用同一份帧存储 |
+| `lnk::PooledBuffer / std::pmr::synchronized_pool_resource` | 单块载荷所有者与共享分配器，使用同一份帧存储 |
 
 生产实现集中在 flow_protocol.h/.cpp 和 lnk_channel.h/.cpp 两组文件。
 FlowSpec、LinkSpec、ProtocolEvent 和端点类是部件使用的边界；共享的实现状态统一放在 lnk 内，
@@ -1000,8 +1000,8 @@ LnkFrameHeader::maximum_payload 按 `65507 - DatagramHeader::length - LnkFrameHe
 最大 Node UDP 数据报为 65507 字节；每跳重新封装，帧头不随路径长度累加。TCP/TLS 多节点接入的读取缓冲
 也采用最大 DATA 载荷 65467 字节，按实际读取长度立即提交，不等待填满。Agent 与本地 UDP 的大接收缓冲保留。
 Node UDP 接收循环复用一个 65508 字节数组（包含一个检测字节），校验报文后仅按非空载荷长度申请池块并复制。
-接收数组位于跨异步等待存活的协程帧中，每 Node 一份；池存储按载荷长度取整到 size class，不携带接收头部空间。
-每个 UDP Flow 方向按 16 个最大块预留，接收队列仍最多 16 包，满时丢当前包。启用 UDP 限速时，burst 必须至少容纳希望转发的报文。
+接收数组位于跨异步等待存活的协程帧中，每 Node 一份；按载荷长度向标准池申请存储，不携带接收头部空间。
+每个 UDP Flow 方向的接收队列最多 16 包，载荷按需分配，满时丢当前包。启用 UDP 限速时，burst 必须至少容纳希望转发的报文。
 此上限不保证实际路径 MTU 允许直接发送；部署须将所有 Node 数据版本同步升级到 2，旧版本不能参与新信用协议。
 
 TCP 的首帧 attach/attached 继续采用 WireMessage/CBOR 并校验 data_version=2，之后只接受 Node 二进制帧。
@@ -1163,7 +1163,7 @@ DatagramMgr 逐包完成接收、路由、校验、头部改写和发送。限�
 ### 5.6 共享数据面容量与逐跳信用
 
 多节点 TCP/TLS Flow 采用**每条 Flow、每个方向、每个相邻跳独立的接收信用**：
-节点先为双向缓存预留容量，再按下游释放速度推进 DATA；末端或中间链路变慢时，背压逐跳传回入口。
+节点限制 Flow 数量和每方向的信用窗口，再按下游释放速度推进 DATA；末端或中间链路变慢时，背压逐跳传回入口。
 UDP 使用有界队列和逐包丢弃，见 5.6.6；它不参与 TCP 信用计算。
 
 本节按“计费与数学模型 → 安装和传输流程 → 信用刷新 → 背压实例 → 容量与性能分析”展开。
@@ -1184,7 +1184,7 @@ UDP 使用有界队列和逐包丢弃，见 5.6.6；它不参与 TCP 信用计�
 [SSH RFC 4254 §5.2](https://www.rfc-editor.org/rfc/rfc4254.html#section-5.2)；
 累计绝对上限的表达参考 [QUIC RFC 9000 §4.1](https://www.rfc-editor.org/rfc/rfc9000.html#section-4.1)。
 RelayWeave 使用自有 Node 帧格式和内存计费单位；这些参考不表示协议兼容。
-本项目在 prepare 时已经取得每条 Flow 的双向容量承诺，传输时不另设需要各流竞争的连接级信用窗口。
+本项目按数量准入 Flow，按固定方向窗口约束逐跳积压；传输时不另设需要各流竞争的连接级信用窗口。
 
 当前实现常量为：
 
@@ -1192,15 +1192,15 @@ RelayWeave 使用自有 Node 帧格式和内存计费单位；这些参考不表
 |---|---|---|
 | `W` | 每节点、每 Flow、每方向的 DATA 计费窗口 | `320 × 1024 = 327680` 字节 |
 | `h` | 每帧管理计费；每方向另留一个 FIN 位置 | `128` 字节 |
-| `B` | 每节点所有已预留 Flow 的合计预算 | `256 MiB = 268435456` 字节 |
+| `N` | 每节点活动及退休 Flow 身份合计上限 | `1000` |
 | `τ` | 节点级小额信用批次的合并间隔 | `20 ms` |
 
-这些值分别限制帧数量、逐跳缓存与节点准入，是当前负载目标下的工程默认值，不是进程 RSS 的逐字节核算。
+这些值分别限制帧数量、逐跳缓存、身份数量和信用通知频率，不是进程 RSS 的逐字节核算。全局字节预算已移除。
 
 这些值固定在 [`flow_protocol.cpp`](../protocol/src/flow_protocol.cpp) 和
-[`lnk_channel.h`](../protocol/inc/lnk_channel.h)，不从配置读取，也不作为公开策略常量暴露。
+[`lnk_channel.h`](../protocol/inc/lnk_channel.h)，不从配置读取；同义 Flow 数量上限统一使用 `lnk::max_flow_count`。
 
-窗口使用 **charge（计费字节）**，需要同时容纳载荷池块和帧管理开销。
+窗口使用 **charge（逻辑计费字节）**，保持既有载荷取整和帧管理计费。标准池实际块尺寸不参与线协议计算。
 设 `a` 为 `PooledBuffer` 的原分配长度，则实际计费为：
 
 ```text
@@ -1213,7 +1213,7 @@ c        = class(a) + h
 当前 TCP 生产路径在首节点按实际读到的 `p` 字节复制，在邻接接收端按帧体长度 `p` 分配，
 故以下 TCP 数值分析可使用 `c(p) = class(p) + 128`。128 是管理计费余量，Node 线协议头另为 32 字节。
 
-| DATA 载荷 `p` | 池块 size class | 单帧 `c(p)` | 一个初始 W 可容纳的完整帧数 | 对应用户载荷总量 |
+| DATA 载荷 `p` | 逻辑载荷计费 | 单帧 `c(p)` | 一个初始 W 可容纳的完整帧数 | 对应用户载荷总量 |
 |---|---|---|---|---|
 | 空 DATA | 0 | 128 | 2560 | 0 字节 |
 | 1 字节 | 256 | 384 | 853 | 853 字节 |
@@ -1230,7 +1230,7 @@ RESET、CREDIT、PING/PONG 不等待 DATA 信用，但仍受控制队列、物�
 
 #### 5.6.2 状态变量、准入条件与有界性证明
 
-以下模型针对一条 Active TCP Flow 的一个方向；关闭后的预算退还与迟到完成见 5.6.6。
+以下模型针对一条 Active TCP Flow 的一个方向；关闭、数量释放与迟到完成见 5.6.6。
 对节点 `i`，统一使用以下符号：
 
 | 符号 | Direction 字段 | 含义 |
@@ -1252,7 +1252,7 @@ RESET、CREDIT、PING/PONG 不等待 DATA 信用，但仍受控制队列、物�
 方向 `finished` 防止重复 FIN 与后续 DATA；FlowStream 的终止标志位于业务执行器，约束业务调用生命周期，
 不与数据执行器上的 Flow 状态重复。Frame 持有 Flow 所有者，保障在途写完成时状态仍然存活。
 
-`B` 是节点总预算，带下标的 `B_i` 是某条 Flow 某方向的当前占用。
+带下标的 `B_i` 是某条 Flow 某方向的当前逻辑占用，不表示全局字节预算。
 有入边时 `B_i = Q_i + 尚未释放的 FIN charge`。方向队列、终点交付、Link 队列和正在执行的 socket 写入
 都属于同一份本跳占用；在这些位置之间移动帧，不减少 `B_i`。
 
@@ -1300,8 +1300,8 @@ forward/reverse 各维护一套状态、互不借用额度。
 以下以 Consumer → H → I → T → Producer 的 forward 方向为例；反向按 T → I → H 独立执行。
 先由 NodeLinkMgr 完成路径安装和首末接入，具体控制事务见 3.5、7.4。
 
-1. **prepare 预留。** H、I、T 各自在本节点预算中为整条 Flow 预留双向 `2 × (W+h)`，检查身份、
-   相邻 Link 和准备期限；预算不足就拒绝建立。预留是容量承诺，载荷池按需分配。
+1. **prepare 准入。** H、I、T 各自检查 Flow 数量、身份、相邻 Link 和准备期限，通过后建立
+   Prepared 状态。活跃与退休身份共用 1000 个名额，载荷池按需分配。
 2. **commit 授信。** 各节点进入 Active；forward 的 I 向 H、T 向 I 发布初始 W。
    H 的 forward 没有入边，因此不为该方向向前发布 CREDIT。各节点对 reverse 做对应的独立初始化。
 3. **H 本地准入。** RemotePair 从 Agent 读取、按用户字节限速，把池缓冲交给 FlowStream。
@@ -1423,52 +1423,37 @@ c = 32768 + 128 = 32896
 有信用的其他 Flow 可以进入共享队列并按标签交错；同流 FIFO、当前写入及 TCP 丢包造成的队头阻塞仍存在。
 这保证协议层不会因等待某条 Flow 的信用而停读整条 Link，不承诺各流的带宽份额或延迟上界。
 
-#### 5.6.6 节点容量承诺、实际占用与 UDP 边界
+#### 5.6.6 数量准入、逐 Flow 边界与实际占用
 
-每条 TCP Flow 在**每一个路径节点**预留双向窗口：
+Flow 不再通过全局字节预留账本准入。prepare 校验数量、身份和邻接状态后建立 Flow，
+commit 仍负责激活和发布初始信用；两阶段用于多节点协调，并非仅为预留内存。
+`flows_ + retired_` 合计最多 1000 个身份，关闭后的身份保留 10 秒，避免立即复用。
+控制域的活动和关闭中 Flow 请求同样受统一的 1000 上限约束。
 
-```text
-R_tcp = 2 × (W + h) = 655616 字节
-N_tcp_max = floor(B / R_tcp) = 409
-100 条 TCP Flow 的预留 = 65561600 字节 ≈ 62.524 MiB / 节点
-```
-
-prepare 成功即占预留，Prepared 和 Active 都在预算内；Flow 关闭时统一退还。
-409 是预算只承载 TCP Flow 时的理论上限，身份表容量、其他 Flow 和准备事务还会限制实际并发。
-410 条需要 268802560 字节，已超过 B；100 条占约 24.42% 预算，余下约 193.476 MiB 可用于其他 Flow 准入。
-三节点百流路径的承诺总和约 187.573 MiB；这是各节点独立记账的总和，不是额外再分配一份缓存。
-即使当前只用一个方向，也预留反方向，以保证后续响应有容量。
-UDP 按有界队列的计费容量预留，不保留 TCP FIN 的额外 h。
-设每方向队列项数 `D=16`，混合准入条件为：
+TCP 每方向已准入 DATA charge 不超过 W，另允许一个 FIN；UDP 按每端点 16 项队列限制积压。
+以下是满载窗口/队列的逻辑容量模型，不是预分配或标准池实际占用：
 
 ```text
-R_udp = 2 × D × (65536 + h) = 2101248 字节
-N_tcp × R_tcp + N_udp × R_udp <= B
+TCP 每 Flow 双向逻辑容量 = 2 × (W + h) = 655616 字节
+1000 条 TCP Flow 的双向逻辑容量 ≈ 625.244 MiB / 节点
+UDP 双向满尺寸队列模型 = 2 × 16 × (65536 + h) = 2101248 字节 / Flow
+1000 条 UDP Flow 的队列模型 ≈ 2003.906 MiB / 节点
 ```
 
-纯 UDP 上限为 127 条，不增加不存在的 FIN 预留。B=256 MiB 能覆盖当前百流目标并留有准入空间；
-它不是对所有机器最优的内存额度。调整时需一起检查 W、混合并发、池峰值和 RSS。
-
-一条经过 n 个节点的 TCP Flow，每个节点独立承诺 `R_tcp`，全路径合计 `n × R_tcp`，
-不能把整条路径的缓存看成只有一个 W。同一方向在各节点的已准入 DATA charge 合计不超过 `nW`，
-还须计入独立的反方向、FIN 位置、未准入交接缓冲和网络栈中的数据。
-
-容量承诺、实际 charge 和进程内存分别观察：
+这些数值不包含窗口外的串行交接块、共享 Link 的读写、其他队列、固定数组、池缓存及内核存储。
+同一方向经过 n 个节点时，各节点独立维持窗口，已准入 DATA charge 合计不超过 nW；反方向另计。
 
 | 层次 | 覆盖范围 | 边界 |
 |---|---|---|
-| Flow 窗口预留 | 已 prepare 的双向容量承诺 | 预算 B 限制承诺总量，不要求启动时分配全部载荷 |
-| `buffered_bytes` | 已准入、仍在本跳方向队列、Link 队列、写入或终点交付的帧 | DATA 不超过 W，另留一个 FIN；移动不减计费 |
-| PayloadPool | 正在使用及已归还待复用的池块 | 硬上限 `B + 1000 × 65536 = 318.5 MiB`，按需分配并回收空闲块 |
-| 其他资源 | 固定读缓冲、协程/队列/状态对象、TLS 和内核 socket 缓冲等 | 未全部纳入上述池上限，不能据此推导进程 RSS 上限 |
+| Flow 身份与业务数量 | Prepared、Active、退休身份及业务控制任务 | 数量上限；不再限制全局预留字节 |
+| `buffered_bytes` | 已准入、仍在本跳队列、Link 写入或终点交付的帧 | DATA 不超过 W，另留一个 FIN；移动不减计费 |
+| 标准同步池 | 在用及标准库保留的块、chunk 和内部元数据 | 无应用层字节上限；允许保留高水位缓存 |
+| 其他资源 | 固定读缓冲、协程/队列/状态对象、TLS 和内核 socket 缓冲 | 依靠数量、队列与长度边界约束，不承诺固定 RSS |
 
-未准入的发送块和跨 Flow 关闭仍存活的业务/在途池块继续受 PayloadPool 上限约束。
-Flow 关闭退还的是承诺额度，池块由最终持有者归还；迟到的 written 不再修改已关闭 Flow 的信用。
-128 字节管理 charge 是容量模型中的计费，不是所有 C++ 对象与分配器开销的逐字节统计。
-当前 GCC/64 位 Frame 为 104 字节、Asio 对应队列元素为 120 字节；编译期断言约束 Frame 本体不超过 h。
-TCP 端点队列的最坏容量为 `W/h+1=2561` 项，允许窗口占满后再排入唯一的 FIN。
-`sizeof(Frame)<=128` 的断言只约束 Frame 本体，不证明容器、分配器、协程与固定对象都被 h 覆盖。
-缩小 W 不会降低 PayloadPool 的 318.5 MiB 硬上限，因为 B 和 1000 个身份上限未改变。
+Flow 关闭会清空其队列，池块由最终持有者归还；迟到的 written 不再修改已关闭 Flow 的信用。
+128 字节管理 charge 及载荷取整属于稳定的协议计费，不是所有 C++ 对象和分配器开销的逐字节统计。
+当前 Frame 为 96 字节，编译期断言约束其本体不超过 h；不能据此认为所有管理开销均被 h 覆盖。
+TCP 端点队列容量仍为 `W/h+1=2561` 项，允许窗口占满后再排入唯一的 FIN。
 
 其他共享容量沿用以下边界：
 
@@ -1477,7 +1462,7 @@ TCP 端点队列的最坏容量为 `W/h+1=2561` 项，允许窗口占满后再�
 | Link 申请 / 端点授权 | 各 1000 条 | 拒绝新申请 |
 | master 活动及关闭中 Flow | 合计 1000 条 | 拒绝新事务 |
 | FlowProtocol `flows_ + retired_` | 合计 1000 条；关闭身份短暂保留，禁止立即复用 | 拒绝 prepare |
-| 每 TCP Link DATA/FIN FairQueue | 从各 Flow 方向的预留额度准入 | 缺信用帧留在本 Flow；同流 FIFO、跨流交错，共享 writer 不另设信用等待 |
+| 每 TCP Link DATA/FIN FairQueue | 从各 Flow 方向的信用窗口准入 | 缺信用帧留在本 Flow；同流 FIFO、跨流交错，共享 writer 不另设信用等待 |
 | 每 TCP Link 一般控制 FIFO | 4096 条；CREDIT 另按 Flow/方向合并，项数受 Flow 身份容量约束 | 控制准入失败关闭相应 Flow 或 Link |
 | 每 UDP Flow 端点发送 / 接收队列 | 各 16 包 | 丢当前包，保留健康 Flow |
 | 共享 UDP 发送队列 | 100 项；其中业务最多 96 项 | 为保活留 4 项；业务超限丢包 |
@@ -1527,12 +1512,12 @@ W >= r × T_i / (8 × η_i)
 考虑整帧零头，9 个 32 KiB DATA 在同一周转下约支持 11.80 Mbps，4 个最大 DATA 约支持 10.47 Mbps；
 4097 字节 DATA 只有约 6.39 Mbps，不能把大块载荷的余量推广到所有分帧。
 
-| 每方向 W | TCP 双向承诺 | 256 MiB 预算的纯 TCP 上限 | 百流承诺 / 节点 |
-|---|---:|---:|---:|
-| 256 KiB | 512 KiB + 256 B | 511 | 50.024 MiB |
-| **320 KiB（当前）** | **640 KiB + 256 B** | **409** | **62.524 MiB** |
-| 512 KiB | 1 MiB + 256 B | 255 | 100.024 MiB |
-| 1 MiB | 2 MiB + 256 B | 127 | 200.024 MiB |
+| 每方向 W | TCP 双向逻辑窗口 | 百流窗口模型 / 节点 |
+|---|---:|---:|
+| 256 KiB | 512 KiB + 256 B | 50.024 MiB |
+| **320 KiB（当前）** | **640 KiB + 256 B** | **62.524 MiB** |
+| 512 KiB | 1 MiB + 256 B | 100.024 MiB |
+| 1 MiB | 2 MiB + 256 B | 200.024 MiB |
 
 从 512 KiB 调至 320 KiB，DATA 窗口容量减少 37.5%，代价是能够覆盖的信用周转缩短；
 不能据此声称进程 RSS 同比降低。初始 CREDIT 必须等于本地 W，当前协议没有窗口或计费单位协商，
@@ -1560,7 +1545,7 @@ W >= r × T_i / (8 × η_i)
 网络、控制帧写入和事件循环调度还会增加实际时延。已有额度、阈值即时刷新和两跳流水会缩短等待。
 只考虑某方向独自每周期释放 `Δ<W/4`、且发送者依赖该更新时，理想化信用供给速率仍可写为 `8Δ/τ` bit/s；
 该估算不描述批次内其他方向的剩余等待，更不能直接预测整条路径的用户吞吐。
-τ 不改变 W、预留预算或缓存上界；节点级批次也不保证 RSS 下降。
+τ 不改变 W、数量限制或单 Flow 缓存上界；节点级批次也不保证 RSS 下降。
 
 动态窗口、字节公平调度（如 DRR）和跨帧的有界批量写仍为待实现项。
 当前提供共享队列的标签交错、CREDIT 合并和有界控制优先；不提供端到端业务 ACK、逐流公平字节带宽或延迟保证。
@@ -1573,10 +1558,10 @@ W >= r × T_i / (8 × η_i)
 | 队首 DATA 超过剩余下游信用 | 留在 `pending_frames`，新 CREDIT 到达后继续 flush |
 | 重复或旧 CREDIT | 忽略，不增加额度 |
 | 非法初始/新增信用上限、计数器溢出、网络 DATA 越窗 | 关闭对应 Flow |
-| 已校验 Flow 内的预留容量不变量被破坏 | 关闭对应 Flow，避免以队列扩张掩盖错误 |
+| 已校验 Flow 内的窗口/队列容量不变量被破坏 | 关闭对应 Flow，避免以队列扩张掩盖错误 |
 | 物理帧格式错误、NodeLink socket I/O 失败 | 关闭 Link 并清理依赖 Flow |
 | FIN | 同方向有序 EOF，保留反方向；不增加 DATA 信用 |
-| RESET、控制失效或 Flow 关闭 | 唤醒并排空挂起任务、退还预留；失败写入不算成功消费 |
+| RESET、控制失效或 Flow 关闭 | 唤醒并排空挂起任务、释放业务状态；失败写入不算成功消费 |
 | UDP 队列满 | 丢当前报文并计数，不进入 TCP 信用等待 |
 
 排查发送停顿时，先区分本地 `buffered_bytes` 不足空间、下游 `send_limit-sent_bytes` 不足、
@@ -1585,8 +1570,8 @@ W >= r × T_i / (8 × η_i)
 
 | 要核对的机制 | 源码位置 |
 |---|---|
-| 原分配长度、size class 与 charge | [`lnk_channel.h`](../protocol/inc/lnk_channel.h)：`PooledBuffer`、`PayloadPool`、`Frame::charge` |
-| 总预算、prepare/commit/关闭 | [`flow_protocol.cpp`](../protocol/src/flow_protocol.cpp)：`flow_reservation`、`prepare_flow`、`commit_flow`、`close_flow` |
+| 原分配长度、逻辑计费与 charge | [`lnk_channel.h`](../protocol/inc/lnk_channel.h)：`PooledBuffer`、`Frame::charge_for_payload/charge` |
+| 数量准入、prepare/commit/关闭 | [`flow_protocol.cpp`](../protocol/src/flow_protocol.cpp)：`prepare_flow`、`commit_flow`、`close_flow` |
 | DATA 准入、队首信用检查和接收授信校验 | 同文件：`Stream::try_send`、`receive`、`flush`、`receive_credit` |
 | 写完成、信用刷新与期限 | 同文件：`written`、`Stream::release_buffer`、`publish_credit`、`poll` |
 | 首末交接与串行消费确认 | 同文件的 `Stream::send_loop/receive_loop`；[`pipeline_mgr.cpp`](../node/src/pipeline_mgr.cpp) 的 `read_remote_pair/write_remote_pair` |
@@ -1596,23 +1581,25 @@ W >= r × T_i / (8 × η_i)
 
 | 测试 | 覆盖边界 |
 |---|---|
-| [`lnk_flow_control_test.cpp`](../test/protocol/lnk_flow_control_test.cpp) | 本地准入与取消、节点信用批次、阈值/耗尽刷新、满窗口 FIN、信用校验、预算退还、UDP 有界丢包及三跳停读恢复 |
+| [`lnk_flow_control_test.cpp`](../test/protocol/lnk_flow_control_test.cpp) | 本地准入与取消、节点信用批次、阈值/耗尽刷新、满窗口 FIN、信用校验、数量准入和退休身份到期、UDP 有界丢包及三跳停读恢复 |
 | [`fair_queue_test.cpp`](../test/protocol/fair_queue_test.cpp) | 独立参考模型、穷举/随机轨迹、有限状态进展、哈希冲突与 Frame 所有权；真实 writer 交错由上项 wire 场景验证 |
 | [`lnk_flow_receive_test.cpp`](../test/protocol/lnk_flow_receive_test.cpp) | 端点交付、载荷所有权、执行器、消费确认、取消和任务排空 |
 | [`lnk_channel_flows_test.cpp`](../test/protocol/lnk_channel_flows_test.cpp) | 真实共享 Link 的 Flow 生命周期、FIN/RESET、并发响应和隔离 |
-| [`pooled_buffer_test.cpp`](../test/common/pooled_buffer_test.cpp) | 池硬容量、空闲块回收、size class、复用和跨线程存储生命周期 |
+| [`pooled_buffer_test.cpp`](../test/common/pooled_buffer_test.cpp) | 标准池复用、稳定逻辑计费和跨线程存储生命周期 |
 
 信用批次场景驱动真实端点任务，并用受控的 `poll(now)` 检查期限前 1 ns 与到期时的行为，不依赖 sleep；
 不同 Flow 与相反方向共享批次，其中一条即时刷新或关闭不能取消另一条的待发布额度。
-满窗口 FIN 场景同时验证精确耗尽刷新，预算场景同时覆盖百流准入、超额拒绝和关闭后复用。
+满窗口 FIN 场景同时验证精确耗尽刷新，数量场景覆盖 TCP、UDP、混合各 1000 个 Flow、超额拒绝和退休身份到期后复用。
 真实 wire 与三跳测试负责验证共享 Link 的健康流进展、背压传播、恢复顺序和失败隔离，不能由受控期限检查替代。
 用例不向生产类增加测试开关；功能回归验证协议和资源边界，性能结论需对应负载下的实测。
 
 #### 5.6.9 参数研究结论与扫描计数
 
-最终选择 **320 KiB 方向窗口、256 MiB 节点预算、20 ms 节点信用批次**。
+当前采用 **320 KiB 方向窗口、1000 个 Flow 身份上限、20 ms 节点信用批次**。
+2026-10-20 移除原 256 MiB 全局预留和自定义池字节上限；以下历史研究保留其原始实现条件。
+标准池改动的后续隔离与长测见 [标准载荷池性能复核](标准载荷池性能复核.md)；首轮三秒对照的固定吞吐降幅未能稳定复现，默认 chunk 增加内存申请已由追踪确认。
 减小窗口约束每条慢流的滞留量；统一批次减少期限错开导致的全量扫描；合并时间只调整信用发布时机，
-不推迟本地释放，不改变 DATA/FIN 的容量承诺，也不提供逐流带宽公平或业务延迟保证。
+不推迟本地释放，不改变 DATA/FIN 的方向窗口，也不提供逐流带宽公平或业务延迟保证。
 
 历史参数研究使用 W=512 KiB。每方向期限阶段比较过 2/8/12/16/20 ms；
 20 ms 在小包负载下减少了扫描与部分 CPU 成本，同时增加某些发送等待尾部，因此没有把吞吐或 RSS 改善作为普遍结论。
@@ -1622,7 +1609,7 @@ W >= r × T_i / (8 × η_i)
 普通 Release 的交错对照中，同场景吞吐约 489 Mbps，CPU 中位数由 73.93% 降至 66.92%；
 大块与接近单核饱和的场景仍有短跑波动，不据此承诺所有场景加速。
 
-以下为当前 W=320 KiB 的八类负载补测：三节点、单进程、单 io 线程、Release 研究副本，
+以下为移除全局预算前、W=320 KiB 的八类负载补测：三节点、单进程、单 io 线程、Release 研究副本，
 预热 1 秒、每阶段 3 秒、各跑一次，编译和回归均在测量前结束。
 计数仅覆盖测量阶段，排除预热和排空；全部载荷、顺序、方向窗口、排空及池块归还检查通过。
 这是单次功能与计数验证，不与历史三次中位数直接推断新旧窗口的吞吐、CPU 或 RSS 收益。
@@ -1738,21 +1725,23 @@ UDP 没有 Stream、CREDIT、FIN、空间通知或消费确认。
 
 #### 5.7.3 池缓冲与剩余开销
 
-lnk::Frame 保存头和独占、可移动的 lnk::PooledBuffer。PayloadPool 负责复用或回收同一块存储，
+lnk::Frame 保存头和独占、可移动的 lnk::PooledBuffer。标准同步池负责复用或回收同一块存储，
 PooledBuffer 保存池块的原分配地址、大小及 span 视图，切片不改变归还地址。
 空载荷不分配字节块，新块不做无用的初始化。业务路径不再新建 BytesBuf：接入端按实际长度复制到池块，
 每个 Node UDP 接收跳也从共享数组复制一次到池块；TCP 邻接接收直接读入池块。
 进入池块后的跨执行器交接和终点输出都移动原块。UDP 以一次载荷复制换取小包按实际大小持有池存储。
-PayloadPool 的分配、归还及空闲块回收使用同一 mutex，
-允许业务执行器和数据执行器共享；载荷访问仍由唯一缓冲所有者执行，不持池锁跨越 socket I/O。
-池有合适空闲块时复用，缺块且预算允许时补充；不要求启动时一次性预分配全部预算。
+直接使用 `std::pmr::synchronized_pool_resource`，不保留包装类或类型别名。
+FlowProtocol 创建池时将最大必需池化块设为 65,536 B，
+上游为 `new_delete_resource()`，其余池选项采用标准库默认值。分配和归还可跨线程执行，
+载荷访问仍由唯一缓冲所有者执行。没有自定义预算、锁、空闲链表或字节统计。
+标准池自行补充 chunk 并保留缓存，业务完全空闲时也不主动 release；不承诺固定 RSS 上限。
 
 只有共享 Link 写队列的帧保活原 FlowState；Flow 自有队列的 owner 为空，避免自引用。
 在途写操作即使越过流表删除仍能持有原帧至完成，但关闭后的迟到 written 不归还信用。
 FlowProtocol、端口和业务池缓冲共享池的生命周期。PooledBuffer 的 deleter 持有资源引用，
 只保活分配器，不保活整个协议；stop 排空协议任务，已交付业务的缓冲可在协议停止、销毁后继续存活，
 最后一块缓冲或端口释放后池再销毁。缓冲只接受共享资源，不提供借用资源的构造路径。
-PayloadPool 固定使用标准堆作为上游；分配计数由测试可执行文件完成，生产类不保留测试注入参数。
+FlowProtocol 创建池时使用标准堆作为上游；分配计数由测试可执行文件完成，生产代码不保留测试注入参数。
 
 每次网络输入使用 std::map 查 Flow/Link，为 O(log F)/O(log L)；端点长期任务持有已绑定实例，
 逐帧不查流表。信用计算是常数次整数比较与加减，队列准入与移动摊销 O(1)，状态随 Flow 数线性增长。
@@ -1909,7 +1898,7 @@ UDP 重试由 Forwarder 拥有的独立协程执行并计入停机排空；服�
 | lnk::NodeLink | LnkChannel 的 connections_ 表及建立/接入父任务 | 同步函数及 TCP 读写子协程借用 NodeLink&，父任务等待组合完成后释放持有者 | close 置 Closed、取消 I/O 并删除表项，父任务排空读写后销毁 |
 | lnk::FlowState | FlowProtocol 的 flows_ 表、Stream/Datagram 父任务及 Link 在途帧 | TCP 子协程借用父任务的 const shared_ptr& 和端口引用；帧保留原 Flow 身份 | 关闭队列并删除表项后，父任务等待子协程收尾；retired_ 只保存 ID/期限，不拥有 Flow |
 | FlowProtocol::Stream / Datagram | FlowProtocol 按值包含 | 反向借用 FlowProtocol& | 所属父任务排空后随协议服务销毁 |
-| lnk::PayloadPool | FlowProtocol、FlowStream/FlowDatagram 及池缓冲 deleter 共享 | 只保活分配器，分配与归还使用 mutex | 最后一个端口和在途业务缓冲释放后销毁，不依赖协议服务继续存活 |
+| std::pmr::synchronized_pool_resource | FlowProtocol、FlowStream/FlowDatagram 及池缓冲 deleter 共享 | 只保活标准同步分配器，支持跨线程分配归还 | 最后一个端口和在途业务缓冲释放后销毁，不依赖协议服务继续存活 |
 | TLSChannel | 自己的 run 协程和当前连接协程 | manager/route 使用 `weak_ptr` | 任一读写、心跳、关闭分支结束 |
 | ControlSession | 当前 session 协程 | Registry 和 Relay 使用 weak 引用 | 接收循环结束并完成 disconnect |
 | ClusterRoom | master accept_loop 协程栈 | ClusterSession 保存引用，且必须先于 room 退出 | accept/delivery 停止并等待 participant 清空 |
@@ -2005,7 +1994,7 @@ expires_at 已安装更早期限，operation_aborted 后直接等待新期限，
 stop 会立即退出等待，并发组的协程取消则向上传播。
 单次解析、握手及帧 I/O 超时仍用 cancel_after，不再套另一套独立超时任务。
 动态接入、Link 与端点任务仍由原任务计数管理，stop 关闭资源后等待 run 及动态任务全部排空，
-协议通道排空后才能销毁；PayloadPool 由端口和在途业务缓冲继续保活至最后一次归还。
+协议通道排空后才能销毁；标准同步池由端口和在途业务缓冲继续保活至最后一次归还。
 
 ### 6.4 状态索引、计量与准入约束
 
@@ -2046,7 +2035,7 @@ RX 固定表示 Producer 到 Consumer，TX 表示 Consumer 到 Producer。
 | `control.max_services` | 本节点全部注册服务上限 |
 | `control.max_services_per_session` | 一条普通控制连接可注册的服务上限 |
 | `tcp/tls.max_setup_connections` | 正在读取 attach 的未归属 TCP/TLS socket 上限 |
-| `tcp/tls/udp.max_relays` | 对应 manager 的等待和活动 Relay 上限 |
+| `tcp/tls/udp.max_relays` | 对应协议的建立中、活动和关闭未排空业务任务上限；manager 同时约束等待和活动数据资源 |
 | `tcp/tls.setup_timeout_ms` | 从创建/接受到合法 attach 完成的时间限制 |
 | `udp.setup_timeout_ms` | 单节点 UDP 从创建到双方接入、绑定和激活的建立期限；默认 10000 毫秒，不限制运行期 |
 | `channel.max_queued_messages` | 单条 TLSChannel 的发送队列、ClusterMgr 出站消息队列和 RelayNode 对外集群消息队列容量 |
@@ -2455,7 +2444,7 @@ RemotePair 使用 65467 字节的读取缓冲，从 Agent stream 读到多少就
 同方向 DATA/FIN 的提交与交付顺序保持一致。应用的原始 TCP 写入边界不保留，终点把收到的块顺序写回 stream。
 
 DATA/FIN 没有逐帧远端业务确认，交接完成只保证数据侧拥有载荷，不能解释为已经入队或末端应用已经收到。
-每跳可靠与顺序由该 TCP socket 提供。每 Flow 每方向有固定信用窗口，prepare 时预留全节点缓存预算。
+每跳可靠与顺序由该 TCP socket 提供。每 Flow 每方向有固定信用窗口，prepare 按数量、身份和邻接状态准入。
 缺少出边信用的帧停留在本方向，取得信用后进入 Link 的 FairQueue，按流标签交错、从队首写出；本地方向窗口满时异步提交挂起。
 中间节点向下游写完、终点向 Agent 写完并释放公开载荷后，才归还相邻入边信用。
 正常拥塞不关闭 Flow；越窗、格式错误与真实 I/O 失败仍有明确失败边界，
@@ -2975,8 +2964,9 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 - `cluster_integration`：ClusterRoom 广播与定向发送、来源、保留/重复 ID、非法命令、成员证书、固定 5 秒重连、无历史回放和停止；
 - `node_links`：共享 TCP/UDP、并发复用、握手乱序、单次失败与外层重试、凭据/旧 ID、有效 PONG、epoch/离线、超长 UDP、过期发送项、监听回滚及并发/取消停止；
 - `node_flows`、`lnk_channel_flows`、`lnk_flow_receive`：双向及分叉转发、方向/epoch/FIN、RESET 与满队列、容量隔离、准备期限、控制失效、接收者唤醒及停止后公开载荷有效性；
-- `lnk_flow_control`：本地信用等待与取消、消费确认、节点 20 ms 批次、多 Flow/方向隔离、阈值/精确耗尽刷新、满窗口 FIN、重复/延迟/越界信用、三跳停读恢复、UDP 丢包及预算退还；
-- `lnk_frame`、`pooled_buffer`：二进制头和本地帧校验；独占缓冲移动、偏移归还、队列转移、池硬容量与空闲块回收、预热复用和跨线程生命周期；
+- `lnk_flow_control`：本地信用等待与取消、消费确认、节点 20 ms 批次、多 Flow/方向隔离、阈值/精确耗尽刷新、满窗口 FIN、重复/延迟/越界信用、三跳停读恢复、UDP 丢包及数量限制；
+- `lnk_frame`、`pooled_buffer`：二进制头和本地帧校验；独占缓冲移动、偏移归还、队列转移、稳定信用计费、标准池预热复用和跨线程生命周期；
+- `node_relay_capacity`：暂停数据执行域时，TCP/TLS/UDP 各自的待建立和关闭中任务受 `max_relays` 约束，排空后名额可复用；
 - `agent_cluster`：两个节点上的服务同时转发、主控在线时从节点恢复、服务迁移、首次目标失败、过期发现响应；
 - `relay_protocol`：控制命令枚举映射、自定义命令、三种协议 attach、帧校验、UDP session header
   和协议选择；
@@ -3033,7 +3023,7 @@ Dashboard 的 HistoryStore 由应用创建和关闭，采集客户端只使用�
 
 | 扩展 | 合理位置 | 必须明确的语义 |
 |---|---|---|
-| 按需增长窗口 | FlowProtocol 的方向授信与全局预留账 | 已授出的额度不能立即收回，增长前必须取得预算 |
+| 按需增长窗口 | FlowProtocol 的方向授信与逐 Flow 容量边界 | 已授出的额度不能立即收回，增长会提高满载内存模型，需同时复核数量上限 |
 | 按字节或权重公平调度 | NodeLink 物理写链之前 | 在已有标签交错基础上分配字节份额或权重，保持同方向 DATA/FIN 顺序 |
 | 多物理通道或连接池 | NodeLinkMgr 建连策略与 LnkChannel 安装映射 | 安装 Flow 时固定选中 Link，不能每帧任意换 socket |
 | 存量换路 | NodeLinkMgr 路径事务与 FlowProtocol 路由状态 | 需要路径代次、旧数据排空、确认和顺序保证，不能仅改目的索引 |
@@ -3420,7 +3410,7 @@ TCP/TLS 在双方 finished 后正常收尾，由首 Node 关闭 Flow；UDP 没�
 - [`route/src/route_graph.cpp`](../route/src/route_graph.cpp)：纯成本图和按真实节点数量分层的多入口搜索；
 - [`protocol/src/tls_channel.cpp`](../protocol/src/tls_channel.cpp)：mTLS 握手、收发队列、心跳和通道关闭；
 - [`protocol/inc/flow_protocol.h`](../protocol/inc/flow_protocol.h)：逻辑 Flow 协议、生命周期、端点绑定与类型明确的事件；
-- [`protocol/inc/lnk_channel.h`](../protocol/inc/lnk_channel.h)：NodeLink、统一 Frame、PooledBuffer 与共享 PayloadPool；
+- [`protocol/inc/lnk_channel.h`](../protocol/inc/lnk_channel.h)：NodeLink、统一 Frame 与 PooledBuffer；
 - [`protocol/src/lnk_channel.cpp`](../protocol/src/lnk_channel.cpp)：Node TCP/UDP 接入、物理收发、心跳与任务排空；
 - [`protocol/src/flow_protocol.cpp`](../protocol/src/flow_protocol.cpp)：逻辑流安装、路由、信用窗口、端点收发与任务回收；
 - [`protocol/src/message.cpp`](../protocol/src/message.cpp)：控制命令映射、WireMessage、CtrlMessage、RelayAttach 和
@@ -3484,17 +3474,18 @@ Node Flow 和 NodeLink 的 7 项相关回归全部通过。记录为 build/flow-
 全量 CTest 共 40 项，39 项通过，probe_integration 因原始 ICMP 权限不足跳过，0 项失败，耗时 90.60 秒。
 记录为 build/flow-lifecycle-build.log 和 build/flow-lifecycle-tests.log；63 个本地链接与章节锚点、git diff --check 通过。
 
+以下是采用全局预留及自定义有界池时的历史验证记录；当前资源管理见 5.6.6 和盘点文档 11.6。
 回归覆盖逐跳窗口满后的挂起与恢复、终点写完前不授信、三跳停读和其他 Flow 进度、双向 DATA/FIN、
-RESET、重复/旧/越界 CREDIT、百流准入、预算退还和池复用；同时覆盖端点取消、停止排空、
+RESET、重复/旧/越界 CREDIT、数量准入、关闭复用和池复用；同时覆盖端点取消、停止排空、
 原生完成返回业务执行器、复用 ID 后旧端点操作隔离，以及 UDP 满队列丢整包、最大包与空包。
 共享循环组合补充验证 TCP accept、UDP receive 失败及发送队列意外关闭时取消其他循环、清理 Flow 并排空；
 准备超时只关闭该 Flow，提前更新 timer 期限不终止 monitor，并发组取消则唤醒并结束 monitor；
 停止与尚未认证的 TCP 接入完成交错时，停止不等待新的 bootstrap 超时。
 协议状态整理补充覆盖 TCP ID 被 UDP 复用后旧 TCP 端口 RESET/close 的隔离、新 UDP 端口收发，
 以及 UDP 接收等待在关闭时保留实际关闭原因。
-生产 PayloadPool 预热后累计 20,000 次取块归还（其中 10,000 次由两个线程执行），上游分配次数为 0；
-端点交接保持原载荷地址，已交付缓冲可以晚于协议销毁，并且只保活池。额外覆盖 UDP 池容量不足及
-关闭端口丢包、TCP 池满时 RESET 仍关闭该 Flow，不让分配异常从数据域投递回调中逃出。
+当时的 PayloadPool 预热后累计 20,000 次取块归还（其中 10,000 次由两个线程执行），上游分配次数为 0；
+端点交接保持原载荷地址，已交付缓冲可以晚于协议销毁，并且只保活池。旧有容量失败用例现已由测试侧实际分配失败替代，
+不再保留生产池硬上限或回收策略的专用测试。
 TCP 任务组合补充验证单向 FIN 不取消反向传输、正常 FIN 后另一方向错误保留实际阶段；
 接收失败取消信用等待中的发送者，排空后释放协议；物理 writer 失败取消 reader、保留原始错误，
 关闭依赖 Flow，并在父任务排空后释放借用的 Link。

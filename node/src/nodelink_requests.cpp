@@ -5,7 +5,7 @@
 asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> path, RelayProtocol transport)
 {
     if (path.size() < 2 || path.front() != config_.node_id || transport == RelayProtocol::Tls || !topology_.epoch() ||
-        remote_flows_.size() >= 1000)
+        remote_flows_.size() >= lnk::max_flow_count)
     {
         co_return FlowResult{0, 0, "open", "requires a current ingress and tcp/udp flow"};
     }

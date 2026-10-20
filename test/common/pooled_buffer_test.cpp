@@ -3,6 +3,7 @@
 #include <asio/experimental/channel.hpp>
 #include <array>
 #include <atomic>
+#include <barrier>
 #include <cstdlib>
 #include <future>
 #include <iostream>
@@ -189,36 +190,22 @@ void pool_reuse()
     const auto initial_live = allocation_count::live.load();
     const auto initial_allocations = allocation_count::allocations.load();
     {
-        constexpr std::array<std::size_t, 4> sizes{64, 512, 4096, 4137};
-        auto pool = std::make_shared<lnk::PayloadPool>(4 * 1024 * 1024);
-        {
+        auto pool = std::make_shared<std::pmr::synchronized_pool_resource>(
+            std::pmr::pool_options{.largest_required_pool_block = 65536}, std::pmr::new_delete_resource());
+        std::size_t warmed_allocations = 0;
+        std::barrier warmed(2, [&]() noexcept { warmed_allocations = allocation_count::allocations.load(); });
+        auto transfer = [&] {
+            constexpr std::array<std::size_t, 5> sizes{64, 512, 4096, 4137, 65536};
             std::vector<PooledBuffer> warm;
-            warm.reserve(400);
+            warm.reserve(sizes.size() * 16);
             const allocation_count::Scope counting;
             for (auto size : sizes)
-            {
-                for (int i = 0; i < 100; ++i)
-                {
+                for (int i = 0; i < 16; ++i)
                     warm.emplace_back(pool, size);
-                }
-            }
-        }
-        const auto warmed_allocations = allocation_count::allocations.load();
-        require_buffer(warmed_allocations > initial_allocations, "allocation instrumentation missed the pool");
-        {
-            const allocation_count::Scope counting;
+            warm.clear();
+            // Standard synchronized pools can initialise per-thread state.
+            warmed.arrive_and_wait();
             for (int i = 0; i < 10000; ++i)
-            {
-                PooledBuffer packet(pool, sizes[i % sizes.size()]);
-                packet.bytes().front() = 42;
-                packet.bytes().back() = 255;
-            }
-        }
-        require_buffer(allocation_count::allocations == warmed_allocations,
-                       "steady packet traffic kept allocating from the upstream heap after warmup");
-        auto transfer = [pool, sizes] {
-            const allocation_count::Scope counting;
-            for (int i = 0; i < 5000; ++i)
             {
                 PooledBuffer packet(pool, sizes[i % sizes.size()]);
                 packet.bytes().front() = 42;
@@ -229,60 +216,34 @@ void pool_reuse()
         std::thread second(transfer);
         first.join();
         second.join();
+        require_buffer(warmed_allocations > initial_allocations, "allocation instrumentation missed the pool");
         require_buffer(allocation_count::allocations == warmed_allocations,
-                       "cross-executor pool reuse kept allocating from the upstream heap");
-        std::cout << "[PASS] 20000 pooled packets required 0 upstream allocations after warmup\n";
+                       "steady traffic kept allocating upstream after per-thread warmup");
+        std::cout << "[PASS] 20000 standard-pool packets reused storage after per-thread warmup\n";
     }
     require_buffer(allocation_count::live == initial_live, "pool retained storage after destruction");
 }
 
-// Verify the shared pool's hard capacity and idle-block reclamation independently of Flow credit.
-void pool_capacity()
+void logical_charge()
 {
-    const auto initial_live = allocation_count::live.load();
-    auto retained_bytes = [&] {
-        return allocation_count::live.load() - initial_live;
-    };
+    for (const auto [size, charge] : std::array<std::pair<std::size_t, std::size_t>, 8>{
+             {{0, 128}, {1, 384}, {255, 384}, {256, 384}, {257, 640}, {4097, 8320}, {65467, 65664}, {65536, 65664}}})
     {
-        auto pool = std::make_shared<lnk::PayloadPool>(4096);
-        const allocation_count::Scope counting;
-        for (int round = 0; round < 64; ++round)
-        {
-            {
-                PooledBuffer first(pool, 2048);
-                PooledBuffer second(pool, 2048);
-                require_buffer(retained_bytes() == 4096, "pool did not charge rounded blocks");
-            }
-            {
-                PooledBuffer small(pool, 255);
-                bool rejected = false;
-                try
-                {
-                    PooledBuffer large(pool, 3072);
-                }
-                catch (const std::bad_alloc &)
-                {
-                    rejected = true;
-                }
-                require_buffer(rejected, "pool exceeded hard live budget");
-            }
-            {
-                PooledBuffer large(pool, 3072);
-                require_buffer(retained_bytes() == 4096, "pool failed to reclaim idle blocks");
-            }
-            require_buffer(retained_bytes() <= 4096, "pool retained unbounded storage");
-        }
+        require_buffer(lnk::Frame::charge_for_payload(size) == charge, "wire credit charge changed");
     }
-    require_buffer(allocation_count::live == initial_live, "capacity test leaked pool storage");
+    lnk::Frame frame{};
+    frame.payload = PooledBuffer(std::make_shared<std::pmr::synchronized_pool_resource>(), 4137);
+    frame.payload.slice(100, 1);
+    require_buffer(frame.charge() == 8320, "slicing changed original-allocation credit charge");
 }
 
 void shared_resource_lifetime()
 {
     const auto initial_live = allocation_count::live.load();
-    std::weak_ptr<lnk::PayloadPool> weak;
+    std::weak_ptr<std::pmr::synchronized_pool_resource> weak;
     PooledBuffer payload;
     {
-        auto pool = std::make_shared<lnk::PayloadPool>(65536);
+        auto pool = std::make_shared<std::pmr::synchronized_pool_resource>();
         weak = pool;
         const allocation_count::Scope counting;
         payload = PooledBuffer(pool, 1024);
@@ -306,7 +267,7 @@ int main()
         ownership();
         channel_transfer();
         pool_reuse();
-        pool_capacity();
+        logical_charge();
         shared_resource_lifetime();
         std::cout << "[PASS] exclusive ownership, offset views and asynchronous channel transfers\n";
     }

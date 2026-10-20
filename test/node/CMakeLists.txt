@@ -4,6 +4,8 @@ foreach(name IN ITEMS node_config node_status)
 endforeach()
 relayweave_test(node_lifecycle node_lifecycle_test.cpp
     LIBRARIES relayweave_node_lib LABELS node integration)
+relayweave_test(node_relay_capacity node_relay_capacity_test.cpp
+    LIBRARIES relayweave_node_lib LABELS node integration)
 
 relayweave_test(cluster_integration cluster_integration_test.cpp TIMEOUT 35
     LIBRARIES relayweave_node_lib LABELS node cluster integration)

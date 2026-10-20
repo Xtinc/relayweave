@@ -1,11 +1,16 @@
+#include "failing_payload_pool.h"
 #include "flow_test_io.h"
 #include "frame_io.h"
 #include "flow_test_state.h"
 #include <future>
 #include <iostream>
+#include <fstream>
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 using namespace std::chrono_literals;
-TEST_MEMBER(FlowProtocol, reserved_bytes_)
+TEST_MEMBER(FlowProtocol, retired_)
 TEST_MEMBER(FlowProtocol, credit_deadline_)
 TEST_MEMBER(FlowProtocol, poll)
 TEST_MEMBER(LnkChannel, connections_)
@@ -203,42 +208,85 @@ static void stream_admission_tests()
     }
     {
         LocalFixture fixture;
-        test_access::FlowProtocol_payload_pool_(*fixture.channel) = std::make_shared<lnk::PayloadPool>(256);
+        auto pool = std::make_shared<FailingPayloadPool>();
+        test_access::FlowProtocol_payload_pool_(*fixture.channel) = pool;
         fixture.prepare(251);
-        check(fixture.send(251, {1}), "could not fill reset test pool");
+        check(fixture.send(251, {1}), "could not fill reset allocation fixture");
+        pool->fail_allocations = true;
         const auto port = std::get<std::shared_ptr<lnk::FlowStream>>(fixture.port(251));
-        asio::post(fixture.caller, [port] { port->reset("pool full"); });
+        asio::post(fixture.caller, [port] { port->reset("allocation failed"); });
         fixture.pump();
-        check(!test_access::FlowProtocol_flows_(*fixture.channel).contains(251), "full pool prevented Flow reset");
+        check(!test_access::FlowProtocol_flows_(*fixture.channel).contains(251), "allocation failure prevented Flow reset");
     }
 }
 
-static void reservation_tests()
+static void flow_capacity_tests()
 {
-    const auto reservation = 2 * (test_flow::window_bytes + lnk::Frame::buffer_overhead);
-    const BytesBuf payload(32768, 0x5a);
+    static_assert(lnk::max_flow_count == 1000);
+    for (const int mode : {0, 1, 2})
     {
         LocalFixture fixture;
-        const auto capacity = test_flow::buffer_budget_bytes / reservation;
-        check(capacity >= 100, "defaults cannot admit 100 TCP Flows");
-        for (std::uint64_t id = 10; id < 10 + capacity; ++id)
+        for (std::uint64_t id = 1; id <= 1000; ++id)
         {
-            fixture.prepare(id);
+            fixture.prepare(id, mode == 1 || (mode == 2 && id % 2) ? RelayProtocol::Udp : RelayProtocol::Tcp);
         }
-        fixture.prepare(1000);
-        check(test_access::FlowProtocol_flows_(*fixture.channel).size() == capacity, "prepare overcommitted reservations");
-        check(fixture.send(10, payload), "budget test could not send");
-        auto frame = fixture.receive(10);
-        fixture.close(10);
-        check(test_access::FlowProtocol_reserved_bytes_(*fixture.channel) == (capacity - 1) * reservation,
-              "closing delivered data retained reservation");
+        check(test_access::FlowProtocol_flows_(*fixture.channel).size() == 1000,
+              "Flow admission still depends on a global byte budget");
         fixture.prepare(1001);
-        check(test_access::FlowProtocol_flows_(*fixture.channel).contains(1001), "closed reservation was not reusable");
-        frame = {};
-        fixture.complete(10);
-        check(test_access::FlowProtocol_reserved_bytes_(*fixture.channel) == capacity * reservation,
-              "late completion changed reservation accounting");
+        check(!test_access::FlowProtocol_flows_(*fixture.channel).contains(1001), "Flow count limit was exceeded");
+        fixture.close(1);
+        fixture.prepare(1001);
+        fixture.prepare(1);
+        check(test_access::FlowProtocol_flows_(*fixture.channel).size() == 999 &&
+                  !test_access::FlowProtocol_flows_(*fixture.channel).contains(1),
+              "retired identities stopped consuming capacity or were revived early");
+        asio::post(fixture.data, [&] {
+            test_access::FlowProtocol_poll(*fixture.channel, lnk::Clock::now() + 11s);
+        });
+        fixture.pump();
+        check(test_access::FlowProtocol_retired_(*fixture.channel).empty(), "retired identity did not expire");
+        fixture.prepare(1001);
+        check(test_access::FlowProtocol_flows_(*fixture.channel).contains(1001),
+              "expired identity did not restore count capacity");
     }
+}
+
+static void flow_churn_tests()
+{
+    LocalFixture fixture;
+    auto rss_bytes = []() -> std::size_t {
+#ifdef __linux__
+        std::ifstream stat("/proc/self/statm");
+        std::size_t total = 0, resident = 0;
+        stat >> total >> resident;
+        return resident * static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+#else
+        return 0;
+#endif
+    };
+    std::size_t first_rss = 0, last_rss = 0, peak_rss = 0;
+    for (std::uint64_t round = 0; round < 40; ++round)
+    {
+        for (std::uint64_t slot = 0; slot < 8; ++slot)
+            fixture.prepare(2000 + round * 8 + slot, slot % 2 ? RelayProtocol::Udp : RelayProtocol::Tcp);
+        check(test_access::FlowProtocol_flows_(*fixture.channel).size() == 8, "churn changed fixed concurrency");
+        for (std::uint64_t slot = 0; slot < 8; ++slot)
+        {
+            const auto id = 2000 + round * 8 + slot;
+            const BytesBuf payload(slot % 2 ? LnkFrameHeader::maximum_payload : 32768, 0x5a);
+            check(fixture.send(id, payload), "churn could not enqueue payload");
+            check(fixture.receive(id) == payload, "churn corrupted payload");
+            if (slot % 2 == 0) fixture.complete(id);
+            fixture.close(id);
+            fixture.ports.erase(id);
+        }
+        check(test_access::FlowProtocol_flows_(*fixture.channel).empty(), "churn retained active Flows");
+        last_rss = rss_bytes();
+        if (!round) first_rss = last_rss;
+        peak_rss = std::max(peak_rss, last_rss);
+    }
+    std::cout << "[PASS] 40 mixed Flow churn rounds, concurrency=8; RSS first/last/peak bytes="
+              << first_rss << '/' << last_rss << '/' << peak_rss << '\n';
 }
 
 static void datagram_admission_tests()
@@ -246,9 +294,6 @@ static void datagram_admission_tests()
     {
         LocalFixture fixture;
         fixture.prepare(200, RelayProtocol::Udp);
-        constexpr auto udp_reservation = 2 * 16 * (65536 + lnk::Frame::buffer_overhead);
-        check(test_access::FlowProtocol_reserved_bytes_(*fixture.channel) == udp_reservation,
-              "UDP reservation included a TCP FIN slot or omitted packet capacity");
         for (int index = 0; index < 16; ++index)
         {
             check(fixture.send(200, {9}), "UDP burst was rejected early");
@@ -279,20 +324,23 @@ static void datagram_admission_tests()
     }
     {
         LocalFixture fixture;
-        test_access::FlowProtocol_payload_pool_(*fixture.channel) = std::make_shared<lnk::PayloadPool>(256);
+        auto pool = std::make_shared<FailingPayloadPool>();
+        test_access::FlowProtocol_payload_pool_(*fixture.channel) = pool;
         fixture.prepare(250, RelayProtocol::Udp);
+        pool->fail_allocations = true;
         const auto port = std::get<std::shared_ptr<lnk::FlowDatagram>>(fixture.port(250));
         asio::post(fixture.caller, [port] {
             const std::array<std::uint8_t, 257> payload{};
-            check(!port->try_send(payload), "UDP pool exhaustion did not drop the packet");
+            check(!port->try_send(payload), "UDP allocation failure did not drop the packet");
         });
         fixture.pump();
-        check(test_access::FlowProtocol_flows_(*fixture.channel).contains(250), "UDP pool exhaustion closed Flow");
+        check(test_access::FlowProtocol_flows_(*fixture.channel).contains(250), "UDP allocation failure closed Flow");
+        pool->fail_allocations = false;
         asio::post(fixture.caller, [port] {
-            check(port->try_send(std::array<std::uint8_t, 1>{42}), "UDP did not recover after pool exhaustion");
+            check(port->try_send(std::array<std::uint8_t, 1>{42}), "UDP did not recover after allocation failure");
         });
         fixture.pump();
-        check(fixture.receive(250) == BytesBuf{42}, "UDP pool exhaustion changed the next packet");
+        check(fixture.receive(250) == BytesBuf{42}, "UDP allocation failure changed the next packet");
         asio::post(fixture.caller, [port] {
             port->close();
             check(!port->try_send(std::array<std::uint8_t, 1>{1}), "closed UDP port accepted packet");
@@ -618,8 +666,8 @@ void link_close()
     const auto &flows = test_access::FlowProtocol_flows_(*f.protocol);
     const auto flow = flows.at(20);
     const auto survivor = flows.at(30);
-    auto pool = std::make_shared<lnk::PayloadPool>(4096);
-    const std::weak_ptr<lnk::PayloadPool> payloads = pool;
+    auto pool = std::make_shared<std::pmr::synchronized_pool_resource>();
+    const std::weak_ptr<std::pmr::synchronized_pool_resource> payloads = pool;
     // Hold both directions of a transit Flow on its two adjacent Links.
     f.upstream->writes.push({flow.get(), true},
         lnk::Frame{{LnkFrType::Data, true, 16, 7, 20}, PooledBuffer(pool, 16), flow});
@@ -668,7 +716,7 @@ static asio::awaitable<lnk::Frame> read_frame(asio::ip::tcp::socket &socket)
     co_await asio::async_read(socket, asio::buffer(bytes), asio::use_awaitable);
     const auto header = LnkFrameHeader::decode(bytes);
     // Test peer owns ordinary storage; use a resource that outlives the returned test frame.
-    lnk::Frame frame{header, PooledBuffer(std::make_shared<lnk::PayloadPool>(65536), header.body_length)};
+    lnk::Frame frame{header, PooledBuffer(std::make_shared<std::pmr::synchronized_pool_resource>(), header.body_length)};
     if (header.body_length)
     {
         co_await asio::async_read(socket, asio::buffer(frame.payload.data(), frame.payload.size()), asio::use_awaitable);
@@ -782,7 +830,7 @@ static void wire_tests()
         const BytesBuf excessive(LnkFrameHeader::maximum_payload, 0x44);
         const auto incoming = LnkFrameHeader{LnkFrType::Data, true,
             static_cast<std::uint32_t>(excessive.size()), 7, 4}.encode();
-        const auto excessive_charge = lnk::PayloadPool::allocation_size(excessive.size()) + lnk::Frame::buffer_overhead;
+        const auto excessive_charge = lnk::Frame::charge_for_payload(excessive.size());
         for (std::size_t index = 0; index <= window / excessive_charge; ++index)
         {
             const std::array<asio::const_buffer, 2> buffers{asio::buffer(incoming), asio::buffer(excessive)};
@@ -959,7 +1007,7 @@ static void multihop_tests()
         for (const auto &node : nodes)
         {
             check(test_access::flow_buffered_bytes(*node) <= 4 * (window + lnk::Frame::buffer_overhead),
-                  "three-hop queue grew beyond its reservations");
+                  "three-hop queue grew beyond its windows");
         }
         check(co_await test_flow::send_data(nodes.front(), 7, 11, false, {99}),
               "healthy three-hop Flow could not send");
@@ -1015,7 +1063,8 @@ int main()
     try
     {
         stream_admission_tests();
-        reservation_tests();
+        flow_capacity_tests();
+        flow_churn_tests();
         datagram_admission_tests();
         credit_tests::run();
         wire_tests();

@@ -24,9 +24,6 @@
 TEST_MEMBER(FlowProtocol, payload_pool_)
 TEST_MEMBER(LnkChannel, acceptor_)
 TEST_MEMBER(LnkChannel, connections_)
-using PayloadPool = lnk::PayloadPool;
-TEST_MEMBER(PayloadPool, live_)
-TEST_MEMBER(PayloadPool, retained_)
 
 namespace flow_bench
 {
@@ -213,14 +210,20 @@ class Benchmark
             try { task.get(); }
             catch (...) { if (!failure) failure = std::current_exception(); }
         }
-        bool released = true;
-        for (auto &node : nodes_)
+        std::vector<std::weak_ptr<std::pmr::synchronized_pool_resource>> pools;
+        for (const auto &node : nodes_)
+            pools.push_back(test_access::FlowProtocol_payload_pool_(*node));
+        for (auto &pair : pairs_)
         {
-            const auto pool = test_access::FlowProtocol_payload_pool_(*node);
-            released &= test_access::PayloadPool_live_(*pool) == 0;
+            pair.source.reset();
+            pair.sink.reset();
         }
-        metadata_["payloads_released_after_stop"] = released;
-        if (!released && !failure) failure = std::make_exception_ptr(std::runtime_error("stop retained live payloads"));
+        nodes_.clear();
+        // Let the final completion handler unwind and release its captured owners.
+        co_await asio::post(asio::use_awaitable);
+        const bool released = std::ranges::all_of(pools, [](const auto &pool) { return pool.expired(); });
+        metadata_["pool_resources_released_after_cleanup"] = released;
+        if (!released && !failure) failure = std::make_exception_ptr(std::runtime_error("cleanup retained pool resources"));
         write_summary(failure);
         if (failure) std::rethrow_exception(failure);
         std::cout << "Saved " << options_.output << "/{timeline.csv,flows.csv,summary.json}\n";
@@ -438,6 +441,8 @@ class Benchmark
                      {"pause_flow_ms", options_.pause_ms}, {"mode", !options_.network_control.empty() ? "network_netem" :
                          (options_.rates == std::vector<unsigned>{0} ? "unlimited" : "sink_consume")},
                      {"directions", options_.duplex ? 2 : 1},
+                     {"payload_allocator", "std::pmr::synchronized_pool_resource"},
+                     {"admission", "flow_count"}, {"max_flow_count", lnk::max_flow_count},
                      {"execution", "one process, one io_context, one thread"},
                      {"start_monotonic_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(start_.time_since_epoch()).count()}};
         publish(options_.output / "metadata.json", metadata_);
@@ -454,7 +459,7 @@ class Benchmark
         std::ofstream csv(options_.output / "timeline.csv");
         csv << "elapsed_s,interval_s,phase,target_mbps,received_bytes,received_mbps,sent_mbps,cpu_pct,rss_bytes,slow_flow_paused,healthy_received_mbps";
         for (unsigned i = 0; i < nodes_.size(); ++i)
-            csv << ",buffered_" << i << ",pool_live_" << i << ",pool_retained_" << i;
+            csv << ",buffered_" << i;
         csv << '\n' << std::fixed << std::setprecision(6);
         auto previous = start_;
         double previous_cpu = cpu_seconds();
@@ -482,7 +487,6 @@ class Benchmark
             for (unsigned i = 0; i < nodes_.size(); ++i)
             {
                 const auto buffered = test_access::flow_buffered_bytes(*nodes_[i]);
-                const auto pool = test_access::FlowProtocol_payload_pool_(*nodes_[i]);
                 peak_buffers_[i] = std::max(peak_buffers_[i], buffered);
                 // Each active direction also permits one ordered FIN.
                 require(buffered <= pairs_.size() * (test_flow::window_bytes + lnk::Frame::buffer_overhead), "Flow cache exceeded fixed windows");
@@ -490,7 +494,7 @@ class Benchmark
                     for (const auto &direction : flow->stream->directions)
                         require(direction.buffered_bytes <= test_flow::window_bytes + lnk::Frame::buffer_overhead,
                                 "individual Flow direction exceeded its window");
-                csv << ',' << buffered << ',' << test_access::PayloadPool_live_(*pool) << ',' << test_access::PayloadPool_retained_(*pool);
+                csv << ',' << buffered;
             }
             csv << '\n';
             previous = now; previous_cpu = cpu; previous_received = received; previous_sent = sent;

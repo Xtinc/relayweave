@@ -1,3 +1,4 @@
+#include "failing_payload_pool.h"
 #include "frame_io.h"
 #include "node_fixture.h"
 #include "flow_test_io.h"
@@ -431,20 +432,20 @@ void data_failures()
                 require(std::ranges::equal(udp_received.bytes(), valid_payload),
                         "reusing the UDP receive array overwrote an earlier delivery");
             }
-            // Exhaust the payload pool, then use an empty packet as a receive-order barrier.
+            // Fail payload allocation, then use an empty packet as a receive-order barrier.
             const auto original_pool = test_access::FlowProtocol_payload_pool_(*module);
-            auto small_pool = std::make_shared<lnk::PayloadPool>(256);
-            test_access::FlowProtocol_payload_pool_(*module) = small_pool;
-            lnk::PooledBuffer occupied(small_pool, 256);
+            auto failing_pool = std::make_shared<FailingPayloadPool>();
+            test_access::FlowProtocol_payload_pool_(*module) = failing_pool;
+            failing_pool->fail_allocations = true;
             co_await send_payload(valid_payload);
             co_await send_payload({});
             auto empty = co_await port->receive();
-            require(empty.size() == 0, "UDP pool exhaustion did not drop the packet");
-            occupied = {};
+            require(empty.size() == 0, "UDP allocation failure did not drop the packet");
+            failing_pool->fail_allocations = false;
             co_await send_payload(valid_payload);
             auto recovered = co_await port->receive();
             require(std::ranges::equal(recovered.bytes(), valid_payload),
-                    "UDP receiver did not recover after payload pool exhaustion");
+                    "UDP receiver did not recover after payload allocation failure");
             test_access::FlowProtocol_payload_pool_(*module) = original_pool;
             module->close_flow(24);
             // Delay Pong 1 until Ping 2 has been sent. An older, unacknowledged Ping

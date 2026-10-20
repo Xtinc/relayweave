@@ -144,7 +144,8 @@ def main():
                       "healthy_flows_with_progress": sum(value > 0 for value in healthy),
                       "healthy_flows": len(healthy),
                       "peak_flow_cache_mib_by_node": "/".join(f"{value / 2**20:.2f}" for value in summary["peak_buffered_bytes_by_node"]),
-                      "released_after_stop": summary["payloads_released_after_stop"]}
+                      "released_after_cleanup": summary.get("pool_resources_released_after_cleanup",
+                                                            summary.get("payloads_released_after_stop"))}
             record["healthy_mib_while_slow_flow_paused"] = summary["healthy_bytes_while_slow_flow_paused"] / 2**20
             records.append(record)
     if not records and failures:
@@ -177,12 +178,12 @@ def main():
                      f"{row['target_mbps'] or '不限速'} | {row['mean_mbps']:.2f} | {steady} | {convergence} | "
                      f"{row['cpu_mean_pct']:.1f} | {row['rss_peak_mib']:.2f} |")
     lines += ["", "消费调速的收敛时间从阶段边界计起，网络调速从所有方向 qdisc 修改完成计起；至少 500 ms 的滑动窗口连续三次落入目标 ±10% 为准。未达到不等于功能失败。",
-              "该指标包含统计观察窗口，时间下限约 0.7 s。CSV 的 passed 只表示功能、预算与排空检查通过，性能是否达标另见 steady_within_10pct。",
+              "该指标包含统计观察窗口，时间下限约 0.7 s。CSV 的 passed 只表示功能、逐流窗口与清理检查通过，性能是否达标另见 steady_within_10pct。",
               "网络调速的实际 qdisc 应用时间另存于各场景 network.json；切换多个方向需要少量执行时间。",
               "100 ms 吞吐尖峰和超额字节保留在 phases.csv；positive_sample_excess_mib 累加每个采样区间的正向超额，net_excess_mib 为整个阶段相对目标的有符号差额，二者均以业务载荷计。",
               "phases.csv 同时记录每阶段健康流方向的 Jain 公平指数（1 表示等份）、最低与最高吞吐；暂停流从这些指标中排除。",
               "发送等待分位数为 logarithmic histogram 的微秒上界，见各场景 flows.csv；send 完成表示交接，吞吐以终点完成消费为准。", "",
-              "| 场景 | 缓存峰值，按节点/MiB | 健康流方向有进展 | 暂停期间其他流消费/MiB | 停止后池载荷释放 | 功能结果 |",
+              "| 场景 | 缓存峰值，按节点/MiB | 健康流方向有进展 | 暂停期间其他流消费/MiB | 清理后释放检查 | 功能结果 |",
               "|---|---|---:|---:|---|---|"]
     seen = set()
     for row in records:
@@ -193,10 +194,10 @@ def main():
         progress = min(r["healthy_flows_with_progress"] for r in same_case)
         lines.append(f"| {row['case']} | {row['peak_flow_cache_mib_by_node']} | {progress}/{row['healthy_flows']} | "
                      f"{row['healthy_mib_while_slow_flow_paused']:.2f} | "
-                     f"{'是' if row['released_after_stop'] else '否'} | {row['status']} |")
+                     f"{'是' if row['released_after_cleanup'] else '否'} | {row['status']} |")
     lines += ["", "每个场景保留 timeline.csv、flows.csv、metadata.json、summary.json；网络场景额外保留 network.json、qdisc.txt、classes.txt、tcp-states.txt、benchmark.log。",
               "所有收到的数据块均检查序号、Flow 身份及完整载荷内容，排空后核对总发送/消费字节。缓存上限按每流每方向固定窗口检查。",
-              "RSS 与载荷池占用不包括内核 TCP 缓冲和整形队列内存。本机回环与 netem 结果不代表跨机器 1 Gbps 验收；共享物理 TCP 的拥塞、内核缓冲与调度也会影响应用层信用周转。", ""]
+              "RSS 与逻辑窗口占用不包括内核 TCP 缓冲和整形队列内存；新结果检查夹具清理后池资源销毁，旧结果仅检查停止后在用载荷释放。本机回环与 netem 结果不代表跨机器 1 Gbps 验收；共享物理 TCP 的拥塞、内核缓冲与调度也会影响应用层信用周转。", ""]
     if args.plot:
         plot_rates(args.directory)
         lines += ["![动态调速吞吐曲线](dynamic-rate.png)", ""]
