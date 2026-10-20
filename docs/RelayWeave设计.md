@@ -1775,7 +1775,7 @@ NodeSession 用 std::variant 直接拥有 Single 或 Multi 控制器，两者执
 控制器只推进自己的实例，数据管理器不保存控制会话引用、不发 opened/offer/ready/error/closed。
 
 NodeSession 在控制域调用 install/wait/bind/activate/bridge/close；
-install/activate/close 及 Single bind 是同步数据操作，直接投递并返回结果或异常；
+install/activate/close 及 Single bind 通过 co_spawn 启动短协程，在数据 executor 执行同步操作并返回结果或异常；
 Multi bind 在 transfer executor 取得数据域的端点句柄，仅在绑定时跨域并启动长期任务。
 wait_attach/bridge 通过 co_spawn 在数据 executor 执行真正的等待及复制。Single 操作本地配对，Multi 操作 RemotePair。
 跨域绑定只传不可变身份、统计引用和 accessor 副本；数据 manager 不访问控制状态。
@@ -1917,7 +1917,7 @@ NodeConnection 已不再保存指向协程栈的裸指针。这样既不悬空�
 Node 的控制协程持有 ControlSession，断开时按 session ID 删除注册记录和对应服务；启动协程失败时也按 ID 回滚。
 RegistryMgr 不在接入或删除时扫描全部 weak 引用。数据 manager 关闭配对或端点时先从表中移除，
 再通知仍持有该对象的等待者；表内同步操作只需验证接入或激活条件，跨异步等待的代码仍检查关闭状态。
-NodeSession 的 install/activate/close 和 Single bind 为同步数据操作，通过投递返回结果；
+NodeSession 的 install/activate/close 和 Single bind 通过 co_spawn 在所属数据 executor 执行同步操作并返回结果；
 Multi bind 明确跨到协议数据域，完成同步端点绑定后返回。wait_attach 和 bridge 保留真正等待的 co_spawn，
 接入截止时间直接附加在数据侧等待上。
 FlowProtocol 的控制通知使用绑定 control_io 的 concurrent_channel，数据侧直接发送、控制侧直接等待，由 Asio 处理线程安全、取消及完成调度，不逐通知 co_spawn；队列超限用原子标记传递，receive_event 仅保活、等待并检查错误。
@@ -1934,7 +1934,11 @@ EntryWait、连接和期限管理。changed timer 用于状态变化时唤醒等
 EntryWait 由 entry_waits_ 和 select_relay 共同持有，scope guard 删除索引，普通 shared_ptr 自动释放入口连接引用。
 
 NodeSession 的 Single/Multi cancel 会发送真实 cancellation_signal，打断正在等待的 attach、桥接或并行子任务。
-Multi 的 parallel group 也会取消未完成的子任务。控制器只在 run 的统一清理入口屏蔽一次取消，保证同步投递的
+Single/Multi 用 stop_requested_ 记录停止请求或进入收尾，取消信号负责唤醒异步等待；任务入口及 Agent/peer 通知前检查停止状态。
+控制会话拥有者在释放连接前取消关联业务，Single 的 run 不重复检查双方 weak 引用是否过期；读取 Consumer 的 peer 时仍 lock 并判空，绑定前由 co_await 检查取消。
+Multi 的 Flow 监视在确认 Flow 关闭后记录停止状态及原因并返回，由 parallel group 的 wait_for_one 取消并排空另一个子任务；监视等待本身的异常仍向上传递。
+Flow 建立和 Agent 接入使用同一绝对截止时间。等待 peer 的循环保留超时退出判断，激活后、发送 ready 前再检查是否超过建立期限。
+控制器只在 run 的统一清理入口屏蔽一次取消，保证跨域执行的
 资源关闭和 Flow 清理仍能完成；不在每个内部函数重复 reset_cancellation_state。
 FlowProtocol::stop 通过同步 request_stop 标记 stopping、关闭 Flow 队列及邻接 socket、取消事件和 monitor，
 再等待并发组与所属动态任务退出；协议通道不能在排空前销毁，池由端口和在途缓冲独立保活。
@@ -1959,7 +1963,7 @@ NodeConnection 在解析、连接、TLS、节点识别恢复时检查 running。
 | AgentSession select_relay | 每个新业务一次 | 跨到控制域访问拓扑、位置和共享连接，完成后回到 transfer_io |
 | RelayNode control accept / ControlSession | 每个 Node / 每条控制连接一次 | 接入和独立会话生命周期 |
 | StreamPipeline accept / setup | 每个 TCP/TLS 监听 / 每个接入 socket 一次 | setup 做 TLS 和 attach，之后 stream 移交配对，不另启复制任务 |
-| NodeSession run / wait_attach / bridge | 每次业务 / 接入阶段 / 复制阶段 | 控制任务拥有真实数据等待并排空；同步数据操作不 co_spawn |
+| NodeSession run / 数据操作 | 每次业务 / 建立、复制和关闭阶段 | 数据操作统一通过 co_spawn 跨域执行，控制任务等待完成并排空；同步操作使用短协程 |
 | Multi 建立转发 + Flow 监视 | 每个多节点首末实例一组 | 业务和 Flow 失效并行，任一退出后排空另一任务 |
 | RemotePair 双向循环 | 每个业务启动一次 | 持续读取、限速和 socket 写入，顺序等待 Flow 接口 |
 | FlowProtocol stream 端点任务 | 每次绑定启动发送、接收各一次 | native channel 跨域交接；接收任务串行等待写完成并归还信用 |
@@ -3006,7 +3010,7 @@ python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 - 服务位置与连接池分离，只有新业务取得实际入口；附加入口断开不触发重复服务查询。
 - Session 退出从唯一业务容器删除；clear_service 仅标记受影响实例中止，实际协程收尾删除表项，避免挂起 I/O 悬空。
 - LocalPair 与 RemotePair 是并列资源，共用容量预算；数据域不保留旧的服务等待、控制器或业务请求状态。
-- 同步数据操作和中间节点转发不形成子协程；端点仅在绑定时跨执行器启动长期任务，逐帧 channel 交接，限速足额时直接继续复制。
+- NodeSession 的同步数据操作通过短协程跨域执行，中间节点转发不形成逐帧子协程；端点仅在绑定时跨执行器启动长期任务，逐帧 channel 交接，限速足额时直接继续复制。
 - 重复身份、来源和跨等待后的存活检查仍承担实际业务边界，按值跨 co_await 的资源引用用于安全排空。
 - UDP 服务方双向复制在单侧 I/O 失败时传播原异常并排空对向，避免一侧退出而实例仍挂在业务容器。
 - TCP 双向复制同样传播 I/O 错误并排空对向，保留正常 EOF 的半关闭；限速等待取消不再作为正常结束。

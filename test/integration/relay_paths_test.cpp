@@ -845,6 +845,20 @@ void integration()
                               RelayProtocol::Tcp, {"a", "b", "c"}, true);
             co_await exercise(channels[1], channels[3], client_ssl, configs[1], configs[3], epoch, 21,
                               RelayProtocol::Udp, {"a", "b", "c"}, true);
+            // With neither Agent attached, Flow closure must wake and drain the attach tasks.
+            channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
+                njson{{"request_id", 59}, {"service", "manual-tcp"}, {"protocol", "tcp"},
+                      {"epoch", epoch}, {"path", {"a", "b", "c"}}}));
+            const auto pending_flow = co_await receive(channels[1], CtrlCommand::RelayOpened);
+            co_await receive(channels[3], CtrlCommand::RelayOffer);
+            co_await test_node::close_flow(nodes[0], epoch, pending_flow.params->at("flow_id").get<std::uint64_t>());
+            const auto flow_closed = co_await receive(channels[1], CtrlCommand::RelayError);
+            require(flow_closed.params->at("request_id") == 59 && flow_closed.params->at("stage") == "flow" &&
+                    flow_closed.params->at("reason") == "closed by caller",
+                    "Flow monitor did not preserve the close reason or cancel pending attachment");
+            const auto tail_closed = co_await receive(channels[3], CtrlCommand::RelayClosed);
+            require(tail_closed.params->at("stage") == "flow" && tail_closed.params->at("reason") == "closed by caller",
+                    "Tail Flow monitor did not cancel pending attachment");
             // Unattached endpoints expire using each Node's own protocol setup timeout.
             // TCP expires at the ingress; TLS and UDP expire at the egress and close the ingress.
             for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})

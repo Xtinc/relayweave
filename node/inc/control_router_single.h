@@ -29,7 +29,8 @@ class ControlRouterSingle
     std::chrono::steady_clock::time_point deadline_;
     std::string reason_;
     bool ready_ = false;
-    bool closed_ = false;
+    // Stops protocol progression; run() still has to drain tasks and release data resources.
+    bool stop_requested_ = false;
 };
 
 #endif

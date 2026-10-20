@@ -50,7 +50,8 @@ class ControlRouterMulti
     bool ingress_;
     bool peer_prepared_ = false;
     bool peer_finished_ = false;
-    bool closed_ = false;
+    // Stops protocol progression; run() still has to drain tasks and release data resources.
+    bool stop_requested_ = false;
     bool from_peer_ = false;
 };
 
