@@ -614,6 +614,14 @@ RelayNode 拥有唯一 RegistryMgr 和 relay_sessions_ 容器，负责请求查�
 NodeSession 的 variant 直接拥有一个 Single 或 Multi 控制器，两者均在 control_io 运行，只推进本实例。
 数据 manager 只管理 LocalPair / RemotePair，不保存 ControlSession 或代发业务通知。
 
+RelayNode 保留入口字段与当前拓扑校验、服务查找和容量准入；已有实例通过 NodeSession 的行为接口处理消息。
+Multi 控制器自己匹配重复打开请求、检查参数冲突，并按自身进度重发既有端点通知；重复请求先于容量准入处理。
+Single 不消费打开请求，保留每次打开创建新实例的行为。peer 消息由 Multi 按 epoch、flow_id 和认证 source 匹配，
+已请求停止但尚未排空的实例仍消费身份匹配的消息，避免重复创建出口业务。
+控制连接断开、epoch 更新和集群失败同样通过 NodeSession 通知控制器，由实例判断归属、失效条件和关闭原因。
+RelayNode 仅通过 protocol/is_multi 统计准入，通过 cancellation_slot 绑定所属业务任务；
+不访问实例的 controller/data variant、取消信号或控制器的角色、请求字段与进度。
+
 Single 从 Registry 找到 Producer，安装 LocalPair，向两端发送 opened/offer，等待双方票据接入，绑定服务
 统计和 accessor，激活后发 ready，再运行双向数据复制。建立失败通知请求方 error 和已获 offer 的服务方 closed；
 活动 TCP/TLS 由数据 socket 表达结束，UDP 必须发送显式关闭通知。服务离线时 open 直接失败，不占数据容量。

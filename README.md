@@ -15,6 +15,7 @@ Flow 提交后不做周期续租；控制连接断开、epoch/路径成员失效
 超时仅用于建立阶段和关闭确认，NodeLink 与集群控制连接使用各自的心跳检测失联。
 NodeSession 按所选路径直接持有 ControlRouterSingle 或 ControlRouterMulti，两者都在 control_io 协调业务；多跳首尾通过集群单播通信。
 RelayNode 直接持有唯一 RegistryMgr 和 NodeSession 容器，负责全局业务创建、查找分派和停止排空；控制器只推进自己的实例。
+重复请求、peer 身份匹配、控制断线与 epoch 失效判断通过 NodeSession 交给控制器，RelayNode 不读取控制器内部状态。
 master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
 Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
 Agent 服务发现只保存目的 Node 位置，选路后才取得实际入口控制连接；发现继续使用主控，不提供主控离线定位。

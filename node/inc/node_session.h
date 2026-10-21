@@ -7,7 +7,9 @@
 #include "datagram_mgr.h"
 #include <variant>
 
-// One Node business instance; control state stays on control_io, data stays with its manager.
+class RelayNode;
+
+// One Node business instance; entry points require control_io, data stays with its manager.
 class NodeSession
 {
   public:
@@ -16,13 +18,18 @@ class NodeSession
                 njson params, SRVTrafficPtr traffic);
     asio::awaitable<void> run();
     void cancel(std::string stage, std::string reason);
-    bool belongs_to(const ControlSessionPtr &session) const;
+    void control_disconnected(const ControlSessionPtr &session);
+    void invalidate(std::uint64_t epoch, std::string reason);
     bool handle(const ControlSessionPtr &session, const CtrlMessage &message);
+    // Matching peer identity stays consumed until this instance's task drains.
+    bool handle_peer(const CtrlMessage &message);
+    RelayProtocol protocol() const noexcept;
+    bool is_multi() const noexcept;
+    asio::cancellation_slot cancellation_slot() noexcept;
     // Read-only business metadata; called on control_io, without inspecting data-domain state.
     std::optional<njson> status_report() const;
 
   private:
-    friend class RelayNode;
     friend class ControlRouterSingle;
     friend class ControlRouterMulti;
     // Called on control_io; data operations cross to the selected manager's executor.

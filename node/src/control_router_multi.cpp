@@ -15,14 +15,14 @@ ControlRouterMulti::ControlRouterMulti(NodeSession &relay, const ControlSessionP
                          : protocol == RelayProtocol::Tls ? config.tls.setup_timeout
                                                           : config.tcp.setup_timeout;
     deadline_ = Clock::now() + timeout;
-    epoch_ = config::require_unsigned(params_, "epoch", true);
+    epoch_ = params_.at("epoch").get<std::uint64_t>();
     if (ingress_)
     {
         peer_ = params_.at("path").back().get<std::string>();
     }
     else
     {
-        flow_id_ = config::require_unsigned(params_, "flow_id", true);
+        flow_id_ = params_.at("flow_id").get<std::uint64_t>();
         peer_ = params_.at("source").get<std::string>();
         progress_ = Progress::PeerOpened;
     }
@@ -146,16 +146,33 @@ bool ControlRouterMulti::matches(const ControlSessionPtr &session, const njson &
            (uuid && !relay_.endpoint_.empty() && relay_.endpoint_.at("uuid") == *uuid);
 }
 
-bool ControlRouterMulti::belongs_to(const ControlSessionPtr &session) const
-{
-    return session_.lock() == session;
-}
-
 bool ControlRouterMulti::handle(const ControlSessionPtr &session, const CtrlMessage &message)
 {
-    if (!matches(session, config::message_params(message)))
+    const auto &params = *message.params;
+    const bool opening = message.type() == CtrlCommand::RelayOpen;
+    if (opening && !ingress_)
     {
         return false;
+    }
+    if (!matches(session, params))
+    {
+        return false;
+    }
+
+    if (opening)
+    {
+        for (const auto *field : {"path", "epoch", "service", "protocol"})
+        {
+            if (params_.at(field) != params.at(field))
+            {
+                throw std::invalid_argument("relay request conflicts with existing request");
+            }
+        }
+        if (progress_ >= Progress::AgentNotified)
+        {
+            notify_agent();
+        }
+        return true;
     }
 
     if (message.type() == CtrlCommand::RelayReject && (ingress_ || progress_ == Progress::Ready))
@@ -164,18 +181,39 @@ bool ControlRouterMulti::handle(const ControlSessionPtr &session, const CtrlMess
     }
 
     cancel(progress_ == Progress::Ready ? "transfer" : "attach",
-           config::optional_string(config::message_params(message), "reason",
+           config::optional_string(params, "reason",
                                    message.type() == CtrlCommand::RelayReject ? "producer rejected relay"
                                                                               : "relay cancelled"));
     return true;
 }
 
-void ControlRouterMulti::handle_peer(const CtrlMessage &message)
+void ControlRouterMulti::control_disconnected(const ControlSessionPtr &session)
 {
-    const auto &params = config::message_params(message);
+    if (session_.lock() == session)
+    {
+        cancel("control", ingress_ ? "consumer control disconnected" : "producer control disconnected");
+    }
+}
+
+void ControlRouterMulti::invalidate(std::uint64_t epoch, std::string reason)
+{
+    if (!reason.empty() || epoch_ != epoch)
+    {
+        cancel("control", reason.empty() ? "flow epoch changed" : std::move(reason));
+    }
+}
+
+bool ControlRouterMulti::handle_peer(const CtrlMessage &message)
+{
+    const auto &params = *message.params;
+    if (params.at("epoch") != epoch_ || params.at("flow_id") != flow_id_ || params.at("source") != peer_)
+    {
+        return false;
+    }
+    // A matching closing instance still owns this identity until its task drains.
     if (stop_requested_)
     {
-        return;
+        return true;
     }
 
     if ((message.command == "relay.peer.attached" && ingress_) || (message.command == "relay.peer.ready" && !ingress_))
@@ -189,13 +227,14 @@ void ControlRouterMulti::handle_peer(const CtrlMessage &message)
     else if (message.command == "relay.peer.close")
     {
         cancel(params.value("stage", "control"), params.value("reason", "peer closed"), true);
-        return;
+        return true;
     }
     else
     {
-        return;
+        return true;
     }
     changed_.cancel();
+    return true;
 }
 
 asio::awaitable<void> ControlRouterMulti::watch_flow()
@@ -228,7 +267,7 @@ asio::awaitable<void> ControlRouterMulti::run()
                 node.control_executor_,
                 node.nodelink_mgr_->open_flow(
                     params_.at("path").get<std::vector<std::string>>(),
-                    config::message_protocol(params_) == RelayProtocol::Udp ? RelayProtocol::Udp : RelayProtocol::Tcp),
+                    relay_.protocol() == RelayProtocol::Udp ? RelayProtocol::Udp : RelayProtocol::Tcp),
                 asio::cancel_at(deadline_, asio::use_awaitable));
             if (!flow)
             {

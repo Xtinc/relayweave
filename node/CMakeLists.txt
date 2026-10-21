@@ -11,7 +11,7 @@ add_library(relayweave_node_lib
     src/cluster_mgr.cpp
     src/topology.cpp
     src/nodelink_mgr.cpp
-    src/nodelink_requests.cpp
+    src/nodelink_req.cpp
 )
 target_link_libraries(relayweave_node_lib PUBLIC
     relayweave_protocol

@@ -22,6 +22,7 @@ TEST_MEMBER(RelayAgent, entry_waits_)
 TEST_MEMBER(RelayAgent, select_relay)
 TEST_MEMBER(RelayAgent, collect_idle_connections)
 TEST_MEMBER(RelayAgent, primary_connection_id_)
+TEST_MEMBER(RelayNode, config_)
 
 namespace
 {
@@ -883,14 +884,34 @@ void integration()
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen, duplicate));
             const auto original = co_await receive(channels[1], CtrlCommand::RelayOpened);
             co_await receive(channels[3], CtrlCommand::RelayOffer);
+            // Saturate admission after installing the original instance: retries must bypass it.
+            const auto saved_capacity = co_await asio::co_spawn(control,
+                [node = nodes[1]]() -> asio::awaitable<std::size_t> {
+                    auto &limit = test_access::RelayNode_config_(*node).tcp.max_relays;
+                    const auto saved = limit;
+                    limit = 1;
+                    co_return saved;
+                }, asio::use_awaitable);
+            auto extra = duplicate;
+            extra["request_id"] = 400;
+            channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen, extra));
+            const auto full = co_await receive(channels[1], CtrlCommand::RelayError);
+            require(full.params->at("request_id") == 400 && full.params->at("reason") == "relay capacity reached",
+                    "New request bypassed the saturated relay quota");
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen, duplicate));
             const auto replay = co_await receive(channels[1], CtrlCommand::RelayOpened);
-            require(replay.params->at("uuid") == original.params->at("uuid") &&
-                    replay.params->at("flow_id") == original.params->at("flow_id"), "Duplicate request installed another endpoint");
+            require(*replay.params == *original.params, "Duplicate request changed endpoint identity or attachment tickets");
             duplicate["path"] = {"a", "master", "c"};
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen, duplicate));
             const auto conflict = co_await receive(channels[1], CtrlCommand::RelayError);
-            require(conflict.params->at("reason") == "relay request conflicts with existing request", "Conflicting duplicate was accepted");
+            require(conflict.params->at("reason") == "relay request conflicts with existing request" &&
+                    conflict.params->at("stage") == "validate" && conflict.params->at("request_id") == 40,
+                    "Conflicting duplicate changed its error response or reached capacity admission");
+            co_await asio::co_spawn(control,
+                [node = nodes[1], saved_capacity]() -> asio::awaitable<void> {
+                    test_access::RelayNode_config_(*node).tcp.max_relays = saved_capacity;
+                    co_return;
+                }, asio::use_awaitable);
             channels[1]->send(CtrlMessage(CtrlCommand::RelayCancel,
                 njson{{"request_id", 40}, {"reason", "test cancellation"}}));
             const auto cancelled = co_await receive(channels[1], CtrlCommand::RelayError);
@@ -1237,7 +1258,7 @@ void integration()
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             co_await agent->async_stop();
             const auto producer_lost = co_await receive(channels[1], CtrlCommand::RelayError);
-            require(producer_lost.params->at("reason").get<std::string>().find("control disconnected") != std::string::npos,
+            require(producer_lost.params->at("reason") == "producer control disconnected",
                     "Producer control loss did not wake the consumer");
             // Leave a real pending transaction for Node::stop() to cancel and drain.
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,

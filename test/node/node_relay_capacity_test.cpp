@@ -17,11 +17,111 @@ static void require_capacity(bool value, const char *reason)
         throw std::runtime_error(reason);
 }
 
+// Exercise instance events on control_io before any endpoint or business task is installed.
+static void verify_session_events(RelayNode &node, const ControlSessionPtr &consumer,
+                                  const ControlSessionPtr &producer, const ControlSessionPtr &unrelated)
+{
+    const njson params{{"request_id", 7U}, {"service", "events"}, {"protocol", "tcp"},
+                       {"epoch", 17U}, {"path", {"test-master", "peer"}}};
+    NodeSession ingress(node, consumer, params, true);
+    NodeSession single(node, consumer, producer,
+                       njson{{"request_id", 7U}, {"service", "events"}, {"protocol", "tcp"}},
+                       std::make_shared<ServiceTraffic>());
+    unsigned ingress_cancelled = 0;
+    unsigned single_cancelled = 0;
+    ingress.cancellation_slot().assign([&](asio::cancellation_type) { ++ingress_cancelled; });
+    single.cancellation_slot().assign([&](asio::cancellation_type) { ++single_cancelled; });
+    const CtrlMessage open(CtrlCommand::RelayOpen, params);
+    require_capacity(ingress.handle(consumer, open) && ingress.handle(consumer, open),
+                     "Opening duplicate was not consumed before endpoint installation");
+    require_capacity(!ingress.handle(unrelated, open) && !single.handle(consumer, open),
+                     "Opening request crossed session ownership or changed Single creation semantics");
+    require_capacity(ingress_cancelled == 0 && single_cancelled == 0,
+                     "Opening duplicate cancelled a business instance");
+    for (const auto *field : {"path", "epoch", "service", "protocol"})
+    {
+        auto conflict = params;
+        if (std::string_view(field) == "path")
+        {
+            conflict[field] = {"test-master", "other"};
+        }
+        else if (std::string_view(field) == "epoch")
+        {
+            conflict[field] = 18U;
+        }
+        else
+        {
+            conflict[field] = std::string_view(field) == "protocol" ? "tls" : "other-service";
+        }
+        bool rejected = false;
+        try
+        {
+            ingress.handle(consumer, CtrlMessage(CtrlCommand::RelayOpen, conflict));
+        }
+        catch (const std::invalid_argument &error)
+        {
+            rejected = std::string_view(error.what()) == "relay request conflicts with existing request";
+        }
+        require_capacity(rejected && ingress_cancelled == 0, "Conflicting duplicate changed the existing instance");
+    }
+
+    ingress.invalidate(17, {});
+    ingress.control_disconnected(unrelated);
+    single.invalidate(18, "cluster control failed");
+    single.control_disconnected(unrelated);
+    require_capacity(ingress_cancelled == 0 && single_cancelled == 0,
+                     "Unrelated disconnect or unchanged epoch cancelled a healthy instance");
+    ingress.control_disconnected(consumer);
+    single.control_disconnected(producer);
+    require_capacity(ingress_cancelled == 1 && single_cancelled == 1,
+                     "Owning control disconnect did not cancel its instance");
+
+    for (const bool force : {false, true})
+    {
+        NodeSession invalidated(node, consumer, params, true);
+        unsigned cancelled = 0;
+        invalidated.cancellation_slot().assign([&](asio::cancellation_type) { ++cancelled; });
+        invalidated.invalidate(force ? 17 : 18, force ? "cluster control failed" : "");
+        invalidated.invalidate(18, "later failure");
+        require_capacity(cancelled == 1, "Epoch or cluster failure did not cancel exactly once");
+    }
+
+    auto peer_params = params;
+    peer_params["flow_id"] = 39U;
+    peer_params["source"] = "peer";
+    NodeSession egress(node, producer, peer_params, false);
+    unsigned egress_cancelled = 0;
+    egress.cancellation_slot().assign([&](asio::cancellation_type) { ++egress_cancelled; });
+    const njson identity{{"epoch", 17U}, {"flow_id", 39U}, {"source", "peer"}, {"reason", "peer failure"}};
+    for (const auto *field : {"epoch", "flow_id", "source"})
+    {
+        auto wrong = identity;
+        if (std::string_view(field) == "source")
+        {
+            wrong[field] = "other-peer";
+        }
+        else
+        {
+            wrong[field] = wrong.at(field).get<unsigned>() - 1U;
+        }
+        require_capacity(!egress.handle_peer(CtrlMessage("relay.peer.close", wrong)) && egress_cancelled == 0,
+                         "Unmatched peer message cancelled an unrelated instance");
+    }
+    require_capacity(!single.handle_peer(CtrlMessage("relay.peer.close", identity)), "Single consumed a peer message");
+    require_capacity(egress.handle_peer(CtrlMessage("relay.peer.close", identity)) && egress_cancelled == 1,
+                     "Authenticated matching peer close did not cancel its instance");
+    require_capacity(egress.handle_peer(CtrlMessage("relay.peer.open", identity)) && egress_cancelled == 1,
+                     "Closing instance released its peer identity before draining");
+}
+
 int main()
 {
     try
     {
-        asio::io_context control(1), tcp_io(1), udp_io(1), data(1);
+        asio::io_context control(1);
+        asio::io_context tcp_io(1);
+        asio::io_context udp_io(1);
+        asio::io_context data(1);
         asio::ssl::context ssl(asio::ssl::context::tls_server);
         auto config = make_test_node_config();
         config.control.address = config.tcp.address = config.tls.address = config.datagram.address = "127.0.0.1";
@@ -32,6 +132,8 @@ int main()
             std::pair{RelayProtocol::Tcp, 1}, std::pair{RelayProtocol::Tls, 2}, std::pair{RelayProtocol::Udp, 3}};
         auto node = std::make_shared<RelayNode>(control, tcp_io, udp_io, data, ssl, config);
         auto session = std::make_shared<TLSChannel>(asio::ip::tcp::socket(control), ssl, TLSChannelRole::S);
+        auto producer = std::make_shared<TLSChannel>(asio::ip::tcp::socket(control), ssl, TLSChannelRole::S);
+        auto unrelated = std::make_shared<TLSChannel>(asio::ip::tcp::socket(control), ssl, TLSChannelRole::S);
         auto make_relay = [&](RelayProtocol protocol) {
             return std::make_shared<NodeSession>(*node, session, session,
                 njson{{"request_id", 1}, {"service", "capacity"}, {"protocol", relay_protocol_name(protocol)}},
@@ -79,7 +181,10 @@ int main()
         };
         // Each protocol has its own quota. Do not pump either transfer executor:
         // all admitted requests must remain counted while install is pending.
-        asio::post(control, admit);
+        asio::post(control, [&] {
+            verify_session_events(*node, session, producer, unrelated);
+            admit();
+        });
         poll_control();
         require_capacity(test_access::RelayNode_relay_sessions_(*node).size() == 6, "protocol quotas were combined or exceeded");
         asio::post(control, [&] {

@@ -114,7 +114,6 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     void handle_relay(const ControlSessionPtr &session, const CtrlMessage &message);
     void handle_relay_peer(CtrlMessage message);
     void start_relay(std::shared_ptr<NodeSession> relay);
-    void cancel_relays(std::string reason, const ControlSessionPtr &session = {});
     void invalidate_relays(std::string reason = {});
     asio::awaitable<void> stop_relays();
 

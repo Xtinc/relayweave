@@ -1,10 +1,8 @@
 #ifndef RELAYWEAVE_CONTROL_ROUTER_MULTI_H
 #define RELAYWEAVE_CONTROL_ROUTER_MULTI_H
 
-#include "nodelink_mgr.h"
 #include "tls_channel.h"
 
-class RelayNode;
 class NodeSession;
 
 // One multi-node Relay controller, owned by its NodeSession. All access requires control_io.
@@ -14,14 +12,13 @@ class ControlRouterMulti
     ControlRouterMulti(NodeSession &relay, const ControlSessionPtr &session, njson params, bool ingress);
     asio::awaitable<void> run();
     bool handle(const ControlSessionPtr &session, const CtrlMessage &message);
-    void handle_peer(const CtrlMessage &message);
-    bool belongs_to(const ControlSessionPtr &session) const;
+    bool handle_peer(const CtrlMessage &message);
+    void control_disconnected(const ControlSessionPtr &session);
+    void invalidate(std::uint64_t epoch, std::string reason);
     void cancel(std::string stage, std::string reason, bool from_peer = false);
-    bool matches(const ControlSessionPtr &session, const njson &params) const;
     std::optional<njson> status_report() const;
 
   private:
-    friend class RelayNode;
     enum class Progress
     {
         OpeningFlow,
@@ -31,6 +28,7 @@ class ControlRouterMulti
     };
 
     asio::awaitable<void> establish_and_transfer();
+    bool matches(const ControlSessionPtr &session, const njson &params) const;
     asio::awaitable<void> watch_flow();
     void notify_agent() const;
     void close_agent() const;

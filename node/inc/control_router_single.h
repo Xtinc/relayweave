@@ -13,11 +13,12 @@ class ControlRouterSingle
                         njson params);
     asio::awaitable<void> run();
     void cancel(std::string stage, std::string reason);
+    void control_disconnected(const ControlSessionPtr &session);
     bool handle(const ControlSessionPtr &session, const CtrlMessage &message);
-    bool belongs_to(const ControlSessionPtr &session) const;
     std::optional<njson> status_report() const;
 
   private:
+    bool belongs_to(const ControlSessionPtr &session) const;
     bool matches(const ControlSessionPtr &session, const njson &params) const;
     void notify_agents() const;
     void ready_agents() const;

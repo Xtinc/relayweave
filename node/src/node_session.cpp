@@ -53,14 +53,50 @@ void NodeSession::cancel(std::string stage, std::string reason)
     std::visit([&](auto &controller) { controller.cancel(std::move(stage), std::move(reason)); }, control_);
 }
 
-bool NodeSession::belongs_to(const ControlSessionPtr &session) const
+void NodeSession::control_disconnected(const ControlSessionPtr &session)
 {
-    return std::visit([&](const auto &controller) { return controller.belongs_to(session); }, control_);
+    std::visit([&](auto &controller) { controller.control_disconnected(session); }, control_);
+}
+
+void NodeSession::invalidate(std::uint64_t epoch, std::string reason)
+{
+    if (auto *controller = std::get_if<ControlRouterMulti>(&control_))
+    {
+        controller->invalidate(epoch, std::move(reason));
+    }
 }
 
 bool NodeSession::handle(const ControlSessionPtr &session, const CtrlMessage &message)
 {
     return std::visit([&](auto &controller) { return controller.handle(session, message); }, control_);
+}
+
+bool NodeSession::handle_peer(const CtrlMessage &message)
+{
+    if (auto *controller = std::get_if<ControlRouterMulti>(&control_))
+    {
+        return controller->handle_peer(message);
+    }
+    return false;
+}
+
+RelayProtocol NodeSession::protocol() const noexcept
+{
+    if (std::holds_alternative<DatagramMgr *>(data_))
+    {
+        return RelayProtocol::Udp;
+    }
+    return std::holds_alternative<TlsPipeline *>(data_) ? RelayProtocol::Tls : RelayProtocol::Tcp;
+}
+
+bool NodeSession::is_multi() const noexcept
+{
+    return std::holds_alternative<ControlRouterMulti>(control_);
+}
+
+asio::cancellation_slot NodeSession::cancellation_slot() noexcept
+{
+    return cancellation_.slot();
 }
 
 std::uint64_t NodeSession::uuid() const

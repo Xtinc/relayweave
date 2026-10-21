@@ -49,14 +49,31 @@ bool ControlRouterSingle::matches(const ControlSessionPtr &session, const njson 
 
 bool ControlRouterSingle::handle(const ControlSessionPtr &session, const CtrlMessage &message)
 {
-    if (!matches(session, config::message_params(message)))
+    if (message.type() == CtrlCommand::RelayOpen)
+    {
         return false;
+    }
+    const auto &params = *message.params;
+    if (!matches(session, params))
+    {
+        return false;
+    }
     if (message.type() == CtrlCommand::RelayReject && (ready_ || producer_.lock() != session))
+    {
         return true;
-    cancel("control", config::optional_string(config::message_params(message), "reason",
+    }
+    cancel("control", config::optional_string(params, "reason",
                                               message.type() == CtrlCommand::RelayReject ? "producer rejected relay"
                                                                                          : "relay cancelled"));
     return true;
+}
+
+void ControlRouterSingle::control_disconnected(const ControlSessionPtr &session)
+{
+    if (belongs_to(session))
+    {
+        cancel("control", "control session disconnected");
+    }
 }
 
 void ControlRouterSingle::cancel(std::string, std::string reason)
@@ -102,7 +119,7 @@ void ControlRouterSingle::ready_agents() const
 
 void ControlRouterSingle::close_agents() const
 {
-    const auto protocol = config::message_protocol(params_);
+    const auto protocol = relay_.protocol();
     // Stream EOF is carried by data sockets; UDP requires an explicit lifetime notification.
     if (ready_ && protocol != RelayProtocol::Udp)
         return;
