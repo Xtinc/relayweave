@@ -2,6 +2,7 @@
 #define PROXY_CLUSTER_MGR_H
 
 #include "tls_channel.h"
+#include "async_event.h"
 
 class RelayNode;
 class ClusterRoom;
@@ -28,7 +29,6 @@ struct ClusterConfig
 class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
 {
     using tcp = asio::ip::tcp;
-    using done_channel = asio::experimental::channel<void(asio::error_code, std::exception_ptr)>;
     using message_channel = asio::experimental::channel<void(asio::error_code, CtrlMessage)>;
 
   public:
@@ -36,7 +36,8 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
                TLSChannelConfig channel, std::size_t max_connections);
 
     void start();
-    asio::awaitable<void> async_stop();
+    // A normal return always means the loop and member sessions have drained.
+    asio::awaitable<bool> async_stop();
     void send(std::string target, CtrlMessage message);
     void broadcast(CtrlMessage message);
 
@@ -57,11 +58,14 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
     TLSChannelConfig channel_config_;
     std::size_t max_connections_;
     tcp::acceptor acceptor_;
-    done_channel loop_done_;
+    AsyncEvent loop_done_;
+    std::exception_ptr drain_error_;
     message_channel outbound_channel_;
     Connector *connector_ = nullptr;
     std::uint64_t epoch_ = 0;
     bool running_ = false;
+    bool started_ = false;
+    bool stop_ok_ = true;
 };
 
 #endif // CLUSTER_MGR_H

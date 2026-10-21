@@ -307,11 +307,19 @@ void FlowProtocol::spawn(asio::awaitable<void> task)
 {
     ++tasks_;
     asio::co_spawn(executor_, std::move(task), [self = shared_from_this()](std::exception_ptr error) {
-        if (error && !self->stopping_)
+        if (error)
         {
-            const auto reason = "Node data task failed: " + exception_description(error);
-            PROXY_ERROR_PRINT("%s", reason.c_str());
-            self->request_stop(reason);
+            if (self->stopping_)
+            {
+                self->stop_ok_ = false;
+                PROXY_ERROR_PRINT("Node data task close failed reason=%s", exception_description(error).c_str());
+            }
+            else
+            {
+                const auto reason = "Node data task failed: " + exception_description(error);
+                PROXY_ERROR_PRINT("%s", reason.c_str());
+                self->request_stop(reason);
+            }
         }
         if (--self->tasks_ == 0 && self->stopping_)
         {
@@ -421,12 +429,13 @@ void FlowProtocol::request_stop(std::string reason)
     }
 }
 
-asio::awaitable<void> FlowProtocol::stop()
+asio::awaitable<bool> FlowProtocol::stop()
 {
     // cluster_data_io: draining must finish even if the caller cancels its stop request.
     co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     request_stop("node stopping");
     co_await tasks_done_.wait();
+    co_return stop_ok_;
 }
 
 lnk::FlowState::Stream::Stream(asio::any_io_executor executor, bool endpoint)

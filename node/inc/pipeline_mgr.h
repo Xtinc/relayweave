@@ -90,7 +90,7 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     asio::awaitable<void> run_local_pair(std::uint64_t uuid);
     void close_local_pair(std::uint64_t uuid);
     void stop();
-    void wait_for_pending();
+    void wait_for_pending() noexcept;
 
   private:
     asio::awaitable<void> accept_loop();

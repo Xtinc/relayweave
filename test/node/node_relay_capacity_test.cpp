@@ -125,6 +125,7 @@ int main()
         asio::ssl::context ssl(asio::ssl::context::tls_server);
         auto config = make_test_node_config();
         config.control.address = config.tcp.address = config.tls.address = config.datagram.address = "127.0.0.1";
+        config.control.max_connections = 2;
         config.tcp.max_relays = 1;
         config.tls.max_relays = 2;
         config.datagram.max_relays = 3;
@@ -203,6 +204,46 @@ int main()
         poll_control();
         require_capacity(test_access::RelayNode_relay_sessions_(*node).size() == 6, "released quotas were not reusable");
         drain();
+
+        auto make_multi = [&](bool ingress) {
+            return std::make_shared<NodeSession>(
+                *node, session,
+                njson{{"request_id", 7U}, {"service", "capacity"}, {"protocol", "udp"},
+                       {"epoch", 17U}, {"flow_id", 39U}, {"source", "peer"}, {"path", {"test-master", "peer"}}},
+                ingress);
+        };
+        auto reject_multi = [&](bool ingress) {
+            bool rejected = false;
+            try
+            {
+                test_access::RelayNode_start_relay(*node, make_multi(ingress));
+            }
+            catch (const std::runtime_error &error)
+            {
+                rejected = std::string_view(error.what()) == "relay path capacity reached";
+            }
+            require_capacity(rejected, "Ingress/egress bypassed the shared multi Relay quota");
+        };
+        for (unsigned attempt = 0; attempt < 2; ++attempt)
+        {
+            asio::post(control, [&] {
+                auto ingress = make_multi(true);
+                auto egress = make_multi(false);
+                test_access::RelayNode_start_relay(*node, ingress);
+                test_access::RelayNode_start_relay(*node, egress);
+                reject_multi(true);
+                reject_multi(false);
+                ingress->cancel("test", "cancelled");
+                egress->cancel("test", "cancelled");
+                reject_multi(true);
+                reject_multi(false);
+                test_access::RelayNode_start_relay(*node, make_relay(RelayProtocol::Tcp));
+                require_capacity(test_access::RelayNode_relay_sessions_(*node).size() == 3,
+                                 "Multi quota affected Single admission or released closing instances early");
+            });
+            poll_control();
+            drain();
+        }
         std::cout << "[PASS] Relay count includes pending, active and draining tasks per protocol\n";
     }
     catch (const std::exception &error)

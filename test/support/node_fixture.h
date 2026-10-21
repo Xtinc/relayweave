@@ -2,15 +2,21 @@
 #define RELAYWEAVE_TEST_NODE_FIXTURE_H
 
 #include "node_test_config.h"
+#include "node_control.h"
 #include "member_access.h"
 #include "flow_test_io.h"
 
 TEST_MEMBER(RelayNode, nodelink_mgr_)
 TEST_MEMBER(RelayNode, cluster_mgr_)
+TEST_MEMBER(RelayNode, metrics_)
 TEST_MEMBER(NodeLinkMgr, link_requests_)
 
 namespace test_node
 {
+inline NodeMetrics &metrics(const std::shared_ptr<RelayNode> &node)
+{
+    return *test_access::RelayNode_metrics_(*node);
+}
 inline NodeLinkMgr &links(const std::shared_ptr<RelayNode> &node)
 {
     return *test_access::RelayNode_nodelink_mgr_(*node);

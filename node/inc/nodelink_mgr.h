@@ -41,7 +41,6 @@ class NodeLinkMgr
                 std::string tcp_address, std::string udp_address, ClusterMgr &cluster, Topology &topology);
     void start();
     void activate();
-    void rollback() noexcept;
     void handle(CtrlMessage message);
     void members_changed();
     void control_failed(std::string reason);
@@ -52,7 +51,8 @@ class NodeLinkMgr
     bool egress_ready(std::uint64_t epoch, std::uint64_t id, const std::string &ingress,
                       RelayProtocol transport) const;
     asio::awaitable<std::string> wait_flow_closed(std::uint64_t epoch, std::uint64_t id);
-    asio::awaitable<void> stop();
+    // A normal return always means all owned tasks have drained.
+    asio::awaitable<bool> stop();
     FlowProtocol &protocol() const
     {
         return *protocol_;
@@ -135,6 +135,7 @@ class NodeLinkMgr
     std::map<std::uint64_t, std::shared_ptr<FlowWatch>> flow_watches_;
     std::size_t flow_tasks_ = 0;
     asio::steady_timer done_;
+    bool stop_ok_ = true;
     bool running_ = false;
     bool events_running_ = false;
 };

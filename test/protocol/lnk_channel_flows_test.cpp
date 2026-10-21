@@ -321,8 +321,8 @@ int main()
             failure = std::current_exception();
         }
         auto stop = [&]() -> asio::awaitable<void> {
-            co_await a->stop();
-            co_await b->stop();
+            check_channel(co_await a->stop(), "first data service shutdown failed");
+            check_channel(co_await b->stop(), "second data service shutdown failed");
         };
         asio::co_spawn(io, stop(), asio::use_future).get();
         guard.reset();

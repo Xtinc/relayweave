@@ -5,7 +5,9 @@
 #include "control_router_multi.h"
 #include "pipeline_mgr.h"
 #include "datagram_mgr.h"
+#include <memory>
 #include <variant>
+#include <vector>
 
 class RelayNode;
 
@@ -49,5 +51,7 @@ class NodeSession
     njson endpoint_;
     SRVTrafficPtr traffic_;
 };
+
+using NodeSessionList = std::vector<std::shared_ptr<NodeSession>>;
 
 #endif

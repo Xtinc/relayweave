@@ -493,8 +493,6 @@ void StreamPipeline<Transport>::attach(int role, std::uint64_t uuid, std::uint64
 
 template <typename Transport> void StreamPipeline<Transport>::stop()
 {
-    if (stopped_)
-        return;
     stopped_ = true;
     asio::error_code ignored;
     acceptor_.close(ignored);
@@ -506,7 +504,7 @@ template <typename Transport> void StreamPipeline<Transport>::stop()
         close_local_pair(local_pairs_.begin()->first);
 }
 
-template <typename Transport> void StreamPipeline<Transport>::wait_for_pending()
+template <typename Transport> void StreamPipeline<Transport>::wait_for_pending() noexcept
 {
     auto pending = pending_sockets_.load();
     while (pending != 0)

@@ -2,8 +2,8 @@
 #define RELAYWEAVE_TOPOLOGY_H
 
 #include "cluster_mgr.h"
+#include "async_event.h"
 #include "probe_set.h"
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <map>
@@ -12,17 +12,17 @@
 #include <string_view>
 #include <vector>
 
+class NodeMetrics;
+
 class Topology
 {
   public:
     Topology(asio::io_context &io_context, std::string node_id, bool master, ClusterMgr &cluster_mgr,
-             const std::atomic<std::uint32_t> &control_queue_delay_us,
-             const std::atomic<std::uint32_t> &transfer_tcp_queue_delay_us,
-             const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us,
-             const double &available);
+             const NodeMetrics &metrics);
 
     void start();
-    asio::awaitable<void> close();
+    // A normal return always means probes and the reporting task have drained.
+    asio::awaitable<bool> close();
     void update_members(const njson &params);
     void update_report(const njson &params);
     std::optional<CtrlMessage> snapshot_message(std::uint64_t request_id) const;
@@ -93,12 +93,10 @@ class Topology
     std::string node_id_;
     bool master_;
     ClusterMgr &cluster_mgr_;
-    const std::atomic<std::uint32_t> &control_queue_delay_us_;
-    const std::atomic<std::uint32_t> &transfer_tcp_queue_delay_us_;
-    const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us_;
-    const double &available_;
+    const NodeMetrics &metrics_;
     asio::steady_timer wake_timer_;
-    asio::steady_timer finished_wait_;
+    AsyncEvent finished_;
+    std::exception_ptr drain_error_;
     ProbeSet probes_;
     std::map<std::string, std::string> members_;
     std::map<std::string, Report> reports_;

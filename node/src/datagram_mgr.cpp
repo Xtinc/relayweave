@@ -270,11 +270,6 @@ void DatagramMgr::close_local_pair(std::uint64_t uuid)
 
 void DatagramMgr::stop()
 {
-    if (stopped_)
-    {
-        return;
-    }
-
     stopped_ = true;
     while (!remote_pairs_.empty())
     {

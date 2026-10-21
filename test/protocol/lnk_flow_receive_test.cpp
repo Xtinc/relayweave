@@ -201,7 +201,10 @@ int main()
             auto stopped = asio::co_spawn(f.data, f.channel->stop(), asio::use_future);
             f.pump();
             check(stopped.wait_for(0s) == std::future_status::ready, "shared loop cancellation did not drain monitor");
-            stopped.get();
+            check(stopped.get(), "Logged runtime failure changed a successful shutdown result");
+            auto repeated = asio::co_spawn(f.data, f.channel->stop(), asio::use_future);
+            f.pump();
+            check(repeated.get(), "Repeated stop did not preserve its completed shutdown result");
         }
         {
             Fixture f;

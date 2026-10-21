@@ -184,7 +184,8 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
         return executor_;
     }
     void activate();
-    asio::awaitable<void> stop();
+    // A normal return always means all data tasks have drained.
+    asio::awaitable<bool> stop();
     asio::awaitable<lnk::ProtocolEvent> receive_event();
     std::uint64_t take_forwarded_bytes() noexcept
     {
@@ -289,6 +290,7 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     // All Flow directions share one batch deadline; idle nodes have none.
     Clock::time_point credit_deadline_ = Clock::time_point::max();
     AsyncEvent tasks_done_;
+    bool stop_ok_ = true;
     std::size_t tasks_ = 0;
     bool activated_ = false;
     bool stopping_ = false;

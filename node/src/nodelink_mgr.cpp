@@ -77,18 +77,13 @@ void NodeLinkMgr::activate()
         asio::co_spawn(control_, receive_events(), [this](std::exception_ptr error) {
             if (error)
             {
+                stop_ok_ = false;
                 PROXY_ERROR_PRINT("Node data notifications: %s", exception_description(error).c_str());
             }
             events_running_ = false;
             done_.cancel();
         });
     });
-}
-
-void NodeLinkMgr::rollback() noexcept
-{
-    running_ = false;
-    protocol_->links().rollback();
 }
 
 void NodeLinkMgr::handle(CtrlMessage message)
@@ -180,14 +175,15 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
             }
         }
     }
-    catch (const std::exception &e)
+    catch (...)
     {
         if (!running_)
         {
             co_return;
         }
-        PROXY_ERROR_PRINT("Node data notifications failed reason=%s", e.what());
-        control_failed(e.what());
+        const auto reason = exception_description(std::current_exception());
+        PROXY_ERROR_PRINT("Node data notifications failed reason=%s", reason.c_str());
+        control_failed(reason);
     }
     // Notification loss is terminal; do not wait for this receiving task itself.
     co_await shutdown();
@@ -211,16 +207,19 @@ asio::awaitable<void> NodeLinkMgr::shutdown()
     }
     flow_endpoints_.clear();
     link_endpoints_.clear();
-    co_await asio::co_spawn(protocol_->executor(), protocol_->stop(), asio::use_awaitable);
+    const bool data_ok = co_await asio::co_spawn(protocol_->executor(), protocol_->stop(), asio::use_awaitable);
+    stop_ok_ = data_ok && stop_ok_;
 }
 
-asio::awaitable<void> NodeLinkMgr::stop()
+asio::awaitable<bool> NodeLinkMgr::stop()
 {
+    co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     co_await shutdown();
     while (events_running_ || flow_tasks_ != 0)
     {
         co_await done_.async_wait(use_nothrow_awaitable);
     }
+    co_return stop_ok_;
 }
 
 NodeLinkMgr::LinkRequest::LinkRequest(asio::any_io_executor executor, njson values)

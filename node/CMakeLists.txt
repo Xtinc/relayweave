@@ -7,6 +7,7 @@ add_library(relayweave_node_lib
     src/control_router_multi.cpp
     src/node_session.cpp
     src/node_config.cpp
+    src/node_control.cpp
     src/relay_node.cpp
     src/cluster_mgr.cpp
     src/topology.cpp

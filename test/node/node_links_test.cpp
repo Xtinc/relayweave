@@ -677,7 +677,7 @@ void data_failures()
             failure = std::current_exception();
         }
         std::cout << "stopping data module" << std::endl;
-        co_await module->stop();
+        require(co_await module->stop(), "data shutdown failed");
         std::cout << "data module stopped" << std::endl;
         if (failure)
         {
@@ -743,20 +743,20 @@ void concurrent_stop()
     auto stop_with_cancellation = [&]() -> asio::awaitable<void> {
         // Queue cancellation before stop queues the completion of its pending data operations.
         asio::post(io, [&] { cancellation.emit(asio::cancellation_type::all); });
-        co_await module->stop();
+        require(co_await module->stop(), "cancelled stop reported a shutdown error");
     };
     auto cancelled = asio::co_spawn(io, stop_with_cancellation(),
                                     asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
     auto concurrent = asio::co_spawn(io, module->stop(), asio::use_future);
     io.run();
     cancelled.get();
-    concurrent.get();
+    require(concurrent.get(), "concurrent stop reported a shutdown error");
     require(io.stopped(), "concurrent or cancelled stop retained data tasks");
 
     io.restart();
     auto repeated = asio::co_spawn(io, module->stop(), asio::use_future);
     io.run();
-    repeated.get();
+    require(repeated.get(), "repeated stop changed its shutdown result");
     tcp::acceptor rebound(io, {asio::ip::address_v4::loopback(), tp});
     udp::socket rebound_udp(io, {asio::ip::address_v4::loopback(), up});
 }

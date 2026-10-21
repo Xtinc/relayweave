@@ -274,7 +274,9 @@ TLS 业务在 Agent↔Node 接入段使用 TLS，在 Node 间使用 TCP Flow；�
 
 | 模块 | 所属进程或库 | 状态所有者 | 职责与主要流程 |
 |---|---|---|---|
-| `RelayNode` | relayweave-node | 四个 Node executor | 直接持有 RegistryMgr，处理公共控制查询、分派两类中继命令、协调启动和停止 |
+| `RelayNode` | relayweave-node | 四个 Node executor | 直接持有 RegistryMgr 和业务容器，分派公共控制与中继命令、协调启动和停止 |
+| `NodeControl` | RelayNode 的 unique_ptr 成员 | `control_io` | 公共注册/发现、身份/状态/拓扑查询、认证来源与客户端响应回送；只读实例元数据 |
+| `NodeMetrics` | RelayNode 的 shared_ptr 成员 | 三个探针分别在 control/TCP/UDP 域，其余统计在 `control_io` | 拥有三个探针定时器、排队延迟、带宽可用率与运行时间；供查询和拓扑只读访问 |
 | `ControlSession` | relayweave-node | `control_io` | 接受普通客户端 mTLS 控制连接，接收命令并在断线时触发清理 |
 | `ControlRouterSingle` | 单节点 NodeSession 的直接成员 | `control_io` | 本地双方接入、建立期限、ready、取消及控制通知 |
 | `NodeSession` | 每个 Node 业务实例 | `control_io` | 直接持有 Single/Multi variant、本地数据句柄及唯一任务取消信号；跨域调用数据操作 |
@@ -462,8 +464,8 @@ RelayNode 负责启动、停止和处理真实业务协议，不提供通用集�
 业务处理器直接使用 ClusterMgr 的 `send(target, message)` 和 `broadcast(message)`。
 
 RelayNode 独占 `ClusterMgr`，ClusterMgr 反向保存非拥有的 `RelayNode&`。ClusterMgr 在 control executor 上
-验证消息来源后直接调用 RelayNode 的私有消息处理入口，该入口处理公共查询，并将中继命令交给 ControlRouterSingle/Multi。
-RelayNode 消费服务、节点、集群状态和拓扑查询；NodeLink/Flow 及 `relay.peer.*` 交给各自模块处理。
+验证消息来源后直接调用 RelayNode 的私有消息处理入口，该入口将公共控制消息交给 NodeControl，将中继命令交给所属 NodeSession/控制器。
+NodeControl 处理服务、节点、集群状态和拓扑查询；NodeLink/Flow 及 `relay.peer.*` 由 RelayNode 交给各自模块处理。
 `cluster.error` 清理本地 Flow 协调、端点授权及多节点业务；物理 Link 仍由成员变化和独立心跳判断失效。`cluster.joined` 及未识别的普通命令不进入额外队列。
 这条直接关系与 RelayNode 控制状态位于同一串行 executor，生命周期由 RelayNode 的所有权和停止顺序保证。
 发送入口拒绝业务调用使用 `cluster.*` 保留命令，并通过本地 `cluster.error` 报告。
@@ -621,6 +623,7 @@ Single 不消费打开请求，保留每次打开创建新实例的行为。peer
 控制连接断开、epoch 更新和集群失败同样通过 NodeSession 通知控制器，由实例判断归属、失效条件和关闭原因。
 RelayNode 仅通过 protocol/is_multi 统计准入，通过 cancellation_slot 绑定所属业务任务；
 不访问实例的 controller/data variant、取消信号或控制器的角色、请求字段与进度。
+入口和出口的新建业务统一在 start_relay 检查多跳数量与协议额度；业务任务完成时移出容器，最后一个任务排空后唤醒停止等待。
 
 Single 从 Registry 找到 Producer，安装 LocalPair，向两端发送 opened/offer，等待双方票据接入，绑定服务
 统计和 accessor，激活后发 ready，再运行双向数据复制。建立失败通知请求方 error 和已获 offer 的服务方 closed；
@@ -1773,12 +1776,18 @@ RelayNode 使用四个互相独立的单线程 `asio::io_context`：
 
 | 执行域 | 所有者 | 目的 |
 |---|---|---|
-| `control_io` | control acceptor、`ControlSession`、RelayNode 公共控制状态、`RegistryMgr`、`ClusterMgr`、`Topology`、服务发现 | 控制状态按顺序修改，会话、服务表和探测状态由本执行域串行访问 |
+| `control_io` | control acceptor、`ControlSession`、`NodeControl`、`NodeMetrics` 控制侧采样、`RegistryMgr`、`ClusterMgr`、`Topology`、服务发现 | 控制状态按顺序修改，会话、服务表和探测状态由本执行域串行访问 |
 | `transfer_tcp_io` | 两个 `StreamPipeline` 的 acceptor、Relay 索引和流式数据复制 | 把高吞吐流式数据与控制消息隔离 |
 | `transfer_udp_io` | `DatagramMgr`、UDP socket、UDP 路由 | UDP 报文处理与 TCP/TLS、控制面独立调度 |
 | `cluster_data_io` | `FlowProtocol` 的流表、信用、计时与所属 `LnkChannel` 的物理收发 | Node 通道与会话数据面同域运行，与业务服务限速隔离 |
 
-RelayNode 在 control_io 查找服务和业务实例、分派 Agent 及 peer 消息；
+RelayNode 在 control_io 查找中继服务和业务实例、分派 Agent 及 peer 消息；公共控制协议交给 NodeControl。
+NodeControl 显式借用唯一 RegistryMgr、ClusterMgr、只读 Topology/NodeMetrics 和只读业务容器，没有反向 RelayNode 引用或独立后台任务。
+NodeControl 和 NodeMetrics 共用 `node_control.h/.cpp`；集群参数对象及 source 在 ClusterMgr 入口校验，公共查询复用该结果，仅校验各命令自己的字段。
+NodeMetrics::start 在集群启动前记录运行时间、绑定 FlowProtocol；节点就绪后 activate 启动 control/TCP/UDP 三个队列探针定时器，控制域探针同时负责流量采样。
+探针与服务流量均每秒采样；control 探针先记录队列延迟，每五秒读取上次采样的服务速率与 take_forwarded_bytes 计算带宽可用率，再采样本次服务流量，最后重新调度。
+Topology 和公共查询读取同一份 queue_delays/available/uptime，不复制采样状态。
+
 NodeSession 用 std::variant 直接拥有 Single 或 Multi 控制器，两者执行域及层次相同。
 控制器只推进自己的实例，数据管理器不保存控制会话引用、不发 opened/offer/ready/error/closed。
 
@@ -1802,6 +1811,11 @@ flowchart LR
         CS[ControlSession / ClusterMgr] --> RN[RelayNode 全局分派]
         RN --> REG[RegistryMgr]
         RN --> RS[relay_sessions 容器]
+        RN --> NC[NodeControl 公共控制协议]
+        RN --> NM[NodeMetrics 运行指标]
+        NC -->|借用| REG
+        NC -->|只读元数据| RS
+        NC -->|只读| NM
         RS --> S[ControlRouterSingle]
         RS --> M[ControlRouterMulti]
         M --> NL[NodeLinkMgr 既有建路]
@@ -1898,6 +1912,8 @@ UDP 重试由 Forwarder 拥有的独立协程执行并计入停机排空；服�
 |---|---|---|---|
 | RelayNode / RelayAgent | `main()` 的 `shared_ptr` 和必要 completion | 按值跨越顶层异步任务 | stop 完成且线程退出 |
 | ClusterMgr | RelayNode 的 `shared_ptr` 成员 | 非拥有的 `RelayNode&` 反向引用 | `async_stop()` 已等待主循环和成员会话退出 |
+| NodeControl | RelayNode 的 unique_ptr 成员 | 借用 RegistryMgr、ClusterMgr、Topology、NodeMetrics 和只读业务容器 | 集群停止完成前保持可用，随 Node 销毁 |
+| NodeMetrics | RelayNode 的 shared_ptr 成员及在途定时器处理函数 | Topology 和 NodeControl 只读访问 | control 先禁止重新调度，三个执行域分别取消；迟到取消处理只释放自身，不访问已停止的依赖 |
 | RegistryMgr | RelayNode 的直接成员 | 会话使用 weak 引用，两类控制入口借用同一注册表 | Registry 停止并清理会话后销毁 |
 | ControlRouterSingle | NodeSession 的 variant 成员 | 只推进本地双方业务协调，无全局查表或数据 I/O | 随实例任务排空后销毁 |
 | NodeSession / ControlRouterMulti | RelayNode 的唯一业务容器及实例任务；实例直接拥有控制器和本地数据句柄 | 借用 NodeLinkMgr、ClusterMgr 和共享数据 manager | 取消并排空数据任务与 Flow 监视，再释放本地资源及本 Flow；不关闭共享 NodeLink |
@@ -2790,7 +2806,8 @@ relayweave-agent consumer-agent-config.json
 
 #### 8.2.1 RelayNode 进程启动流程
 
-进程入口先按配置准备普通客户端控制/TLS 数据使用的 TLS context；RelayNode 构造时再准备集群 TLS context、Registry 和三个 Relay manager。`start()` 按以下顺序建立可运行环境：
+进程入口先按配置准备普通客户端控制/TLS 数据使用的 TLS context；RelayNode 构造时再准备集群 TLS context、Registry 和三个 Relay manager。
+main 为四个执行域建立 work guard 并启动线程，通过 control_io 提交 `start()`，按以下顺序建立可运行环境：
 
 ```mermaid
 flowchart TD
@@ -2799,13 +2816,16 @@ flowchart TD
     C --> D[绑定 TCP data acceptor]
     D --> E[绑定 TLS data acceptor]
     E --> F[启动 DatagramMgr UDP socket]
-    F --> G[状态切换为 Running]
-    G --> H[启动 master accept_loop 或 slave_loop]
-    H --> I[启动控制/TCP/TLS accept 协程]
-    I --> J[启动队列延迟和流量采样 timer]
+    F --> N[启动 NodeLink 监听并记录 NodeMetrics 运行时间]
+    N --> H[启动集群控制、Topology 和 NodeLink 通知消费]
+    H --> G[状态切换为 Running]
+    G --> I[启动控制 accept 协程]
+    I --> J[NodeMetrics.activate 启动三个探针 timer，控制探针兼做流量采样]
 ```
 
-监听、UDP 或集群启动在进入 Running 前失败时，`start()` 关闭已经打开的 acceptor 并停止 DatagramMgr，然后把原异常交给 `main()`。程序不会在部分端口可用的状态下继续运行。
+监听、UDP 或集群启动失败时，`start()` 关闭控制监听并保留 Stopping，将原异常交给调用者。
+main 仍调用 stop()，在存活的执行域中收拢已发布的任务，再释放 work guard、join 四个线程，最后报告原启动异常。
+其他调用者可在 io_context 运行前 bootstrap，或在 control_io 调用 start()；失败后同样必须保持执行域运行并调用 stop()。
 
 #### 8.2.2 RelayAgent 进程启动流程
 
@@ -2836,7 +2856,7 @@ TCP/TLS 服务尚未定位时关闭当前应用连接，监听保留；UDP 此�
 #### 8.3.1 RelayNode 停止流程
 
 `RelayNode::stop()` 是同步收敛接口，由 `control_io`、`transfer_tcp_io`、`transfer_udp_io`、`cluster_data_io` 之外的线程调用。
-它通过一次性状态保护执行以下流程：
+它通过只供外部 stop 调用方持有的互斥量协调并发调用，以 Stopped 状态复用重复调用结果；control、TCP/TLS、UDP 阶段依次执行，返回 bool 表示是否正常关闭：
 
 ```mermaid
 sequenceDiagram
@@ -2846,6 +2866,7 @@ sequenceDiagram
     participant U as transfer_udp_io
 
     X->>C: co_spawn control stop
+    C->>C: NodeMetrics.stop_control 禁止重调度并取消控制采样
     C->>C: close control acceptor, RegistryMgr.stop
     C->>C: 取消全部 NodeSession，排空控制及数据子任务，关闭本地配对或端点及本 Flow
     C->>C: 拒绝新 Node link 申请并完成等待者
@@ -2855,13 +2876,14 @@ sequenceDiagram
     C->>C: wait all ControlSession tasks
     C-->>X: control completion
     X->>T: enqueue TCP/TLS stop after prior data-plane posts
-    T->>T: stop TCP/TLS StreamPipeline and acceptors
+    T->>T: NodeMetrics.stop_tcp，stop TCP/TLS StreamPipeline and acceptors
     T-->>X: TCP/TLS stop dispatched
     X->>X: wait accepted setup socket tasks
     X->>U: enqueue UDP stop after TCP follow-up posts
-    U->>U: stop DatagramMgr and UDP socket
+    U->>U: NodeMetrics.stop_udp，stop DatagramMgr and UDP socket
     U-->>X: UDP completion
     X->>X: state=Stopped
+    X->>X: 释放 work guard，join 全部执行线程，再根据关闭结果退出
 ```
 
 Node 先取消并排空所有单节点及多节点 NodeSession；该过程仍需 NodeLinkMgr 和集群控制处理关闭确认及失效通知。
@@ -2871,9 +2893,25 @@ RelayNode 的控制命令不会再创建新业务。业务复制子任务已由�
 ClusterMgr 首先把自身置为非运行状态，再取消 master accept/slave connect、关闭出站消息队列和全部成员
 session 并等待退出。ClusterMgr 不维护额外的业务收件箱；停止返回后不再调用 RelayNode。
 
+需要等待排空的模块关闭接口返回 `asio::awaitable<bool>`，模块内部记录错误，对外只交付关闭结果。
+正常返回（包括 false）均保证所属任务已经退出；false 表示关闭阶段发生了已处理的错误。
+运行期间已经记录的错误不会单独使随后完成排空的关闭返回 false。调用方取消不会中断模块排空，
+并发、重复关闭等待同一完成条件，并保持同一关闭结果。
+
+NodeLinkMgr 接收 FlowProtocol 的关闭结果后，仍等待通知和 Flow 控制任务退出。
+Topology 和 ClusterMgr 的完成事件在后台协程退出时唤醒等待者；无法确认排空完成的失败单独保留，
+由关闭接口抛出，不能转换成普通 false 或提前设置 Stopped。Topology 仅在 DNS / ICMP 排空后置为 Stopped。
+RelayNode 依次调用 NodeLinkMgr、Topology、ClusterMgr，不因某一步返回 false 而跳过后续模块或会话排空，
+随后完成 TCP/TLS、UDP 停止，设置 Stopped 并返回汇总结果，不保存或重抛模块历史运行异常。
+任务提交或排空本身失败时，异常交给外层，互斥量随作用域释放，Node 保持 Stopping，后续 stop() 可以再次进入关闭流程。
+main 的信号等待只交付信号结果，stop() 在回调外调用；先释放 work guard、join 全部线程，再结束 Node 生命周期。
+正常关闭退出 0，已完成但关闭结果为 false 时退出 1；启动异常在清理与 join 后报告原始原因。
+已取消的指标处理函数可以迟到，但只释放模块自身，不再访问注册表或协议服务；不使用 io_context.stop() 跳过排空，也不增加全局强停超时。
+
 TCP/TLS accept 后、首帧解析前的 socket 由各 StreamPipeline 的独立 setup 协程暂时持有，不能只关闭
 acceptor 就假定它们消失。每个实例自己的 `pending_sockets_` 记录这部分协程；TCP/TLS 停止阶段在进入
 UDP 停止前使用原子 wait 等待它们归零。accept/setup 协程按值捕获 Pipeline 的 shared_ptr，
+未完成接入继续受现有 setup_timeout 约束，不增加待接入 socket 管理表。
 业务复制由 NodeSession 的控制任务跨域拥有并排空，不再由 manager detached 启动。
 
 #### 8.3.2 RelayAgent 停止流程
@@ -3079,7 +3117,7 @@ Node、Agent、Dashboard 需要同步升级；不兼容旧的业务分页字段�
 | 组件 | 接收入口与执行域 | 负责的命令 | 推进的状态 |
 |---|---|---|---|
 | TLSChannel | 通道读循环，通道所属 executor | `ping/pong` | 控制连接存活；消息在通道内部消费 |
-| RelayNode / RegistryMgr | `handle_control_message`，control_io | `server.identify`、`service.*`、`node.lookup`、状态及拓扑查询 | 节点身份、注册、发现和查询结果 |
+| NodeControl / RegistryMgr | `NodeControl::handle_client/handle_cluster`，control_io | `server.identify`、`service.*`、`node.lookup`、状态及拓扑查询 | 节点身份、注册、发现和查询结果 |
 | RelayAgent / NodeConnection | `NodeConnection::run` / `RelayAgent::handle_control_message`，control_io | `server.identified`、服务/节点定位结果、`topology.snapshot` | 控制连接 Ready、服务位置、入口等待和候选路径 |
 | Forwarder / AgentSession | RelayAgent 投递到 transfer_io | `relay.opened/offer/ready/error/closed` | 单次业务接入、数据复制和退出 |
 | NodeSession / Single / Multi | `handle_relay`、`handle_relay_peer`，control_io | `relay.open/reject/cancel`、`relay.peer.*` | LocalPair 或 RemotePair 的建立和收尾 |
@@ -3212,7 +3250,7 @@ Flow→Producer 在 socket 写入后累计 TX，首 Node 和中间 Node 不重�
 
 `server.load` 和 `server.traffic` 只报告当前节点；`server.cluster` 广播查询，各在线节点把独立完整报告定向发回入口，入口只转发、不聚合或缓存结果。当前所有普通客户端共用客户端证书，因此任意通过 mTLS 的客户端都能请求这些信息，它们不是独立管理员接口。
 
-`relays` 只包含已 Ready 且尚未关闭的业务，由 Single/Multi 控制器只读现有元数据，NodeSession 分派，RelayNode 在 control_io 汇总，不访问数据域队列。
+`relays` 只包含已 Ready 且尚未关闭的业务，由 Single/Multi 控制器只读现有元数据，NodeSession 分派，NodeControl 在 control_io 汇总，不访问数据域队列。
 Single 报告 mode、service、protocol、uuid、consumer_peer、producer_peer。Multi 首节点报告 mode、role=ingress、service、protocol、epoch、flow_id、agent_peer 和完整有序 path；末节点报告 role=egress 和 Producer 的 agent_peer，不报告 path。
 Python 按同一 server.cluster 请求轮次收集；已知成员全部回复后发布，三个周期仍缺报则发布部分结果并列出缺报节点。Multi 按 epoch + flow_id 拼接，并验证服务、协议和路径端点；未拼齐的业务不生成路线。
 每轮替换业务集合，空数组清理旧业务，断线使当前业务失效，成员或 epoch 变化清理旧轮次。同端点、服务、协议和有序路径合并成一条线路，业务 ID 转为字符串。
@@ -3400,7 +3438,8 @@ TCP/TLS 在双方 finished 后正常收尾，由首 Node 关闭 Flow；UDP 没�
 
 - [`node/src/main.cpp`](../node/src/main.cpp)：RelayNode 配置入口、TLS context、执行线程和进程信号；
 - [`node/src/node_config.cpp`](../node/src/node_config.cpp)：Node 配置解析与字段校验；
-- [`node/src/relay_node.cpp`](../node/src/relay_node.cpp)：子系统构造、控制连接接入、执行域协调、公共控制入口、服务发现和状态报告，以及全局业务创建、实例及 peer 分派、取消和停止排空；
+- [`node/src/relay_node.cpp`](../node/src/relay_node.cpp)：子系统构造、控制连接接入、公共控制与中继入口分派、全局业务创建、实例及 peer 分派、取消和停止排空；
+- [`node/inc/node_control.h`](../node/inc/node_control.h)、[`node/src/node_control.cpp`](../node/src/node_control.cpp)：NodeControl 处理公共服务注册/发现、节点定位、状态/拓扑查询、集群响应路由及状态响应校验；NodeMetrics 提供队列探针、服务流量采样、转发流量预算与运行时间；
 - [`node/src/control_router_single.cpp`](../node/src/control_router_single.cpp)：控制域内的本地双方接入、建立期限、ready、取消和通知；
 - [`node/src/control_router_multi.cpp`](../node/src/control_router_multi.cpp)：首末协调、实例内 Flow 监视及清理；
 - [`node/src/node_session.cpp`](../node/src/node_session.cpp)：直接拥有 Single/Multi 控制器和本地数据句柄，跨域操作数据 manager；

@@ -463,7 +463,7 @@ class ClusterMgr::Connector
 ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::ssl::context &context,
                        ClusterConfig config, TLSChannelConfig channel, std::size_t max_connections)
     : server_(server), executor_(executor), context_(context), config_(std::move(config)), channel_config_(channel),
-      max_connections_(max_connections), acceptor_(executor), loop_done_(executor, 1),
+      max_connections_(max_connections), acceptor_(executor), loop_done_(executor),
       outbound_channel_(executor, channel.max_queued_messages)
 {
     if (config_.node_id.empty() || config_.address.empty())
@@ -493,55 +493,61 @@ ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::
 
 void ClusterMgr::start()
 {
-    if (running_)
+    if (started_)
     {
         throw std::logic_error("Cluster already started");
     }
 
+    ScopeGuard rollback([this]() noexcept {
+        running_ = false;
+        asio::error_code ignored;
+        acceptor_.close(ignored);
+    });
     if (config_.role == ClusterConfig::Role::Master)
     {
-        ScopeGuard close_acceptor([this]() noexcept {
-            asio::error_code ignored;
-            acceptor_.close(ignored);
-        });
         tcp::endpoint endpoint(asio::ip::make_address(config_.address), config_.control_port);
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(tcp::acceptor::reuse_address(true));
         acceptor_.bind(endpoint);
         acceptor_.listen();
-        close_acceptor.dismiss();
     }
 
     running_ = true;
-    ScopeGuard rollback([this]() noexcept {
-        running_ = false;
-        asio::error_code ignored;
-        acceptor_.close(ignored);
-        outbound_channel_.close();
-    });
     std::weak_ptr<ClusterMgr> weak = shared_from_this();
     auto loop = config_.role == ClusterConfig::Role::Master ? accept_loop() : slave_loop();
     asio::co_spawn(executor_, std::move(loop), [weak](std::exception_ptr error) {
         if (auto self = weak.lock())
         {
-            self->loop_done_.try_send(asio::error_code{}, std::move(error));
+            self->drain_error_ = error;
+            if (error)
+            {
+                PROXY_ERROR_PRINT("Cluster close failed reason=%s", exception_description(error).c_str());
+            }
+            self->loop_done_.notify_all();
         }
     });
+    started_ = true;
     rollback.dismiss();
 }
 
-asio::awaitable<void> ClusterMgr::async_stop()
+asio::awaitable<bool> ClusterMgr::async_stop()
 {
-    if (!running_)
+    co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
+    if (!started_)
     {
-        co_return;
+        co_return true;
     }
 
     running_ = false;
     if (config_.role == ClusterConfig::Role::Master)
     {
-        asio::error_code ignored;
-        acceptor_.close(ignored);
+        asio::error_code error;
+        acceptor_.close(error);
+        if (error)
+        {
+            stop_ok_ = false;
+            PROXY_ERROR_PRINT("Cluster listener close failed reason=%s", error.message().c_str());
+        }
         outbound_channel_.close();
     }
 
@@ -550,11 +556,12 @@ asio::awaitable<void> ClusterMgr::async_stop()
         connector_->stop();
     }
 
-    auto loop_error = co_await loop_done_.async_receive(asio::use_awaitable);
-    if (loop_error)
+    co_await loop_done_.wait();
+    if (drain_error_)
     {
-        std::rethrow_exception(loop_error);
+        std::rethrow_exception(drain_error_);
     }
+    co_return stop_ok_;
 }
 
 asio::awaitable<void> ClusterMgr::accept_loop()
@@ -562,7 +569,6 @@ asio::awaitable<void> ClusterMgr::accept_loop()
     ClusterRoom room(executor_, config_.node_id, epoch_);
     room.join(std::make_shared<LocalParticipant>(config_.node_id, config_.advertise_address, *this));
 
-    std::exception_ptr error;
     try
     {
         using namespace asio::experimental::awaitable_operators;
@@ -570,11 +576,9 @@ asio::awaitable<void> ClusterMgr::accept_loop()
     }
     catch (...)
     {
-        error = std::current_exception();
+        PROXY_ERROR_PRINT("Cluster failed reason=%s", exception_description(std::current_exception()).c_str());
     }
     co_await room.async_stop();
-    if (error)
-        std::rethrow_exception(error);
 }
 
 asio::awaitable<void> ClusterMgr::slave_loop()

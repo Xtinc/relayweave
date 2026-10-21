@@ -3,10 +3,13 @@
 #include "node_fixture.h"
 #include <deque>
 #include <iostream>
+#include <set>
 #include <thread>
 
 using namespace std::chrono_literals;
 using tcp = asio::ip::tcp;
+
+TEST_MEMBER(RelayNode, registry_)
 
 namespace
 {
@@ -288,7 +291,120 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         std::rethrow_exception(failure);
 }
 
-void verify_relay_node(asio::ssl::context &context)
+asio::awaitable<CtrlMessage> client_reply(const std::shared_ptr<TLSChannel> &client, CtrlCommand command)
+{
+    auto message = co_await client->async_receive(3s);
+    require(message.type() == command, "Public query returned an unexpected response");
+    for (const auto *field : {"source", "target", "session_id", "requester_node"})
+    {
+        require(!message.params->contains(field), "Internal routing field leaked to the client");
+    }
+    co_return message;
+}
+
+asio::awaitable<CtrlMessage> peer_query(const std::shared_ptr<TLSChannel> &peer, std::uint64_t request)
+{
+    for (;;)
+    {
+        auto message = co_await peer->async_receive(3s);
+        if (message.type() == CtrlCommand::NodeLookup && message.params->at("request_id") == request)
+        {
+            co_return message;
+        }
+    }
+}
+
+CtrlMessage located_reply(const CtrlMessage &query, std::uint16_t port)
+{
+    const auto &params = *query.params;
+    return CtrlMessage(CtrlCommand::NodeLocated,
+        njson{{"target", params.at("source")}, {"requester_node", params.at("source")},
+              {"session_id", params.at("session_id")}, {"request_id", params.at("request_id")},
+              {"source", "forged"}, {"node_id", "forged"}, {"address", "127.0.0.1"}, {"port", port}});
+}
+
+asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &peer,
+                                           asio::ssl::context &client_context, const std::shared_ptr<RelayNode> &master,
+                                           std::uint16_t master_port, std::uint16_t slave_port)
+{
+    auto local = co_await connect(client_context, slave_port);
+    auto remote = co_await connect(client_context, master_port);
+    local->send(CtrlMessage(CtrlCommand::ServiceRegister,
+                           njson{{"request_id", 100U}, {"service", "public-query"}, {"protocol", "tcp"}}));
+    co_await client_reply(local, CtrlCommand::ServiceOk);
+    for (const auto &client : {local, remote})
+    {
+        client->send(CtrlMessage(CtrlCommand::ServiceLookup,
+                                njson{{"request_id", 101U}, {"service", "public-query"}, {"protocol", "tcp"}}));
+        const auto service = co_await client_reply(client, CtrlCommand::ServiceLocated);
+        require(service.params->at("node_id") == "slave" && service.params->at("port") == slave_port,
+                "Local/remote service discovery changed its owner or endpoint");
+        client->send(CtrlMessage(CtrlCommand::NodeLookup,
+                                njson{{"request_id", 102U}, {"node_id", "slave"}}));
+        const auto node = co_await client_reply(client, CtrlCommand::NodeLocated);
+        require(node.params->at("node_id") == "slave" && node.params->at("port") == slave_port,
+                "Local/remote node discovery changed its endpoint");
+        client->send(CtrlMessage(CtrlCommand::TopologyQuery, njson{{"request_id", 103U}}));
+        const auto topology = co_await client_reply(client, CtrlCommand::TopologySnapshot);
+        require(topology.params->at("nodes").size() >= 2, "Topology query lost cluster members");
+        client->send(CtrlMessage(CtrlCommand::ServerCluster, njson{{"request_id", 104U}}));
+        std::set<std::string> reported;
+        for (unsigned i = 0; i < 2; ++i)
+        {
+            const auto status = co_await client_reply(client, CtrlCommand::ServerStatusReported);
+            reported.insert(status.params->at("node_id").get<std::string>());
+            require(status.params->at("request_id") == 104U && status.params->at("relays").empty() &&
+                        status.params->at("uptime_ms").get<std::uint64_t>() < 30'000,
+                    "Status query changed its request, ready-only relays or startup clock");
+        }
+        require(reported == std::set<std::string>{"slave", "test-master"}, "Cluster status lost or duplicated a node");
+        client->send(CtrlMessage(CtrlCommand::ServerLoad, njson{{"request_id", 105U}}));
+        const auto load = co_await client_reply(client, CtrlCommand::ServerLoaded);
+        require(load.params->contains("transfer_udp_queue_delay_us"), "Load query lost executor metrics");
+    }
+    local->send(CtrlMessage(CtrlCommand::ServiceList, njson{{"request_id", 106U}}));
+    const auto listed = co_await client_reply(local, CtrlCommand::ServiceListed);
+    require(listed.params->at("services") == njson::array({"public-query"}), "Service list lost the registration");
+    local->send(CtrlMessage(CtrlCommand::ServerTraffic, njson{{"request_id", 107U}}));
+    const auto traffic = co_await client_reply(local, CtrlCommand::ServerTrafficReported);
+    require(traffic.params->at("services").size() == 1, "Traffic query lost the registered service");
+
+    // The observer holds a real lookup so replies can exercise routing without timing races.
+    remote->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 201U}, {"node_id", "observer"}}));
+    const auto query = co_await peer_query(peer, 201U);
+    auto wrong = located_reply(query, master_port);
+    (*wrong.params)["requester_node"] = "another-node";
+    (*wrong.params)["address"] = "wrong.invalid";
+    peer->send(std::move(wrong));
+    peer->send(located_reply(query, master_port));
+    const auto correct = co_await client_reply(remote, CtrlCommand::NodeLocated);
+    require(correct.params->at("node_id") == "observer" && correct.params->at("address") == "127.0.0.1",
+            "Reply accepted a wrong requester or trusted a forged source/node ID");
+
+    remote->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 202U}, {"node_id", "observer"}}));
+    const auto late = co_await peer_query(peer, 202U);
+    co_await remote->async_disconnect();
+    const auto old_session = late.params->at("session_id").get<std::uint64_t>();
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (test_access::RelayNode_registry_(*master).contains(old_session))
+    {
+        require(std::chrono::steady_clock::now() < deadline, "Disconnected client remained registered");
+        asio::steady_timer wait(co_await asio::this_coro::executor, 1ms);
+        co_await wait.async_wait(asio::use_awaitable);
+    }
+    auto replacement = co_await connect(client_context, master_port);
+    replacement->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 203U}, {"node_id", "observer"}}));
+    const auto fresh = co_await peer_query(peer, 203U);
+    require(fresh.params->at("session_id") != old_session, "Replacement connection reused a retired session ID");
+    peer->send(located_reply(late, master_port));
+    peer->send(located_reply(fresh, master_port));
+    const auto current = co_await client_reply(replacement, CtrlCommand::NodeLocated);
+    require(current.params->at("request_id") == 203U, "Late reply reached the replacement client");
+    co_await local->async_disconnect();
+    co_await replacement->async_disconnect();
+}
+
+void verify_relay_node(asio::ssl::context &context, asio::ssl::context &client_context)
 {
     asio::io_context control(1);
     asio::io_context tcp_io(1);
@@ -299,15 +415,25 @@ void verify_relay_node(asio::ssl::context &context)
     reservation.close();
 
     auto settings = make_test_node_config();
+    context.load_verify_file((test_data::directory() / "tls_channel_test_client_ca.pem").string());
     settings.control.address = settings.tcp.address = settings.tls.address = settings.datagram.address = "127.0.0.1";
     settings.cluster.control_port = port;
     settings.channel.disconnect_timeout = 100ms;
+    tcp::acceptor client_reservation(control, {asio::ip::address_v4::loopback(), 0});
+    const auto master_port = client_reservation.local_endpoint().port();
+    client_reservation.close();
+    settings.control.port = master_port;
     auto master = std::make_shared<RelayNode>(control, tcp_io, udp_io, cluster_data.io, context, settings);
+    master->start();
     settings.cluster.role = ClusterConfig::Role::Slave;
     settings.cluster.node_id = "slave";
     configure_test_cluster_data(settings.cluster);
+    client_reservation.open(tcp::v4());
+    client_reservation.bind({asio::ip::address_v4::loopback(), 0});
+    const auto slave_port = client_reservation.local_endpoint().port();
+    client_reservation.close();
+    settings.control.port = slave_port;
     auto slave = std::make_shared<RelayNode>(control, tcp_io, udp_io, cluster_data.io, context, settings);
-    master->start();
     slave->start();
     // A real cluster peer observes wire replies; RelayNode needs no generic inbox.
     auto scenario = [&](std::uint64_t previous_epoch) -> asio::awaitable<std::uint64_t> {
@@ -343,6 +469,7 @@ void verify_relay_node(asio::ssl::context &context)
                         report.params->at("requester_node") == "observer" && !report.params->contains("target"),
                     "Real cluster query lost its routing metadata");
         }
+        co_await verify_public_queries(peer, client_context, master, master_port, slave_port);
         co_await peer->async_disconnect();
         co_return epoch;
     };
@@ -360,6 +487,7 @@ void verify_relay_node(asio::ssl::context &context)
         restarted.control.address = restarted.tcp.address = restarted.tls.address = restarted.datagram.address = "127.0.0.1";
         restarted.cluster.control_port = port;
         restarted.channel.disconnect_timeout = 100ms;
+        restarted.control.port = master_port;
         master = std::make_shared<RelayNode>(control, tcp_io, udp_io, cluster_data.io, context, std::move(restarted));
         master->start();
         asio::co_spawn(control, scenario(epoch), asio::use_future).get();
@@ -393,7 +521,7 @@ int main()
         auto result = asio::co_spawn(io, verify(io, context, client_context, anonymous_context), asio::use_future);
         io.run();
         result.get();
-        verify_relay_node(context);
+        verify_relay_node(context, client_context);
         std::cout << "[PASS] cluster room, broadcast, mTLS, reconnect and shutdown\n";
         return 0;
     }

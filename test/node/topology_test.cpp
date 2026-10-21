@@ -1,5 +1,6 @@
 #include "node_test_config.h"
 #include "topology.h"
+#include "node_control.h"
 
 #include <iostream>
 
@@ -62,11 +63,9 @@ int main()
         stage = "construct topology";
         auto cluster = std::make_shared<ClusterMgr>(*owner, control_io.get_executor(), context, settings.cluster,
                                                     settings.channel, 16);
-        std::atomic<std::uint32_t> control_delay{1};
-        std::atomic<std::uint32_t> tcp_delay{2};
-        std::atomic<std::uint32_t> udp_delay{3};
-        const double available = 1.0;
-        Topology topology(control_io, "master", true, *cluster, control_delay, tcp_delay, udp_delay, available);
+        RegistryMgr registry(16, 16, 16);
+        NodeMetrics metrics(control_io.get_executor(), tcp_io.get_executor(), udp_io.get_executor(), registry, 100);
+        Topology topology(control_io, "master", true, *cluster, metrics);
 
         stage = "update members";
         topology.update_members(njson{{"source", "master"},

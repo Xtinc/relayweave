@@ -1,5 +1,5 @@
 #include "node_fixture.h"
-TEST_MEMBER(RelayNode, bandwidth_at_)
+TEST_MEMBER(NodeMetrics, bandwidth_at_)
 #include <asio/experimental/awaitable_operators.hpp>
 #include <future>
 #include <iostream>
@@ -196,7 +196,7 @@ void flow_integration()
                 require_flow(bool(s1) && bool(s2) && bool(shared), "forked flows failed");
                 for (const auto &node : nodes)
                 {
-                    test_access::RelayNode_bandwidth_at_(*node) = std::chrono::steady_clock::now();
+                    test_access::NodeMetrics_bandwidth_at_(test_node::metrics(node)) = std::chrono::steady_clock::now();
                     test_node::links(node).protocol().take_forwarded_bytes();
                 }
                 for (std::uint8_t i = 0; i < 12; ++i)
