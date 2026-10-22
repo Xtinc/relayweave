@@ -10,9 +10,9 @@ AgentSession::AgentSession(Forwarder &owner, std::uint64_t request, ServiceKey s
                            Clock::time_point deadline)
     : owner(owner), request(request), service(std::move(service)), destination(std::move(destination)),
       deadline(deadline), data(this->service.protocol == RelayProtocol::Udp
-                                   ? Data(std::in_place_type<DatagramData>, owner.transfer_work_.get_executor())
-                                   : Data(std::in_place_type<StreamData>, owner.transfer_work_.get_executor())),
-      changed(owner.transfer_work_.get_executor())
+                                   ? Data(std::in_place_type<DatagramData>, owner.executor())
+                                   : Data(std::in_place_type<StreamData>, owner.executor())),
+      changed(owner.executor())
 {
 }
 
@@ -35,7 +35,7 @@ void AgentSession::fail(std::string cause)
     }
 
     cancel(cause.empty() ? "relay failed" : std::move(cause));
-    if (owner.state_ == Forwarder::State::Running)
+    if (owner.running())
     {
         const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
         PROXY_ERROR_PRINT("Relay failed %s %s service=%s request_id=%llu uuid=%llu reason=%s",
@@ -106,10 +106,7 @@ void AgentSession::handle(const CtrlMessage &message)
         PROXY_INFO_PRINT("Relay [+] %s %s service=%s uuid=%llu", relay_protocol_name(service.protocol).data(),
                          producer() ? "producer" : "consumer", service.service.c_str(),
                          static_cast<unsigned long long>(config::require_unsigned(endpoint, "uuid", true)));
-        if (forward)
-        {
-            owner.datagram_forwards_.at(*forward).retry_delay = std::chrono::milliseconds(500);
-        }
+        owner.relay_ready(*this);
         changed.cancel();
     }
     else if (command == CtrlCommand::RelayError || command == CtrlCommand::RelayClosed)
@@ -162,9 +159,7 @@ asio::awaitable<void> AgentSession::run()
         if (!producer())
         {
             // Selection accesses control_io state; attach and transfer stay on transfer_io.
-            selection =
-                co_await asio::co_spawn(owner.agent_.control_executor_,
-                                        owner.agent_.select_relay(service, destination, deadline), asio::use_awaitable);
+            selection = co_await owner.select_relay(service, destination, deadline);
             if (!reason.empty())
             {
                 throw asio::system_error(asio::error::operation_aborted);
@@ -213,7 +208,7 @@ asio::awaitable<void> AgentSession::run()
             }
             else
             {
-                co_await receive_datagrams();
+                co_await owner.receive_datagrams(*this);
             }
 
             cancel("UDP forwarding ended");
@@ -274,22 +269,13 @@ asio::awaitable<void> AgentSession::run()
 
     if (reason.empty())
         close_io(); // cancel()/fail() already closed I/O on aborted sessions.
-    owner.relays_.erase(request);
     selection.connection.reset();
-
-    if (forward)
-    {
-        auto &listener = owner.datagram_forwards_.at(*forward);
-        if (listener.relay.get() == this)
-        {
-            listener.relay.reset();
-            owner.schedule_datagram_retry(*forward);
-        }
-    }
+    owner.relay_finished(*this);
 }
 
 asio::awaitable<void> AgentSession::attach()
 {
+    const auto &options = owner.session_options();
     if (!reason.empty())
     {
         throw asio::system_error(asio::error::operation_aborted);
@@ -333,19 +319,19 @@ asio::awaitable<void> AgentSession::attach()
         {
             auto endpoints = co_await sockets.resolver.async_resolve(
                 target->target_host, std::to_string(target->target_port),
-                asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+                asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
             if (!reason.empty())
             {
                 throw asio::system_error(asio::error::operation_aborted);
             }
             const auto address = endpoints.begin()->endpoint();
-            sockets.target.emplace(owner.transfer_work_.get_executor());
+            sockets.target.emplace(owner.executor());
             sockets.target->open(address.protocol());
             sockets.target->connect(address);
         }
         auto endpoints = co_await sockets.resolver.async_resolve(
             server.host, std::to_string(port),
-            asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+            asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         if (!reason.empty())
         {
             throw asio::system_error(asio::error::operation_aborted);
@@ -362,29 +348,29 @@ asio::awaitable<void> AgentSession::attach()
         {
             auto endpoints = co_await sockets.resolver.async_resolve(
                 target->target_host, std::to_string(target->target_port),
-                asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+                asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
             co_await asio::async_connect(sockets.local, endpoints,
-                                         asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+                                         asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         }
         auto endpoints = co_await sockets.resolver.async_resolve(
             server.host, std::to_string(port),
-            asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+            asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         co_await asio::async_connect(sockets.transfer, endpoints,
-                                     asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+                                     asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         if (service.protocol == RelayProtocol::Tls)
         {
-            sockets.tls.emplace(std::move(sockets.transfer), owner.ssl_context_);
-            configure_tls_client(*sockets.tls, server.host, owner.server_name_);
+            sockets.tls.emplace(std::move(sockets.transfer), options.ssl_context);
+            configure_tls_client(*sockets.tls, server.host, options.server_name);
             co_await sockets.tls->async_handshake(
                 asio::ssl::stream_base::client,
-                asio::cancel_after(remaining(owner.handshake_timeout_), asio::use_awaitable));
+                asio::cancel_after(remaining(options.handshake_timeout), asio::use_awaitable));
             co_await asio::async_write(*sockets.tls, asio::buffer(frame),
-                                       asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+                                       asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         }
         else
         {
             co_await asio::async_write(sockets.transfer, asio::buffer(frame),
-                                       asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+                                       asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         }
     }
 
@@ -395,7 +381,7 @@ asio::awaitable<void> AgentSession::attach()
         {
             auto &sockets = std::get<DatagramData>(data);
             const auto sent = co_await sockets.transfer.async_send(
-                asio::buffer(frame), asio::cancel_after(remaining(owner.connect_timeout_), asio::use_awaitable));
+                asio::buffer(frame), asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
             if (sent != frame.size())
             {
                 throw std::runtime_error("truncated relay.attach");
@@ -417,42 +403,5 @@ asio::awaitable<void> AgentSession::attach()
     if (!reason.empty())
     {
         throw asio::system_error(asio::error::operation_aborted);
-    }
-}
-
-asio::awaitable<void> AgentSession::receive_datagrams()
-{
-    auto &sockets = std::get<DatagramData>(data);
-    auto &listener = owner.datagram_forwards_.at(*forward);
-    const auto &header = sockets.session_header;
-    std::array<std::uint8_t, DatagramHeader::maximum_wire_payload + 1> buffer;
-    while (reason.empty())
-    {
-        const auto [error, size] = co_await sockets.transfer.async_receive(asio::buffer(buffer), use_nothrow_awaitable);
-        if (!reason.empty())
-        {
-            co_return;
-        }
-        if (error == asio::error::message_size)
-        {
-            continue;
-        }
-        if (error)
-        {
-            throw asio::system_error(error);
-        }
-        if (size < header.size() || size > header.size() + sockets.maximum_payload ||
-            !std::equal(header.begin(), header.end(), buffer.begin()) || !listener.local_peer)
-        {
-            continue;
-        }
-        const auto peer = *listener.local_peer;
-        const auto payload_size = size - header.size();
-        const auto sent = co_await listener.listener_socket.async_send_to(
-            asio::buffer(buffer.data() + header.size(), payload_size), peer, asio::use_awaitable);
-        if (sent != payload_size)
-        {
-            throw std::runtime_error("truncated local datagram");
-        }
     }
 }

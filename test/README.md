@@ -2,13 +2,14 @@
 
 测试按被验证的组件分组；需要完整 Agent、Node 或 Proxy 链路的场景归入 `integration/`。
 测试夹具、私有状态访问和参考实现只存在于测试目录，不给业务类增加测试接口。
+Agent 路由测试通过夹具检查私有候选计算；生产接口只提供目的节点选路，不为测试保留探测模式或全目的候选查询。
 
 | 目录 | 内容 | CTest 标签 |
 |---|---|---|
 | `common/` | 双索引容器、LRU、缓冲池、AsyncEvent、令牌桶、流量计数 | `common`、`unit` |
 | `protocol/` | 控制/二进制编解码、mTLS、FlowProtocol/NodeLink、Stream/Datagram 端点、TCP/TLS/UDP 复制 | `protocol`，按用例区分 `unit` / `integration` |
 | `route/` | 链路质量、路径算法、DNS 探测生命周期、真实 ICMP | `routing`，真实 ICMP 另标 `icmp` |
-| `agent/` | Agent/Session/Forwarder 生命周期、路由组装和缓存 | `agent`，路由相关另标 `routing` |
+| `agent/` | Agent/Session/Forwarder 生命周期、控制连接池、路由组装和缓存 | `agent`，路由相关另标 `routing` |
 | `node/` | 配置/统计、启动停止、集群控制、共享 NodeLink、Flow、UDP session 路由、拓扑 | `node`，集群相关另标 `cluster` |
 | `proxy/` | HTTP、CONNECT、SOCKS5、容量、超时和监听回滚 | `proxy`、`integration` |
 | `integration/` | 单/多节点 TCP/TLS/UDP、恢复、迁移及 Proxy 完整链路 | `end_to_end`、`integration` |
@@ -62,6 +63,11 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 性能基准的构建、运行和产物目录见 [benchmark/README.md](../benchmark/README.md)。
 
 ## 回归边界与整理原则
+
+- Agent 连接池（`node_connection`）：真实 mTLS 后仍等待节点识别；就绪连接不创建等待或分配请求编号、Node/端点复用、身份冲突、活动引用防回收、60 秒空闲边界、停止期间复用旧索引、任务完成后重建、并发停止排空，以及连接句柄晚于 Agent 释放。
+- Agent 停止（`agent_lifecycle`）：取消一个停止等待者不打断独立排空任务，其他等待者仍等待依赖退出；排空失败保持 Stopping、保留元数据并向并发及后续等待者传播错误，最终释放 Agent。
+- Agent 入口（`agent_session`）：回复同时关联 primary 来源、request_id、node_id、原截止时间和取消状态；Session 本地取消保留入口预算，整体停止立即唤醒并排空。
+
 
 - 公共控制（`cluster_integration`）：本地/远端发现、状态与拓扑查询、认证来源与路由字段清理、错误 requester 和关闭会话的迟到响应；重启后重复验证。
 - 运行指标（`node_metrics`）：启动前的无效队列值和运行时间、三个执行域采样、控制探针同时采样服务流量、转发字节计入可用率、分域取消后回调释放且不重调度；`node_flows` 继续验证真实转发计数。

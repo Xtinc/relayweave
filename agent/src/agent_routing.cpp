@@ -4,14 +4,15 @@
 #include <algorithm>
 #include <cmath>
 #include <set>
+#include <sstream>
 
 static std::chrono::milliseconds age(std::uint64_t value)
 {
     return std::chrono::milliseconds(std::min(value, std::uint64_t(std::chrono::milliseconds::max().count())));
 }
 
-AgentRouting::AgentRouting(asio::io_context &io, bool discover_entries, std::size_t max_nodes)
-    : discover_entries_(discover_entries), max_nodes_(max_nodes), probes_(io)
+AgentRouting::AgentRouting(asio::io_context &io, std::size_t max_nodes)
+    : max_nodes_(max_nodes), probes_(io)
 {
     if (max_nodes == 0 || max_nodes > MAX_PATH_NODES)
     {
@@ -25,6 +26,7 @@ bool AgentRouting::set_required_targets(ProbeSet::Targets targets)
     {
         return false;
     }
+    path_cache_.clear();
     required_targets_ = std::move(targets);
     update_targets();
     return true;
@@ -32,7 +34,7 @@ bool AgentRouting::set_required_targets(ProbeSet::Targets targets)
 
 void AgentRouting::update_targets()
 {
-    auto targets = discover_entries_ ? nodes_ : ProbeSet::Targets{};
+    auto targets = nodes_;
     for (const auto &[id, host] : required_targets_)
     {
         targets.insert_or_assign(id, host);
@@ -134,6 +136,10 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
         update_targets();
         links_ = std::move(links);
         snapshot_at_ = pending_.started - created_age;
+        if (epoch_ != epoch)
+        {
+            path_cache_.clear();
+        }
         epoch_ = epoch;
         version_ = version;
         pending_ = Pending{};
@@ -148,6 +154,7 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
 
 void AgentRouting::invalidate_snapshot()
 {
+    path_cache_.clear();
     nodes_.clear();
     report_ages_.clear();
     available_.clear();
@@ -164,7 +171,6 @@ asio::awaitable<bool> AgentRouting::refresh_probes()
 
 void AgentRouting::stop()
 {
-    invalidate_snapshot();
     probes_.stop();
 }
 
@@ -239,7 +245,7 @@ std::vector<RouteGraph::Entry> AgentRouting::measured_entries() const
     return entries;
 }
 
-AgentRouting::CandidatePaths AgentRouting::candidate_paths(Clock::time_point now) const
+std::vector<RouteGraph::Path> AgentRouting::candidate_paths(const std::string &destination, Clock::time_point now) const
 {
     const auto entries = measured_entries();
     if (entries.empty())
@@ -255,20 +261,54 @@ AgentRouting::CandidatePaths AgentRouting::candidate_paths(Clock::time_point now
     }
 
     const auto routes = graph(now);
-    CandidatePaths result;
+    std::vector<RouteGraph::Path> result;
     for (const auto &[node, cost] : ingress_costs)
     {
         const RouteGraph::Entry entry{node, cost + bandwidth_penalty(node, now)};
-        for (auto &[destination, path] : routes.shortest_paths(std::span(&entry, 1), max_nodes_))
+        auto paths = routes.shortest_paths(std::span(&entry, 1), max_nodes_);
+        if (const auto path = paths.find(destination); path != paths.end())
         {
-            result[destination].push_back(std::move(path));
+            result.push_back(std::move(path->second));
         }
     }
-    for (auto &[_, paths] : result)
-    {
-        std::sort(paths.begin(), paths.end(), [](const auto &left, const auto &right) {
-            return left.cost != right.cost ? left.cost < right.cost : left.nodes < right.nodes;
-        });
-    }
+    std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
+        return left.cost != right.cost ? left.cost < right.cost : left.nodes < right.nodes;
+    });
     return result;
+}
+
+std::vector<std::string> AgentRouting::select_path(const ServiceKey &service, const std::string &destination)
+{
+    const auto now = AgentRouting::Clock::now();
+    if (const auto cached = path_cache_.get(destination, now))
+    {
+        return *cached;
+    }
+
+    auto candidates = candidate_paths(destination, now);
+    // Keep one complete log record per path so journald preserves level and service context.
+    if (proxy_is_debug_enabled())
+    {
+        const auto count = candidates.size();
+        PROXY_DEBUG_PRINT("Routes service=%s/%s -> %s candidates=%zu max_nodes=%zu%s", service.service.c_str(),
+                          relay_protocol_name(service.protocol).data(), destination.c_str(), count, max_nodes_,
+                          count == 0 ? " cost=unavailable" : "");
+        for (std::size_t index = 0; index < std::min(count, MAX_LOGGED_CANDIDATES); ++index)
+        {
+            const auto &candidate = candidates[index];
+            std::ostringstream path;
+            path << "agent";
+            for (const auto &node : candidate.nodes)
+            {
+                path << " -> " << node;
+            }
+            PROXY_DEBUG_PRINT("Route #%zu cost=%.3f service=%s/%s: %s%s", index + 1, candidate.cost,
+                              service.service.c_str(), relay_protocol_name(service.protocol).data(), path.str().c_str(),
+                              index == 0 ? " *" : "");
+        }
+    }
+
+    auto best = candidates.empty() ? std::vector<std::string>{} : std::move(candidates.front().nodes);
+    path_cache_.put(destination, best);
+    return best;
 }

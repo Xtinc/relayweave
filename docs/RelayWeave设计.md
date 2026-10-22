@@ -177,7 +177,7 @@ NodeLinkMgr 安装相邻 Link 与完整 Flow 路径，FlowProtocol 和本地数�
 
 | 职责分组 | 职责 | 主要组件 | 输出 |
 |---|---|---|---|
-| 服务与路径决策 | 服务定位、入口选择和路径计算 | RegistryMgr、RelayAgent、Topology、AgentRouting、route | 服务位置、Node 序列、epoch |
+| 服务与路径决策 | 服务定位、入口选择和路径计算 | RegistryMgr、AgentControl、Topology、AgentRouting、route | 服务位置、Node 序列、epoch |
 | 业务与路径编排 | 业务授权、建立、激活与关闭 | AgentSession、NodeSession、Single/Multi、NodeLinkMgr | 接入票据、本地数据句柄、LinkSpec/FlowSpec |
 | 数据接入与逻辑流 | 本地配对、端点交接、方向与信用管理 | StreamPipeline、DatagramMgr、FlowProtocol、FlowStream/FlowDatagram | 已接手的池载荷、DATA/FIN、待发送的邻接帧 |
 | 邻接传输与通道 | 接入认证、顺序收发与连接存活检测 | LnkChannel、NodeLink、TLSChannel、XfrChannel | 实际 I/O 完成、协议事件、业务 EOF 或错误 |
@@ -247,10 +247,12 @@ TLS 业务在 Agent↔Node 接入段使用 TLS，在 Node 间使用 TCP Flow；�
 
 | 模块 | 所属进程或库 | 状态所有者 | 职责与主要流程 |
 |---|---|---|---|
-| `RelayAgent` | relayweave-agent | `control_io` | primary/附加节点连接池、服务注册、发现和路由控制 |
+| `RelayAgent` | relayweave-agent | `control_io` | 组合根、配置、跨域入口与整体启动停止 |
+| `AgentControl` | relayweave-agent | `control_io` | 服务注册/发现、入口等待、控制消息分派与维护循环 |
+| `NodeConnectionMgr` | RelayAgent 的直接成员 | `control_io` | primary/附加连接池、身份索引、复用、空闲回收和任务排空 |
 | `NodeConnection` | relayweave-agent | `control_io` | 单节点解析、连接、mTLS、识别、接收和指数退避重连 |
 | `Forwarder` / `AgentSession` | relayweave-agent | `transfer_io` | Forwarder 管理本地监听和实例；AgentSession 拥有单次接入、ready 等待和业务复制 |
-| `AgentRouting` | relayweave-agent | `control_io` | 探测入口与服务节点、组装拓扑、计算推荐路径 |
+| `AgentRouting` | relayweave-agent | `control_io` | 探测入口与服务节点、组装拓扑、计算推荐路径并保存目的 Node 缓存 |
 | `ProbeSet` / `ICMP` | route | 所属进程的 `control_io` | DNS、IPv4 去重、原始 socket 探测、历史保留和关闭 |
 | `LinkQuality` / `RouteGraph` | route | 调用方 executor | 固定内存质量统计、纯边权计算和多入口最短路径 |
 | `TLSChannel` | protocol | 创建它的 executor | mTLS 握手、帧收发、bounded queue、心跳和统一关闭 |
@@ -293,17 +295,11 @@ TLS 业务在 Agent↔Node 接入段使用 TLS，在 Node 间使用 TCP Flow；�
 
 ### 3.3 Agent 服务发现与入口连接
 
-RelayAgent 保存服务位置并管理共享控制连接；业务选定路径后取得实际入口连接，连接引用随业务排空后释放。
+AgentControl 保存服务位置，NodeConnectionMgr 管理共享控制连接；业务选定路径后取得实际入口连接，连接引用随业务排空后释放。
 
 #### 3.3.1 RelayAgent 状态与职责
 
-RelayAgent 分别维护入口控制连接和服务位置记录：
-
-- 初始配置只决定 primary 入口；
-- 每个 `(service, protocol)` 保存自己的目标节点；
-- 每个目标节点对应一个 `NodeConnection`；
-- 同一节点的多个服务复用同一连接；
-- 不同节点的连接和 Relay 相互独立。
+详细设计见 [primary 与服务位置](RelayAgent设计.md#primary-与服务位置)。
 
 #### 3.3.2 服务发现流程
 
@@ -319,68 +315,11 @@ RelayAgent 分别维护入口控制连接和服务位置记录：
 
 #### 3.3.5 NodeConnection 连接池
 
-每条控制连接在可用前都执行 `server.identify/server.identified`。客户端校验服务器返回的 `node_id`：已知位置指定了节点 ID 时，实际连接到其他节点会使该次连接失败。
-
-连接池先按 `node_id` 复用，再按 `host:port` 复用。每个 `NodeConnection` 自己运行连接、接收、清理和重连循环：
-
-- 初始重连延迟由 `reconnect.initial_delay_ms` 指定；
-- 失败后翻倍，最多到 `reconnect.max_delay_ms`；
-- 连接成功后恢复初始延迟；
-- 已知附加节点独立重连，不依赖 primary 在线。
-
-`NodeConnection` 不长期保存强 TLSChannel 引用。每次 `run()` 使用成员中的
-`optional<Operations>` 原位拥有 resolver、socket 和 retry timer；运行开始时构造，连接循环退出时由
-scope guard 清空，`stop()` 因而可以直接取消这些对象而不引用协程栈地址。当前通道仍只保存
-`weak_ptr<TLSChannel>`。协程 completion handler 在任务期间持有 RelayAgent；连接池强持有 NodeConnection，运行协程及其 completion handler 只借用连接。
-
-连接池直接保存普通 `shared_ptr<NodeConnection>`，每个连接只有一个 shared_ptr 控制块。
-EntryWait 和活动的请求方 AgentSession 保存同一连接的共享引用，EntryWait 只在入口选择期间存在。
-复用现有 5 秒维护周期：附加连接只剩池内引用时开始计时，连续空闲 60 秒后调用 `stop()`；
-有会话或等待者持有时不回收，短暂复用也会重新计时，primary 不参与空闲回收。
-停止后连接不再 ready，但池内索引与对象保留到 `run()` 完成，随后由 Agent 的 completion handler 移除。
-同节点新请求遇到停止中的连接时等待其任务退出，再使用原地址重建，整个过程仍受原建立截止时间约束。
-入口查询结果只保存地址与端口，不长期保留 JSON 回复；DNS 和控制接收恢复时检查停止状态，避免启动下一阶段。
-附加节点断线只结束使用它的业务实例；主控制连接恢复后重新注册和发现服务，不设计离线定位。
-
-单条 NodeConnection 的状态转换可以表示为：
-
-```mermaid
-stateDiagram-v2
-    [*] --> Resolving
-    Resolving --> Connecting: resolve 成功
-    Resolving --> WaitingRetry: 失败
-    Connecting --> Handshaking: TCP 成功
-    Connecting --> WaitingRetry: 失败
-    Handshaking --> Identifying: mTLS 成功
-    Handshaking --> WaitingRetry: 失败
-    Identifying --> Ready: node_id 匹配
-    Identifying --> WaitingRetry: 超时/不匹配
-    Ready --> WaitingRetry: 收包结束或通道关闭
-    WaitingRetry --> Resolving: timer 到期
-    Ready --> Stopped: stop
-    WaitingRetry --> Stopped: stop
-    Resolving --> Stopped: stop/cancel
-```
-
-Ready 只表示 mTLS 和 `server.identified` 都成功。TCP 已连接或 TLS 已握手但尚未识别节点时，不会注册服务、安装 Forwarder 路由或发送业务请求。
-
-连接失败后的清理顺序为：清除 weak channel、通知 owner 结束使用该控制连接的业务、等待 TLSChannel 断开、等待重连 timer。stop 会同时取消 resolver、socket 和 timer，使协程从任何阶段退出。
+详细设计见 [NodeConnection 连接池](RelayAgent设计.md#nodeconnection-连接池)。
 
 #### 3.3.6 路由失效与重新发现
 
-客户端每 5 秒通过主控制连接查询尚未定位的服务；定位结果与入口控制连接独立。
-主控制恢复后重新注册和发现，不增加主控离线位置缓存或备用发现通道。
-只有配置了本地转发的 Agent 才运行发现及探测循环；只发布服务的 Agent 保留主控制连接和服务注册流程。
-附加入口断线只清理使用它的业务，不触发服务补查；主控制连接恢复和既有轮询负责发现重试。
-
-relay.error 的 service unavailable / service protocol mismatch 若仍对应当前目的 Node，
-会清除该次服务位置并通知 Forwarder 清除可用性，再经主控查询。
-单节点控制接入超时也重新发现；多节点首 Node 查询失败不删除有效的服务目的位置。
-无人使用的附加入口连接在连续空闲 60 秒后停止，任务退出后从连接池移除。服务迁移后新业务重新选路，不重放旧数据或沿用旧票据。
-入口失效通知只处理 control 侧等待者；服务丢失由 transfer 侧 clear_service 一次完成可用性清除、
-待建立会话及 UDP 会话取消。拓扑变化和服务迁移则分别取消仍在建立的请求方会话。
-
-发现请求和 Relay 请求使用各自执行域内的 `request_id` 分配器。它们的数值可能相同，但由命令类型、连接和对应 pending 容器共同限定，不会把服务查询响应误配到 Relay 打开请求。计数器越过 `uint64_t` 最大值后跳过零。
+详细设计见 [路由失效与重新发现](RelayAgent设计.md#路由失效与重新发现)。
 
 #### 3.3.7 Node 的查询处理与观测旁路
 
@@ -446,7 +385,7 @@ Node 成员 / Agent 配置入口、服务发现与拓扑
   → ICMP / LinkQuality：探测完成样本与三尺度统计
   → Node 报告 → master 拓扑汇总
   → Agent：筛选远端边，合并本地接入成本
-  → AgentRouting::candidate_paths：共用路由图，逐入口搜索所有目的 Node，再按成本与节点序列排序
+  → AgentRouting 内部计算：共用路由图，逐入口搜索，只汇集当前目的 Node 的候选并排序
 ```
 
 `ProbeSet` 直接拥有 DNS resolver、IP 到 Node ID 的映射、ICMP 实例和重建历史。先解析完整目标集合，
@@ -517,7 +456,7 @@ min(1, 长尺度有效完成样本权重 / evidence_target))`，其中 `evidence
 | `RouteGraph::Entry {node, access_cost}` | 真实入口及本地接入成本，不需要虚拟 Agent 节点 |
 | `RouteGraph::Path {nodes, cost}` | 真实 Node 序列与总代价 |
 | `shortest_paths(entries, max_nodes)` | 一次多入口搜索全部目的地，每个服务终点之前的 Node 增加成本 2 |
-| `AgentRouting::candidate_paths(now)` | 返回各目的 Node 的候选路径，按成本与节点序列排序 |
+| `AgentRouting::select_path(service, destination)` | 返回当前目的 Node 的最佳节点序列；候选计算为私有实现 |
 
 服务候选路径包含 `N` 个真实 Node 时，总代价为：
 
@@ -535,23 +474,23 @@ TCP、TLS 或 UDP 不改变上述公式。
 
 shortest_paths 使用按“节点、已用节点数”分层的算法，同成本按完整节点序列排序。节点预算只计算真实
 Node；孤立入口仍能给出单 Node 直达路径。后台轮询只维护探测目标和拓扑，不计算服务候选路径，
-不维护路径切换状态或独立备用路径。`candidate_paths()` 为每个可用入口分别保留到各终点的一条最优路径，
-不是同一入口下的全部路径枚举，也不保证候选之间节点或链路不相交。候选缓存由 RelayAgent 拥有。
+不维护路径切换状态或独立备用路径。内部候选计算为每个可用入口保留到当前目的 Node 的一条最优路径，
+不是同一入口下的全部路径枚举，也不保证候选之间节点或链路不相交。最佳路径缓存由 AgentRouting 拥有。
 
 TCP/TLS 每个本地连接、UDP 每个新业务实例均由 AgentSession 跨到 control_io 调用 select_relay。
-calculate_service_paths 返回最佳 Node 序列；命中有效 LRU 时直接取第一候选，未命中才计算并缓存候选。
+AgentRouting::select_path 返回最佳 Node 序列；命中有效 LRU 时直接返回该序列，未命中才计算候选并缓存最佳节点序列。
 该函数是 control_io 上的同步计算，不创建协程；入口定位及控制连接等待仍由 select_relay 协程负责。
 随后附当前 epoch 并取得实际入口，返回路径、入口 ServerRoute 及共享连接引用。
 后台探测不触发业务选路，活动业务也不重新计算或换路；服务发现不提前建立尾 Node 控制连接。
 
-候选按目的 Node 缓存 15 秒，LRU 容量 16，TCP/TLS/UDP 共享，空候选也缓存。
+最佳节点序列按目的 Node 缓存 15 秒，LRU 容量 16，TCP/TLS/UDP 共享，无路径时也缓存空结果。
 命中只更新次序，不续期；必需探测目标变化、主控制断开或拓扑 epoch 改变时清空。
 同 epoch 的指标及普通快照版本变化不直接清空缓存；TTL 到期后的下一次业务使用当前测量重新计算。
 有效候选只用于选择最佳路径，不复用之前的接入票据或 Flow。
 `cost` 是含质量、新鲜度、冷启动、带宽及中继惩罚的路由成本，不等同于 RTT。
 路径为空或仅一个 Node 时按目的服务位置走 Single；多节点首 Node 定位或连接失败结束当前实例，
 不在原实例内重新选路或回退。业务实例以服务名、本地 uuid 及 Flow 身份关联。
-Forwarder 使用 `ServerRoute::id`（host:port）管理入口连接与 Relay。
+NodeConnectionMgr 使用 endpoint/node_id 复用入口连接；Forwarder 使用 `ServerRoute::id`（host:port）匹配业务消息和控制失效。
 
 Agent 启动即探测配置入口，身份确认后关联 Node ID，服务发现后加入服务目标。有 forwards 时查询完整
 拓扑并比较全部 Node 入口，候选探测不额外建立业务连接。服务 Node 本身可作入口；本地有效直达测量
@@ -626,62 +565,7 @@ Dashboard 页面先展示集群状态和当前 Flow 交通图，再展示所选 
 
 #### 6.1.2 RelayAgent、Forwarder 与业务资源归属
 
-RelayAgent 的 control_io 拥有控制连接、服务位置、拓扑和路径缓存；Forwarder 的 transfer_io
-拥有本地 forward 与 AgentSession。数据域只保存 `(service, protocol) -> 目的 Node ID`，
-不保存用于选路的另一份控制连接表或服务地址。控制域通过 post 分派可用性和协议消息。
-
-| 对象 | 生命周期与职责 |
-|---|---|
-| StreamForward | 配置产生的长期 acceptor；每条应用连接独立建立业务 |
-| DatagramForward | 配置产生的长期 UDP socket、固定来源 IP/可更新端口、当前会话强引用、重试退避 |
-| AgentSession | 一次请求方或服务方接入；独占协议 socket、接入等待、取消和实际数据复制 |
-| Forwarder::relays_ | 以本地 request_id 拥有所有业务实例；按控制来源、协议、请求或 UUID 分派消息 |
-| RelayAgent::entry_waits_ | 只保存尚未完成的入口定位/连接等待；建立成功、失败或取消后立即移除 |
-| RelaySelection::connection | 请求方 session 强持有共享入口连接引用；业务清理后释放 |
-| RelayAgent::connections_ | 强持有所有连接直至后台任务完成；按 endpoint/node_id 复用，primary 不参与空闲回收 |
-
-Agent 通过普通共享引用判断附加连接是否仍在使用，不维护 session 使用计数或数字 lease。
-只剩池内引用满 60 秒后停止；后台控制协程借用连接，Agent 等任务完成后才移除池内引用。
-停止中的索引保留，因此同端点不会同时运行新旧两个连接任务。Session 释放引用无需自定义 deleter 或投递停止任务。
-
-AgentSession 的数据资源使用 StreamData / DatagramData variant，只持有所需协议的资源。
-StreamData 拥有应用/目标 TCP socket、Node TCP socket 和可选 TLS stream；
-DatagramData 拥有 Node UDP socket，服务方才创建目标 UDP socket；接入时缓存二进制 session 头和路径载荷上限。
-UDP 请求方的本地监听仍由 DatagramForward 拥有。
-
-AgentSession 只保存两个控制事件标记 ready、node_closed，以及中止原因 reason。
-ready 表明已收到 relay.ready，node_closed 只表示 Node 已结束业务；reason 为空表示没有中止，
-非空表示已经中止并包含具体原因。cancel 保留首次原因并关闭 I/O，空原因补为默认取消文本，
-后续通知或取消不覆盖原原因。fail 在首次失败发生时调用 cancel，无需保存失败类别。
-活动实例处理关闭/错误通知时先验证 reason、stage，再设置 node_closed，字段错误不留下半更新状态。
-UDP 的 Node 关闭始终中止实例，因此本地发送只检查 ready 和 reason，发送错误统一交给幂等 fail 处理。
-建立期限耗尽的错误仍保留原始异常原因。
-relay.open 是否提交只由 run 协程使用，因此 submitted 留在协程内。
-收到 Node 的正常 stream complete 通知只唤醒等待，不中断本地数据复制，也不判定本地复制成功。
-本地完成由 run 中的复制正常返回且没有中止表示，不额外保存 Completed 状态或完成标记。
-即使 Node 已正常结束，本地排空的真实错误仍保留原因；预期取消保留原取消原因。
-run 末尾统一清理，在本地中止、Node 未关闭且已提交请求或接受 offer 时通知 Node；
-多跳流正常结束须排空本地双向数据并收到 Node 完成通知，之后才能释放入口引用。
-TCP/TLS/UDP 共用 ready 等待；UDP 只在其中补充 attach 重发。
-取消和资源回收共用幂等 close_io；Node 已关闭时不反向发送 cancel/reject，不再接受该实例的迟到通知。
-中止时已由 cancel/fail 关闭 I/O，run 收尾仅在正常完成时执行 close_io，避免重复取消和关闭。
-AgentSession 不再绑定协程取消信号；close_io 取消自己的定时器和 resolver、关闭自己的 socket，
-异步接入步骤开始前检查 reason 与剩余建立预算，已中止时不再发起下一步操作。
-select_relay 的入口等待只由 RelayAgent 的状态、连接/失效事件和原建立截止时间决定。
-单个 Session 中止不会打断入口等待；它返回后 run 再检查 reason，释放已取得的入口引用并清理。
-因此此阶段的回收可能延迟至剩余建立期限，默认总预算 10 秒，取消不重新计时。
-Agent 整体停止仍由 invalidate_entries 设置入口等待原因并唤醒，排空业务后再释放全局资源。
-
-业务任务独立启动并由 Forwarder 计数；运行协程持有实例直到清理结束。
-Forwarder 停机同步取消全部已登记实例；Session 建立流程以 reason 检查取消，不重复读取 Forwarder 状态。
-AgentSession 只引用其拥有者 Forwarder；关闭流程保活 Agent，取消并排空全部业务任务后再完成关闭。
-UDP 本地发送临时保留当前实例，避免业务退出时销毁尚在发送的 socket；不保留额外弱索引或 pending 表。
-DatagramForward 保存当前会话的 shared_ptr；会话仍统一登记在 relays_，清理时按对象身份解除 forward 的引用。
-本地接收协程每包复制一次当前强引用并直接 async_send，不再查 relays_、读取 JSON 元数据或创建发送子协程。
-发送和返回路径复用缓存的二进制头与载荷上限，接收缓冲区仍保留完整 UDP 容量。
-UDP 重试由 Forwarder 拥有的独立协程执行并计入停机排空；服务失效将重试期限提前到当前时刻，
-使尚未开始等待的任务也能看到唤醒，重试协程退出等待时才清除标记，
-避免旧取消结果覆盖新重试。若服务已恢复，按当前服务位置建立新实例。
+详细设计见 [资源归属与取消](RelayAgent设计.md#4-资源归属与取消)。
 
 ### 6.2 对象包含与生命周期原则
 
@@ -716,13 +600,13 @@ UDP 重试由 Forwarder 拥有的独立协程执行并计入停机排空；服�
 | ControlSession | 当前 session 协程 | Registry 和 Relay 使用 weak 引用 | 接收循环结束并完成 disconnect |
 | ClusterRoom | master accept_loop 协程栈 | ClusterSession 保存引用，且必须先于 room 退出 | accept/delivery 停止并等待 participant 清空 |
 | ClusterMgr::Connector | slave_loop 协程栈 | ClusterMgr 仅存停止用临时指针 | running=false 且当前操作取消 |
-| NodeConnection | RelayAgent::connections_ 强持有；primary 始终保留 | EntryWait / 请求方 AgentSession 保存同一普通 shared_ptr，后台 run 只借用 | 附加连接连续空闲 60 秒或 Agent stop 时停止，run 完成后移出池，最后引用释放时销毁 |
+| NodeConnection | NodeConnectionMgr::connections_ 强持有；primary 始终保留 | EntryWait / 请求方 AgentSession 保存同一普通 shared_ptr，后台 run 只借用 | 附加连接连续空闲 60 秒或 Agent stop 时停止，run 完成后移出池，最后引用释放时销毁 |
 | NodeConnection Operations | NodeConnection 的 `optional` 成员在 run 期间原位拥有 | stop 直接访问同 executor 上的拥有型状态 | 连接循环退出时 scope guard 清空 |
 | Topology / AgentRouting | RelayNode / RelayAgent 直接拥有 | 同一 control executor 内调用 | close 已排空刷新与探测任务 |
 | ProbeSet / ICMP Session | Topology 或 AgentRouting / ProbeSet 中的 ICMP 实例 | 按值读取评估结果；历史只复制 ProbeState | close 等待 DNS、探测和接收协程退出 |
 | Node 本地配对 / 端点 | 对应数据 manager 的表及运行数据协程 | NodeSession 按值保存 AttachInfo/AttachPair 接入描述，以 uuid 操作资源；数据侧无控制会话引用 | 控制器排空数据任务后 close，或 manager stop |
 | AgentSession | Forwarder::relays_、运行协程与 UDP forward 的当前强引用；UDP 发送期间临时保活 | 反向引用 Forwarder、可选 forward ID；请求方持有入口连接共享句柄 | 建立失败、数据结束、控制失效或 stop，清理后释放入口句柄并解除 forward 的强引用 |
-| RelayAgent DatagramForward | datagram_forwards_ 按值拥有 | 稳定 ID 定位；本地来源、当前会话强引用和重试归 forward | 当前会话引用由会话清理解除；forward 在 Forwarder 销毁时释放 |
+| Forwarder DatagramForward | datagram_forwards_ 按值拥有 | 稳定 ID 定位；本地来源、当前会话强引用和重试归 forward | 当前会话引用由会话清理解除；forward 在 Forwarder 销毁时释放 |
 
 ClusterMgr::Connector 仍使用同一 executor 上的非拥有临时指针执行取消，并在栈对象退出前清空；
 NodeConnection 直接拥有运行期 Operations；连接循环退出时销毁该状态。
@@ -744,7 +628,7 @@ Node 同步 stop 通过 post
 
 AgentSession 使用 reason 与自己的 I/O 关闭表达中止；没有业务取消信号。入口等待由 control_io 的
 EntryWait、连接和期限管理。changed timer 用于状态变化时唤醒等待者。
-EntryWait 由 entry_waits_ 和 select_relay 共同持有，scope guard 删除索引，普通 shared_ptr 自动释放入口连接引用。
+EntryWait 由 entry_waits_ 按值持有，select_relay 借用稳定的表项，scope guard 删除表项并释放其入口连接引用；已就绪的连接不创建 EntryWait。
 
 NodeSession 的 Single/Multi cancel 会发送真实 cancellation_signal，打断正在等待的 attach、桥接或并行子任务。
 Single/Multi 用 stop_requested_ 记录停止请求或进入收尾，取消信号负责唤醒异步等待；任务入口及 Agent/peer 通知前检查停止状态。
@@ -773,7 +657,7 @@ NodeConnection 在解析、连接、TLS、节点识别恢复时检查 running。
 
 | 协程链 | 启动频率 | 运行职责与完成边界 |
 |---|---|---|
-| RelayAgent discovery / NodeConnection | 每个 Agent / 每个实际入口连接一次 | 长期发现、连接接收及重连；由 Agent 计数排空 |
+| AgentControl discovery / NodeConnection | 每个 Agent / 每个实际入口连接一次 | 发现和连接接收/重连分别由 AgentControl、NodeConnectionMgr 排空 |
 | Forwarder listener / retry / AgentSession | 每个监听 / 每次建立失败 / 每次业务 | listener 长期运行，retry 独立退避，Session 独占业务 I/O |
 | AgentSession select_relay | 每个新业务一次 | 跨到控制域访问拓扑、位置和共享连接，完成后回到 transfer_io |
 | RelayNode control accept / ControlSession | 每个 Node / 每条控制连接一次 | 接入和独立会话生命周期 |
@@ -808,8 +692,7 @@ NodeConnection 在解析、连接、TLS、节点识别恢复时检查 running。
 
 | 使用者 | 主键 | 次键 | 用途 |
 |---|---|---|---|
-| RelayAgent `connections_` | connection ID | `node_id` | 强持有连接，按内部连接或已识别节点复用，任务完成后删除 |
-| RelayAgent `service_locations_` | `(service, protocol)` | 目的 Node ID | 保存服务位置及发现请求，独立于控制连接 |
+| NodeConnectionMgr `connections_` | connection ID | `node_id` | 强持有连接，按内部连接或已识别节点复用，任务完成后删除 |
 | RegistryMgr `services_` | `(service, protocol)` | `session_id` | 服务查询，并在控制会话断开时批量注销 |
 
 唯一次键查询使用 `find_secondary()` 返回值指针。容器中的 Node 独立分配，rehash 只重建 bucket
@@ -892,76 +775,12 @@ server.host 是长期主控制和服务发现入口；实际业务入口由所�
 
 ### 7.2 Agent 入口选择、接入与业务生命周期
 
-请求方从本地应用进入，服务方从 offer 进入；两端以相同的接入与 ready 约束启动复制，UDP forward 在实例结束后独立决定重试。
+<a id="721-服务发现选路与入口连接"></a>
+<a id="722-单次接入ready-与数据复制"></a>
+<a id="723-udp-本地等待与重试"></a>
+<a id="724-控制失效数据端点与停止"></a>
 
-#### 7.2.1 服务发现、选路与入口连接
-
-service.lookup/located 返回服务所在 Node 的身份和位置，位置记录不意味着已连接该 Node。
-AgentSession 在 control_io 调用 select_relay，按目的 Node 读取有效 LRU 或计算最佳路径。
-无可用路径或只有一个 Node 时，入口就是服务 Node；多节点入口是路径首 Node。
-
-服务 Node 作为入口时直接使用已发现的位置；其他入口需要时通过主控制连接查询 node.lookup/located。
-同一入口复用控制连接表中的现有连接，已经在连接的入口也共享连接任务，不重复查询或连接。
-主控制连接始终保留，活动业务各自保留一个入口引用；附加控制连接无业务引用满 60 秒后停止，后台任务完成后从池中移除。
-发现服务不会为多跳请求方额外保留尾 Node 控制连接。
-
-路径确定以后才发送 relay.open：单节点只携带原有 request_id/service/protocol；
-多节点另带最佳 path 和当前 epoch，不传递建立超时预算。有效缓存不重新计算，仍使用当前 epoch。
-入口定位失败结束当前建立，不偷偷换路径；UDP 后续重试会重新执行选择。
-
-#### 7.2.2 单次接入、ready 与数据复制
-
-请求方接受本地 TCP/TLS 连接或在 UDP 服务可用后创建 AgentSession；服务方收到 relay.offer 创建 AgentSession。
-两种角色使用相同 run/attach 及 run 末尾的统一收尾：
-
-1. 请求方选择入口并发送 relay.open，等待 relay.opened；服务方复用注册服务的控制连接和 offer。
-2. 服务方先连接配置的目标，随后双方连接各自 Node 的 data_port。
-3. TLS 接入继续使用 mTLS、主机名验证和既有握手超时。
-4. 发送带 role/uuid/ticket 的 relay.attach，双方均等待 relay.ready 后开始业务。
-5. 控制通知同时匹配控制来源和协议；响应按 request_id 关联请求方，活动通知按本地 UUID 关联。
-   同一个 Agent 的 Single 请求方和服务方可以共用一个 UUID，ready/closed/error 必须作用于两种角色。
-6. 结束时注销实例、关闭拥有的 socket，释放入口引用；UDP forward 保留并按服务状态决定重试。
-
-单节点 TCP 使用 relay_tcp，TLS 使用 relay_tls；正常业务 EOF 保留半关闭，真实错误取消并排空对向。
-多节点使用相同的 relay_tcp / relay_tls，同样允许单向 FIN 后反向排空，并在真实错误时收敛两个方向。
-Multi 复制结束后等待 Node 的 stream complete 通知，再释放入口引用，避免控制关闭抢在最后 DATA/FIN 之前。
-该正常通知只记录完成，不提前取消数据读取；真实错误仍保存原始原因并收敛当前实例。
-
-relay.open_timeout_ms 是 Agent 本端 TCP/TLS/UDP 共同的建立超时，默认 10 秒。
-请求方从创建 AgentSession 开始计时，包含选择入口、连接、opened、attach 和 ready；
-服务方从收到 relay.offer 创建 AgentSession 开始，使用自己的配置计时。
-首末 Node 各自从创建 NodeSession 开始，使用本地协议对应的 setup_timeout_ms，不跨端传递剩余预算。
-各端内部阶段切换不重新计时；Agent 的 connect 和 TLS handshake 同时遵守单步超时与本端剩余建立时间。
-任一端失败或超时，通过既有 cancel/close 通知其他端清理；Flow 建路超时和未提交表项的过期回收独立保留。
-建立以后不再计时，不给活动业务添加租约、续期或定时结束。
-
-#### 7.2.3 UDP 本地等待与重试
-
-服务未定位时不创建 AgentSession，也不向 Node 申请资源。UDP listener 继续接收并丢弃无法转发的报文，
-服务上线后重新选择路径并申请新实例，不复用旧票据或 Flow。服务丢失时取消当前 UDP 实例，等待重新发现。
-服务在发现后、open 前消失时，Node 立即返回 service unavailable；Agent 清除该次发现并重新查询。
-
-等待 ready 时每 500 毫秒重发 UDP attach，所有等待受同一建立预算限制。
-失败后的 retry_timer 只控制新实例的退避：从 500 毫秒增加到最多 10 秒，ready 后恢复初始退避。
-每次新实例重新执行选路与入口连接；已知服务位置仍有效时不重复发现。
-
-UDP payload 沿用 session 头：单节点保留原最大载荷，多节点为 0..65467 字节，无应用层分片。
-本地首次报文固定来源 IP，同一 IP 更换端口会更新返回地址；其他 IP 报文丢弃。
-来源地址属于长期 forward，业务结束不重置；返回 payload 在尚无本地来源时丢弃。
-
-#### 7.2.4 控制失效、数据端点与停止
-
-clear_server 只取消使用该控制连接的 AgentSession，不删除服务位置。
-主控制失效会清空已发现服务位置，使拓扑和未完成建立失效；恢复连接后按原流程重新发现服务。
-当前不设计主控断线后的服务定位，不增加位置缓存或备用发现通道。附加入口断开只结束相关实例。
-Topology epoch 变化使路径缓存及未完成建立失效，不在原实例中换路。
-
-relay.opened/offer 仍只返回 data_port；数据主机取对应已识别控制连接的 ServerRoute.host。
-首末分别拥有本地端点和票据，服务发现位置只用于目的身份及直接入口定位，不充当多跳数据目的地。
-ServerRoute 的 weak TLSChannel 由业务入口引用保障存活，发送投递不能替代 opened/ready 确认。
-
-Agent 停止先取消控制任务和探测，再关闭 Forwarder 监听、重试与业务实例，排空跨域选择及数据任务。
-每个实例先完成数据取消/清理再释放入口引用，全部业务任务退出以后才销毁 Forwarder 与 Agent。
+详细设计见 [本地转发与单次业务](RelayAgent设计.md#3-本地转发与单次业务)。
 
 ### 7.3 单节点业务建立与数据复制
 
@@ -1127,25 +946,7 @@ relayweave-agent consumer-agent-config.json
 
 #### 8.2.2 RelayAgent 进程启动流程
 
-RelayAgent 构造时从全部 `forwards` 建立服务发现集合。启动本地监听和主控制连接后，
-主连接完成 TCP、mTLS 与身份识别，注册本地 `services`、查询尚未定位的服务及拓扑。
-服务发现保存目的 Node ID、地址和控制端口，投递给 Forwarder 的只有服务可用性及目的 Node ID；
-发现过程不创建到服务 Node 的附加控制连接。
-
-```mermaid
-flowchart TD
-    A[启动 Forwarder 本地监听] --> B[主控制连接识别]
-    B --> C[注册服务与查询 service.lookup]
-    C --> D[service.located 保存目的 Node 位置]
-    D --> E[Forwarder 保存服务与目的 Node ID]
-    E --> F[TCP 接受连接或 UDP 主动建立]
-    F --> G[创建 AgentSession 并选择最佳路径]
-    G --> H[取得或复用实际入口控制连接]
-    H --> I[relay.open 然后 attach 与 ready]
-```
-
-TCP/TLS 服务尚未定位时关闭当前应用连接，监听保留；UDP 此时只保留本地 forward。
-服务上线由既有发现循环获知，UDP 重新选择路径后建立新业务实例。
+详细设计见 [配置与启动](RelayAgent设计.md#配置与启动)。
 
 ### 8.3 协同停止与依赖排空
 
@@ -1157,55 +958,7 @@ TCP/TLS 服务尚未定位时关闭当前应用连接，监听保留；UDP 此�
 
 #### 8.3.2 RelayAgent 停止流程
 
-`RelayAgent::async_stop()` 是唯一的公开停止接口，调用方必须保证它完成后才销毁 Agent 或结束 executor。
-一般调用方直接等待该 awaitable；Agent 进程的信号回调则在 `control_io` 上 detached 启动它，避免阻塞
-`signal_io` 线程，随后由 `main()` join control/transfer 线程间接等待停止收敛。`main()` 持有的 Agent
-`shared_ptr` 在 join 完成前保持有效。重复调用在 `StoppingControl` 或 `StoppingForwarder` 状态等待同一个完成
-信号，在 `Stopped` 状态立即返回。尚未启动的 Agent 也走完整停止路径，以释放已构造 Forwarder 持有的
-transfer work guard。
-停止顺序固定为：
-
-1. control executor 把 Agent 切换为 `StoppingControl`，取消 discovery timer、停止 AgentRouting 探测，并停止所有 NodeConnection；
-2. NodeConnection 取消其拥有的 resolver/socket/retry timer，并要求当前 TLSChannel 断开；
-3. discovery 协程等待 `AgentRouting::close()` 排空 DNS / ICMP；discovery 和连接协程共用任务启动、计数回滚与 completion handler，递减 control `active_tasks`；
-4. control `active_tasks==0` 后，把 Agent 切换为 `StoppingForwarder`，并向 transfer executor 队列尾部启动
-   `Forwarder::async_stop()`；
-5. Forwarder 切换为 `Stopping`，关闭本地 acceptor 和 UDP socket，取消重试等待和全部 AgentSession；
-   接受新业务及安排重试的入口在非 Running 状态拒绝新工作；
-6. 监听、业务和重试任务的 completion handler 递减 transfer `active_tasks`；归零后释放
-   transfer work guard、切换为 `Stopped`，通过一次性 `stopped_event`（AsyncEvent）唤醒全部停止等待者；
-7. control executor 清空连接池和 service routes，把 Agent 切换为 `Stopped`，通过一次性 `stopped_event`（AsyncEvent）唤醒所有停止等待者。
-
-RelayAgent 不靠固定延迟等待关闭。control 任务先完全退出，保证不会再产生新的 transfer 投递，然后才在
-transfer 队列尾部关闭 Forwarder；两个 executor 的实际协程计数决定停止完成时刻。
-
-```mermaid
-sequenceDiagram
-    participant X as stop 调用方
-    participant C as Agent control_io
-    participant N as NodeConnection tasks
-    participant T as Agent transfer_io
-    participant F as Forwarder tasks
-
-    X->>C: async_stop
-    C->>C: state = StoppingControl
-    C->>C: cancel discovery_timer
-    loop 每条 NodeConnection
-        C->>N: stop
-        N->>N: cancel resolver/socket/retry，断开 TLSChannel
-        N-->>C: completion，active_tasks--
-    end
-    C->>C: discovery completion，active_tasks--
-    Note over C: control active_tasks == 0
-    C->>C: state = StoppingForwarder
-    C->>T: co_spawn Forwarder::async_stop
-    T->>F: 关闭 listeners、timer、pending 和 active Relay
-    F-->>T: transfer active_tasks--
-    Note over T,F: transfer active_tasks == 0，释放 work guard
-    T-->>C: Forwarder stop complete
-    C->>C: 清空 connections/routes，state = Stopped
-    C-->>X: 唤醒全部停止等待者
-```
+详细设计见 [RelayAgent 停止流程](RelayAgent设计.md#relayagent-停止流程)。
 
 ## 9. 质量验证与架构演进
 
@@ -1269,6 +1022,7 @@ ctest --test-dir build -C Debug -L icmp --output-on-failure
 - `node_config`、`node_status`、`node_lifecycle`：配置校验、旧配置拒绝、服务统计及超长报告、监听回滚和停止后的对象释放；
 - `udp_relay_integration`、`udp_session_routing`：attach、路由、endpoint 固定、丢包边界、重建和统计，
   以及离线不分配资源、注册不复活旧请求、半接入超时、过期票据丢弃、ready 后无运行超时和容量恢复；
+- `node_connection`：mTLS 后身份门槛、按 Node/端点复用、空闲回收与新请求交错及并发停止排空；
 - `agent_lifecycle`、`agent_reconnect`：重复启动/停止、可等待停止、断线重连取消以及停止后的对象释放。
 
 性能基准位于仓库根目录 `benchmark/`，由 `BUILD_BENCHMARKS` 独立启用，不注册为 CTest。
@@ -1374,8 +1128,10 @@ Dashboard 的 HistoryStore 由应用创建和关闭，采集客户端只使用�
 - [`node/src/datagram_mgr.cpp`](../node/src/datagram_mgr.cpp)：UDP Relay、session 路由和 endpoint 校验；
 - [`node/inc/app_common.h`](../node/inc/app_common.h)、[`node/src/app_common.cpp`](../node/src/app_common.cpp)：AttachInfo/AttachPair 值描述及通知字段生成、Relay 标识、服务流量采样、RelayEndpoint 公共绑定与计数；
 - [`agent/src/main.cpp`](../agent/src/main.cpp)：RelayAgent 配置入口、双执行域线程和进程信号；
-- [`agent/src/relay_agent.cpp`](../agent/src/relay_agent.cpp)：服务器连接池、节点身份、重连和服务发现；
-- [`agent/src/agent_routing.cpp`](../agent/src/agent_routing.cpp)：拓扑组装、入口探测目标及推荐路径计算；
+- [`agent/src/relay_agent.cpp`](../agent/src/relay_agent.cpp)：配置解析、模块组合、跨域入口选择和整体停止；
+- [`agent/src/agent_control.cpp`](../agent/src/agent_control.cpp)：服务注册/发现、入口定位等待及控制消息分派；
+- [`agent/src/node_connection_mgr.cpp`](../agent/src/node_connection_mgr.cpp)、[`agent/src/node_connection.cpp`](../agent/src/node_connection.cpp)：连接池、身份索引、空闲回收及单节点重连；
+- [`agent/src/agent_routing.cpp`](../agent/src/agent_routing.cpp)：拓扑组装、入口探测目标、推荐路径计算及目的 Node 缓存；
 - [`agent/src/forwarder.cpp`](../agent/src/forwarder.cpp)：本地 forward 监听、业务容器和消息分派；
 - [`agent/src/agent_session.cpp`](../agent/src/agent_session.cpp)：统一单次 Agent 入口选择、目标连接、TCP/TLS/UDP 接入、复制和清理；
 - [`route/src/link_quality.cpp`](../route/src/link_quality.cpp)：三尺度聚合统计、Assessment 与最终边权；

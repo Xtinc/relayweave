@@ -6,3 +6,5 @@ relayweave_test(agent_routing agent_routing_test.cpp
     LIBRARIES relayweave_agent_lib LABELS agent routing unit)
 relayweave_test(agent_path_cache agent_path_cache_test.cpp TIMEOUT 30
     LIBRARIES relayweave_agent_lib LABELS agent routing integration)
+relayweave_test(node_connection node_connection_test.cpp
+    LIBRARIES relayweave_agent_lib LABELS agent integration)

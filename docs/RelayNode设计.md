@@ -2427,8 +2427,8 @@ Node、Agent、Dashboard 需要同步升级；不兼容旧的业务分页字段�
 |---|---|---|---|
 | TLSChannel | 通道读循环，通道所属 executor | `ping/pong` | 控制连接存活；消息在通道内部消费 |
 | NodeControl / RegistryMgr | `NodeControl::handle_client/handle_cluster`，control_io | `server.identify`、`service.*`、`node.lookup`、状态及拓扑查询 | 节点身份、注册、发现和查询结果 |
-| RelayAgent / NodeConnection | `NodeConnection::run` / `RelayAgent::handle_control_message`，control_io | `server.identified`、服务/节点定位结果、`topology.snapshot` | 控制连接 Ready、服务位置、入口等待和候选路径 |
-| Forwarder / AgentSession | RelayAgent 投递到 transfer_io | `relay.opened/offer/ready/error/closed` | 单次业务接入、数据复制和退出 |
+| AgentControl / NodeConnection | `NodeConnection::run` / `AgentControl::handle_control_message`，control_io | `server.identified`、服务/节点定位结果、`topology.snapshot` | 控制连接 Ready、服务位置、入口等待和候选路径 |
+| Forwarder / AgentSession | AgentControl 投递到 transfer_io | `relay.opened/offer/ready/error/closed` | 单次业务接入、数据复制和退出 |
 | NodeSession / Single / Multi | `handle_relay`、`handle_relay_peer`，control_io | `relay.open/reject/cancel`、`relay.peer.*` | LocalPair 或 RemotePair 的建立和收尾 |
 | ClusterMgr / ClusterRoom | 集群连接读循环，control_io | `cluster.*` 与普通集群消息路由 | 成员加入、广播和定向交付 |
 | Topology | RelayNode 集群分派，control_io | `topology.members/report/query/snapshot` | 成员版本、质量报告和快照 |
@@ -2824,7 +2824,7 @@ Frame::charge() = Frame::charge_for_payload(payload.allocation_size())
 | `DatagramMgr::receive_datagram` | 65,508 B（零初始化） | **每 Node 1 个**（共享） | `datagram_mgr.cpp` |
 | `LnkChannel::udp_read` | 65,508 B（不做零初始化） | **每 Node 1 个**（共享）；校验后按实际载荷复制进池 | `lnk_channel.cpp` |
 | `Forwarder::receive_local_datagrams` | 65,500 B | 每个 UDP forward 1 个 | `forwarder.cpp` |
-| `AgentSession::receive_datagrams` | 65,508 B | 每个 UDP 请求方（Consumer）会话 1 个 | `agent_session.cpp` |
+| `Forwarder::receive_datagrams` | 65,508 B | 每个 UDP 请求方（Consumer）会话 1 个 | `forwarder.cpp` |
 
 注意：这些数组位于协程帧内，**随协程存活**，不随单次 I/O 释放。
 单节点 TCP/TLS 每个 LocalPair 或每个 Agent 会话的双向复制缓冲分别为
@@ -2908,7 +2908,7 @@ NodeLink 排队持有的载荷按实际长度申请，标准池内部块、chunk
 | `TcpPipeline::accept_loop` | 1 | — |
 | `TlsPipeline::accept_loop` | 1 | — |
 | `DatagramMgr::receive_datagram` | 1 | — |
-| `RelayAgent::discovery_loop`（配置了 forwards 时） | — | 1 |
+| `AgentControl::discovery_loop`（配置了 forwards 时） | — | 1 |
 | `Forwarder::accept_stream`（每个 TCP/TLS forward） | — | 1 |
 | `Forwarder::receive_local_datagrams`（每个 UDP forward） | — | 1 |
 

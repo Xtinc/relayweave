@@ -3,7 +3,8 @@
 本文是项目的编码风格约束，适用于贡献者和 AI 编码工具。新增与修改代码应遵循本文，异步代码参考
 `protocol/src/xfr_channel.cpp` 和 `protocol/src/tls_channel.cpp` 的既有风格。
 
-系统、Agent、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)；
+系统、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)；
+Agent 的部件、连接池、业务生命周期及停止顺序见 [RelayAgent 设计](docs/RelayAgent设计.md)；
 Node 的部件结构、完整业务流程、配置与协议集中见 [RelayNode 设计](docs/RelayNode设计.md)，
 执行域见其中的[部件结构与执行域](docs/RelayNode设计.md#1-部件结构与执行域)，
 内存分配、协程数量及性能复核见[资源模型与验证](docs/RelayNode设计.md#8-资源模型与验证)。
@@ -22,6 +23,8 @@ NodeControl 借用注册表、拓扑和业务元数据，统一处理公共注�
 重复请求、peer 身份匹配、控制断线与 epoch 失效判断通过 NodeSession 交给控制器，RelayNode 不读取控制器内部状态。
 master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
 Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
+RelayAgent 直接持有 AgentControl、NodeConnectionMgr、AgentRouting 和 Forwarder，配置保留在 relay_agent.h/.cpp。
+AgentControl 借用同级模块，负责发现与入口等待；连接池拥有控制连接，AgentRouting 拥有目的 Node 路径缓存。
 Agent 服务发现只保存目的 Node 位置，选路后才取得实际入口控制连接；发现继续使用主控，不提供主控离线定位。
 Forwarder 拥有长期本地监听和业务容器，AgentSession 统一一次 TCP/TLS/UDP 接入与复制；UDP 服务离线时只保留本地 forward。
 单跳和多跳 TCP/TLS 均保留双向半关闭，UDP 单节点用户载荷上限为 65499 字节、多节点为 65467 字节；服务限速和统计保留在端点，
@@ -42,7 +45,7 @@ TCP 共享发送队列按流标签交错插入，算法、接口与实现比较�
   注释集中在声明处，实现在 `.cpp` 内的局部类也遵循同一规则；覆盖的接口可使用 `@copydoc` 复用基类契约。
   移除零散的行内、语句旁及分段说明注释；必要的设计原因和执行器约束归入对应类或接口的 Doxygen 注释，
   跨模块流程、容量推导和历史验证记录按职责归入设计文档：Node 相关内容由 `docs/RelayNode设计.md` 维护，
-  系统、Agent 与通用约束由 `docs/RelayWeave设计.md` 维护，避免多处维护同一说明。
+  Agent 由 `docs/RelayAgent设计.md` 维护，系统与通用约束由 `docs/RelayWeave设计.md` 维护，避免多处维护同一说明。
 - 每条普通变量声明只声明一个变量，并独占一行，适用于局部变量、成员变量和全局变量。
   即使类型相同，也不得使用逗号连写，例如 `bool left_ready = false, right_ready = false;` 应拆成两行独立声明。
 - 头文件避免重复包含应使用防卫式声明，不使用 `#pragma once`。

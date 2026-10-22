@@ -51,7 +51,6 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
     void fail(std::string cause);
     void close_io();
     asio::awaitable<void> attach();
-    asio::awaitable<void> receive_datagrams();
 
     Forwarder &owner;
     std::uint64_t request;

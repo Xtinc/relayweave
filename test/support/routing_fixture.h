@@ -5,6 +5,7 @@
 #include "member_access.h"
 
 TEST_MEMBER(AgentRouting, probes_)
+TEST_MEMBER(AgentRouting, candidate_paths)
 TEST_MEMBER(ProbeSet, resolved_)
 TEST_MEMBER(ProbeSet, icmp_)
 TEST_MEMBER(ICMP, sessions_)
@@ -17,15 +18,16 @@ namespace test_routing
 {
 struct Fixture : AgentRouting
 {
-    Fixture(asio::io_context &io, bool discover_entries, std::size_t max_nodes)
-        : AgentRouting(io, discover_entries, max_nodes), io(io) {}
+    Fixture(asio::io_context &io, std::size_t max_nodes)
+        : AgentRouting(io, max_nodes), io(io) {}
     asio::io_context &io;
 };
 
 // Populate existing measurement state without opening raw sockets or changing
 // the production route calculator's inputs. All candidates use measured_entries().
-inline AgentRouting::CandidatePaths candidates(Fixture &routing, AgentRouting::Clock::time_point now,
-                                               std::span<const RouteGraph::Entry> entries)
+inline std::vector<RouteGraph::Path> candidates(Fixture &routing, const std::string &destination,
+                                                AgentRouting::Clock::time_point now,
+                                                std::span<const RouteGraph::Entry> entries)
 {
     auto &probes = test_access::AgentRouting_probes_(routing);
     auto &icmp = test_access::ProbeSet_icmp_(probes);
@@ -53,7 +55,7 @@ inline AgentRouting::CandidatePaths candidates(Fixture &routing, AgentRouting::C
             ema.rtt_square_sum = 10000.0 * entry.access_cost * entry.access_cost;
         }
     }
-    return routing.candidate_paths(now);
+    return test_access::AgentRouting_candidate_paths(routing, destination, now);
 }
 } // namespace test_routing
 #endif

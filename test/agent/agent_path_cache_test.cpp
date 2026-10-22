@@ -1,5 +1,6 @@
 #include "test_data.h"
 #include "relay_agent.h"
+#include "agent_routing.h"
 
 #include <array>
 #include <cstdio>
@@ -312,7 +313,10 @@ asio::awaitable<void> verify_cache(ControlPeer &peer, std::shared_ptr<RelayAgent
 
     // Accept fresh metrics at two regular five-second polls. They must neither
     // invalidate the destination cache nor renew its fifteen-second TTL.
-    auto request = peer.topology_request;
+    auto request = config::require_unsigned(snapshot, "request_id", true);
+    // A poll may arrive while batches run. Exercise this ordering explicitly and
+    // track the last answered request instead of discarding an unanswered one.
+    co_await wait_for([&] { return peer.topology_request != request; }, "Waiting for queued metric refresh", 6s);
     for (unsigned update = 1; update <= 2; ++update)
     {
         co_await wait_for([&] { return peer.topology_request != request; }, "Waiting for metric refresh", 6s);
@@ -395,7 +399,15 @@ int main()
             asio::co_spawn(control_io, peer.run(), asio::detached);
             auto result = asio::co_spawn(control_io, verify_cache(peer, agent, ports, logs), asio::use_future);
             IoRunner control_runner(control_io), transfer_runner(transfer_io);
-            result.get();
+            try
+            {
+                result.get();
+            }
+            catch (...)
+            {
+                std::cerr << logs.read();
+                throw;
+            }
         }
         std::cout << "[PASS] Agent destination cache sharing, empty results, TTL and invalidation\n";
         return 0;

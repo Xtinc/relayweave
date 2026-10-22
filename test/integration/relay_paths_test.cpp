@@ -1,6 +1,8 @@
 #include "test_data.h"
 #include "node_fixture.h"
 #include "relay_agent.h"
+#include "agent_control.h"
+#include "agent_routing.h"
 #include "forwarder.h"
 #include "xfr_channel.h"
 #include <asio/experimental/awaitable_operators.hpp>
@@ -11,33 +13,49 @@
 
 // Compile-time fixture access only: seed the existing LRU so full Agent paths do not require raw ICMP.
 #include "member_access.h"
-TEST_MEMBER(RelayAgent, service_locations_)
+TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(RelayAgent, routing_)
-TEST_MEMBER(RelayAgent, path_cache_)
-TEST_MEMBER(RelayAgent, calculate_service_paths)
 TEST_MEMBER(RelayAgent, transfer_executor_)
 TEST_MEMBER(RelayAgent, forwarder_)
+TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(RelayAgent, connections_)
-TEST_MEMBER(RelayAgent, entry_waits_)
-TEST_MEMBER(RelayAgent, select_relay)
-TEST_MEMBER(RelayAgent, collect_idle_connections)
-TEST_MEMBER(RelayAgent, primary_connection_id_)
+TEST_MEMBER(AgentControl, entry_waits_)
+TEST_MEMBER(AgentRouting, path_cache_)
+TEST_MEMBER(NodeConnectionMgr, connections_)
 TEST_MEMBER(RelayNode, config_)
 
 namespace
 {
 struct RelayAgentTestAccess
 {
+    static AgentControl &control(RelayAgent &agent)
+    {
+        return test_access::RelayAgent_control_(agent);
+    }
+    static AgentRouting &routing(RelayAgent &agent)
+    {
+        return test_access::RelayAgent_routing_(agent);
+    }
+    static NodeConnectionMgr &manager(RelayAgent &agent)
+    {
+        return test_access::RelayAgent_connections_(agent);
+    }
+    static auto &connections(RelayAgent &agent)
+    {
+        return test_access::NodeConnectionMgr_connections_(manager(agent));
+    }
+
     static asio::awaitable<void> select_cached_path(RelayAgent &agent, ServiceKey service, std::uint64_t epoch,
                                                     std::vector<std::string> path)
     {
         for (unsigned attempt = 0; attempt < 200; ++attempt)
         {
-            const auto destination = test_access::RelayAgent_service_locations_(agent).secondary_key(service);
-            if (test_access::RelayAgent_routing_(agent).epoch() == epoch && destination)
+            const auto &locations = test_access::AgentControl_service_locations_(control(agent));
+            const auto destination = locations.find(service);
+            if (routing(agent).epoch() == epoch && destination != locations.end() && !destination->second.node.empty())
             {
-                test_access::RelayAgent_path_cache_(agent).put(path.back(), std::vector<RouteGraph::Path>{{path, 1.0}}, AgentRouting::Clock::now());
-                if (test_access::RelayAgent_calculate_service_paths(agent, service, *destination) != path)
+                test_access::AgentRouting_path_cache_(routing(agent)).put(path.back(), path, AgentRouting::Clock::now());
+                if (routing(agent).select_path(service, destination->second.node) != path)
                 {
                     asio::steady_timer timer(co_await asio::this_coro::executor, std::chrono::milliseconds(20));
                     co_await timer.async_wait(asio::use_awaitable);
@@ -49,9 +67,9 @@ struct RelayAgentTestAccess
                         forwarder->clear_service(service);
                         co_return;
                     }, asio::use_awaitable);
-                test_access::RelayAgent_path_cache_(agent).put(path.back(), std::vector<RouteGraph::Path>{{path, 1.0}}, AgentRouting::Clock::now());
+                test_access::AgentRouting_path_cache_(routing(agent)).put(path.back(), path, AgentRouting::Clock::now());
                 // Refresh availability without connecting to the service Node.
-                asio::post(test_access::RelayAgent_transfer_executor_(agent), [forwarder = test_access::RelayAgent_forwarder_(agent), service, node = *destination] {
+                asio::post(test_access::RelayAgent_transfer_executor_(agent), [forwarder = test_access::RelayAgent_forwarder_(agent), service, node = destination->second.node] {
                     forwarder->set_service(service, node);
                 });
                 co_return;
@@ -65,34 +83,34 @@ struct RelayAgentTestAccess
     {
         const ServiceKey service{"auto-tcp", RelayProtocol::Tcp};
         co_await select_cached_path(agent, service, epoch, {"a", "b", "master"});
-        if (test_access::RelayAgent_connections_(agent).size() != 1 || test_access::RelayAgent_connections_(agent).find_secondary("master"))
+        if (connections(agent).size() != 1 || connections(agent).find_secondary("master"))
         {
             throw std::runtime_error("Service discovery connected to the tail Node before route selection");
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
-        auto first = co_await test_access::RelayAgent_select_relay(agent, service, "master", deadline);
-        auto second = co_await test_access::RelayAgent_select_relay(agent, service, "master", deadline);
+        auto first = co_await agent.select_relay(service, "master", deadline);
+        auto second = co_await agent.select_relay(service, "master", deadline);
         if (!first.connection || first.connection != second.connection ||
-            first.server.id != second.server.id || test_access::RelayAgent_connections_(agent).size() != 2 ||
-            !test_access::RelayAgent_connections_(agent).find_secondary("a") || test_access::RelayAgent_connections_(agent).find_secondary("master"))
+            first.server.id != second.server.id || connections(agent).size() != 2 ||
+            !connections(agent).find_secondary("a") || connections(agent).find_secondary("master"))
         {
             throw std::runtime_error("Multi relay did not reuse the head control without connecting the tail");
         }
-        if (!test_access::RelayAgent_entry_waits_(agent).empty())
+        if (!test_access::AgentControl_entry_waits_(control(agent)).empty())
         {
             throw std::runtime_error("Completed entry selections retained their waiting state");
         }
         bool timed_out = false;
         try
         {
-            co_await test_access::RelayAgent_select_relay(agent, service, "master", std::chrono::steady_clock::now());
+            co_await agent.select_relay(service, "master", std::chrono::steady_clock::now());
         }
         catch (const std::runtime_error &)
         {
             timed_out = true;
         }
-        const auto shared = test_access::RelayAgent_connections_(agent).find_secondary("a");
-        if (!timed_out || !test_access::RelayAgent_entry_waits_(agent).empty() || !shared || *shared != second.connection)
+        const auto shared = connections(agent).find_secondary("a");
+        if (!timed_out || !test_access::AgentControl_entry_waits_(control(agent)).empty() || !shared || *shared != second.connection)
         {
             throw std::runtime_error("A failed entry selection retained its wait or dropped another session's handle");
         }
@@ -100,9 +118,9 @@ struct RelayAgentTestAccess
         const auto start = Clock::now();
         std::weak_ptr<NodeConnection> old = first.connection;
         first.connection.reset();
-        test_access::RelayAgent_collect_idle_connections(agent, start);
-        test_access::RelayAgent_collect_idle_connections(agent, start + std::chrono::seconds(120));
-        auto active = co_await test_access::RelayAgent_select_relay(agent, service, "master", Clock::now() + std::chrono::seconds(2));
+        manager(agent).collect_idle_connections(start);
+        manager(agent).collect_idle_connections(start + std::chrono::seconds(120));
+        auto active = co_await agent.select_relay(service, "master", Clock::now() + std::chrono::seconds(2));
         if (old.expired() || active.connection != second.connection)
             throw std::runtime_error("Idle collection stopped an entry still used by another relay");
         active.connection.reset();
@@ -118,24 +136,24 @@ struct RelayAgentTestAccess
             throw std::runtime_error("Releasing the last session removed the connection before idle collection");
 
         const auto idle = Clock::now();
-        test_access::RelayAgent_collect_idle_connections(agent, idle);
-        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(59));
-        auto brief = co_await test_access::RelayAgent_select_relay(agent, service, "master", Clock::now() + std::chrono::seconds(2));
+        manager(agent).collect_idle_connections(idle);
+        manager(agent).collect_idle_connections(idle + std::chrono::seconds(59));
+        auto brief = co_await agent.select_relay(service, "master", Clock::now() + std::chrono::seconds(2));
         if (brief.connection != old.lock())
             throw std::runtime_error("An entry was retired before the idle timeout");
         brief.connection.reset();
         // A brief use between maintenance scans must restart the idle period.
-        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(60));
-        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(119));
-        if (test_access::RelayAgent_connections_(agent).size() != 2 || old.expired())
+        manager(agent).collect_idle_connections(idle + std::chrono::seconds(60));
+        manager(agent).collect_idle_connections(idle + std::chrono::seconds(119));
+        if (connections(agent).size() != 2 || old.expired())
             throw std::runtime_error("Brief reuse did not restart the entry's idle period");
-        auto reused = co_await test_access::RelayAgent_select_relay(agent, service, "master", Clock::now() + std::chrono::seconds(2));
+        auto reused = co_await agent.select_relay(service, "master", Clock::now() + std::chrono::seconds(2));
         if (reused.connection != old.lock())
             throw std::runtime_error("Brief reuse allowed the original idle deadline to stop the entry");
         reused.connection.reset();
-        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(120));
-        test_access::RelayAgent_collect_idle_connections(agent, idle + std::chrono::seconds(180));
-        if (test_access::RelayAgent_connections_(agent).size() != 2 || old.expired())
+        manager(agent).collect_idle_connections(idle + std::chrono::seconds(120));
+        manager(agent).collect_idle_connections(idle + std::chrono::seconds(180));
+        if (connections(agent).size() != 2 || old.expired())
             throw std::runtime_error("A stopping entry was removed before its task completed");
 
         // Both requests arrive while the old entry is stopping. They must wait
@@ -143,27 +161,27 @@ struct RelayAgentTestAccess
         using namespace asio::experimental::awaitable_operators;
         const auto replacement_deadline = Clock::now() + std::chrono::seconds(2);
         auto [third, fourth] = co_await (
-            test_access::RelayAgent_select_relay(agent, service, "master", replacement_deadline) &&
-            test_access::RelayAgent_select_relay(agent, service, "master", replacement_deadline));
-        const auto replacement = test_access::RelayAgent_connections_(agent).find_secondary("a");
+            agent.select_relay(service, "master", replacement_deadline) &&
+            agent.select_relay(service, "master", replacement_deadline));
+        const auto replacement = connections(agent).find_secondary("a");
         if (!old.expired() || !replacement || *replacement != third.connection ||
-            third.connection != fourth.connection || !test_access::RelayAgent_entry_waits_(agent).empty() || test_access::RelayAgent_connections_(agent).size() != 2)
+            third.connection != fourth.connection || !test_access::AgentControl_entry_waits_(control(agent)).empty() || connections(agent).size() != 2)
             throw std::runtime_error("Requests during shutdown failed to share a replacement entry");
 
         std::weak_ptr<NodeConnection> retired = third.connection;
         third.connection.reset();
         fourth.connection.reset();
         const auto last_idle = Clock::now();
-        test_access::RelayAgent_collect_idle_connections(agent, last_idle);
-        test_access::RelayAgent_collect_idle_connections(agent, last_idle + std::chrono::seconds(60));
+        manager(agent).collect_idle_connections(last_idle);
+        manager(agent).collect_idle_connections(last_idle + std::chrono::seconds(60));
         const auto exit_deadline = Clock::now() + std::chrono::seconds(2);
         while (!retired.expired() && Clock::now() < exit_deadline)
         {
             asio::steady_timer timer(co_await asio::this_coro::executor, std::chrono::milliseconds(5));
             co_await timer.async_wait(asio::use_awaitable);
         }
-        if (!retired.expired() || test_access::RelayAgent_connections_(agent).size() != 1 || !test_access::RelayAgent_entry_waits_(agent).empty() ||
-            !test_access::RelayAgent_connections_(agent).find_primary(test_access::RelayAgent_primary_connection_id_(agent)))
+        if (!retired.expired() || connections(agent).size() != 1 || !test_access::AgentControl_entry_waits_(control(agent)).empty() ||
+            !manager(agent).primary())
             throw std::runtime_error("Idle entry tasks leaked or collection removed the primary connection");
     }
 

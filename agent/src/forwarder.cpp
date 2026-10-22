@@ -23,8 +23,8 @@ Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ss
                      std::chrono::steady_clock::duration connect_timeout,
                      std::chrono::steady_clock::duration relay_open_timeout, std::vector<AgentServiceConfig> services,
                      std::vector<AgentForwardConfig> forwards)
-    : agent_(agent), transfer_work_(asio::make_work_guard(std::move(executor))), ssl_context_(ssl_context),
-      server_name_(std::move(server_name)), handshake_timeout_(handshake_timeout), connect_timeout_(connect_timeout),
+    : agent_(agent), transfer_work_(asio::make_work_guard(std::move(executor))),
+      session_options_{ssl_context, std::move(server_name), handshake_timeout, connect_timeout},
       relay_open_timeout_(relay_open_timeout), stopped_event_(transfer_work_.get_executor())
 {
     for (auto &service : services)
@@ -163,11 +163,11 @@ void Forwarder::clear_server(const std::string &server_id)
     }
 }
 
-void Forwarder::invalidate_relays(std::string reason, const std::optional<ServiceKey> &service)
+void Forwarder::invalidate_relays(std::string reason)
 {
     for (const auto &[request, relay] : relays_)
     {
-        if (!relay->producer() && !relay->ready && (!service || relay->service == *service))
+        if (!relay->producer() && !relay->ready)
         {
             relay->cancel(reason);
         }
@@ -524,6 +524,68 @@ std::uint64_t Forwarder::allocate_request_id()
         if (!relays_.contains(request))
         {
             return request;
+        }
+    }
+}
+
+asio::awaitable<RelaySelection> Forwarder::select_relay(ServiceKey service, std::string destination,
+                                                       Clock::time_point deadline)
+{
+    return agent_.select_relay(std::move(service), std::move(destination), deadline);
+}
+
+void Forwarder::relay_ready(const AgentSession &relay)
+{
+    if (relay.forward)
+    {
+        datagram_forwards_.at(*relay.forward).retry_delay = std::chrono::milliseconds(500);
+    }
+}
+
+void Forwarder::relay_finished(const AgentSession &relay)
+{
+    relays_.erase(relay.request);
+    if (relay.forward)
+    {
+        auto &listener = datagram_forwards_.at(*relay.forward);
+        listener.relay.reset();
+        schedule_datagram_retry(*relay.forward);
+    }
+}
+
+asio::awaitable<void> Forwarder::receive_datagrams(AgentSession &relay)
+{
+    auto &sockets = std::get<AgentSession::DatagramData>(relay.data);
+    auto &listener = datagram_forwards_.at(*relay.forward);
+    const auto &header = sockets.session_header;
+    std::array<std::uint8_t, DatagramHeader::maximum_wire_payload + 1> buffer;
+    while (relay.reason.empty())
+    {
+        const auto [error, size] = co_await sockets.transfer.async_receive(asio::buffer(buffer), use_nothrow_awaitable);
+        if (!relay.reason.empty())
+        {
+            co_return;
+        }
+        if (error == asio::error::message_size)
+        {
+            continue;
+        }
+        if (error)
+        {
+            throw asio::system_error(error);
+        }
+        if (size < header.size() || size > header.size() + sockets.maximum_payload ||
+            !std::equal(header.begin(), header.end(), buffer.begin()) || !listener.local_peer)
+        {
+            continue;
+        }
+        const auto peer = *listener.local_peer;
+        const auto payload_size = size - header.size();
+        const auto sent = co_await listener.listener_socket.async_send_to(
+            asio::buffer(buffer.data() + header.size(), payload_size), peer, asio::use_awaitable);
+        if (sent != payload_size)
+        {
+            throw std::runtime_error("truncated local datagram");
         }
     }
 }
