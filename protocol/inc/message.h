@@ -4,6 +4,7 @@
 #include "nlohmann/json.hpp"
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <exception>
 #include <filesystem>
 #include <optional>
@@ -23,36 +24,20 @@ enum class RelayProtocol
 std::string_view relay_protocol_name(RelayProtocol protocol) noexcept;
 RelayProtocol parse_relay_protocol(std::string_view value);
 
-enum class CtrlCommand
+// Command layout: [group:8][subgroup:8][command:16]. Values are internal; wire names stay strings.
+#define CTRL_GROUP_MASK 0xff000000u
+#define CTRL_SUBGROUP_MASK 0xffff0000u
+
+enum class CtrlCommand : std::uint32_t
 {
-    Unknown,
+    Unknown = 0,
+
+    Heartbeat = 0x09000000u,
     Ping,
     Pong,
+
+    Relay = 0x01000000u,
     RelayAttach,
-    ServerIdentify,
-    ServerIdentified,
-    ServiceRegister,
-    ServiceOk,
-    ServiceError,
-    NodeLookup,
-    NodeLocated,
-    NodeError,
-    ServiceLookup,
-    ServiceLocated,
-    ServiceList,
-    ServiceListed,
-    ServerLoad,
-    ServerLoaded,
-    ServerTraffic,
-    ServerTrafficReported,
-    ServerCluster,
-    ServerStatusQuery,
-    ServerStatusReport,
-    ServerStatusReported,
-    TopologyMembers,
-    TopologyReport,
-    TopologyQuery,
-    TopologySnapshot,
     RelayOpen,
     RelayOpened,
     RelayOffer,
@@ -61,6 +46,15 @@ enum class CtrlCommand
     RelayCancel,
     RelayClosed,
     RelayError,
+
+    RelayPeer = 0x01010000u,
+    RelayPeerOpen,
+    RelayPeerAttached,
+    RelayPeerReady,
+    RelayPeerFinished,
+    RelayPeerClose,
+
+    Link = 0x02000000u,
     LinkPrepare,
     LinkPrepared,
     LinkConnect,
@@ -70,6 +64,8 @@ enum class CtrlCommand
     LinkClosed,
     LinkAttach,
     LinkAttached,
+
+    Flow = 0x03000000u,
     FlowPrepare,
     FlowPrepared,
     FlowCommit,
@@ -77,10 +73,57 @@ enum class CtrlCommand
     FlowError,
     FlowClose,
     FlowClosed,
+    FlowOpen,
+    FlowOpened,
+    FlowCloseRequest,
+
+    Cluster = 0x04000000u,
     ClusterJoin,
     ClusterJoined,
     ClusterError,
+
+    Topology = 0x05000000u,
+    TopologyMembers,
+    TopologyReport,
+    TopologyQuery,
+    TopologySnapshot,
+
+    Server = 0x06000000u,
+    ServerIdentify,
+    ServerIdentified,
+    ServerLoad,
+    ServerLoaded,
+    ServerCluster,
+    ServerStatusQuery,
+    ServerStatusReport,
+    ServerStatusReported,
+    ServerTraffic,
+    ServerTrafficReported,
+
+    Service = 0x07000000u,
+    ServiceRegister,
+    ServiceOk,
+    ServiceError,
+    ServiceLookup,
+    ServiceLocated,
+    ServiceList,
+    ServiceListed,
+
+    Node = 0x08000000u,
+    NodeLookup,
+    NodeLocated,
+    NodeError,
 };
+
+constexpr CtrlCommand ctrl_command_group(CtrlCommand command) noexcept
+{
+    return static_cast<CtrlCommand>(static_cast<std::uint32_t>(command) & CTRL_GROUP_MASK);
+}
+
+constexpr CtrlCommand ctrl_command_subgroup(CtrlCommand command) noexcept
+{
+    return static_cast<CtrlCommand>(static_cast<std::uint32_t>(command) & CTRL_SUBGROUP_MASK);
+}
 
 std::string_view ctrl_command_name(CtrlCommand command) noexcept;
 CtrlCommand parse_ctrl_command(std::string_view command) noexcept;

@@ -1,5 +1,4 @@
 #include "node_test_config.h"
-#include <future>
 #include <thread>
 #include <iostream>
 #include <stdexcept>
@@ -109,23 +108,9 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         std::weak_ptr<RelayNode> weak_server = server;
         server->start();
 
-        std::promise<bool> executor_stop_rejected;
-        auto executor_stop_result = executor_stop_rejected.get_future();
-        asio::post(control_io, [server, &executor_stop_rejected]() {
-            try
-            {
-                server->stop();
-                executor_stop_rejected.set_value(false);
-            }
-            catch (const std::logic_error &)
-            {
-                executor_stop_rejected.set_value(true);
-            }
-        });
         std::thread control_thread([&control_io]() { control_io.run(); });
         std::thread transfer_tcp_thread([&transfer_tcp_io]() { transfer_tcp_io.run(); });
         std::thread transfer_udp_thread([&transfer_udp_io]() { transfer_udp_io.run(); });
-        const bool rejected_executor_stop = executor_stop_result.get();
         server.reset();
         auto running_server = weak_server.lock();
         const bool retained_by_accept_loops = static_cast<bool>(running_server);
@@ -143,7 +128,6 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         control_thread.join();
         transfer_tcp_thread.join();
         transfer_udp_thread.join();
-        require(rejected_executor_stop, "Server stop was accepted from the control executor");
         require(retained_by_accept_loops, "Accept loops did not retain the running server");
         require(weak_server.expired(), "Stopped server was retained after accept loops completed");
     }

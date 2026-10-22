@@ -66,7 +66,7 @@ inline asio::awaitable<void> close_link(std::shared_ptr<RelayNode> node, std::ui
         {
             auto params = request->params;
             params["source"] = params.at("left");
-            manager.handle(CtrlMessage(CtrlCommand::LinkClosed, std::move(params)));
+            manager.handle(CtrlCommand::LinkClosed, CtrlMessage(CtrlCommand::LinkClosed, std::move(params)));
             break;
         }
     }

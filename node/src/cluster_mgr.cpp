@@ -5,24 +5,41 @@
 #include <random>
 #include <set>
 
+/**
+ * @brief Define a master-room participant on control_io.
+ * @details The room retains participants until their connection tasks leave; delivery only
+ * queues a message, and stop() requests shutdown without waiting for connection drainage.
+ */
 class ClusterParticipant
 {
   public:
+    /** @brief Destroy a participant after its owned connection work has drained. */
     virtual ~ClusterParticipant() = default;
+    /** @brief Borrow the joined node identity, or an empty identity before join completes. */
     virtual std::string_view node_id() const noexcept = 0;
+    /** @brief Borrow the participant's advertised Node address. */
     virtual std::string_view address() const noexcept = 0;
+    /** @brief Queue a control message for this participant on control_io. */
     virtual void deliver(CtrlMessage message) = 0;
+    /** @brief Request participant shutdown on control_io. */
     virtual void stop() = 0;
 };
 
+/**
+ * @brief Own master participants, publish membership, and authenticate message sources.
+ * @details All access requires control_io. The master accept loop owns this room and drains
+ * remote sessions before destruction; sessions borrow the room until they leave.
+ */
 class ClusterRoom
 {
   public:
+    /** @brief Initialize a master room with one membership epoch and an empty participant set. */
     ClusterRoom(asio::any_io_executor executor, std::string master_id, std::uint64_t epoch)
         : master_id_(std::move(master_id)), epoch_(epoch), changed_(executor)
     {
     }
 
+    /** @brief Retain a participant and publish membership if its identity is already known. */
     void join(const std::shared_ptr<ClusterParticipant> &participant)
     {
         participants_.insert(participant);
@@ -32,11 +49,13 @@ class ClusterRoom
         }
     }
 
+    /** @brief Publish membership after a remote participant finishes joining. */
     void ready()
     {
         publish_members();
     }
 
+    /** @brief Return whether a nonempty, nonreserved node identity is unused. */
     bool available(std::string_view node_id) const
     {
         return !node_id.empty() && node_id != cluster_broadcast_target &&
@@ -44,6 +63,7 @@ class ClusterRoom
                                     [&](const auto &participant) { return participant->node_id() == node_id; });
     }
 
+    /** @brief Release a participant, wake shutdown, and publish membership when appropriate. */
     void leave(const std::shared_ptr<ClusterParticipant> &participant)
     {
         const auto was_ready = !participant->node_id().empty();
@@ -55,11 +75,13 @@ class ClusterRoom
         }
     }
 
+    /** @brief Return participant count, including unjoined sessions and the local master. */
     std::size_t size() const noexcept
     {
         return participants_.size();
     }
 
+    /** @brief Validate routing, stamp the authenticated source, and deliver unicast or broadcast. */
     void deliver(std::string_view source, CtrlMessage message)
     {
         if (message.command.starts_with("cluster."))
@@ -92,6 +114,7 @@ class ClusterRoom
         }
     }
 
+    /** @brief Stop remote participants and await their removal before releasing the room. */
     asio::awaitable<void> async_stop()
     {
         stopping_ = true;
@@ -140,9 +163,15 @@ class ClusterRoom
     bool stopping_ = false;
 };
 
+/**
+ * @brief Own one remote member's TLS channel and join/read lifecycle on the master.
+ * @details The room retains this participant; reader completion removes it only after TLS
+ * drainage. The room and borrowed TLS context must outlive the session task.
+ */
 class ClusterSession : public ClusterParticipant, public std::enable_shared_from_this<ClusterSession>
 {
   public:
+    /** @brief Adopt an accepted socket and borrow its master room and TLS context. */
     ClusterSession(asio::ip::tcp::socket socket, asio::ssl::context &context, ClusterRoom &room,
                    TLSChannelConfig config)
         : channel_(std::make_shared<TLSChannel>(std::move(socket), context, TLSChannelRole::S, config)), room_(room),
@@ -150,6 +179,7 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
     {
     }
 
+    /** @brief Launch the independent reader on the channel executor and leave the room on completion. */
     void start()
     {
         std::weak_ptr<ClusterSession> weak = shared_from_this();
@@ -161,21 +191,25 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
         });
     }
 
+    /** @copydoc ClusterParticipant::node_id */
     std::string_view node_id() const noexcept override
     {
         return node_id_;
     }
 
+    /** @copydoc ClusterParticipant::address */
     std::string_view address() const noexcept override
     {
         return address_;
     }
 
+    /** @copydoc ClusterParticipant::deliver */
     void deliver(CtrlMessage message) override
     {
         channel_->send(std::move(message));
     }
 
+    /** @copydoc ClusterParticipant::stop */
     void stop() override
     {
         stopping_ = true;
@@ -248,29 +282,35 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
     bool stopping_ = false;
 };
 
+/** @brief Represent the master locally on control_io, delivering directly to its borrowed ClusterMgr. */
 class ClusterMgr::LocalParticipant : public ClusterParticipant
 {
   public:
+    /** @brief Retain master identity and borrow the manager that receives local messages. */
     LocalParticipant(std::string node_id, std::string address, ClusterMgr &manager)
         : node_id_(std::move(node_id)), address_(std::move(address)), manager_(manager)
     {
     }
 
+    /** @copydoc ClusterParticipant::address */
     std::string_view address() const noexcept override
     {
         return address_;
     }
 
+    /** @copydoc ClusterParticipant::node_id */
     std::string_view node_id() const noexcept override
     {
         return node_id_;
     }
 
+    /** @copydoc ClusterParticipant::deliver */
     void deliver(CtrlMessage message) override
     {
         manager_.receive(std::move(message));
     }
 
+    /** @brief Keep the local participant until room drainage releases it; no socket is owned. */
     void stop() override
     {
     }
@@ -281,17 +321,26 @@ class ClusterMgr::LocalParticipant : public ClusterParticipant
     ClusterMgr &manager_;
 };
 
+/**
+ * @brief Reconnect a slave to the master and receive cluster messages on control_io.
+ * @details Owned by slave_loop for its complete run(). ClusterMgr borrows it for stop();
+ * run() exposes temporary cancellation state only on this executor and clears it on exit.
+ * Failed channels drain before retry, and control failure invalidates old Flow authorization.
+ */
 class ClusterMgr::Connector
 {
     using tcp = asio::ip::tcp;
 
+    /** @brief Hold resolver, socket, and retry timer for one Connector run() lifetime. */
     struct ConnectOperations
     {
+        /** @brief Construct all cancellable connection operations on control_io. */
         explicit ConnectOperations(asio::any_io_executor executor)
             : resolver(executor), socket(executor), retry(executor)
         {
         }
 
+        /** @brief Cancel resolution, connection, and retry waiting on their owning executor. */
         void cancel()
         {
             resolver.cancel();
@@ -306,12 +355,14 @@ class ClusterMgr::Connector
     };
 
   public:
+    /** @brief Borrow manager, TLS context, and configuration for the slave loop's lifetime. */
     Connector(asio::any_io_executor executor, asio::ssl::context &context, const ClusterConfig &config,
               const TLSChannelConfig &channel_config, ClusterMgr &manager)
         : executor_(executor), context_(context), config_(config), channel_config_(channel_config), manager_(manager)
     {
     }
 
+    /** @brief Queue a joined control message or report cluster disconnection locally. */
     void send(CtrlMessage message)
     {
         if (auto channel = channel_.lock(); channel && joined_)
@@ -320,6 +371,7 @@ class ClusterMgr::Connector
             manager_.receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster disconnected"}}});
     }
 
+    /** @brief Stop retries and cancel current operations and the active TLS channel. */
     void stop()
     {
         running_ = false;
@@ -339,6 +391,7 @@ class ClusterMgr::Connector
         }
     }
 
+    /** @brief Resolve, connect, join, and receive repeatedly, draining each channel before retry. */
     asio::awaitable<void> run()
     {
         ConnectOperations operations(executor_);
@@ -347,7 +400,6 @@ class ClusterMgr::Connector
         constexpr auto retry_interval = std::chrono::seconds(5);
         while (running_)
         {
-            // Release this attempt's channel before waiting to reconnect.
             {
                 std::shared_ptr<TLSChannel> channel;
                 try
@@ -420,7 +472,6 @@ class ClusterMgr::Connector
                     PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=%s", config_.node_id.c_str(),
                                      config_.address.c_str(), static_cast<unsigned int>(config_.control_port),
                                      running_ ? "channel closed" : "node stopping");
-                    // Invalidate old Flows before reconnecting, including receive-side/heartbeat failures.
                     joined_ = false;
                     if (running_)
                     {
@@ -711,7 +762,7 @@ void ClusterMgr::receive(CtrlMessage message)
         {
             static_cast<void>(config::required_string(config::message_params(message), "source", message.command));
         }
-        server_.handle_cluster_message(std::move(message));
+        server_.handle_cluster_message(command, std::move(message));
     }
     catch (const std::exception &exception)
     {

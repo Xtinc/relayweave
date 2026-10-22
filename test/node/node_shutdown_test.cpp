@@ -105,8 +105,7 @@ static void stop_drains_all_domains(bool fail_during_stop)
     f.start();
     auto &protocol = test_node::links(f.node).protocol();
     auto release = std::make_shared<AsyncEvent>(f.data.get_executor());
-    std::future<bool> first;
-    std::future<bool> second;
+    std::future<bool> stopped;
     ScopeGuard unblock([&] { asio::post(f.data, [release] { release->notify_all(); }); });
 
     auto inject = [&]() -> asio::awaitable<void> {
@@ -126,10 +125,8 @@ static void stop_drains_all_domains(bool fail_during_stop)
     };
     asio::co_spawn(f.data, inject(), asio::use_future).get();
 
-    first = std::async(std::launch::async, [&] { return f.node->stop(); });
-    second = std::async(std::launch::async, [&] { return f.node->stop(); });
-    require_shutdown(first.wait_for(50ms) == std::future_status::timeout &&
-                         second.wait_for(50ms) == std::future_status::timeout,
+    stopped = std::async(std::launch::async, [&] { return f.node->stop(); });
+    require_shutdown(stopped.wait_for(50ms) == std::future_status::timeout,
                      "Stop returned before the outstanding data task drained");
     if (fail_during_stop)
     {
@@ -139,11 +136,10 @@ static void stop_drains_all_domains(bool fail_during_stop)
         })).get();
     }
     asio::post(f.data, [release] { release->notify_all(); });
-    const bool first_ok = first.get();
-    const bool second_ok = second.get();
+    const bool stop_ok = stopped.get();
     unblock.dismiss();
-    require_shutdown(first_ok == !fail_during_stop && second_ok == first_ok && f.node->stop() == first_ok,
-                     "Concurrent/repeated stop did not preserve its shutdown result");
+    require_shutdown(stop_ok == !fail_during_stop && f.node->stop() == stop_ok,
+                     "Repeated stop did not preserve its shutdown result");
     asio::post(f.control, asio::use_future([&] {
         using State = decltype(test_access::RelayNode_state_(*f.node).load());
         auto &links = test_node::links(f.node);

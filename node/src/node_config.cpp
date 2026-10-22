@@ -48,7 +48,7 @@ StreamNodeConfig parse_stream_node_config(const njson &root, std::string_view na
     result.traffic = parse_traffic_limit_config(stream, name);
     return result;
 }
-} // namespace
+}
 
 ClusterConfig parse_cluster_config(const njson &root)
 {

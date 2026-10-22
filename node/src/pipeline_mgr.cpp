@@ -13,7 +13,7 @@ auto remaining_timeout(std::chrono::steady_clock::time_point deadline)
     return remaining;
 }
 
-} // namespace
+}
 
 TcpTransport::TcpTransport(asio::ssl::context &) noexcept
 {
@@ -181,7 +181,6 @@ template <typename Transport> njson StreamPipeline<Transport>::install_local_pai
 template <typename Transport> asio::awaitable<bool> StreamPipeline<Transport>::wait_local_pair(std::uint64_t uuid)
 {
     auto pair = local_pairs_.at(uuid);
-    // The event signals either both roles attached or close.
     co_return co_await pair->attached.wait() && !pair->closed;
 }
 
@@ -211,7 +210,6 @@ template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::r
     auto pair = local_pairs_.at(uuid);
     if (!pair->active)
         throw std::runtime_error("local pair unavailable");
-    // The controller owns and drains this data-domain copy task.
     co_await Transport::relay(*pair->producer_stream, *pair->consumer_stream, pair->rx_limiter, pair->tx_limiter,
                               *pair->traffic);
 }
@@ -267,7 +265,6 @@ template <typename Transport> asio::awaitable<bool> StreamPipeline<Transport>::w
         co_return false;
     }
     auto endpoint = it->second;
-    // The event signals either a completed attach or close.
     co_return co_await endpoint->attached.wait() && !endpoint->closed;
 }
 
@@ -280,7 +277,6 @@ asio::awaitable<void> StreamPipeline<Transport>::bind_remote_pair(std::uint64_t 
     {
         throw std::runtime_error("relay endpoint cannot bind flow");
     }
-    // Cross from the socket executor to the protocol owner once; binding itself is synchronous.
     auto port = co_await asio::co_spawn(channel.executor(),
         [protocol = channel.shared_from_this(), epoch, flow_id, reverse = endpoint->role == RelayAttach::Producer,
          transfer = executor_]() -> asio::awaitable<std::shared_ptr<lnk::FlowStream>> {
@@ -323,7 +319,6 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
             co_return;
         }
         co_await limiter.consume(size);
-        // Copy once into reusable storage; the channel transfers that block's ownership.
         co_await endpoint->flow->send(endpoint->flow->copy_payload({buffer.data(), size}));
         endpoint->count(true, size);
     }
@@ -353,7 +348,6 @@ asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_p
             }
             co_return;
         }
-        // A successful downstream write releases this delivery through the protocol endpoint.
         co_await limiter.consume(data->size());
         if constexpr (std::is_same_v<Transport, TlsTransport>)
         {
@@ -401,7 +395,6 @@ template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::r
     std::exception_ptr failure;
     try
     {
-        // Both directions share this transfer executor; EOF ends only its own direction.
         co_await await_transfers(read_remote_pair(endpoint), write_remote_pair(endpoint));
     }
     catch (...)
@@ -418,7 +411,6 @@ template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::r
         }
         catch (const std::exception &)
         {
-            // ControlRouterMulti also closes the failed Flow through the existing control path.
         }
     }
     if (failure)
@@ -481,7 +473,6 @@ void StreamPipeline<Transport>::attach(int role, std::uint64_t uuid, std::uint64
     if (iterator == local_pairs_.end())
         throw std::invalid_argument("relay.attach uuid is unknown or expired");
     const auto &pair = iterator->second;
-    // RelayAttach::from_msg has already validated the role.
     auto &slot = role == RelayAttach::Producer ? pair->producer_stream : pair->consumer_stream;
     const auto expected = role == RelayAttach::Producer ? pair->producer_ticket : pair->consumer_ticket;
     if (ticket != expected || slot)

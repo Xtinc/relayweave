@@ -161,17 +161,17 @@ bool NodeControl::handle_client(SessionId id, const ControlSessionPtr &session, 
     return true;
 }
 
-void NodeControl::handle_cluster(CtrlMessage message)
+void NodeControl::handle_cluster(CtrlCommand command, CtrlMessage message)
 {
     const auto &params = *message.params;
-    switch (message.type())
+    switch (command)
     {
     case CtrlCommand::NodeLookup:
         handle_node_lookup(params);
         break;
     case CtrlCommand::NodeLocated:
     case CtrlCommand::NodeError:
-        handle_node_location(std::move(message));
+        handle_node_location(command, std::move(message));
         break;
     case CtrlCommand::ServiceLookup:
         handle_cluster_lookup(params);
@@ -469,13 +469,13 @@ void NodeControl::handle_node_lookup(const njson &params)
     cluster_.send(source, std::move(reply));
 }
 
-void NodeControl::handle_node_location(CtrlMessage message)
+void NodeControl::handle_node_location(CtrlCommand command, CtrlMessage message)
 {
     if (auto session = prepare_client_reply(message, "node.located"))
     {
         const auto &params = *message.params;
         config::require_unsigned(params, "request_id", true);
-        if (message.type() == CtrlCommand::NodeLocated)
+        if (command == CtrlCommand::NodeLocated)
         {
             config::required_string(params, "address", "node.located");
             config::required_port(params, "port", "node.located");

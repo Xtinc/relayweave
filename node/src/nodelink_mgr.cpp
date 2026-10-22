@@ -86,27 +86,25 @@ void NodeLinkMgr::activate()
     });
 }
 
-void NodeLinkMgr::handle(CtrlMessage message)
+void NodeLinkMgr::handle(CtrlCommand command, CtrlMessage message)
 {
     if (!running_)
     {
         return;
     }
 
-    if (message.command == "flow.open" || message.command == "flow.opened" || message.command == "flow.close.request")
+    switch (ctrl_command_group(command))
     {
-        handle_flow_request(std::move(message));
-    }
-    else if (message.command.starts_with("link."))
-    {
-        handle_link(std::move(message));
-    }
-    else if (message.command.starts_with("flow."))
-    {
-        handle_flow(std::move(message));
+    case CtrlCommand::Link:
+        handle_link(command, std::move(message));
+        break;
+    case CtrlCommand::Flow:
+        handle_flow(command, std::move(message));
+        break;
+    default:
+        break;
     }
 }
-// Runs on control_io; the concurrent queue receives notifications from cluster_data_io.
 asio::awaitable<void> NodeLinkMgr::receive_events()
 {
     try
@@ -185,10 +183,8 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
         PROXY_ERROR_PRINT("Node data notifications failed reason=%s", reason.c_str());
         control_failed(reason);
     }
-    // Notification loss is terminal; do not wait for this receiving task itself.
     co_await shutdown();
 }
-// Runs on control_io. Stop requests and await data tasks before control is disconnected.
 asio::awaitable<void> NodeLinkMgr::shutdown()
 {
     running_ = false;
@@ -233,7 +229,6 @@ NodeLinkMgr::LinkKey NodeLinkMgr::link_key(const njson &p)
             parse_relay_protocol(p.at("transport").get_ref<const std::string &>())};
 }
 
-// Runs on control_io.
 asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::string right, RelayProtocol transport)
 {
     if (!running_)
@@ -269,7 +264,6 @@ asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::stri
     }
     else
     {
-        // IDs and credentials are fresh for every outer attempt, including failed attempts.
         if (link_requests_.size() >= 1000)
         {
             co_return LinkResult{0, "ensure", "node link capacity exceeded"};
@@ -341,7 +335,7 @@ void NodeLinkMgr::finish_link(std::shared_ptr<LinkRequest> request, std::string 
     request->completed_event.notify_all();
 }
 
-void NodeLinkMgr::handle_link(CtrlMessage message)
+void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
 {
     try
     {
@@ -353,7 +347,6 @@ void NodeLinkMgr::handle_link(CtrlMessage message)
         {
             return;
         }
-        const auto type = message.type();
         if (type == CtrlCommand::LinkPrepare || type == CtrlCommand::LinkConnect || type == CtrlCommand::LinkClose)
         {
             if (source != topology_.master_id())
@@ -425,7 +418,6 @@ void NodeLinkMgr::handle_link(CtrlMessage message)
                 else if (type == CtrlCommand::LinkClose)
                 {
                     asio::post(protocol_->executor(), [data = protocol_, id] { data->links().close(id); });
-                    // The data executor acknowledges after closing the actual socket and queues.
                 }
             }
             return;
@@ -591,7 +583,6 @@ void NodeLinkMgr::arm_flow_timeout(const std::shared_ptr<FlowRequest> &r)
         }
     });
 }
-// Runs on control_io; adjacent NodeLink requests below start independent concurrent chains.
 asio::awaitable<FlowResult> NodeLinkMgr::open_flow(std::vector<std::string> path, RelayProtocol transport)
 {
     if (!running_)
@@ -659,6 +650,7 @@ asio::awaitable<FlowResult> NodeLinkMgr::establish_flow(std::shared_ptr<FlowRequ
 {
     const auto path = r->params.at("path").get<std::vector<std::string>>();
     const auto transport = parse_relay_protocol(r->params.at("transport").get<std::string>());
+    /** @brief Own one adjacent-Link establishment result for the control-side parallel path setup. */
     struct Edge
     {
         std::size_t index;
@@ -778,8 +770,19 @@ void NodeLinkMgr::released(std::shared_ptr<FlowRequest> r, std::string error)
     r->released_event.notify_all();
 }
 
-void NodeLinkMgr::handle_flow(CtrlMessage message)
+void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
 {
+    switch (type)
+    {
+    case CtrlCommand::FlowOpen:
+    case CtrlCommand::FlowOpened:
+    case CtrlCommand::FlowCloseRequest:
+        handle_flow_request(type, std::move(message));
+        return;
+    default:
+        break;
+    }
+
     try
     {
         const auto &p = config::message_params(message);
@@ -790,7 +793,6 @@ void NodeLinkMgr::handle_flow(CtrlMessage message)
         {
             return;
         }
-        const auto type = message.type();
         if (type == CtrlCommand::FlowPrepare || type == CtrlCommand::FlowCommit || type == CtrlCommand::FlowClose)
         {
             if (source != topology_.master_id())
@@ -960,8 +962,7 @@ asio::awaitable<void> NodeLinkMgr::close_flow(std::uint64_t epoch, std::uint64_t
     if (!topology_.is_master())
     {
         cluster_.send(std::string(topology_.master_id()),
-                      CtrlMessage("flow.close.request", njson{{"epoch", epoch}, {"flow_id", id}}));
-        // Bound cleanup even if cluster control disappears before the local close acknowledgement.
+                      CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}}));
         co_await asio::co_spawn(control_, wait_flow_closed(epoch, id), asio::cancel_after(10s, asio::use_awaitable));
         co_return;
     }
@@ -1054,7 +1055,6 @@ void NodeLinkMgr::control_failed(std::string reason)
         released(closing_flows_.begin()->second, reason);
     }
     fail_remote_flows(reason);
-    // Drop authorization before data cleanup; its notifications must not target a lost control connection.
     flow_endpoints_.clear();
     asio::post(protocol_->executor(),
                [data = protocol_, reason = std::move(reason)] { data->invalidate_flows(reason); });

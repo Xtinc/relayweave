@@ -80,7 +80,6 @@ asio::awaitable<bool> DatagramMgr::wait_remote_pair(std::uint64_t uuid)
         co_return false;
     }
     auto endpoint = it->second;
-    // The event signals either a completed attach or close.
     co_return co_await endpoint->attached.wait() && !endpoint->closed;
 }
 
@@ -92,7 +91,6 @@ asio::awaitable<void> DatagramMgr::bind_remote_pair(std::uint64_t uuid, FlowProt
     {
         throw std::runtime_error("relay endpoint cannot bind flow");
     }
-    // Cross from the socket executor to the protocol owner once; binding itself is synchronous.
     auto port = co_await asio::co_spawn(
         channel.executor(),
         [protocol = channel.shared_from_this(), epoch, flow_id, reverse = endpoint->role == RelayAttach::Producer,
@@ -120,7 +118,6 @@ asio::awaitable<void> DatagramMgr::write_remote_pair(std::shared_ptr<RemotePair>
         {
             continue;
         }
-        // One datagram from two buffers; this coroutine owns both until send completes.
         const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(data.data(), data.size())};
         const auto sent = co_await socket_.async_send_to(buffers, *endpoint->source, asio::use_awaitable);
         if (sent != header.size() + data.size())
@@ -158,7 +155,6 @@ asio::awaitable<void> DatagramMgr::run_remote_pair(std::uint64_t uuid)
             endpoint->traffic->remove_accessor(endpoint->accessor);
         }
     });
-    // Inbound datagrams are routed by the shared listener; only the return path waits here.
     co_await write_remote_pair(endpoint);
 }
 
@@ -216,7 +212,6 @@ njson DatagramMgr::install_local_pair()
 asio::awaitable<bool> DatagramMgr::wait_local_pair(std::uint64_t uuid)
 {
     const auto pair = local_pairs_.at(uuid);
-    // The event signals either both roles attached or close.
     const bool notified = co_await pair->attached.wait();
     co_return notified && !pair->closed;
 }
@@ -246,7 +241,6 @@ asio::awaitable<void> DatagramMgr::run_local_pair(std::uint64_t uuid)
     auto pair = local_pairs_.at(uuid);
     if (!pair->active)
         throw std::runtime_error("local pair unavailable");
-    // The shared listener performs I/O; this owned wait follows the resource lifetime.
     if (!co_await pair->finished.wait())
         throw asio::system_error(asio::error::operation_aborted);
 }
@@ -306,7 +300,6 @@ asio::awaitable<void> DatagramMgr::receive_datagram()
         auto route = route_datagram(std::span(buffer.data(), size), source);
         if (route)
         {
-            // Reuse the received bytes; the next receive starts only after this send completes.
             const auto [send_error, sent] = co_await socket_.async_send_to(asio::buffer(buffer.data(), size),
                                                                            route->destination, use_nothrow_awaitable);
             if (!send_error && sent == size)

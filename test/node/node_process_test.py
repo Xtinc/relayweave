@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,19 @@ def rebind(config):
             sock.bind(("127.0.0.1", config[section][key]))
 
 
+def reject_invalid_control(config, data):
+    context = ssl.create_default_context(cafile=config["certificate"]["server_ca_file"])
+    context.load_cert_chain(data / "tls_channel_test_client.pem", data / "tls_channel_test_client.key")
+    with socket.create_connection(("127.0.0.1", config["control"]["port"]), timeout=2) as sock:
+        with context.wrap_socket(sock, server_hostname="127.0.0.1") as stream:
+            # CBOR {"command": "invalid.command", "params": {}} exercises the session error boundary.
+            payload = b"\xa2\x67command\x6finvalid.command\x66params\xa0"
+            stream.sendall(len(payload).to_bytes(4, "big") + payload)
+            if stream.recv(1) != b"":
+                raise RuntimeError("Invalid control command did not close its session")
+            stream.unwrap().close()
+
+
 def run(binary, data, directory, fail_start):
     with contextlib.ExitStack() as reservations:
         config = configuration(data, reservations)
@@ -68,6 +82,7 @@ def run(binary, data, directory, fail_start):
                         if process.poll() is not None or time.monotonic() >= deadline:
                             raise RuntimeError("Node did not open its control listener")
                         time.sleep(0.01)
+                reject_invalid_control(config, data)
                 # Keep unbound TCP and TLS setup sockets alive while shutdown drains their deadlines.
                 with contextlib.ExitStack() as pending:
                     for section in ("tcp", "tls"):
@@ -92,4 +107,4 @@ if __name__ == "__main__":
     with tempfile.TemporaryDirectory() as directory:
         for fail_start in (False, True):
             run(sys.argv[1], Path(sys.argv[2]).resolve(), Path(directory), fail_start)
-    print("[PASS] Node signal shutdown, pending setup and failed-start process cleanup")
+    print("[PASS] Node control error cleanup, signal shutdown, pending setup and failed-start cleanup")

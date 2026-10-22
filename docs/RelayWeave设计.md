@@ -7,6 +7,11 @@ RelayWeave 由 `relayweave-node`、`relayweave-agent`、共享 protocol 与 rout
 证书生成、信任链、SAN 与 TLS 排错见 [证书制作与部署](证书制作与部署.md)；Debian 打包、安装、升级和
 卸载见 [RelayWeave 打包与安装](RelayWeave打包与安装.md)。
 
+Node 的架构、执行域、内存与协程盘点、性能候选和历史复核统一维护在本文。
+原《中继链路内存与协程盘点》和《标准载荷池性能复核》已合并；FairQueue 的通用接口、
+独立参考模型和容器选型实验仍见 [FairQueue](FairQueue.md)，部署操作保留在各专题文档。
+源码中的类与对外接口使用英文 Doxygen 注释说明契约，注释约束见 [README](../README.md#c--asio-编码约束)。
+
 章节导航：
 
 - [1. 系统上下文与架构约束](#1-系统上下文与架构约束)
@@ -70,6 +75,8 @@ RelayWeave 由 `relayweave-node`、`relayweave-agent`、共享 protocol 与 rout
   - [6.4 状态索引、计量与准入约束](#64-状态索引计量与准入约束)
   - [6.5 失败收敛与恢复](#65-失败收敛与恢复)
   - [6.6 认证与安全边界](#66-认证与安全边界)
+  - [6.7 Node 链路内存与分配口径](#67-node-链路内存与分配口径)
+  - [6.8 Node 链路协程数量](#68-node-链路协程数量)
 
 - [7. 端到端业务链路](#7-端到端业务链路)
 
@@ -91,6 +98,8 @@ RelayWeave 由 `relayweave-node`、`relayweave-agent`、共享 protocol 与 rout
   - [9.1 构建、测试入口与覆盖范围](#91-构建测试入口与覆盖范围)
   - [9.2 冗余审查与测试边界](#92-冗余审查与测试边界)
   - [9.3 已知限制与扩展位置](#93-已知限制与扩展位置)
+  - [9.4 Node 链路开销与演进候选](#94-node-链路开销与演进候选)
+  - [9.5 性能验证口径与覆盖缺口](#95-性能验证口径与覆盖缺口)
 
 - [附录 A. 控制协议规范](#附录-a-控制协议规范)
 
@@ -109,6 +118,11 @@ RelayWeave 由 `relayweave-node`、`relayweave-agent`、共享 protocol 与 rout
 
   - [C.1 原模块整理的验证范围](#c1-原模块整理的验证范围)
   - [C.2 流控重构的阶段验证](#c2-流控重构的阶段验证)
+  - [C.3 UDP 接收与数量准入的历史验证](#c3-udp-接收与数量准入的历史验证)
+  - [C.4 标准载荷池性能复核](#c4-标准载荷池性能复核)
+  - [C.5 普通 TCP 32 KiB 缓冲的历史对照](#c5-普通-tcp-32-kib-缓冲的历史对照)
+
+- [附录 D. Node 链路常量与复现](#附录-d-node-链路常量与复现)
 
 ## 1. 系统上下文与架构约束
 
@@ -1478,7 +1492,6 @@ TCP 端点队列容量仍为 `W/h+1=2561` 项，允许窗口占满后再排入�
 | 每 UDP Flow 端点发送 / 接收队列 | 各 16 包 | 丢当前包，保留健康 Flow |
 | 共享 UDP 发送队列 | 100 项；其中业务最多 96 项 | 为保活留 4 项；业务超限丢包 |
 | FlowProtocol 控制事件 | 4096 条 | 事件溢出使本地协调失效并排空通道 |
-| DatagramMgr 每 RemotePair 入站队列 | 16 包；多节点入 Flow 路径不经过此队列 | 丢当前包 |
 | Node 数据 TCP 握手接入 | 100 个 | 拒绝新 socket |
 
 UDP `try_send` 返回 false 表示当前包没有入队；出队立即释放位置，每个串行终点写循环可另持有一个在发包。
@@ -1608,7 +1621,7 @@ W >= r × T_i / (8 × η_i)
 
 当前采用 **320 KiB 方向窗口、1000 个 Flow 身份上限、20 ms 节点信用批次**。
 2026-10-20 移除原 256 MiB 全局预留和自定义池字节上限；以下历史研究保留其原始实现条件。
-标准池改动的后续隔离与长测见 [标准载荷池性能复核](标准载荷池性能复核.md)；首轮三秒对照的固定吞吐降幅未能稳定复现，默认 chunk 增加内存申请已由追踪确认。
+标准池改动的后续隔离与长测见 [C.4 标准载荷池性能复核](#c4-标准载荷池性能复核)；首轮三秒对照的固定吞吐降幅未能稳定复现，默认 chunk 增加内存申请已由追踪确认。
 减小窗口约束每条慢流的滞留量；统一批次减少期限错开导致的全量扫描；合并时间只调整信用发布时机，
 不推迟本地释放，不改变 DATA/FIN 的方向窗口，也不提供逐流带宽公平或业务延迟保证。
 
@@ -1772,7 +1785,11 @@ FlowProtocol 创建池时使用标准堆作为上游；分配计数由测试可�
 
 #### 6.1.1 RelayNode 编排与四个执行域
 
-RelayNode 使用四个互相独立的单线程 `asio::io_context`：
+RelayNode 使用四个互相独立的单线程 `asio::io_context`，各由一个 worker 运行；
+`main()` 另在主线程运行只处理信号的 `signal_io`，因此当前进程总计五个线程。
+worker 在提交 `start()` 前已启动；启动失败时保持运行，使已发布的任务能够通过 `stop()` 排空。
+
+四个服务执行域的职责如下：
 
 | 执行域 | 所有者 | 目的 |
 |---|---|---|
@@ -2066,7 +2083,7 @@ RX 固定表示 Producer 到 Consumer，TX 表示 Consumer 到 Producer。
 | `tcp/tls/udp.max_relays` | 对应协议的建立中、活动和关闭未排空业务任务上限；manager 同时约束等待和活动数据资源 |
 | `tcp/tls.setup_timeout_ms` | 从创建/接受到合法 attach 完成的时间限制 |
 | `udp.setup_timeout_ms` | 单节点 UDP 从创建到双方接入、绑定和激活的建立期限；默认 10000 毫秒，不限制运行期 |
-| `channel.max_queued_messages` | 单条 TLSChannel 的发送队列、ClusterMgr 出站消息队列和 RelayNode 对外集群消息队列容量 |
+| `channel.max_queued_messages` | 单条 TLSChannel 的读写队列与 ClusterMgr 出站消息队列容量 |
 | `relay.open_timeout_ms` | Agent 本端 TCP/TLS/UDP 的建立超时；请求方从入口选择前、服务方从收到 offer 开始计时，不传递给其他端；不限制运行期 |
 | `server.connect_timeout_ms` | RelayAgent 的解析/连接和数据连接超时 |
 
@@ -2095,6 +2112,10 @@ TLSChannel 的发送队列满时拒绝本帧、记录原因并直接关闭通道
 | server stop 期间的取消错误 | 各停止边界 | 保留原停止原因，排空资源 |
 
 底层使用 `asio::use_awaitable` 的操作默认通过异常传播错误。accept 循环、停止取消、UDP 逐包收发等需要按错误码继续或区分 `operation_aborted` 的位置使用无异常结果。错误表示方式在其处理边界内保持一致。
+
+RelayNode 的启动与业务任务提交用 ScopeGuard 回滚，异常自然向上传递。普通控制会话在退出时只记录一条结果日志，
+正常断开及节点停止使用 INFO，运行中的异常使用 ERROR。peer 消息先校验身份，再处理已有实例；
+仅新建 peer 业务的失败转为 peer.close，身份字段错误直接交给 ClusterMgr::receive 拒绝，避免在错误回复中再次读取坏字段。
 
 #### 6.5.2 故障场景与恢复行为
 
@@ -2125,6 +2146,222 @@ Agent 业务通过首末端点接入显式 Node 路径；已有业务保持建�
 - `server.load`、`server.traffic`、`server.cluster` 等控制查询对所有通过普通客户端 mTLS 的连接可用。
 
 证书角色、信任根、SAN 和私钥保护措施见 [证书制作与部署](证书制作与部署.md)。
+
+### 6.7 Node 链路内存与分配口径
+
+本节合并原《中继链路内存与协程盘点》的实现盘点，控制、接入、邻接与 Flow 的流程分别见第 3、5、7 章。
+对象大小来自 2026-10-20 的 Linux aarch64、libstdc++、Asio 1.38.2 环境，属于历史测量；
+结构布局、ABI 或依赖版本变化后应重新测量，复现见附录 D。
+下文区分对象本体、容量推导、实际分配与 RSS；窗口和队列容量均不表示启动时预分配。
+
+#### 6.7.1 对象本体
+
+| 类型 | `sizeof` | 说明 |
+|---|---|---|
+| `lnk::PooledBuffer` | 48 B | 指针 + deleter（含 `shared_ptr<memory_resource>`）+ span |
+| `lnk::Frame` | 96 B | `LnkFrameHeader` 32 B + `PooledBuffer` 48 B + `shared_ptr` 16 B；静态断言要求 ≤ 128 B |
+| `lnk::FlowState` | 616 B | 含 TCP 端点接收 channel（200 B）与双向 Direction |
+| `lnk::FlowStream` | 1088 B | 4 个 channel（各 200–232 B）+ 共享状态 |
+| `lnk::FlowDatagram` | 360 B | 发送 channel + 共享接收 channel 指针等 |
+| `lnk::NodeLink` | 832 B | socket/resolver/channel/FairQueue/map；成员扫描集合增加 56 B（原 776 B） |
+| `LnkChannel` | 648 B | 表 + acceptor + UDP socket + 共享发送 channel |
+| `FlowProtocol` | 1336 B | 表 + 池共享指针 + 事件 channel + monitor；已移除预留字节计数 |
+| `TLSChannel` | 1416 B | TLS stream + 4 个 channel + 状态 |
+| `CtrlMessage` | 56 B | 命令字符串 + `optional<njson>` |
+| Asio channel（容量型） | 200–232 B | `FrameChannel`/`OptChannel`/`DatagramChannel` 200 B；`SigChannel` 232 B |
+
+这些数值只覆盖对象本体；socket 内核状态、容器动态存储、共享控制块及协程帧另计。
+NodeLink 使用明文 TCP/UDP，不含 SSL。一个多节点 TCP Flow 的对象本体为
+616 B（中间节点）或 616 + 1088 B（已绑定首末节点），不能据此推断总分配量。
+
+#### 6.7.2 标准池与逻辑计费
+
+标准同步池的配置、跨线程归还及生命周期见 5.7.3，逐 Flow 数量与窗口边界见 5.6.6。
+原申请长度用于归还资源和保持稳定信用计费；切片只改变视图，不改变原地址和申请长度：
+
+```text
+Frame::charge_for_payload(a) = 128                         , a = 0
+                            = 128 + bit_ceil(max(a, 256)) , a > 0
+Frame::charge() = Frame::charge_for_payload(payload.allocation_size())
+```
+
+`allocation_size()` 不等于标准池的内部块大小。标准库自行管理 chunk、元数据和高水位缓存，
+生产池不保留 live/retained 字节账本；测试侧统计上游申请，清理后验证最后一个池引用释放。
+默认 chunk 扩展对 RSS 的实测影响及其限制见 C.4。
+
+#### 6.7.3 共享队列与端点队列
+
+| 队列 | 容量 | 存储 | 位置 |
+|---|---|---|---|
+| 端点 `receive_queue`（TCP 首末） | 2561 | Asio channel + `deque` | `flow_protocol.cpp` |
+| 中间节点接收队列（TCP） | 0（保留 channel 对象，不作端点交付） | Asio channel | `flow_protocol.cpp` |
+| `FlowStream::send_queue_` | 0（rendezvous） | Asio channel | `flow_protocol.cpp` |
+| `FlowStream::receive_queue_` | 1 | Asio channel | `flow_protocol.cpp` |
+| `FlowStream::receive_completed_` / `send_space_` | 1 / 1 | Asio channel | `flow_protocol.cpp` |
+| `FlowDatagram` 发送 / 接收 | 16 / 16 | Asio channel | `flow_protocol.cpp` |
+| `NodeLink::controls` | 4096 | `deque<Frame>` | `lnk_channel.h` |
+| `NodeLink::writes` | 无独立上限 | `FairQueue` + `list` | `lnk_channel.h` |
+| UDP 共享发送队列 | 100（业务 ≤ 96） | Asio channel | `lnk_channel.cpp` |
+| `FlowProtocol::events_` | 4096 | concurrent channel | `flow_protocol.cpp` |
+| 控制连接写/读队列 | 100 各（默认） | Asio channel | `tls_channel.h` |
+| 集群 master 出站队列 | 100（默认） | Asio channel | `cluster_mgr.cpp` |
+| `accepting_`（NodeLink 待认证） | 100 | `set` | `lnk_channel.cpp` |
+
+端点接收队列 2561 项的 `Frame` 对象本体约 240 KiB；容器管理及分配器开销另计，
+容量不是启动时预分配量。实际仅在大量空 DATA 且末端不消费时接近该项数。
+
+#### 6.7.4 协程内固定数组
+
+| 缓冲 | 大小 | 数量级 | 位置 |
+|---|---|---|---|
+| `transfer_tcp` 读缓冲 | 32 KiB（零初始化） | 每方向 1 个 | `xfr_channel.cpp` |
+| `transfer_tls` 读缓冲 | 65,467 B（零初始化） | 每方向 1 个 | `xfr_channel.cpp` |
+| `relay_udp_connected` 本地→传输 | 65,500 B | 1 个 | `xfr_channel.cpp` |
+| `relay_udp_connected` 传输→本地 | 65,508 B | 1 个 | `xfr_channel.cpp` |
+| `read_remote_pair` | 65,467 B | 每 RemotePair 1 个 | `pipeline_mgr.cpp` |
+| `DatagramMgr::receive_datagram` | 65,508 B（零初始化） | **每 Node 1 个**（共享） | `datagram_mgr.cpp` |
+| `LnkChannel::udp_read` | 65,508 B（不做零初始化） | **每 Node 1 个**（共享）；校验后按实际载荷复制进池 | `lnk_channel.cpp` |
+| `Forwarder::receive_local_datagrams` | 65,500 B | 每个 UDP forward 1 个 | `forwarder.cpp` |
+| `AgentSession::receive_datagrams` | 65,508 B | 每个 UDP 请求方（Consumer）会话 1 个 | `agent_session.cpp` |
+
+注意：这些数组位于协程帧内，**随协程存活**，不随单次 I/O 释放。
+单节点 TCP/TLS 每个 LocalPair 或每个 Agent 会话的双向复制缓冲分别为
+64 KiB（TCP）或 130,934 B（TLS）。一个完整业务包含两个 Agent 会话和一个 Node LocalPair，
+不能只把一个 Agent 与一个 Node 的缓冲相加作为端到端总量，见 6.7.6。
+
+#### 6.7.5 控制面描述保留
+
+`NodeLinkMgr` 为授权与重放检查保留完整描述：
+
+| 表 | 内容 | 上限 | 生命周期 |
+|---|---|---|---|
+| `link_endpoints_` | Link prepare 的完整 `njson`（含 token、地址、端口、peer） | 1000 | 直到 Link 关闭 |
+| `link_requests_` | master 的 `shared_ptr<LinkRequest>`，对象内保存参数 | 1000 | 成功后作为复用记录保留；链路失效、成员变化或停止时清理 |
+| `flow_endpoints_` | Flow prepare 的完整 `njson`（path、addresses、links、transport） | 1000 | 直到 Flow 关闭 |
+| `flow_requests_` / `closing_flows_` | `shared_ptr<FlowRequest>`，对象内保存参数；关闭时转入关闭表 | 创建时两表合计 < 1000 | 成功 Flow 关闭时从活跃表移除，关闭确认或关闭超时后清理关闭表 |
+| `remote_flows_` | 远端 `flow.open` 等待结果 | 1000 | 结果返回或超时 |
+| `flow_watches_` | 关闭等待 | 与业务同量 | 关闭通知到达 |
+| `FlowProtocol::retired_` | 仅 `id + time_point` | 1000 | 10 秒 |
+
+`flow_requests_` 保存的是指向 `FlowRequest` 的指针，不能与 `FlowRequest::params` 算成两份 JSON。
+master 同时为路径节点时，本地 `flow_endpoints_` 才额外保留一份端点参数；其他路径节点的副本属于其他进程。
+Link 也类似：master 可以管理不连接自身的 A↔B 链路，此时 master 没有该 Link 的本地 endpoint。
+事件转发还会产生临时 JSON 副本。每份描述的实际分配量随路径、地址和字符串长度变化，
+尚未测量，不按固定 0.5–1 KiB 或「三份描述」推算收益。
+
+#### 6.7.6 端到端固定存储估算
+
+以下按一个完整业务的两个 Agent 会话、单节点的一个 LocalPair 或多节点的两个 RemotePair 计数。
+第一张表只加总**随业务增长的固定复制数组**；池载荷、Flow/Pair 对象、容器管理、其他协程帧、
+socket 内核缓冲、OpenSSL 内部缓冲及 Asio 完成队列均另计，不将单个端点的小计称为系统总量。
+
+| 场景 | 两个 Agent 的固定数组 | Node 固定数组 | 完整业务的固定数组合计 |
+|---|---|---|---|
+| 单节点 TCP | 2 × 65,536 B | 65,536 B | 196,608 B = 192 KiB |
+| 单节点 TLS | 2 × 130,934 B | 130,934 B | 392,802 B ≈ 383.6 KiB |
+| 单节点 UDP | 请求方 65,508 B + 服务方 131,008 B | 无逐业务复制数组，共享 listener 另计 | 196,516 B ≈ 191.9 KiB |
+| 多节点 TCP | 2 × 65,536 B | 首末各 65,467 B；中间无逐 Flow 复制数组 | 262,006 B ≈ 255.9 KiB |
+| 多节点 TLS | 2 × 130,934 B | 首末各 65,467 B；中间无逐 Flow 复制数组 | 392,802 B ≈ 383.6 KiB |
+| 多节点 UDP | 请求方 65,508 B + 服务方 131,008 B | 无逐业务复制数组；共享接收和在途池块另计 | 196,516 B ≈ 191.9 KiB |
+
+UDP 还需按实际部署计入每 Node 的 `DatagramMgr` 共享 65,508 B 接收数组、
+每个 Agent UDP forward 的共享 65,500 B 接收数组，以及每 Node 的 NodeLink 共享 65,508 B 接收数组。
+NodeLink 排队持有的载荷按实际长度申请，标准池内部块、chunk 和缓存另计。
+它们不都随业务数线性增长，不能逐业务重复相加；池存储也不能与逻辑窗口模型相加作为 RSS。
+
+多节点 Flow 的对象本体另计：每个路径节点一个 616 B `FlowState`，每个已绑定 TCP 首末节点再加
+1,088 B `FlowStream`，或每个 UDP 首末节点再加 360 B `FlowDatagram`；容器动态存储另计。
+每条 Flow 在**每个路径 Node** 的 `cluster_data_io` 上独立限制窗口或队列：
+
+| 场景 | 每 Flow 双向逻辑容量 | 说明 |
+|---|---|---|
+| 多节点 TCP/TLS | 640.25 KiB | 双向 `W + h`，窗口/队列模型而非常驻分配 |
+| 多节点 UDP | 2.0 MiB | 双向 16 包满尺寸，窗口/队列模型而非常驻分配 |
+
+### 6.8 Node 链路协程数量
+
+本节按源码中主要长期应用协程列出生命周期，不把每次返回 `awaitable` 的函数都算作独立协程。
+例如 `NodeSession::run/wait_attach/bind/bridge`、`relay_tcp/relay_tls/relay_udp_connected`
+以及 `Transport::relay` 中的普通返回包装没有自己的语言级协程帧。
+协程启动理由、执行域与排空方式见 6.3.1；本节只补充计数口径。
+下表不穷举逐次 I/O 的 `send/receive/read_tls_data` 等辅助协程，也不统计 Asio 的组合操作和
+`co_spawn` 内部包装；编译器还可能消除部分分配。因此长期应用协程数、实际存活帧数、
+堆分配次数和执行域唤醒次数必须分别测量，不能互相替代。
+
+#### 6.8.1 进程级常驻
+
+| 协程 | Node | Agent |
+|---|---|---|
+| `FlowProtocol::run` | 1 | — |
+| 其子循环：`accept_loop`、`udp_read`、`udp_write`、`monitor` | 4 | — |
+| `NodeLinkMgr::receive_events` | 1 | — |
+| `ClusterMgr::accept_loop` 或 `slave_loop` | 1 | — |
+| `accept_sessions` + `deliver_messages`（仅 master） | 2 | — |
+| `Connector::run`（仅 slave，也承担连接级收消息） | 1 | — |
+| `RelayNode::control_accept_loop` | 1 | — |
+| `TcpPipeline::accept_loop` | 1 | — |
+| `TlsPipeline::accept_loop` | 1 | — |
+| `DatagramMgr::receive_datagram` | 1 | — |
+| `RelayAgent::discovery_loop`（配置了 forwards 时） | — | 1 |
+| `Forwarder::accept_stream`（每个 TCP/TLS forward） | — | 1 |
+| `Forwarder::receive_local_datagrams`（每个 UDP forward） | — | 1 |
+
+按表内服务均已启动的口径，Node 的 master 为 13 个、slave 为 12 个主要长期协程；
+slave 计入了 `slave_loop` 和 `Connector::run`，但尚未计入 `TLSChannel` 内部循环。
+`Connector::run` 同时是连接级会话接收循环，与下一节合计时不要重复计算。
+Agent 的发现任务受 forwards 配置影响，每个 TCP/TLS/UDP forward 各增加一个监听/接收任务，
+控制连接另计；不把固定的「2–3 个」当作所有配置下的基数。
+
+#### 6.8.2 连接级
+
+| 协程 | 频率 | 稳态 |
+|---|---|---|
+| `TLSChannel::run` | 每条 TLS 控制连接 | 1 |
+| `rloop` / `wloop` / `keepalive` | 每条 TLS 控制连接 | 3 |
+| `ClusterSession::reader` | 每个集群成员（master 侧） | 1 |
+| `Connector::run` | slave 的集群控制连接 | 1（已计入 6.8.1） |
+| `run_control_session` | 每条 Agent 控制连接（Node 侧） | 1 |
+| `NodeConnection::run` | 每条控制连接（Agent 侧） | 1 |
+| `run_transfer_session` | 每个接入中的数据 socket | 建立期临时 |
+| `LnkChannel::establish` 或 `accept` | 每条 TCP NodeLink | 1（持有 Link 到关闭） |
+| `tcp_run` + `tcp_read` + `tcp_write` | 每条 TCP NodeLink | 3 |
+
+即：每条 TLS 控制连接有 5 个、每条 TCP NodeLink 有 4 个主要长期应用协程。
+UDP NodeLink 没有逐 Link 常驻数据协程，复用进程级 UDP 收发循环。
+
+#### 6.8.3 业务级
+
+| 协程 | 频率 | 稳态 |
+|---|---|---|
+| `ControlRouterSingle::run` / `ControlRouterMulti::run` | 每业务 1 个，由 `NodeSession::run` 返回 | 1 |
+| `ControlRouterMulti::establish_and_transfer` | 每个多节点首末业务 | 1 |
+| `ControlRouterMulti::watch_flow` | 每个多节点首末业务 | 1 |
+| `NodeSession::wait_attach` 返回的 manager 等待任务 | 每业务一次跨域 `co_spawn` | 接入期临时，包装函数不另计帧 |
+| `NodeSession::install/activate/close` 的同步数据操作 | 每业务各一次跨域 `co_spawn`（提前失败时可能跳过） | 建立或关闭期短协程，不在逐帧转发路径 |
+| `NodeSession::bind` 返回的绑定操作 | Multi 先到 transfer，再到 data；Single 通过 `co_spawn` 执行同步绑定 | 绑定期临时，不由调用层数推断分配数 |
+| `run_remote_pair` → `await_transfers` | 每 TCP/TLS RemotePair | 4（父任务 + 组合 + 2 方向） |
+| `run_local_pair` → `relay_*` → `await_transfers` | 每 TCP/TLS LocalPair | 4（同上） |
+| `FlowProtocol::Stream::run` + `send_loop` + `receive_loop` | 每个 TCP Flow 端点 | 3 |
+| `FlowProtocol::Datagram::run` | 每个 UDP Flow 端点 | 1 |
+| `ensure_link` | 每次 Flow 建立 × 每条边 | 建立期临时 |
+| `open_flow` + edges channel | 每个多节点 ingress | 建立期临时 |
+| `AgentSession::run` + `attach` | 每业务 | run 长期存在，attach 仅建立期 |
+| `AgentSession` 的 `relay_tcp`/`relay_tls`/`relay_udp_connected` | 每业务 | 3（`await_transfers` + 2 方向） |
+| `relay_agent.cpp` `select_relay` | 每个新业务 1 次 | 建立期临时 |
+
+#### 6.8.4 按场景汇总
+
+| 场景 | Node 侧（每业务） | Agent 侧（每业务） |
+|---|---|---|
+| 单节点 TCP | 控制器 `run` 1 + `run_local_pair` 1 + 组合 1 + 方向 2 = **5** | 每个 Agent 会话：`run` 1 + 组合 1 + 方向 2 = **4** |
+| 单节点 TLS | 同上 = **5** | 同上 = **4** |
+| 单节点 UDP | 控制器 `run` 1 + `run_local_pair` 1（等待 `finished`）= **2** | 服务方 `run` + 组合 + 方向 2 = **4**；请求方 2 |
+| 多节点 TCP/TLS 首末 | `run` 1 + `watch_flow` 1 + `establish_and_transfer` 1 + `run_remote_pair` 1 + 组合 1 + 方向 2 + Flow 端点 3 = **10** | **4** |
+| 多节点 UDP 首末 | `run` 1 + `watch_flow` 1 + `establish_and_transfer` 1 + `run_remote_pair` 1 + `write_remote_pair` 1 + `Datagram::run` 1 = **6** | 服务方 4；请求方 2 |
+| 中间 Node | 0（仅 Flow 表项，无端点任务） | — |
+
+Node 首末节点和两个 Agent 分别计数；表内不包含进程级及共享 Link 协程，
+也不包含上述等待调用的辅助帧，不能据此直接估算堆内存。
 
 ## 7. 端到端业务链路
 
@@ -2855,8 +3092,9 @@ TCP/TLS 服务尚未定位时关闭当前应用连接，监听保留；UDP 此�
 
 #### 8.3.1 RelayNode 停止流程
 
-`RelayNode::stop()` 是同步收敛接口，由 `control_io`、`transfer_tcp_io`、`transfer_udp_io`、`cluster_data_io` 之外的线程调用。
-它通过只供外部 stop 调用方持有的互斥量协调并发调用，以 Stopped 状态复用重复调用结果；control、TCP/TLS、UDP 阶段依次执行，返回 bool 表示是否正常关闭：
+`RelayNode::stop()` 是同步收敛接口，由 `control_io`、`transfer_tcp_io`、`transfer_udp_io`、`cluster_data_io` 之外的所有者线程顺序调用，且不能与 start() 重叠。
+生产入口 main 在信号等待结束或启动失败后统一调用一次 stop()，信号回调和工作线程不会调用它，因此不使用互斥量支持并发 stop。
+以 Stopped 状态复用顺序重复调用的结果；control、TCP/TLS、UDP 阶段依次执行，返回 bool 表示是否正常关闭：
 
 ```mermaid
 sequenceDiagram
@@ -2903,7 +3141,7 @@ Topology 和 ClusterMgr 的完成事件在后台协程退出时唤醒等待者�
 由关闭接口抛出，不能转换成普通 false 或提前设置 Stopped。Topology 仅在 DNS / ICMP 排空后置为 Stopped。
 RelayNode 依次调用 NodeLinkMgr、Topology、ClusterMgr，不因某一步返回 false 而跳过后续模块或会话排空，
 随后完成 TCP/TLS、UDP 停止，设置 Stopped 并返回汇总结果，不保存或重抛模块历史运行异常。
-任务提交或排空本身失败时，异常交给外层，互斥量随作用域释放，Node 保持 Stopping，后续 stop() 可以再次进入关闭流程。
+任务提交或排空本身失败时，异常交给外层，Node 保持 Stopping，后续顺序调用 stop() 可以再次进入关闭流程。
 main 的信号等待只交付信号结果，stop() 在回调外调用；先释放 work guard、join 全部线程，再结束 Node 生命周期。
 正常关闭退出 0，已完成但关闭结果为 false 时退出 1；启动异常在清理与 join 后报告原始原因。
 已取消的指标处理函数可以迟到，但只释放模块自身，不再访问注册表或协议服务；不使用 io_context.stop() 跳过排空，也不增加全局强停超时。
@@ -2913,6 +3151,11 @@ acceptor 就假定它们消失。每个实例自己的 `pending_sockets_` 记录
 UDP 停止前使用原子 wait 等待它们归零。accept/setup 协程按值捕获 Pipeline 的 shared_ptr，
 未完成接入继续受现有 setup_timeout 约束，不增加待接入 socket 管理表。
 业务复制由 NodeSession 的控制任务跨域拥有并排空，不再由 manager detached 启动。
+
+其余两处业务互斥量用于实际跨线程共享：ServiceTraffic 的访问者列表由 TCP/UDP transfer executor 修改，
+control_io 生成报告时读取；RelayIdAllocator 的 ID 集合和序号由 TCP/TLS 与 UDP transfer executor 共同分配和释放。
+两者保留互斥量。RelayNode 的 state_ 仍由外部 stop 写入、control_io 读取，保留原子状态；
+StreamPipeline 的待接入计数、跨执行域流量计数、指标探针及 FlowProtocol 事件溢出标记同样需要跨线程同步。
 
 #### 8.3.2 RelayAgent 停止流程
 
@@ -3082,6 +3325,116 @@ Dashboard 的 HistoryStore 由应用创建和关闭，采集客户端只使用�
 服务限速是字节每秒速率控制，信用/背压是内存和消费能力控制，两者不合并。
 当前只对新业务选路，不迁移活动连接，不自动切换备用路径；不提前增加这些扩展的字段、空状态或占位类。
 
+### 9.4 Node 链路开销与演进候选
+
+#### 9.4.1 数据热路径
+
+| 编号 | 现象 | 影响 | 位置 |
+|---|---|---|---|
+| H1 | 已优化：UDP 复用接收数组，校验后按实际载荷复制进池 | 小包不再申请最大接收块；标准池实际尺寸由实现管理，代价是多一次复制 | `lnk_channel.cpp` `udp_read` |
+| H2 | `FairQueue::push` 查同 tag、扫描不重复区间、插入 `list` | 已复用成员 `unordered_set` 的桶；集合节点仍按扫描分配，list 节点仍需分配；已有同标签连续入队缓存 | `fair_queue.h` |
+| H3 | 发送 rendezvous、接收逐 DATA 等待一次 `complete_receive` | 有逐帧交接与确认成本；实际跨线程唤醒取决于队列和执行器调度，未测量 | `flow_protocol.cpp` |
+| H4 | 标准同步池的内部同步 | 分配/归还跨执行域，实际争用需测量；没有自定义全局锁 | `lnk_channel.h` |
+| H5 | 每帧 `map` 查找（Flow、Link、credits） | O(log F) + O(log L)，热路径固定成本 | `flow_protocol.cpp`、`lnk_channel.cpp` |
+| H6 | 端点接收队列按 `Frame` 存储 | 空 DATA 场景帧对象本体可接近 240 KiB，容器开销另计 | `flow_protocol.cpp` |
+| H7 | `Frame::charge()` 把原申请长度映射为逻辑信用单位 | 保持既有信用协议，不代表标准池实际尺寸；切片不改变计费 | `lnk_channel.h` |
+| H8 | 部分复制/接收缓冲使用 `{}` 零初始化 | 源码要求创建时清零；是否生成实际 memset 需看优化后产物，不是每包成本 | `datagram_mgr.cpp`、`xfr_channel.cpp` |
+
+#### 9.4.2 控制面
+
+| 编号 | 现象 | 影响 | 位置 |
+|---|---|---|---|
+| C1 | `ClusterRoom::deliver` 每条消息 `WireMessage::pack` 后丢弃 | 校验包含按值拷贝及完整 CBOR 编码；远端各自再次编码 | `cluster_mgr.cpp` |
+| C2 | 事件转发复制整份 njson 并追加字段 | 仍有完整 endpoint JSON 深拷贝；P0-2 未实施 | `nodelink_mgr.cpp` |
+| C3 | 成功的 `LinkRequest` 作为链路复用记录保留完整参数 | 长期保留建立期对象及 JSON；失效时清理，不是无期限泄漏 | `nodelink_mgr.cpp` |
+| C4 | `send_all` 先复制公共参数，再分别构造消息 | 显式产生 1+N 次参数副本；P0-2 未实施 | `nodelink_mgr.cpp` |
+| C5 | `relay.*` 分派线性扫描 `relay_sessions_` / `relays_` | 每消息 O(n)；Agent 上限 1000，Node 全部会话不能统一按 512 计算 | `relay_node.cpp`、`forwarder.cpp` |
+| C6 | `TLSChannel::send` 每消息一次 `post` + `shared_from_this` | 控制消息逐条分配/原子操作 | `tls_channel.cpp` |
+| C7 | `AsyncEvent::wait` 每个挂起等待者在帧内持有 channel（对象 232 B）并注册到 vector | 按业务建立/释放及组件停止触发，不在逐帧路径；channel 内部存储和 vector 增长可能分配 | `async_event.h` |
+| C8 | 控制连接队列满即关闭连接 | 突发控制消息可能造成连接抖动 | `tls_channel.cpp` |
+| C9 | `FlowProtocol::events_` 溢出即终止数据面 | 事件突发会导致全部 Flow 失效 | `flow_protocol.cpp` |
+
+#### 9.4.3 生命周期
+
+| 编号 | 现象 | 影响 |
+|---|---|---|
+| L1 | `TLSChannel`、`FlowState`、`NodeLink` 使用 `shared_ptr` 保活 | 复制/销毁有引用计数成本；移动和按引用持有不等于每个操作都增加一次计数 |
+| L2 | `FlowStream::close/reset`、`FlowDatagram::close` 向数据域 `post` 一个捕获 `shared_ptr` 的 lambda | 关闭路径的异步包装与保活成本 |
+| L3 | Multi 绑定涉及 control → transfer → data → transfer → control | 各域拥有不同状态，换异步接口不自动消除必要交接；实际唤醒/分配需测量 |
+| L4 | `NodeSession::wait_attach`、`bridge` 返回跨域 `co_spawn` 操作 | 有任务包装与完成交接成本；两个包装函数本身不是语言级协程 |
+| L5 | `NodeLinkMgr` 的 `AsyncEvent` 与 `steady_timer` 每请求各一个 | 请求级固定开销 |
+
+#### 9.4.4 实施状态与后续决策
+
+下表保留原盘点编号便于追溯，编号不表示当前优先级。它们是已实施局部改动或待验证候选，
+不能用源码操作次数直接推断吞吐、CPU 或 RSS 收益。所有候选均须保持 5.6 的信用不变量、授权、
+半关闭和取消排空；不在 NodeLink 上增加第二套流控。
+
+| 顺序 | 原编号 | 状态与行动 | 决策条件 |
+|---|---|---|---|
+| 0 | P2-5 | 补最小观测与多节点 UDP、控制编码基准 | 按所属执行域取快照，不逐帧发送统计消息；队列延迟不等于深度 |
+| 1 | P1-1 | 已实施：NodeLink UDP 固定数组接收，校验后按实际载荷申请并复制 | 增加一次复制；功能通过不表示业务性能已提高 |
+| 2 | P0-1 | 候选：复用控制消息编码结果 | Room 当前完整 pack 校验后丢弃，远端再次编码；保留分发前校验、16 MiB 长度、每连接独立队列与溢出关闭 |
+| 3 | P1-3 | 已局部实施：FairQueue 成员集合复用桶 | 节点仍重新分配，入队仍需扫描；数据见 [FairQueue](FairQueue.md#成员扫描集合复用) |
+| 4 | P1-2b | 已局部实施：普通 TCP 每方向数组改为 32 KiB | 每双向复制少 64 KiB，但本机大块回环吞吐下降约 40%，见 C.5；read_remote_pair 仍为 65,467 B |
+| 5 | P2-2 | 候选：复用请求表并补消息索引 | Agent 现有 request map 可 O(log n) 查找；UUID 必须允许同 Agent 双角色，Node 请求须含控制会话身份 |
+| 6 | P0-2 | 未实施：事件 JSON 与授权存储优化 | 先量化副本；JSON 普通复制为深拷贝，回执裁剪须保留接收端实际校验字段 |
+| 7 | P0-3 | 未实施：压缩成功 Link 记录 | 成功请求仍是复用和失效检查缓存；master 未必是 Link 端点，不可直接删记录或移交本地 endpoint |
+| 8 | P1-2a | 候选：去除无用零初始化 | 先确认优化后产物有实际清零，且只读取填充范围；影响主要在任务启动，数组容量不变 |
+| 9 | P2-4 | 候选：按部署开放部分容量配置 | 保持正值、范围、溢出校验和派生容量关系，不恢复全局字节预留 |
+| 10 | P2-1 | 已实施：标准同步池与数量准入 | 允许高水位缓存；只有测出争用后才评估替代，复核见 C.4 |
+| 11 | P1-4 | 候选：端点流水线与完成确认 | 先测逐帧等待；只加 channel 深度不会自动减少确认，新增源侧在途块需重审窗口外余量与 FIN 顺序 |
+| 12 | P0-4 | 暂不实施：轻量化 AsyncEvent | 等待发生在建立、关闭和停止，并非逐包；需证明高周转率或大量等待者的实际收益 |
+| 13 | P2-3 | 候选：减少 Multi 绑定包装 | 每业务仅建立时发生；仍保留 transfer→data→transfer→control 的状态检查和跨域关闭处理 |
+
+AsyncEvent 曾实验以按需 vector 队列替代默认 deque：在 Asio 1.38.2、预热 service 后，
+1000 次构造探针中 channel 从 232 B 降至 176 B，每次构造堆申请从两次、568 B 降至零。
+该实验只覆盖构造，未证明端到端收益，替换已撤回。重新评估时须保持广播、迟到等待者立即完成、
+单等待者独立取消、取消后注销及通知/取消竞争结果，沿用 `test/common/async_event_test.cpp`。
+
+不直接采用小 UDP 缓冲截断后重读、缩小 TLS 完整帧缓冲、每域少量共享借用块、仅加 FairQueue
+最后位置索引就宣称 O(1)、仅扩 channel 就宣称减少交接等方案。
+挂起读、限速与慢写可长期占有借用块，线程数不等于在途所有者数。
+多线程驱动同一 io_context 或合并 FlowProtocol 与 StreamPipeline 执行域，均需重新审计所有权和调度隔离。
+
+### 9.5 性能验证口径与覆盖缺口
+
+| 改动 | 现有覆盖 | 必须补充或注意 |
+|---|---|---|
+| P1-1 NodeLink UDP 接收 | `udp_relay_benchmark.cpp` 只测 `relay_udp_connected`，当前负载为 1400 B | 需补经过 `LnkChannel::udp_read`、中间转发和 FlowDatagram 端点的多节点 UDP 基准；现有程序不能直接证明该优化收益 |
+| P0-1 控制消息一次编码 | cluster 集成测试验证路由和连接行为 | 需补本地 + 多远端、单播/广播/分片的编码次数、分配字节和时间比较 |
+| P1-3 FairQueue | FairQueue 对拍；成员集合版本已按比较程序完整矩阵与修改前版本对比 | 数据见 [FairQueue.md](FairQueue.md#成员扫描集合复用)；业务收益仍需 Flow 基准，不沿用旧布局耗时 |
+| P1-2a/b 复制缓冲 | `tcp_relay_benchmark.cpp`、`tls_relay_benchmark.cpp` 覆盖复制函数；32 KiB TCP 回归与回环对比已完成，见 C.5 | 高并发/空闲连接/慢写及启动成本仍待测；变更 `read_remote_pair` 时补 Pipeline 多节点负载，Flow 直连基准不经过该数组 |
+| P2-2 / P0-2 / P0-3 控制状态 | node/agent/cluster 功能用例 | 增加大量会话分派、频繁开关及长时间 Link 复用的分配和 CPU 测量 |
+| P1-4 流水线 | `flow_benchmark.cpp`、`congestion_benchmark.cpp`、`run_congestion_network.py` | 先建立等待时间基线；这些基准主要覆盖 TCP Flow，另补真实接入 socket 的端到端验证 |
+| P2-1 / P0-4 锁与等待者 | 池和 AsyncEvent 功能用例 | 增加真实多执行域争用或多等待者/取消负载，比较替代方案总分配，不能只比较 sizeof |
+
+UDP 包长使用 64/512/1400 B 和最大合法载荷 65,467 B，后者不是 65,536 B。
+覆盖双向、多 Flow、慢末端、队列满、数量接近上限、分配失败、关闭和身份复用，并同时报告实际收包率和丢包率。
+
+#### 9.5.1 回归边界
+
+| 改动 | 必须保持的行为 |
+|---|---|
+| 任何内存改动 | TCP 双向半关闭、TLS 业务 FIN、UDP 丢整包语义及实际读取范围 |
+| 任何信用改动 | 5.6.2 的 `A ≤ G`、`G = R + W`、单 Flow 窗口有界；消费完成前不归还信用 |
+| 任何协程/池改动 | stop 在资源销毁前排空所属任务；交付出去的池块仍能独立存活并正确归还 |
+| 任何控制面改动 | 分发前校验、错误隔离、epoch/来源/路径授权、失效清理与关闭确认 |
+| 索引改动 | 同 Agent 双角色共享 UUID、不同控制会话同 request ID、迟到消息和失败回滚 |
+| AsyncEvent 改动 | 独立取消、广播、迟到等待者、通知与取消竞争结果 |
+| FairQueue 改动 | 参考模型次序、每 tag FIFO、DATA/FIN 排序、健康 Flow 推进及关闭清理 |
+
+#### 9.5.2 收益判定
+
+对比同机、相同编译参数、相同负载与预热条件下的基线和候选，保存源码版本、配置、原始样本和重复测量结果。
+观测吞吐/包速率、CPU、p99 延迟、进程 RSS、测试侧分配次数/字节、逻辑窗口及 Link 队列峰值。
+生产池不再提供 live/retained 统计；基准排空任务并释放端点、协议持有者后，以弱引用验证池最终销毁。
+没有 CPU 或 RSS 测量时，不用对象尺寸或一次入队耗时替代这些结论。
+
+小缓冲方案同时看系统调用次数，UDP 同时看 offered/received/丢包，
+池优化看测试侧分配、固定并发下的 RSS 趋势和最终资源释放，信用方案看慢末端停止读取后的收敛和恢复时间。
+只在结果支持且正确性回归通过时实施；如果主要收益来自不符合部署的负载，应调整 9.4.4 的顺序而非推广为普遍收益。
+
 ## 附录 A. 控制协议规范
 
 控制通道使用 `WireMessage` 长度帧承载 CBOR 编码的 `CtrlMessage`。消息结构为：
@@ -3096,6 +3449,16 @@ Dashboard 的 HistoryStore 由应用创建和关闭，采集客户端只使用�
 共享协议库使用 `CtrlCommand` 表示普通控制命令和 Link/Flow 事务命令。发送方可用枚举构造 `CtrlMessage`，
 接收方通过 `type()` 得到枚举并分派。`params` 在内存中使用 `nlohmann::json` 对象表示，线上编码是 CBOR，
 不是 JSON 文本；文中的 JSON 示例只用于展示字段。业务处理器负责校验自身字段和状态。
+
+`CtrlCommand` 保持平铺枚举，底层使用 uint32_t，按 `[大类:8][子类:8][命令:16]` 编码。
+仅定义 `CTRL_GROUP_MASK` 和 `CTRL_SUBGROUP_MASK` 两个掩码宏，各组起始值直接放在枚举中，具体命令随后自动递增。
+`ctrl_command_group(command)` 和 `ctrl_command_subgroup(command)` 将取掩码和类型转换封装为 constexpr 函数，
+分别与 `CtrlCommand::Link`、`CtrlCommand::Flow` 等大类和 `CtrlCommand::RelayPeer` 等子类比较，不按字符串前缀分派已知业务命令。
+子类掩码包含大类位，保证不同大类的同号子类不会混淆。枚举值仅供进程内部分类，不写入线上消息。
+分组按实际分派职责划分，不按命令字符串中的点号机械分层；当前仅 RelayPeer 需要单独的子类。
+`type()` 仍从 command 字符串解析枚举；集群入口由 ClusterMgr 解析，普通控制入口由 RelayNode 解析，
+随后向 NodeLinkMgr、NodeControl、NodeSession 及控制器传递枚举，避免层层重复解析，也避免遍历业务实例时为每个实例重新解析。
+NodeLinkMgr 先按大类进入 Link 或 Flow；Flow 入口再区分远程请求和事务消息，不在大类分派前单独处理请求。
 
 集群 wire 继续把 `source/target` 放在 `params` 中。非保留的普通 cluster command 仍以字符串透传，
 `type()` 对它们返回 `Unknown`；`cluster.*` 命令由集群握手保留。扩展命令仍使用同一
@@ -3543,3 +3906,250 @@ TCP 任务组合补充验证单向 FIN 不取消反向传输、正常 FIN 后另
 测试访问由夹具提供，生产接口不开放测试访问。
 
 上述验证覆盖功能、生命周期和关闭边界，未进行跨机器 1 Gbps 或真实高 RTT 吞吐压测。
+
+### C.3 UDP 接收与数量准入的历史验证
+
+以下是合并前已记录的历史实验，不能视为本次注释和文档整理重新执行的测试。
+
+2026-10-19，Debug 构建通过，`node_links`、`node_flows`、`lnk_flow_control` 三项 CTest 均通过。
+
+`node_links` 的原始 UDP 接收用例检查 1/64/512/65,467 B 载荷按实际长度申请，
+以及空载荷不申请池块、复用接收数组不覆盖仍持有的旧载荷、畸形长度拒绝和池分配失败后丢包/恢复。
+`node_flows` 覆盖实际多节点 UDP 双向转发，`lnk_flow_control` 覆盖既有队列有界、丢包和准入行为。
+该次记录采用旧自定义有界池；当前实际分配失败注入与数量上限验证见 C.3.1。
+这些功能检查不替代吞吐、CPU 或 RSS 基准，当前未声称端到端性能收益。
+
+#### C.3.1 数量准入与标准池验证（2026-10-20）
+
+Linux aarch64、GCC 14.2.0、libstdc++、Asio 1.38.2，Release 构建。以下 11 项相关 CTest 均通过：
+`pooled_buffer`、`fair_queue`、`lnk_flow_control`、`lnk_flow_receive`、`lnk_channel_flows`、
+`node_relay_capacity`、`node_links`、`node_flows`、`relay_integration`、`udp_relay_integration`、`relay_paths`。
+`relay_integration` 首次在随机端口绑定阶段遇到 Address already in use，单独重跑通过。
+
+- 数量：TCP、UDP、混合分别达到 1000 Flow，第 1001 个拒绝；关闭后的退休身份继续占名额，10 秒到期后可重新准入。
+- 业务任务：暂停数据执行域，TCP/TLS/UDP 分别设置 1/2/3 个 `max_relays`，验证各自准入额度；取消后在排空前仍拒绝，排空后恢复全部名额。
+- 信用与结束：保留慢消费者、满队列、消费确认、DATA/FIN 顺序、RESET、健康流推进和单/多节点收发回归。
+- 池与所有权：两个线程分别预热后，合计 20,000 次取块归还无新增上游分配；覆盖移动、切片、最大块、跨线程归还、载荷越过协议销毁存活及最终释放。
+- 实际分配失败：由测试侧 `FailingPayloadPool` 注入，覆盖 UDP 丢当前包后恢复、TCP RESET 分配失败仍关闭；生产池无故障注入接口。
+
+代码整理后，上述 11 项回归再次全部通过。基准清理以一次执行器交接代替限时轮询，
+小包、常规流量、八节点最大载荷、拥塞恢复及暂停跨越测量结束的 5 个场景均通过数据、窗口和池最终销毁检查；
+记录位于 `build-fair-queue/standard-pool/cleanup-review/`。
+
+固定并发观测使用 8 个混合 TCP/UDP Flow，连续 40 轮建立、传输、关闭；TCP 载荷 32,768 B，UDP 载荷 65,467 B。
+该次测试进程 RSS 首轮/末轮/峰值均为 8 MiB，没有随轮次持续上升。观测包含同进程先前用例及分配器缓存，
+是短时趋势检查，不是长期泄漏证明或固定 RSS 上限，也不要求空闲后 RSS 立即下降。
+
+同机对照采用修改前 `46e67de` 的可执行文件和当前工作树，两者均为 Release。
+以下保留首轮三秒短测记录；其中吞吐降幅的稳定性判断已由后续补测修正，见 C.4。
+三节点、同进程单 io 线程、双向、32 KiB 分帧；每轮预热 1 秒、测量 3 秒，10/100 Flow 各交错重复 3 次。
+以下为各项中位数，CPU 以单核 100% 计；RSS 为每轮测量阶段峰值的中位数：
+
+| Flow | 实现 | 吞吐 / Mbps | CPU / % | RSS / MiB |
+|---|---|---:|---:|---:|
+| 10 | 原自定义有界池 | 3785.66 | 99.81 | 15.36 |
+| 10 | 标准同步池 | 2953.39 | 99.91 | 22.70 |
+| 100 | 原自定义有界池 | 3024.61 | 99.94 | 91.91 |
+| 100 | 标准同步池 | 2902.06 | 99.51 | 142.75 |
+
+这组历史短测的吞吐差值约为 22%/4%，后续未稳定复现，不作为退化结论；RSS 更高。初次短测另覆盖 1/10/100 Flow 和
+10 Flow 的消费降速/恢复与单流暂停；后者两版均能恢复并保持健康流推进。
+全部 20 个新旧基准场景的数据、窗口、排空与各自释放检查通过；新实现的 10 个场景均通过池弱引用销毁检查。
+本次收益是移除硬预算账本及自定义池管理，不能据此声称降低内存或提高吞吐；未做跨机器或高 RTT 性能验收。
+
+原始样本及报表保存在 `build-fair-queue/standard-pool/comparison/` 和 `build-fair-queue/standard-pool/repeats/`，
+均含 `timeline.csv`、`flows.csv`、元数据和汇总；旧结果只验证停止后在用载荷释放，新结果验证清理后池资源最终销毁。
+
+### C.4 标准载荷池性能复核
+
+2026-10-20，复核移除全局字节预算、将 PayloadPool 改为标准同步池后的性能。复核期间未修改生产代码。
+
+#### 结论
+
+此前三秒短测得出的“十流下降约 22%、百流下降约 4%”不能作为稳定回归结论。
+延长测量、交错重复并隔离分配器后，未复现这一固定降幅；本次也不据此宣称新版加速。
+短测的比较方向会随运行条件改变，旧样本缺少足够的调度记录，不能追溯为某个确定的 CPU 或缓存问题。
+
+已确认两项成本：标准同步池的预热取还路径比旧池慢几十纳秒；默认 chunk 扩展明显增加上游申请和 RSS。
+前者不足以解释原先 22% 的链路差距，后者有分配追踪与调整 chunk 的对照支持。
+
+#### 方法与范围
+
+环境为 Raspberry Pi 5、Linux aarch64、GCC 14.2.0、libstdc++、Asio 1.38.2、Release。
+CPU governor 保持 `ondemand`，没有修改系统配置；固定核实验使用 CPU 2。
+长测记录的开始/结束频率为 2.4 GHz，温度约 52～55°C；没有连续监测所有外部负载，不能将环境噪声视为完全消除。
+
+共增加 63 个 Flow 场景和 24 组分配微基准：
+
+- 原始二进制对照：旧版 `46e67de` 与当前实现，三节点、单进程单 io 线程、双向、32 KiB 分帧；预热两秒、测十秒，交错重复三次，覆盖 10/100 Flow。十流另做不绑核长测及绑核/不绑核三秒短测。
+- 分配器隔离：在同一份当前协议代码中，通过基准夹具替换池，比较旧池、只去掉池预算检查的旧池、标准同步池、标准非同步池、每 chunk 最多八块的标准同步池及直接上游分配。四种主要池分别在 10/100 Flow 下交错长测三次。
+- 微基准：预热后保持 64/600 个 32 KiB 块，分别测纯取还和取还加复制；记录上游请求。所有测量串行执行，编译结束后才开始测量。
+- CPU 采样：对旧池、标准同步池和非同步池各做一次十五秒的用户态硬件采样，另由进程 CPU 时间统计用户态/内核态比例。采样场景用于定位，未混入普通吞吐中位数。
+
+非同步池仅用于单线程诊断。项目的跨线程分配、归还仍需要同步保证。
+
+#### 原始生产二进制长测
+
+下表为三轮测量的中位数；括号是吞吐最小～最大值，单位 Mbps。RSS 是各轮测量峰值的中位数。
+
+| 条件 | Flow | 旧实现吞吐 | 新实现吞吐 | 旧/新 RSS，MiB |
+|---|---:|---:|---:|---:|
+| 固定 CPU 2，测十秒 | 10 | 3587.59（3329.26～3675.84） | 3685.73（3684.18～3718.20） | 15.66 / 22.69 |
+| 固定 CPU 2，测十秒 | 100 | 2805.60（2787.89～2817.54） | 2838.84（2820.43～2881.45） | 91.89 / 142.77 |
+| 不绑核，测十秒 | 10 | 3696.00（3527.34～3872.42） | 3713.75（3460.70～3849.18） | 见原始 CSV |
+
+三秒短测中，不绑核的十流中位数为旧 3850.91、新 3383.40 Mbps；固定核则为旧 3386.68、新 3563.08 Mbps，比较方向反转。
+不绑核长测记录到每轮 0～7 次 CPU 迁移，两版都有快慢轮次；没有证据将差距单独归因于迁移。
+上述数据说明原先的固定降幅缺少重复性，不证明所有部署条件下两版性能相同。
+
+#### 同一协议代码，只替换池
+
+每种条件重复三次，固定 CPU 2，预热两秒、测十秒；下表均为中位数。
+
+| 池 | 十流吞吐，Mbps | 百流吞吐，Mbps | 十流/百流 RSS，MiB |
+|---|---:|---:|---:|
+| 原自定义有界池 | 3647.09 | 2833.32 | 15.70 / 91.92 |
+| 标准同步池，默认 chunk | 3715.24 | 2889.29 | 22.64 / 142.70 |
+| 标准非同步池，默认 chunk | 3656.57 | 2865.24 | 24.50 / 142.72 |
+| 标准同步池，每 chunk 最多八块 | 3659.07 | 2891.55 | 17.36 / 103.06 |
+
+去掉同步没有稳定提高链路吞吐；限制 chunk 显著降低 RSS，却没有稳定提高吞吐。
+因此，不能把整体链路的快慢简单解释为锁竞争或 RSS 大小。
+
+#### 已定位的分配与内存成本
+
+##### 预热取还成本
+
+纯取还微基准每次包括一次归还和一次分配，测量阶段均未增加上游分配：
+
+| 保持的 32 KiB 块数 | 旧池 | 标准同步池 | 标准非同步池 |
+|---|---:|---:|---:|
+| 64 | 32.15 ns | 93.09 ns | 42.93 ns |
+| 600 | 37.39 ns | 96.52 ns | 49.08 ns |
+
+本机标准库二进制的同步池路径包含档位查找、读写锁、线程局部池查找及 chunk/位图管理；旧池常用路径为 mutex 加空闲链表取还。
+这些工作解释了微基准中的额外成本。但在约 3～4 Gbps、32 KiB 分帧、三节点的负载下，
+每帧约三次载荷分配，额外约 60 ns/次折算只约占单核 0.2%～0.3%，不能解释原先约 22% 的差距。
+这只是预热路径的量级估算，不覆盖缓存状态、缺块和上游申请。
+
+用户态采样中，直接池函数和读写锁仅占少量样本；复制、校验与异步调度占用更多。
+进程统计显示这组回环负载超过一半 CPU 时间在内核态；本次没有内核调用栈，不能精确拆分其成本。
+没有足够证据把余下波动归因于某一种缓存、复制或内核路径。
+
+##### 默认 chunk 扩展
+
+追踪标准池的上游请求后，32 KiB 档依次申请容纳约 15、30、60、120、240、480、960 块的 chunk，另加少量位图存储。
+单个首末节点的累计池请求峰值如下，单位 MiB：
+
+| Flow | 原自定义池 | 标准同步池默认 chunk | 标准同步池每 chunk 最多八块 |
+|---|---:|---:|---:|
+| 10 | 3.4688 | 7.0327 | 3.4705 |
+| 100 | 34.4062 | 59.5329 | 34.4757 |
+
+旧池逐块补充，标准池按 chunk 批量补充。在百流场景，默认池的两个首末节点合计多申请约 50.25 MiB，
+与进程 RSS 增加约 50.8 MiB 接近，确认了此次内存增加的主要来源。
+每 chunk 最多八块的对照减少了这部分余量，但 RSS 仍高于旧池；上游请求字节不包含其分配器的对齐浪费等全部成本。
+本轮没有继续分解这一剩余差异，也没有将该选项应用到生产。
+
+全部 63 个 Flow 场景的数据一致性、窗口、排空及各自资源释放检查通过；33 个带上游追踪的场景在池销毁后，
+申请/归还次数相等、上游在用字节归零。观测到的较高运行期 RSS 不等同于池载荷泄漏。
+
+#### 产物与实施判断
+
+原始数据、诊断源代码、编译产物、执行脚本、CPU 样本、上游请求、环境及二进制 SHA-256 均保存在：
+`build-fair-queue/standard-pool/diagnosis/`。
+其中 `production/` 是原始二进制长测，`long/` 是同协议换池长测，`short/`、`unpinned_long/` 复核运行条件，
+`samples/` 保存采样，`micro.csv` 保存微基准。各 Flow 目录保留完整 CSV、JSON 和日志。
+
+全局预留只在建立/关闭时记账，当前 10/100 Flow 也没有触发旧预算；RelayNode 的任务准入不在本基准路径中。
+没有依据把吞吐变化归因于删除这些限制，也没有依据为恢复原先短测数字而直接回撤实现。
+当前可确认的取舍是维护简化伴随更大的默认池缓存；是否调整 chunk，应按实际部署的内存目标另做选择。
+
+### C.5 普通 TCP 32 KiB 缓冲的历史对照
+
+2026-10-19，普通 TCP 复制数组由每方向 64 KiB 缩为 32 KiB，保留限速、计数和半关闭。
+
+本次 `tcp_relay` 回归通过，覆盖两侧读写失败、限速等待取消、双向半关闭及流量计数。
+Release（GCC 14.2.0、`-O3 -DNDEBUG`）下，沿用 `benchmark_tcp_relay`，每方向发送 4,096 块，
+修改前后各预热一次，再交替运行五次取中位数；每次检查内容、顺序和 FIN。
+本机回环结果如下，CPU 时间指传输相同数据所用的进程 CPU 秒数，并非 CPU 使用率：
+
+| 数据块 | 64 KiB 缓冲吞吐 | 32 KiB 缓冲吞吐 | 吞吐变化 | CPU 时间（64 → 32 KiB） |
+|---|---:|---:|---:|---:|
+| 1,400 B | 1,364 Mbps | 1,404 Mbps | 约 +3.0% | 0.0644 → 0.0653 s（约 +1.3%） |
+| 32,768 B | 9,690 Mbps | 5,834 Mbps | 约 −39.8% | 0.2206 → 0.3677 s（约 +66.6%） |
+
+大块样本五次均出现明显吞吐损失，不能把缩小缓冲描述成没有性能代价。
+上述是本机回环负载，不能直接推断受网络带宽或限速约束的部署结果；高并发 RSS 也尚未测量。
+原始 JSON、汇总及修改前源码/可执行文件保存在 `build-fair-queue/tcp-buffer-32k/`。
+
+TLS 仍要求缓冲容纳完整合法业务帧，不能直接缩至 32 KiB；UDP 接收缓冲同样保留最大报文检测能力。
+本记录不替代高并发空闲连接、慢写或真实网络部署的 RSS、系统调用与吞吐测量。
+
+## 附录 D. Node 链路常量与复现
+
+| 符号/项 | 值 | 位置 |
+|---|---|---|
+| `lnk::max_flow_count` | 1000 | [`lnk_channel.h`](../protocol/inc/lnk_channel.h)，协调与数据域共用 |
+| `flow_window_bytes` (`W`) | 327,680 | `flow_protocol.cpp` |
+| `datagram_queue_capacity` | 16 | `flow_protocol.cpp` |
+| `retired_flow_ttl` | 10 s | `flow_protocol.cpp` |
+| `Frame::buffer_overhead` (`h`) | 128 | [`lnk_channel.h`](../protocol/inc/lnk_channel.h) |
+| 标准同步池最大必需池化块 | 65,536 B；并非最大允许分配长度 | `flow_protocol.cpp` |
+| `udp_send_queue_capacity` | 100 | [`lnk_channel.cpp`](../protocol/src/lnk_channel.cpp) |
+| `reserved_control_frames` | 4 | `lnk_channel.cpp` |
+| `control_queue_capacity` | 4096 | `lnk_channel.cpp` |
+| `max_pending_accepts` | 100 | `lnk_channel.cpp` |
+| `link_setup_timeout` | 10 s | `lnk_channel.cpp` |
+| `heartbeat_interval` / `heartbeat_timeout` | 5 s / 20 s | `lnk_channel.cpp` |
+| `frame_read_timeout` | 20 s | `lnk_channel.cpp` |
+| 事件队列容量 | 4096 | `flow_protocol.cpp` |
+| `TLSChannelConfig::max_queued_messages` | 100 | [`tls_channel.h`](../protocol/inc/tls_channel.h) |
+| `WireMessage::max_payload_length` | 64 KiB | [`message.h`](../protocol/inc/message.h) |
+| `WireMessage::max_message_length` | 16 MiB | `message.h` |
+| `LnkFrameHeader` | 32 B，`maximum_payload` 65,467 | `message.h` |
+| `DatagramHeader` | 8 B，`maximum_user_payload` 65,499 | `message.h` |
+| `NodeLinkMgr::max_flow_nodes` | 8 | [`nodelink_mgr.h`](../node/inc/nodelink_mgr.h) |
+| 表容量 | 1000（Link/Flow/remote Flow） | `nodelink_mgr.cpp`、`nodelink_req.cpp` |
+| Agent `relays_` 上限 | 1000 | [`forwarder.cpp`](../agent/src/forwarder.cpp) |
+| Node/Agent 线程数 | 5 / 3 | `node/src/main.cpp`、`agent/src/main.cpp` |
+
+### D.1 对象大小与容量推导
+
+`sizeof` 测量（不需要链接业务库）：
+
+```console
+cat > /tmp/sizes.cpp <<'EOF'
+#include "flow_protocol.h"
+#include "tls_channel.h"
+#include <cstdio>
+int main() {
+    std::printf("Frame=%zu PooledBuffer=%zu FlowState=%zu FlowStream=%zu FlowDatagram=%zu\n",
+                sizeof(lnk::Frame), sizeof(lnk::PooledBuffer), sizeof(lnk::FlowState),
+                sizeof(lnk::FlowStream), sizeof(lnk::FlowDatagram));
+    std::printf("NodeLink=%zu LnkChannel=%zu FlowProtocol=%zu LnkFrameHeader=%zu\n",
+                sizeof(lnk::NodeLink), sizeof(LnkChannel), sizeof(FlowProtocol), sizeof(LnkFrameHeader));
+    std::printf("TLSChannel=%zu CtrlMessage=%zu\n", sizeof(TLSChannel), sizeof(CtrlMessage));
+    return 0;
+}
+EOF
+g++ -std=c++20 -Iprotocol/inc -Ivendor/asio-1.38.2/include \
+    -Ivendor/json-3.12.0/include /tmp/sizes.cpp -o /tmp/sizes -pthread -lssl -lcrypto
+/tmp/sizes
+```
+
+推导值的计算方式：
+
+```text
+TCP Flow 双向逻辑窗口 = 2 × (327,680 + 128) = 655,616
+UDP Flow 双向队列模型 = 2 × 16 × (65,536 + 128) = 2,101,248
+Flow 数量准入 = flows_.size() + retired_.size() < 1000
+端点队列深度  = 327,680 / 128 + 1            = 2561
+单节点 TCP 固定数组合计 = 2 × (2 × 32,768) + 2 × 32,768 = 196,608
+单节点 TLS 固定数组合计 = 2 × (2 × 65,467) + 2 × 65,467 = 392,802
+多节点 TCP 固定数组合计 = 2 × (2 × 32,768) + 2 × 65,467 = 262,006
+UDP 逐业务固定数组合计 = 65,508 + (65,500 + 65,508) = 196,516
+```
+
+上述固定数组合计不含共享 listener、池载荷和其他对象，不代表 RSS。
+修改结构布局或常量后，应重新执行本节测量与推导，并同步 5.6、6.7、6.8 和本附录。

@@ -47,9 +47,9 @@ bool ControlRouterSingle::matches(const ControlSessionPtr &session, const njson 
            (request && consumer_.lock() == session && params_.at("request_id") == *request);
 }
 
-bool ControlRouterSingle::handle(const ControlSessionPtr &session, const CtrlMessage &message)
+bool ControlRouterSingle::handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
 {
-    if (message.type() == CtrlCommand::RelayOpen)
+    if (command == CtrlCommand::RelayOpen)
     {
         return false;
     }
@@ -58,13 +58,12 @@ bool ControlRouterSingle::handle(const ControlSessionPtr &session, const CtrlMes
     {
         return false;
     }
-    if (message.type() == CtrlCommand::RelayReject && (ready_ || producer_.lock() != session))
+    if (command == CtrlCommand::RelayReject && (ready_ || producer_.lock() != session))
     {
         return true;
     }
-    cancel("control", config::optional_string(params, "reason",
-                                              message.type() == CtrlCommand::RelayReject ? "producer rejected relay"
-                                                                                         : "relay cancelled"));
+    const auto fallback = command == CtrlCommand::RelayReject ? "producer rejected relay" : "relay cancelled";
+    cancel("control", config::optional_string(params, "reason", fallback));
     return true;
 }
 
@@ -110,7 +109,6 @@ void ControlRouterSingle::ready_agents() const
     {
         consumer->send(CtrlMessage(CtrlCommand::RelayReady, values));
     }
-    // One frame reaches both roles when they share this Agent control connection.
     if (auto session = producer_.lock(); session && session != consumer)
     {
         session->send(CtrlMessage(CtrlCommand::RelayReady, values));
@@ -120,7 +118,6 @@ void ControlRouterSingle::ready_agents() const
 void ControlRouterSingle::close_agents() const
 {
     const auto protocol = relay_.protocol();
-    // Stream EOF is carried by data sockets; UDP requires an explicit lifetime notification.
     if (ready_ && protocol != RelayProtocol::Udp)
         return;
     njson values{{"request_id", params_.at("request_id")},
@@ -146,7 +143,6 @@ asio::awaitable<void> ControlRouterSingle::run()
             throw asio::system_error(asio::error::operation_aborted);
         }
         co_await relay_.install();
-        // Control-session owners request stop before releasing their sessions.
         if (stop_requested_)
         {
             throw asio::system_error(asio::error::operation_aborted);
@@ -162,7 +158,6 @@ asio::awaitable<void> ControlRouterSingle::run()
             {
                 throw asio::system_error(asio::error::operation_aborted);
             }
-            // co_await observes cancellation before starting the binding task.
             co_await relay_.bind(std::string(consumer->peer()));
         }
         co_await relay_.activate();

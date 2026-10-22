@@ -71,6 +71,11 @@ static constexpr std::pair<CtrlCommand, std::string_view> ctrl_commands[] = {
     {CtrlCommand::RelayCancel, "relay.cancel"},
     {CtrlCommand::RelayClosed, "relay.closed"},
     {CtrlCommand::RelayError, "relay.error"},
+    {CtrlCommand::RelayPeerOpen, "relay.peer.open"},
+    {CtrlCommand::RelayPeerAttached, "relay.peer.attached"},
+    {CtrlCommand::RelayPeerReady, "relay.peer.ready"},
+    {CtrlCommand::RelayPeerFinished, "relay.peer.finished"},
+    {CtrlCommand::RelayPeerClose, "relay.peer.close"},
     {CtrlCommand::LinkPrepare, "link.prepare"},
     {CtrlCommand::LinkPrepared, "link.prepared"},
     {CtrlCommand::LinkConnect, "link.connect"},
@@ -87,10 +92,27 @@ static constexpr std::pair<CtrlCommand, std::string_view> ctrl_commands[] = {
     {CtrlCommand::FlowError, "flow.error"},
     {CtrlCommand::FlowClose, "flow.close"},
     {CtrlCommand::FlowClosed, "flow.closed"},
+    {CtrlCommand::FlowOpen, "flow.open"},
+    {CtrlCommand::FlowOpened, "flow.opened"},
+    {CtrlCommand::FlowCloseRequest, "flow.close.request"},
     {CtrlCommand::ClusterJoin, "cluster.join"},
     {CtrlCommand::ClusterJoined, "cluster.joined"},
     {CtrlCommand::ClusterError, "cluster.error"},
 };
+
+static_assert([] {
+    for (std::size_t i = 0; i < std::size(ctrl_commands); ++i)
+    {
+        for (std::size_t j = i + 1; j < std::size(ctrl_commands); ++j)
+        {
+            if (ctrl_commands[i].first == ctrl_commands[j].first || ctrl_commands[i].second == ctrl_commands[j].second)
+            {
+                return false;
+            }
+        }
+    }
+    return true;
+}(), "Control command values and wire names must be unique");
 
 std::string_view ctrl_command_name(CtrlCommand command) noexcept
 {

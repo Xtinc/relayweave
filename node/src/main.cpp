@@ -72,7 +72,6 @@ int main(int argc, char *argv[])
         std::exception_ptr failure;
         bool stopped = false;
         {
-            // Startup failure also needs live executors to drain already-published tasks.
             auto control_work = asio::make_work_guard(control_io);
             auto tcp_work = asio::make_work_guard(transfer_tcp_io);
             auto udp_work = asio::make_work_guard(transfer_udp_io);
@@ -110,7 +109,6 @@ int main(int argc, char *argv[])
             {
                 failure = std::current_exception();
             }
-            // Stop outside the signal callback, and join all workers even when stop reports an error.
             try
             {
                 stopped = node->stop();

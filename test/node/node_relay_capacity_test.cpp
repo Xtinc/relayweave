@@ -8,6 +8,7 @@
 TEST_MEMBER(RelayNode, start_relay)
 TEST_MEMBER(RelayNode, relay_sessions_)
 TEST_MEMBER(RelayNode, stop_relays)
+TEST_MEMBER(RelayNode, handle_relay_peer)
 
 using namespace std::chrono_literals;
 
@@ -21,6 +22,23 @@ static void require_capacity(bool value, const char *reason)
 static void verify_session_events(RelayNode &node, const ControlSessionPtr &consumer,
                                   const ControlSessionPtr &producer, const ControlSessionPtr &unrelated)
 {
+    for (const auto *field : {"epoch", "flow_id"})
+    {
+        njson invalid{{"epoch", 17U}, {"flow_id", 39U}, {"source", "peer"}};
+        invalid.erase(field);
+        bool rejected = false;
+        try
+        {
+            test_access::RelayNode_handle_relay_peer(node, CtrlCommand::RelayPeerOpen,
+                                                     CtrlMessage(CtrlCommand::RelayPeerOpen, invalid));
+        }
+        catch (const std::invalid_argument &error)
+        {
+            rejected = error.what() == std::string(field) + " is required";
+        }
+        require_capacity(rejected, "Invalid peer identity lost its original error while constructing a reply");
+    }
+
     const njson params{{"request_id", 7U}, {"service", "events"}, {"protocol", "tcp"},
                        {"epoch", 17U}, {"path", {"test-master", "peer"}}};
     NodeSession ingress(node, consumer, params, true);
@@ -32,9 +50,11 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
     ingress.cancellation_slot().assign([&](asio::cancellation_type) { ++ingress_cancelled; });
     single.cancellation_slot().assign([&](asio::cancellation_type) { ++single_cancelled; });
     const CtrlMessage open(CtrlCommand::RelayOpen, params);
-    require_capacity(ingress.handle(consumer, open) && ingress.handle(consumer, open),
+    require_capacity(ingress.handle(CtrlCommand::RelayOpen, consumer, open) &&
+                         ingress.handle(CtrlCommand::RelayOpen, consumer, open),
                      "Opening duplicate was not consumed before endpoint installation");
-    require_capacity(!ingress.handle(unrelated, open) && !single.handle(consumer, open),
+    require_capacity(!ingress.handle(CtrlCommand::RelayOpen, unrelated, open) &&
+                         !single.handle(CtrlCommand::RelayOpen, consumer, open),
                      "Opening request crossed session ownership or changed Single creation semantics");
     require_capacity(ingress_cancelled == 0 && single_cancelled == 0,
                      "Opening duplicate cancelled a business instance");
@@ -56,7 +76,7 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
         bool rejected = false;
         try
         {
-            ingress.handle(consumer, CtrlMessage(CtrlCommand::RelayOpen, conflict));
+            ingress.handle(CtrlCommand::RelayOpen, consumer, CtrlMessage(CtrlCommand::RelayOpen, conflict));
         }
         catch (const std::invalid_argument &error)
         {
@@ -104,13 +124,16 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
         {
             wrong[field] = wrong.at(field).get<unsigned>() - 1U;
         }
-        require_capacity(!egress.handle_peer(CtrlMessage("relay.peer.close", wrong)) && egress_cancelled == 0,
+        require_capacity(!egress.handle_peer(CtrlCommand::RelayPeerClose, CtrlMessage(CtrlCommand::RelayPeerClose, wrong)) &&
+                             egress_cancelled == 0,
                          "Unmatched peer message cancelled an unrelated instance");
     }
-    require_capacity(!single.handle_peer(CtrlMessage("relay.peer.close", identity)), "Single consumed a peer message");
-    require_capacity(egress.handle_peer(CtrlMessage("relay.peer.close", identity)) && egress_cancelled == 1,
+    const CtrlMessage close(CtrlCommand::RelayPeerClose, identity);
+    require_capacity(!single.handle_peer(CtrlCommand::RelayPeerClose, close), "Single consumed a peer message");
+    require_capacity(egress.handle_peer(CtrlCommand::RelayPeerClose, close) && egress_cancelled == 1,
                      "Authenticated matching peer close did not cancel its instance");
-    require_capacity(egress.handle_peer(CtrlMessage("relay.peer.open", identity)) && egress_cancelled == 1,
+    require_capacity(egress.handle_peer(CtrlCommand::RelayPeerOpen, CtrlMessage(CtrlCommand::RelayPeerOpen, identity)) &&
+                         egress_cancelled == 1,
                      "Closing instance released its peer identity before draining");
 }
 

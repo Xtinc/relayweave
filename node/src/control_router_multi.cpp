@@ -28,11 +28,11 @@ ControlRouterMulti::ControlRouterMulti(NodeSession &relay, const ControlSessionP
     }
 }
 
-void ControlRouterMulti::send_peer(std::string command, njson params) const
+void ControlRouterMulti::send_peer(CtrlCommand command, njson params) const
 {
     params["epoch"] = epoch_;
     params["flow_id"] = flow_id_;
-    relay_.node_.cluster_mgr_->send(peer_, CtrlMessage(std::move(command), std::move(params)));
+    relay_.node_.cluster_mgr_->send(peer_, CtrlMessage(command, std::move(params)));
 }
 
 std::optional<njson> ControlRouterMulti::status_report() const
@@ -102,7 +102,6 @@ void ControlRouterMulti::close_agent() const
         {
             values["flow_id"] = flow_id_;
         }
-        // Flow establishment can fail before install() creates an endpoint.
         if (!relay_.endpoint_.empty())
         {
             values.update(relay_.endpoint_);
@@ -146,10 +145,10 @@ bool ControlRouterMulti::matches(const ControlSessionPtr &session, const njson &
            (uuid && !relay_.endpoint_.empty() && relay_.endpoint_.at("uuid") == *uuid);
 }
 
-bool ControlRouterMulti::handle(const ControlSessionPtr &session, const CtrlMessage &message)
+bool ControlRouterMulti::handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
 {
     const auto &params = *message.params;
-    const bool opening = message.type() == CtrlCommand::RelayOpen;
+    const bool opening = command == CtrlCommand::RelayOpen;
     if (opening && !ingress_)
     {
         return false;
@@ -175,15 +174,13 @@ bool ControlRouterMulti::handle(const ControlSessionPtr &session, const CtrlMess
         return true;
     }
 
-    if (message.type() == CtrlCommand::RelayReject && (ingress_ || progress_ == Progress::Ready))
+    if (command == CtrlCommand::RelayReject && (ingress_ || progress_ == Progress::Ready))
     {
         return true;
     }
 
-    cancel(progress_ == Progress::Ready ? "transfer" : "attach",
-           config::optional_string(params, "reason",
-                                   message.type() == CtrlCommand::RelayReject ? "producer rejected relay"
-                                                                              : "relay cancelled"));
+    const auto fallback = command == CtrlCommand::RelayReject ? "producer rejected relay" : "relay cancelled";
+    cancel(progress_ == Progress::Ready ? "transfer" : "attach", config::optional_string(params, "reason", fallback));
     return true;
 }
 
@@ -203,28 +200,27 @@ void ControlRouterMulti::invalidate(std::uint64_t epoch, std::string reason)
     }
 }
 
-bool ControlRouterMulti::handle_peer(const CtrlMessage &message)
+bool ControlRouterMulti::handle_peer(CtrlCommand command, const CtrlMessage &message)
 {
     const auto &params = *message.params;
     if (params.at("epoch") != epoch_ || params.at("flow_id") != flow_id_ || params.at("source") != peer_)
     {
         return false;
     }
-    // A matching closing instance still owns this identity until its task drains.
     if (stop_requested_)
     {
         return true;
     }
 
-    if ((message.command == "relay.peer.attached" && ingress_) || (message.command == "relay.peer.ready" && !ingress_))
+    if ((command == CtrlCommand::RelayPeerAttached && ingress_) || (command == CtrlCommand::RelayPeerReady && !ingress_))
     {
         peer_prepared_ = true;
     }
-    else if (message.command == "relay.peer.finished")
+    else if (command == CtrlCommand::RelayPeerFinished)
     {
         peer_finished_ = true;
     }
-    else if (message.command == "relay.peer.close")
+    else if (command == CtrlCommand::RelayPeerClose)
     {
         cancel(params.value("stage", "control"), params.value("reason", "peer closed"), true);
         return true;
@@ -246,7 +242,6 @@ asio::awaitable<void> ControlRouterMulti::watch_flow()
         reason_ = reason;
         stop_requested_ = true;
     }
-    // Completion makes wait_for_one() cancel and drain the transfer task.
     co_return;
 }
 
@@ -283,11 +278,10 @@ asio::awaitable<void> ControlRouterMulti::run()
             }
             const auto session = session_.lock();
             progress_ = Progress::PeerOpened;
-            send_peer("relay.peer.open", njson{{"service", params_.at("service")},
-                                               {"protocol", params_.at("protocol")},
-                                               {"accessor", std::string(session->peer())}});
+            send_peer(CtrlCommand::RelayPeerOpen, njson{{"service", params_.at("service")},
+                                                       {"protocol", params_.at("protocol")},
+                                                       {"accessor", std::string(session->peer())}});
         }
-        // The watcher is a child of this instance, cancelled and drained when either task finishes.
         const auto [order, transfer_error, flow_error] =
             co_await asio::experimental::make_parallel_group(
                 asio::co_spawn(node.control_executor_, establish_and_transfer(), asio::deferred),
@@ -313,7 +307,6 @@ asio::awaitable<void> ControlRouterMulti::run()
         }
     }
 
-    // Cancellation can end the business task, but resource cleanup must still finish.
     co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     stop_requested_ = true;
     if (progress_ == Progress::Ready)
@@ -326,7 +319,7 @@ asio::awaitable<void> ControlRouterMulti::run()
     close_agent();
     if (progress_ >= Progress::PeerOpened && !from_peer_)
     {
-        send_peer("relay.peer.close", njson{{"stage", stage_}, {"reason", reason_}});
+        send_peer(CtrlCommand::RelayPeerClose, njson{{"stage", stage_}, {"reason", reason_}});
     }
     co_await relay_.close();
     if (ingress_ && flow_id_)
@@ -365,9 +358,8 @@ asio::awaitable<void> ControlRouterMulti::establish_and_transfer()
     }
     if (!ingress_)
     {
-        send_peer("relay.peer.attached", njson::object());
+        send_peer(CtrlCommand::RelayPeerAttached, njson::object());
     }
-    // Ingress waits for the tail's binding; egress waits for the head's activation.
     while (!peer_prepared_ && !stop_requested_)
     {
         changed_.expires_at(deadline_);
@@ -388,13 +380,12 @@ asio::awaitable<void> ControlRouterMulti::establish_and_transfer()
     }
     if (ingress_)
     {
-        send_peer("relay.peer.ready", njson::object());
+        send_peer(CtrlCommand::RelayPeerReady, njson::object());
     }
     ready_agent();
     stage_ = "transfer";
     co_await relay_.bridge();
-    // Both FIN directions must reach both endpoints before the ingress closes the Flow.
-    send_peer("relay.peer.finished", njson::object());
+    send_peer(CtrlCommand::RelayPeerFinished, njson::object());
     while (!peer_finished_ && !stop_requested_)
     {
         changed_.expires_at(Clock::time_point::max());

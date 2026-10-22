@@ -66,16 +66,16 @@ void NodeSession::invalidate(std::uint64_t epoch, std::string reason)
     }
 }
 
-bool NodeSession::handle(const ControlSessionPtr &session, const CtrlMessage &message)
+bool NodeSession::handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
 {
-    return std::visit([&](auto &controller) { return controller.handle(session, message); }, control_);
+    return std::visit([&](auto &controller) { return controller.handle(command, session, message); }, control_);
 }
 
-bool NodeSession::handle_peer(const CtrlMessage &message)
+bool NodeSession::handle_peer(CtrlCommand command, const CtrlMessage &message)
 {
     if (auto *controller = std::get_if<ControlRouterMulti>(&control_))
     {
-        return controller->handle_peer(message);
+        return controller->handle_peer(command, message);
     }
     return false;
 }
@@ -138,7 +138,6 @@ asio::awaitable<bool> NodeSession::wait_attach(std::chrono::steady_clock::time_p
 asio::awaitable<void> NodeSession::bind(std::string accessor, std::uint64_t epoch, std::uint64_t flow_id)
 {
     auto *channel = std::holds_alternative<ControlRouterMulti>(control_) ? &node_.nodelink_mgr_->protocol() : nullptr;
-    // Copy immutable binding values before crossing to the owning data executor.
     return std::visit(
         [&](auto *manager) -> asio::awaitable<void> {
             if (channel)

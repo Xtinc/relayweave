@@ -103,7 +103,7 @@ void validate_snapshot_link(const njson &link, std::string_view location)
     static_cast<void>(optional_age(link, "age_ms", location));
     static_cast<void>(parse_quality(link.at("quality")));
 }
-} // namespace
+}
 
 void Topology::validate_snapshot(const njson &params, std::string_view location)
 {

@@ -4,8 +4,8 @@
 `protocol/src/xfr_channel.cpp` 和 `protocol/src/tls_channel.cpp` 的既有风格。
 
 设计、配置、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)，测试分组与运行入口见 [测试目录](test/README.md)；
-Node 间与 Node-Agent 链路的执行域、内存分配和协程现状见
-[中继链路内存与协程盘点](docs/中继链路内存与协程盘点.md)。
+Node 间与 Node-Agent 链路的执行域、内存分配和协程现状统一见
+[设计文档的运行时架构](docs/RelayWeave设计.md#6-运行时架构与系统保障)，性能复核见该文档附录 C。
 RelayNode 直接持有 node/nodelink_mgr，统一协调 NodeLink 建连与 NodeFlow 路径事务，层次与 Pipeline/DatagramMgr 一致。
 NodeLinkMgr 直接持有 protocol/FlowProtocol；协议服务持有 lnk_channel 的邻接 TCP/UDP 传输并统一管理 Flow。
 部件通过 FlowStream/FlowDatagram 收发，层次与接口见 [设计文档中的协议边界](docs/RelayWeave设计.md#51-flowprotocol端点与本地逻辑流状态)。
@@ -32,6 +32,14 @@ TCP 共享发送队列按流标签交错插入，算法、接口与实现比较�
 
 ## C++ / Asio 编码约束
 
+- 类与结构体说明、对外接口统一使用 Doxygen 风格的英文注释（`/** ... */`），以 `@brief` 概括职责或行为。
+  类说明应交代所有权、依赖生命周期和执行域；有参数的对外接口必须逐个使用 `@param` 说明参数含义、单位、有效范围或所有权，
+  有返回值的对外接口必须使用 `@return` 说明结果含义及失败或空值情况，协程说明等待完成后的结果。
+  私有接口及实现内部类的接口可使用简短的 `@brief`，无需逐项列出参数和返回值；保留必要的执行域、生命周期与取消约束。
+  按需使用 `@pre`、`@throws` 说明调用前提、异常、取消与排空语义，模板参数使用 `@tparam`；不逐字段或逐语句复述代码。
+  注释集中在声明处，实现在 `.cpp` 内的局部类也遵循同一规则；覆盖的接口可使用 `@copydoc` 复用基类契约。
+  移除零散的行内、语句旁及分段说明注释；必要的设计原因和执行器约束归入对应类或接口的 Doxygen 注释，
+  跨模块流程、容量推导和历史验证记录归入 `docs/RelayWeave设计.md`，避免多处维护同一说明。
 - 每条普通变量声明只声明一个变量，并独占一行，适用于局部变量、成员变量和全局变量。
   即使类型相同，也不得使用逗号连写，例如 `bool left_ready = false, right_ready = false;` 应拆成两行独立声明。
 - 头文件避免重复包含应使用防卫式声明，不使用 `#pragma once`。

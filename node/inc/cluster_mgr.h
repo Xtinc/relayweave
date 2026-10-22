@@ -9,6 +9,7 @@ class ClusterRoom;
 
 inline constexpr std::string_view cluster_broadcast_target = "all";
 
+/** @brief Configure the Node role, identity, master control endpoint, and local NodeLink ports. */
 struct ClusterConfig
 {
     enum class Role
@@ -26,19 +27,46 @@ struct ClusterConfig
     std::string advertise_address;
 };
 
+/**
+ * @brief Own cluster control transport and route authenticated messages on control_io.
+ * @details A master hosts a participant room; a slave reconnects through a Connector.
+ * The RelayNode and TLS context are borrowed and must outlive all owned tasks.
+ */
 class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
 {
     using tcp = asio::ip::tcp;
     using message_channel = asio::experimental::channel<void(asio::error_code, CtrlMessage)>;
 
   public:
+    /**
+     * @brief Construct cluster control resources without starting the master or slave loop.
+     * @param server Owning RelayNode receiving validated cluster messages.
+     * @param executor Single-threaded control executor owning cluster sockets and member routing.
+     * @param context TLS context borrowed for the lifetime of the connection resources.
+     * @param config Local master/slave role, Node identity, control endpoint, and advertised address.
+     * @param channel TLS handshake, heartbeat, and bounded-message-queue settings.
+     * @param max_connections Maximum remote cluster sessions accepted by the master.
+     */
     ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::ssl::context &context, ClusterConfig config,
                TLSChannelConfig channel, std::size_t max_connections);
 
+    /** @brief Start once during bootstrap or on control_io; the owner must retain this manager until drainage. */
     void start();
-    // A normal return always means the loop and member sessions have drained.
+    /**
+     * @brief Cancel and drain the control loop and member sessions on control_io.
+     * @return False for handled shutdown errors; every normal return guarantees tasks have drained.
+     */
     asio::awaitable<bool> async_stop();
+    /**
+     * @brief Queue a unicast on control_io; delivery is not acknowledged by this call.
+     * @param target Destination Node identity, or the reserved broadcast target where supported.
+     * @param message Control message to dispatch; ownership of its parameters may be transferred.
+     */
     void send(std::string target, CtrlMessage message);
+    /**
+     * @brief Queue delivery to all joined participants, including the local master, on control_io.
+     * @param message Control message to dispatch; ownership of its parameters may be transferred.
+     */
     void broadcast(CtrlMessage message);
 
   private:
@@ -68,4 +96,4 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
     bool stop_ok_ = true;
 };
 
-#endif // CLUSTER_MGR_H
+#endif

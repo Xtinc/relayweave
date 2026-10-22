@@ -68,34 +68,29 @@ void RelayNode::start()
         throw std::logic_error("RelayWeave Node can only be started once");
     }
 
-    try
-    {
-        const tcp::endpoint endpoint(asio::ip::make_address(config_.control.address), config_.control.port);
-        control_acceptor_.open(endpoint.protocol());
-        control_acceptor_.set_option(asio::socket_base::reuse_address(true));
-        control_acceptor_.bind(endpoint);
-        control_acceptor_.listen();
-        tcp_pipeline_->start();
-        tls_pipeline_->start();
-        datagram_mgr_->start();
-        nodelink_mgr_->start();
-        metrics_->start(nodelink_mgr_->protocol(), std::chrono::steady_clock::now());
-        cluster_mgr_->start();
-        topology_->start();
-        nodelink_mgr_->activate();
-        state_.store(State::Running);
-        asio::co_spawn(
-            control_executor_, [self = shared_from_this()] { return self->control_accept_loop(); }, asio::detached);
-        metrics_->activate();
-    }
-    catch (...)
-    {
-        // The caller keeps the executors running and uses stop() to drain any published tasks.
+    ScopeGuard rollback([this]() noexcept {
         state_.store(State::Stopping);
         asio::error_code ignored;
         control_acceptor_.close(ignored);
-        throw;
-    }
+    });
+    const tcp::endpoint endpoint(asio::ip::make_address(config_.control.address), config_.control.port);
+    control_acceptor_.open(endpoint.protocol());
+    control_acceptor_.set_option(asio::socket_base::reuse_address(true));
+    control_acceptor_.bind(endpoint);
+    control_acceptor_.listen();
+    tcp_pipeline_->start();
+    tls_pipeline_->start();
+    datagram_mgr_->start();
+    nodelink_mgr_->start();
+    metrics_->start(nodelink_mgr_->protocol(), std::chrono::steady_clock::now());
+    cluster_mgr_->start();
+    topology_->start();
+    nodelink_mgr_->activate();
+    state_.store(State::Running);
+    asio::co_spawn(
+        control_executor_, [self = shared_from_this()] { return self->control_accept_loop(); }, asio::detached);
+    metrics_->activate();
+    rollback.dismiss();
 
     PROXY_INFO_PRINT("Node listening control=%s:%u tcp=%s:%u tls=%s:%u udp=%s:%u", config_.control.address.c_str(),
                      static_cast<unsigned int>(config_.control.port), config_.tcp.address.c_str(),
@@ -106,14 +101,6 @@ void RelayNode::start()
 
 bool RelayNode::stop()
 {
-    if (control_executor_.running_in_this_thread() || transfer_tcp_executor_.running_in_this_thread() ||
-        transfer_udp_executor_.running_in_this_thread() || cluster_data_executor_.running_in_this_thread())
-    {
-        throw std::logic_error("Synchronous server stop must be called outside the server executors");
-    }
-
-    // Only external stop callers take this lock; executor tasks never acquire it.
-    std::lock_guard lock(stop_mutex_);
     const auto state = state_.load();
     if (state == State::Stopped)
     {
@@ -121,7 +108,6 @@ bool RelayNode::stop()
     }
     if (state != State::Created)
     {
-        // A submission or drain failure leaves Stopping; the next caller can retry.
         state_.store(State::Stopping);
         auto self = shared_from_this();
         const bool control_ok = asio::co_spawn(control_executor_, stop_control(), asio::use_future).get();
@@ -176,19 +162,15 @@ asio::awaitable<void> RelayNode::control_accept_loop()
     {
         auto [error, socket] = co_await control_acceptor_.async_accept(use_nothrow_awaitable);
         const auto state = state_.load();
+        if (state != State::Running || error == asio::error::operation_aborted)
+        {
+            co_return;
+        }
         if (error)
         {
-            if (state != State::Running || error == asio::error::operation_aborted)
-            {
-                co_return;
-            }
             PROXY_ERROR_PRINT("Control accept failed reason=%s category=%s", error.message().c_str(),
                               error.category().name());
             continue;
-        }
-        if (state != State::Running)
-        {
-            co_return;
         }
         if (registry_.full())
         {
@@ -270,24 +252,40 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
     }
     registry_.remove(id);
     co_await session->async_disconnect();
-    if (connected)
-    {
-        PROXY_INFO_PRINT("Control [x] session_id=%llu peer=%.*s reason=%s", static_cast<unsigned long long>(id),
-                         static_cast<int>(session->peer().size()), session->peer().data(),
-                         state_.load() != State::Running ? "node stopping"
-                         : failure.empty()               ? "channel closed"
-                                                         : "error");
-    }
     if (!failure.empty() && state_.load() == State::Running)
     {
         PROXY_ERROR_PRINT("Control failed session_id=%llu peer=%.*s reason=%s", static_cast<unsigned long long>(id),
                           static_cast<int>(session->peer().size()), session->peer().data(), failure.c_str());
     }
+    else if (connected)
+    {
+        PROXY_INFO_PRINT("Control [x] session_id=%llu peer=%.*s reason=%s", static_cast<unsigned long long>(id),
+                         static_cast<int>(session->peer().size()), session->peer().data(),
+                         state_.load() != State::Running ? "node stopping" : "channel closed");
+    }
 }
 
-void RelayNode::handle_cluster_message(CtrlMessage message)
+void RelayNode::handle_cluster_message(CtrlCommand command, CtrlMessage message)
 {
-    switch (message.type())
+    const auto group = ctrl_command_group(command);
+    if (group == CtrlCommand::Link || group == CtrlCommand::Flow)
+    {
+        if (state_.load() == State::Running || command != CtrlCommand::FlowOpen)
+        {
+            nodelink_mgr_->handle(command, std::move(message));
+        }
+        return;
+    }
+    if (ctrl_command_subgroup(command) == CtrlCommand::RelayPeer)
+    {
+        if (state_.load() == State::Running)
+        {
+            handle_relay_peer(command, message);
+        }
+        return;
+    }
+
+    switch (command)
     {
     case CtrlCommand::TopologyMembers:
         topology_->update_members(config::message_params(message));
@@ -296,38 +294,20 @@ void RelayNode::handle_cluster_message(CtrlMessage message)
             nodelink_mgr_->members_changed();
             invalidate_relays();
         }
-        return;
+        break;
     case CtrlCommand::TopologyReport:
         topology_->update_report(config::message_params(message));
-        return;
+        break;
     case CtrlCommand::ClusterError:
         nodelink_mgr_->control_failed(config::message_params(message).value("reason", "cluster control failed"));
         invalidate_relays("cluster control failed");
-        return;
+        break;
     default:
+        control_->handle_cluster(command, std::move(message));
         break;
     }
-    if (message.command.starts_with("link.") || message.command.starts_with("flow."))
-    {
-        // Drain existing acknowledgements while relay cleanup is running; reject new remote opens during stop.
-        if (state_.load() == State::Running || message.command != "flow.open")
-        {
-            nodelink_mgr_->handle(std::move(message));
-        }
-        return;
-    }
-    if (message.command.starts_with("relay.peer."))
-    {
-        if (state_.load() == State::Running)
-        {
-            handle_relay_peer(message);
-        }
-        return;
-    }
-    control_->handle_cluster(std::move(message));
 }
 
-// Public Node control state and queries require control_io.
 void RelayNode::handle_control_message(SessionId id, const ControlSessionPtr &session, const CtrlMessage &message)
 {
     const auto &params = config::message_params(message);
@@ -337,7 +317,7 @@ void RelayNode::handle_control_message(SessionId id, const ControlSessionPtr &se
     case CtrlCommand::RelayOpen:
     case CtrlCommand::RelayReject:
     case CtrlCommand::RelayCancel:
-        handle_relay(session, message);
+        handle_relay(command, session, message);
         return;
     default:
         if (!control_->handle_client(id, session, command, params))
@@ -379,12 +359,10 @@ void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
         throw std::runtime_error("relay capacity reached");
     }
     relay_sessions_.push_back(relay);
-    try
-    {
-        // This is the sole owned business task; its controller drains every child before returning.
-        asio::co_spawn(control_executor_, relay->run(),
-                       asio::bind_cancellation_slot(relay->cancellation_slot(), [self = shared_from_this(),
-                                                                                 relay](std::exception_ptr error) {
+    ScopeGuard rollback([this, &relay]() noexcept { std::erase(relay_sessions_, relay); });
+    asio::co_spawn(control_executor_, relay->run(),
+                   asio::bind_cancellation_slot(
+                       relay->cancellation_slot(), [self = shared_from_this(), relay](std::exception_ptr error) {
                            if (error)
                            {
                                PROXY_ERROR_PRINT("Relay task failed reason=%s", exception_description(error).c_str());
@@ -395,22 +373,17 @@ void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
                                self->relays_done_.cancel();
                            }
                        }));
-    }
-    catch (...)
-    {
-        std::erase(relay_sessions_, relay);
-        throw;
-    }
+    rollback.dismiss();
 }
 
-void RelayNode::handle_relay(const ControlSessionPtr &session, const CtrlMessage &message)
+void RelayNode::handle_relay(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
 {
     const auto &params = *message.params;
-    if (message.type() != CtrlCommand::RelayOpen)
+    if (command != CtrlCommand::RelayOpen)
     {
         for (const auto &relay : relay_sessions_)
         {
-            if (relay->handle(session, message))
+            if (relay->handle(command, session, message))
             {
                 return;
             }
@@ -436,7 +409,7 @@ void RelayNode::handle_relay(const ControlSessionPtr &session, const CtrlMessage
             }
             for (const auto &relay : relay_sessions_)
             {
-                if (relay->handle(session, message))
+                if (relay->handle(command, session, message))
                 {
                     return;
                 }
@@ -469,25 +442,25 @@ void RelayNode::handle_relay(const ControlSessionPtr &session, const CtrlMessage
     }
 }
 
-void RelayNode::handle_relay_peer(const CtrlMessage &message)
+void RelayNode::handle_relay_peer(CtrlCommand command, const CtrlMessage &message)
 {
     const auto &params = *message.params;
-    try
+    const auto epoch = config::require_unsigned(params, "epoch", true);
+    const auto id = config::require_unsigned(params, "flow_id", true);
+    const auto &source = params.at("source").get_ref<const std::string &>();
+    for (const auto &relay : relay_sessions_)
     {
-        const auto epoch = config::require_unsigned(params, "epoch", true);
-        const auto id = config::require_unsigned(params, "flow_id", true);
-        const auto &source = params.at("source").get_ref<const std::string &>();
-        for (const auto &relay : relay_sessions_)
-        {
-            if (relay->handle_peer(message))
-            {
-                return;
-            }
-        }
-        if (message.command != "relay.peer.open")
+        if (relay->handle_peer(command, message))
         {
             return;
         }
+    }
+    if (command != CtrlCommand::RelayPeerOpen)
+    {
+        return;
+    }
+    try
+    {
         const auto protocol = config::message_protocol(params);
         if (!nodelink_mgr_->egress_ready(epoch, id, source,
                                          protocol == RelayProtocol::Udp ? RelayProtocol::Udp : RelayProtocol::Tcp))
@@ -504,14 +477,9 @@ void RelayNode::handle_relay_peer(const CtrlMessage &message)
     catch (const std::exception &error)
     {
         PROXY_DEBUG_PRINT("Relay peer command=%s reason=%s", message.command.c_str(), error.what());
-        if (message.command == "relay.peer.open")
-        {
-            cluster_mgr_->send(params.at("source").get<std::string>(),
-                               CtrlMessage("relay.peer.close", njson{{"epoch", params.at("epoch")},
-                                                                     {"flow_id", params.at("flow_id")},
-                                                                     {"stage", "bind"},
-                                                                     {"reason", error.what()}}));
-        }
+        cluster_mgr_->send(
+            source, CtrlMessage(CtrlCommand::RelayPeerClose,
+                                njson{{"epoch", epoch}, {"flow_id", id}, {"stage", "bind"}, {"reason", error.what()}}));
     }
 }
 
