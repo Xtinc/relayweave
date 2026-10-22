@@ -104,13 +104,16 @@ class NodeSession
   private:
     friend class ControlRouterSingle;
     friend class ControlRouterMulti;
+    using Attachment = std::variant<std::monostate, AttachInfo, AttachPair>;
     /** @brief Install a local pair or remote endpoint on its transfer executor from control_io. */
     asio::awaitable<void> install(int role = RelayAttach::Consumer);
     /** @brief Await attachment on the transfer executor with the controller's absolute deadline. */
     asio::awaitable<bool> wait_attach(std::chrono::steady_clock::time_point deadline);
-    /** @brief Copy binding metadata across executors and bind a service or committed Flow endpoint. */
-    asio::awaitable<void> bind(std::string accessor, std::uint64_t epoch = 0, std::uint64_t flow_id = 0);
-    /** @brief Activate the installed resource on its owning transfer executor. */
+    /** @brief Bind and activate a Single local pair in one task on its transfer executor from control_io. */
+    asio::awaitable<void> bind_and_activate(std::string accessor);
+    /** @brief Copy binding metadata across executors and bind a committed Multi Flow endpoint. */
+    asio::awaitable<void> bind(std::string accessor, std::uint64_t epoch, std::uint64_t flow_id);
+    /** @brief Activate the Multi endpoint on its transfer executor after peer coordination. */
     asio::awaitable<void> activate();
     /** @brief Await the manager-owned transfer operation on its transfer executor. */
     asio::awaitable<void> bridge();
@@ -123,7 +126,7 @@ class NodeSession
     void select_data(RelayProtocol protocol);
     asio::any_io_executor data_executor() const;
     asio::cancellation_signal cancellation_;
-    njson endpoint_;
+    Attachment endpoint_;
     SRVTrafficPtr traffic_;
 };
 

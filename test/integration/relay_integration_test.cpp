@@ -240,6 +240,11 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
             "Producer and Consumer received different relay UUIDs");
     require(params_of(first_opened).at("ticket").get<uint64_t>() != params_of(first_offer).at("ticket").get<uint64_t>(),
             "Producer and Consumer received the same relay ticket");
+    for (const auto *message : {&first_opened, &first_offer})
+    {
+        require(!params_of(*message).contains("session_id") && !params_of(*message).contains("tls_framing"),
+                "TCP attachment contains fields from another transport");
+    }
 
     consumer->send(CtrlMessage{"server.traffic", njson{{"request_id", 310U}}});
     const auto pending_traffic = co_await receive_command(consumer, "server.traffic.reported");

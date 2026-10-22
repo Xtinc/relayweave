@@ -146,12 +146,11 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
     /**
      * @brief Reserve a relay ID and return attachment credentials for one multi-node Agent role.
      * @param role Local Agent role: RelayAttach::Producer or RelayAttach::Consumer.
-     * @return Attachment descriptor with uuid, ticket, and data_port; UDP also includes session_id and TLS
-     * includes tls_framing.
+     * @return Agent attachment information with uuid, ticket, data_port, and a zero session_id.
      * @throws std::invalid_argument If role is not Producer or Consumer.
      * @throws std::runtime_error If the manager is stopped or its combined relay capacity is exhausted.
      */
-    njson install_remote_pair(int role);
+    AttachInfo install_remote_pair(int role);
     /**
      * @brief Await Agent attachment; return false if closure wakes the waiter before attachment.
      * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
@@ -196,7 +195,7 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
      * @return Producer and Consumer attachment descriptors sharing one uuid and using distinct tickets.
      * @throws std::runtime_error If the manager is stopped or its combined relay capacity is exhausted.
      */
-    njson install_local_pair();
+    AttachPair install_local_pair();
     /**
      * @brief Await both Agent roles; return false when closure wakes the waiter.
      * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.

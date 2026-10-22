@@ -49,7 +49,7 @@ void DatagramMgr::start()
     asio::co_spawn(executor_, [self = shared_from_this()] { return self->receive_datagram(); }, asio::detached);
 }
 
-njson DatagramMgr::install_remote_pair(int role)
+AttachInfo DatagramMgr::install_remote_pair(int role)
 {
     if (role != RelayAttach::Consumer && role != RelayAttach::Producer)
     {
@@ -68,8 +68,7 @@ njson DatagramMgr::install_remote_pair(int role)
     remote_pairs_.emplace(uuid, endpoint);
     bindings_.emplace(session, Binding{uuid, role == RelayAttach::Producer ? Side::Producer : Side::Consumer});
     rollback.dismiss();
-    return {
-        {"uuid", uuid}, {"ticket", endpoint->ticket}, {"session_id", session}, {"data_port", listen_endpoint_.port()}};
+    return {uuid, endpoint->ticket, listen_endpoint_.port(), session};
 }
 
 asio::awaitable<bool> DatagramMgr::wait_remote_pair(std::uint64_t uuid)
@@ -177,7 +176,7 @@ void DatagramMgr::close_remote_pair(std::uint64_t uuid)
     id_allocator_->release(uuid);
 }
 
-njson DatagramMgr::install_local_pair()
+AttachPair DatagramMgr::install_local_pair()
 {
     if (stopped_ || local_pairs_.size() + remote_pairs_.size() >= capacity_)
         throw std::runtime_error(stopped_ ? "server stopping" : "relay capacity reached");
@@ -197,16 +196,8 @@ njson DatagramMgr::install_local_pair()
     bindings_.emplace(pair->consumer_session_id, Binding{uuid, Side::Consumer});
     binding_rollback.dismiss();
     rollback.dismiss();
-    return {{"producer",
-             {{"uuid", uuid},
-              {"ticket", pair->producer_ticket},
-              {"session_id", pair->producer_session_id},
-              {"data_port", listen_endpoint_.port()}}},
-            {"consumer",
-             {{"uuid", uuid},
-              {"ticket", pair->consumer_ticket},
-              {"session_id", pair->consumer_session_id},
-              {"data_port", listen_endpoint_.port()}}}};
+    return {{uuid, pair->producer_ticket, listen_endpoint_.port(), pair->producer_session_id},
+            {uuid, pair->consumer_ticket, listen_endpoint_.port(), pair->consumer_session_id}};
 }
 
 asio::awaitable<bool> DatagramMgr::wait_local_pair(std::uint64_t uuid)

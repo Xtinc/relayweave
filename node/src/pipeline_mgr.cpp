@@ -152,7 +152,7 @@ template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::r
     }
 }
 
-template <typename Transport> njson StreamPipeline<Transport>::install_local_pair()
+template <typename Transport> AttachPair StreamPipeline<Transport>::install_local_pair()
 {
     if (stopped_ || local_pairs_.size() + remote_pairs_.size() >= capacity_)
     {
@@ -166,16 +166,7 @@ template <typename Transport> njson StreamPipeline<Transport>::install_local_pai
     while (pair->consumer_ticket == pair->producer_ticket);
     local_pairs_.emplace(uuid, pair);
     rollback.dismiss();
-    njson result{{"producer", {{"uuid", uuid}, {"ticket", pair->producer_ticket}, {"data_port", data_port_}}},
-                 {"consumer", {{"uuid", uuid}, {"ticket", pair->consumer_ticket}, {"data_port", data_port_}}}};
-    if constexpr (std::is_same_v<Transport, TlsTransport>)
-    {
-        for (auto &descriptor : result)
-        {
-            descriptor["tls_framing"] = std::string(tls_data_framing);
-        }
-    }
-    return result;
+    return {{uuid, pair->producer_ticket, data_port_}, {uuid, pair->consumer_ticket, data_port_}};
 }
 
 template <typename Transport> asio::awaitable<bool> StreamPipeline<Transport>::wait_local_pair(std::uint64_t uuid)
@@ -233,7 +224,7 @@ template <typename Transport> void StreamPipeline<Transport>::close_local_pair(s
     id_allocator_->release(uuid);
 }
 
-template <typename Transport> njson StreamPipeline<Transport>::install_remote_pair(int role)
+template <typename Transport> AttachInfo StreamPipeline<Transport>::install_remote_pair(int role)
 {
     if (role != RelayAttach::Consumer && role != RelayAttach::Producer)
     {
@@ -249,12 +240,7 @@ template <typename Transport> njson StreamPipeline<Transport>::install_remote_pa
     endpoint->ticket = generate_random_id();
     remote_pairs_.emplace(uuid, endpoint);
     rollback.dismiss();
-    njson result{{"uuid", uuid}, {"ticket", endpoint->ticket}, {"data_port", data_port_}};
-    if constexpr (std::is_same_v<Transport, TlsTransport>)
-    {
-        result["tls_framing"] = std::string(tls_data_framing);
-    }
-    return result;
+    return {uuid, endpoint->ticket, data_port_};
 }
 
 template <typename Transport> asio::awaitable<bool> StreamPipeline<Transport>::wait_remote_pair(std::uint64_t uuid)

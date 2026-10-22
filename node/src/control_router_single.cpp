@@ -86,11 +86,12 @@ void ControlRouterSingle::cancel(std::string, std::string reason)
 
 void ControlRouterSingle::notify_agents() const
 {
+    const auto &pair = std::get<AttachPair>(relay_.endpoint_);
     for (const auto producer : {false, true})
     {
         if (auto session = producer ? producer_.lock() : consumer_.lock())
         {
-            auto values = relay_.endpoint_.at(producer ? "producer" : "consumer");
+            auto values = (producer ? pair.producer : pair.consumer).to_params(relay_.protocol());
             values["service"] = params_.at("service");
             values["protocol"] = params_.at("protocol");
             if (!producer)
@@ -158,9 +159,8 @@ asio::awaitable<void> ControlRouterSingle::run()
             {
                 throw asio::system_error(asio::error::operation_aborted);
             }
-            co_await relay_.bind(std::string(consumer->peer()));
+            co_await relay_.bind_and_activate(std::string(consumer->peer()));
         }
-        co_await relay_.activate();
         if (stop_requested_ || Clock::now() >= deadline_)
         {
             throw asio::system_error(asio::error::operation_aborted);

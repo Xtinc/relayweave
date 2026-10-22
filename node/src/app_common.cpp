@@ -4,6 +4,20 @@
 #include <openssl/rand.h>
 #include <stdexcept>
 
+njson AttachInfo::to_params(RelayProtocol protocol) const
+{
+    njson params{{"uuid", uuid}, {"ticket", ticket}, {"data_port", data_port}};
+    if (protocol == RelayProtocol::Udp)
+    {
+        params["session_id"] = session_id;
+    }
+    else if (protocol == RelayProtocol::Tls)
+    {
+        params["tls_framing"] = std::string(tls_data_framing);
+    }
+    return params;
+}
+
 ServiceTraffic::ServiceTraffic() : last_sample_(Clock::now())
 {
 }

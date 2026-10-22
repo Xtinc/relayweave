@@ -19,6 +19,33 @@ struct TrafficLimitConfig
 };
 
 /**
+ * @brief Describe one Agent's data attachment without owning its runtime resources.
+ * @details Managers return this value to control_io. session_id is nonzero for UDP and zero for streams.
+ */
+struct AttachInfo
+{
+    /**
+     * @brief Encode attachment fields for an Agent control notification.
+     * @param protocol Agent-facing transport determining UDP session and TLS framing fields.
+     * @return Parameters containing uuid, ticket, and data_port, plus transport-specific fields.
+     * @pre The descriptor belongs to protocol; UDP requires a nonzero session_id.
+     */
+    njson to_params(RelayProtocol protocol) const;
+
+    std::uint64_t uuid = 0;
+    std::uint64_t ticket = 0;
+    std::uint16_t data_port = 0;
+    std::uint64_t session_id = 0;
+};
+
+/** @brief Describe both Agent attachments of a local pair, sharing a UUID and using distinct tickets. */
+struct AttachPair
+{
+    AttachInfo producer;
+    AttachInfo consumer;
+};
+
+/**
  * @brief Share service byte counters, sampled rates, and active accessor counts.
  * @details Transfer executors update atomic counters and mutex-protected accessors. Sampling
  * and sampled-rate reads require control_io. RX denotes Producer-to-Consumer service traffic.

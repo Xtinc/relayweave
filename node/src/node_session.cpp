@@ -101,23 +101,29 @@ asio::cancellation_slot NodeSession::cancellation_slot() noexcept
 
 std::uint64_t NodeSession::uuid() const
 {
-    if (endpoint_.empty())
+    if (const auto *endpoint = std::get_if<AttachInfo>(&endpoint_))
     {
-        return 0;
+        return endpoint->uuid;
     }
-    const auto &endpoint = std::holds_alternative<ControlRouterSingle>(control_) ? endpoint_.at("consumer") : endpoint_;
-    return config::require_unsigned(endpoint, "uuid", true);
+    if (const auto *pair = std::get_if<AttachPair>(&endpoint_))
+    {
+        return pair->consumer.uuid;
+    }
+    return 0;
 }
 
 asio::awaitable<void> NodeSession::install(int role)
 {
     endpoint_ = co_await asio::co_spawn(
         data_executor(),
-        [data = data_, role,
-         single = std::holds_alternative<ControlRouterSingle>(control_)]() -> asio::awaitable<njson> {
+        [data = data_, role, single = !is_multi()]() -> asio::awaitable<Attachment> {
             co_return std::visit(
-                [&](auto *manager) {
-                    return single ? manager->install_local_pair() : manager->install_remote_pair(role);
+                [&](auto *manager) -> Attachment {
+                    if (single)
+                    {
+                        return manager->install_local_pair();
+                    }
+                    return manager->install_remote_pair(role);
                 },
                 data);
         },
@@ -128,32 +134,36 @@ asio::awaitable<bool> NodeSession::wait_attach(std::chrono::steady_clock::time_p
 {
     return std::visit(
         [&](auto *manager) {
-            auto task = std::holds_alternative<ControlRouterSingle>(control_) ? manager->wait_local_pair(uuid())
-                                                                              : manager->wait_remote_pair(uuid());
+            auto task = is_multi() ? manager->wait_remote_pair(uuid()) : manager->wait_local_pair(uuid());
             return asio::co_spawn(data_executor(), std::move(task), asio::cancel_at(deadline, asio::use_awaitable));
+        },
+        data_);
+}
+
+asio::awaitable<void> NodeSession::bind_and_activate(std::string accessor)
+{
+    return std::visit(
+        [&](auto *manager) {
+            return asio::co_spawn(
+                data_executor(),
+                [manager, id = uuid(), traffic = traffic_, accessor = std::move(accessor)]() -> asio::awaitable<void> {
+                    manager->bind_local_pair(id, traffic, accessor);
+                    manager->activate_local_pair(id);
+                    co_return;
+                },
+                asio::use_awaitable);
         },
         data_);
 }
 
 asio::awaitable<void> NodeSession::bind(std::string accessor, std::uint64_t epoch, std::uint64_t flow_id)
 {
-    auto *channel = std::holds_alternative<ControlRouterMulti>(control_) ? &node_.nodelink_mgr_->protocol() : nullptr;
     return std::visit(
-        [&](auto *manager) -> asio::awaitable<void> {
-            if (channel)
-            {
-                return asio::co_spawn(
-                    data_executor(),
-                    manager->bind_remote_pair(uuid(), *channel, epoch, flow_id, traffic_, std::move(accessor)),
-                    asio::use_awaitable);
-            }
-            return asio::co_spawn(
-                data_executor(),
-                [manager, id = uuid(), traffic = traffic_, accessor = std::move(accessor)]() -> asio::awaitable<void> {
-                    manager->bind_local_pair(id, traffic, accessor);
-                    co_return;
-                },
-                asio::use_awaitable);
+        [&](auto *manager) {
+            return asio::co_spawn(data_executor(),
+                                  manager->bind_remote_pair(uuid(), node_.nodelink_mgr_->protocol(), epoch, flow_id,
+                                                            traffic_, std::move(accessor)),
+                                  asio::use_awaitable);
         },
         data_);
 }
@@ -162,16 +172,8 @@ asio::awaitable<void> NodeSession::activate()
 {
     return asio::co_spawn(
         data_executor(),
-        [data = data_, id = uuid(),
-         single = std::holds_alternative<ControlRouterSingle>(control_)]() -> asio::awaitable<void> {
-            std::visit(
-                [&](auto *manager) {
-                    if (single)
-                        manager->activate_local_pair(id);
-                    else
-                        manager->activate_remote_pair(id);
-                },
-                data);
+        [data = data_, id = uuid()]() -> asio::awaitable<void> {
+            std::visit([&](auto *manager) { manager->activate_remote_pair(id); }, data);
             co_return;
         },
         asio::use_awaitable);
@@ -181,8 +183,7 @@ asio::awaitable<void> NodeSession::bridge()
 {
     return std::visit(
         [&](auto *manager) {
-            auto task = std::holds_alternative<ControlRouterSingle>(control_) ? manager->run_local_pair(uuid())
-                                                                              : manager->run_remote_pair(uuid());
+            auto task = is_multi() ? manager->run_remote_pair(uuid()) : manager->run_local_pair(uuid());
             return asio::co_spawn(data_executor(), std::move(task), asio::use_awaitable);
         },
         data_);
@@ -190,20 +191,24 @@ asio::awaitable<void> NodeSession::bridge()
 
 asio::awaitable<void> NodeSession::close()
 {
-    if (endpoint_.empty())
+    const auto id = uuid();
+    if (!id)
     {
         co_return;
     }
     co_await asio::co_spawn(
         data_executor(),
-        [data = data_, id = uuid(),
-         single = std::holds_alternative<ControlRouterSingle>(control_)]() -> asio::awaitable<void> {
+        [data = data_, id, single = !is_multi()]() -> asio::awaitable<void> {
             std::visit(
                 [&](auto *manager) {
                     if (single)
+                    {
                         manager->close_local_pair(id);
+                    }
                     else
+                    {
                         manager->close_remote_pair(id);
+                    }
                 },
                 data);
             co_return;

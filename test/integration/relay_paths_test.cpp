@@ -331,6 +331,21 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
                                 first.at("flow_id").get<std::uint64_t>(), 1, protocol, path, false);
     require(first.at("flow_id") == last.at("flow_id") && first.at("epoch") == epoch,
             "Flow identity lost across endpoint notifications");
+    for (const auto *descriptor : {&first, &last})
+    {
+        require(descriptor->contains("session_id") == (protocol == RelayProtocol::Udp),
+                "Attachment session ID presence does not match its transport");
+        require(descriptor->contains("tls_framing") == (protocol == RelayProtocol::Tls),
+                "Attachment TLS framing presence does not match its transport");
+        if (protocol == RelayProtocol::Udp)
+        {
+            require(descriptor->at("session_id").get<std::uint64_t>() != 0, "UDP attachment has a zero session ID");
+        }
+        if (protocol == RelayProtocol::Tls)
+        {
+            require(descriptor->at("tls_framing") == tls_data_framing, "TLS attachment framing changed");
+        }
+    }
     require(!first.contains("data_address") && !last.contains("data_address") &&
             !first.contains("consumer_session_id") && !last.contains("consumer_session_id") &&
             !first.contains("budget_ms") && !last.contains("budget_ms") &&
