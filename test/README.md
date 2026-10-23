@@ -11,7 +11,7 @@ Agent 路由测试通过夹具检查私有候选计算；生产接口只提供�
 | `route/` | 链路质量、路径算法、DNS 探测生命周期、真实 ICMP | `routing`，真实 ICMP 另标 `icmp` |
 | `agent/` | Agent/Session/Forwarder 生命周期、控制连接池、路由组装和缓存 | `agent`，路由相关另标 `routing` |
 | `node/` | 配置/统计、启动停止、集群控制、共享 NodeLink、Flow、UDP session 路由、拓扑 | `node`，集群相关另标 `cluster` |
-| `proxy/` | HTTP、CONNECT、SOCKS5、容量、超时和监听回滚 | `proxy`、`integration` |
+| `proxy/` | HTTP、CONNECT、SOCKS5、请求边界校验、容量、408/504 超时、停止中接入和监听回滚 | `proxy`、`integration` |
 | `integration/` | 单/多节点 TCP/TLS/UDP、恢复、迁移及 Proxy 完整链路 | `end_to_end`、`integration` |
 | `deployment/` | Deb 控制脚本换行与执行、能力校验、证书校验与配置 dry-run | `deployment`、`integration` |
 | `tools/` | ICMP/TLS 手动诊断、真实 Dashboard 服务 smoke | 手动运行，不注册 CTest |

@@ -37,14 +37,14 @@ int main(int argc, char *argv[])
         auto config = load_proxy_config(config_path);
 
         asio::io_context io(1);
-        auto proxy = std::make_shared<ProxyServer>(io, std::move(config));
-        proxy->start();
+        ProxyServer proxy(io, std::move(config));
+        proxy.start();
 
         asio::signal_set signals(io, SIGINT, SIGTERM);
-        signals.async_wait([proxy](const asio::error_code &error, int) {
+        signals.async_wait([&proxy](const asio::error_code &error, int) {
             if (!error)
             {
-                proxy->stop();
+                proxy.stop();
             }
         });
         io.run();

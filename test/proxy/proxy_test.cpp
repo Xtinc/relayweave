@@ -91,9 +91,9 @@ class RunningProxy
 {
   public:
     explicit RunningProxy(ProxyConfig config)
-        : config(std::move(config)), server(std::make_shared<ProxyServer>(io, this->config))
+        : config(std::move(config)), server(io, this->config)
     {
-        server->start();
+        server.start();
         thread = std::thread([this]() { io.run(); });
     }
 
@@ -104,7 +104,7 @@ class RunningProxy
             std::promise<void> stopped;
             auto result = stopped.get_future();
             asio::post(io, [this, &stopped]() {
-                server->stop();
+                server.stop();
                 stopped.set_value();
             });
             result.wait();
@@ -114,7 +114,7 @@ class RunningProxy
 
     ProxyConfig config;
     asio::io_context io;
-    std::shared_ptr<ProxyServer> server;
+    ProxyServer server;
     std::thread thread;
 };
 
@@ -213,7 +213,8 @@ void verify_http_forward(RunningProxy &proxy)
                          "/upload?x=1 HTTP/1.1\r\nHost: ignored.example\r\n"
                          "Proxy-Authorization: Basic secret\r\nProxy-Connection: keep-alive\r\n"
                          "Connection: keep-alive, X-Hop\r\nX-Hop: remove\r\n"
-                         "Content-Length: 4\r\nX-Test: yes\r\n\r\nDATA";
+                         "Connection: X-Second-Hop\r\nX-Second-Hop: remove\r\n"
+                         "Content-Length: 4\r\ncontent-length: 4\r\nX-Test: yes\r\n\r\nDATA";
     asio::write(client, asio::buffer(request));
     const auto response = read_all(client);
     origin_thread.join();
@@ -224,7 +225,8 @@ void verify_http_forward(RunningProxy &proxy)
             "HTTP Host header was not rewritten");
     require(upstream_request.find("Proxy-Authorization") == std::string::npos &&
                 upstream_request.find("Proxy-Connection") == std::string::npos &&
-                upstream_request.find("X-Hop") == std::string::npos,
+                upstream_request.find("X-Hop") == std::string::npos &&
+                upstream_request.find("X-Second-Hop") == std::string::npos,
             "Hop-by-hop HTTP headers leaked upstream");
     require(upstream_request.find("Connection: close") != std::string::npos && upstream_request.ends_with("DATA"),
             "HTTP body or close semantics were not forwarded");
@@ -293,6 +295,21 @@ void verify_http_connect(RunningProxy &proxy)
 void verify_http_errors(RunningProxy &proxy)
 {
     asio::io_context io;
+    for (const std::string_view request : {
+             "GET /path#fragment HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+             "GET /path\tinvalid HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\ncontent-length: 9\r\n\r\n",
+             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: invalid\r\n\r\n",
+             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n",
+             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\nConnection: Content-Length\r\n\r\n",
+             "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nTransfer-Encoding: chunked\r\nConnection: Transfer-Encoding\r\n\r\n"})
+    {
+        tcp::socket client(io);
+        client.connect({asio::ip::address_v4::loopback(), proxy.config.http.port});
+        asio::write(client, asio::buffer(request));
+        require(read_all(client).find("400 Bad Request") != std::string::npos,
+                "Invalid HTTP target or framing was not rejected: " + std::string(request));
+    }
     tcp::socket malformed(io);
     malformed.connect({asio::ip::address_v4::loopback(), proxy.config.http.port});
     asio::write(malformed, asio::buffer("GET relative HTTP/1.1\r\n\r\n", 25));
@@ -494,10 +511,64 @@ void verify_capacity_and_timeout()
     excess.read_some(asio::buffer(byte), error);
     require(error && error != asio::error::would_block, "Proxy connection capacity was not enforced");
 
-    first.read_some(asio::buffer(byte), error);
-    require(error == asio::error::eof || error == asio::error::connection_reset,
-            "Incomplete proxy handshake did not time out");
+    require(read_all(first).find("408 Request Timeout") != std::string::npos,
+            "Incomplete HTTP handshake did not return 408");
 }
+
+void verify_stop_with_queued_accept()
+{
+    for (const bool http : {false, true})
+    {
+        asio::io_context io;
+        const auto config = test_config();
+        ProxyServer server(io, config);
+        server.start();
+        tcp::socket client(io);
+        client.connect({asio::ip::address_v4::loopback(), http ? config.http.port : config.socks5.port});
+        // accept succeeds immediately when its queued loop starts; stop runs before its completion.
+        asio::post(io, [&] { server.stop(); });
+        io.run_for(100ms);
+        require(io.stopped(), "Stop admitted a queued successful accept and left its handshake running");
+        require(read_all(client).empty(), "Stopped listener sent a proxy response");
+    }
+}
+
+#if defined(__linux__)
+void verify_connect_timeout()
+{
+    asio::io_context io;
+    tcp::acceptor origin(io, {asio::ip::address_v4::loopback(), 0});
+    // Linux permits one queued connection with backlog zero; leave it full without accepting.
+    origin.listen(0);
+    const auto endpoint = origin.local_endpoint();
+    tcp::socket queued(io);
+    queued.connect(endpoint);
+
+    auto config = test_config();
+    config.connect_timeout = 50ms;
+    RunningProxy proxy(config);
+    tcp::socket http(io);
+    http.connect({asio::ip::address_v4::loopback(), config.http.port});
+    const auto request = "CONNECT 127.0.0.1:" + std::to_string(endpoint.port()) + " HTTP/1.1\r\n\r\n";
+    asio::write(http, asio::buffer(request));
+    require(read_all(http).find("504 Gateway Timeout") != std::string::npos,
+            "HTTP upstream connection timeout did not return 504");
+
+    tcp::socket socks(io);
+    socks.connect({asio::ip::address_v4::loopback(), config.socks5.port});
+    constexpr std::array<std::uint8_t, 3> greeting{0x05, 0x01, 0x00};
+    asio::write(socks, asio::buffer(greeting));
+    std::array<std::uint8_t, 2> method{};
+    read_exact(socks, method.data(), method.size());
+    const std::array<std::uint8_t, 10> connect{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1,
+                                             static_cast<std::uint8_t>(endpoint.port() >> 8),
+                                             static_cast<std::uint8_t>(endpoint.port())};
+    asio::write(socks, asio::buffer(connect));
+    const auto response = read_all(socks);
+    require(response.size() == 10 && static_cast<std::uint8_t>(response[1]) == 0x04,
+            "SOCKS5 upstream connection timeout did not return host unreachable");
+}
+#endif
 
 void verify_listener_rollback()
 {
@@ -514,11 +585,11 @@ void verify_listener_rollback()
 #endif
     occupied.bind({asio::ip::address_v4::loopback(), config.http.port});
     occupied.listen();
-    auto server = std::make_shared<ProxyServer>(io, config);
+    ProxyServer server(io, config);
     bool failed = false;
     try
     {
-        server->start();
+        server.start();
     }
     catch (const std::exception &)
     {
@@ -536,6 +607,10 @@ int main()
     {
         verify_config();
         verify_listener_rollback();
+        verify_stop_with_queued_accept();
+#if defined(__linux__)
+        verify_connect_timeout();
+#endif
         RunningProxy proxy(test_config());
         verify_http_forward(proxy);
         verify_http_origin_form(proxy);

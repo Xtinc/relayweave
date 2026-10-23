@@ -32,7 +32,15 @@ ProxyConfig load_proxy_config(const std::filesystem::path &path);
 
 class ProxySession;
 
-class ProxyServer : public std::enable_shared_from_this<ProxyServer>
+enum class ProxyProtocol
+{
+    Http,
+    Socks5,
+};
+
+// All operations use one executor. The owner keeps this object alive until io.run() and workers finish.
+// stop() requests cancellation; the executor drains listener and session completions afterwards.
+class ProxyServer
 {
   public:
     ProxyServer(asio::io_context &io, ProxyConfig config);
@@ -41,13 +49,7 @@ class ProxyServer : public std::enable_shared_from_this<ProxyServer>
     void stop();
 
   private:
-    enum class ListenerProtocol
-    {
-        Http,
-        Socks5,
-    };
-
-    asio::awaitable<void> accept_loop(asio::ip::tcp::acceptor &acceptor, ListenerProtocol protocol);
+    asio::awaitable<void> accept_loop(asio::ip::tcp::acceptor &acceptor, ProxyProtocol protocol);
     void session_finished(const std::shared_ptr<ProxySession> &session, std::exception_ptr failure);
 
     asio::any_io_executor executor_;

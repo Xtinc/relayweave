@@ -246,8 +246,8 @@ int main()
         proxy_config.socks5 = {"127.0.0.1", proxy_socks_port};
         proxy_config.http.address = "127.0.0.1";
         proxy_config.http.port = proxy_http_port;
-        auto proxy = std::make_shared<ProxyServer>(proxy_io, proxy_config);
-        proxy->start();
+        ProxyServer proxy(proxy_io, proxy_config);
+        proxy.start();
 
         NodeConfig node_config = make_test_node_config();
         node_config.control.address = "127.0.0.1";
@@ -308,7 +308,7 @@ int main()
         std::promise<void> proxy_stopped;
         auto proxy_stopped_result = proxy_stopped.get_future();
         asio::post(proxy_io, [&]() {
-            proxy->stop();
+            proxy.stop();
             asio::error_code ignored;
             http_origin.close(ignored);
             echo_origin.close(ignored);
