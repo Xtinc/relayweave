@@ -7,7 +7,6 @@
 #include <unordered_map>
 
 struct AgentConfig;
-class RelayAgent;
 class AgentRouting;
 class NodeConnectionMgr;
 class Forwarder;
@@ -15,8 +14,9 @@ class Forwarder;
 /**
  * @brief Own service discovery, request correlation, entrance waits, and business control dispatch.
  * @details All methods and mutable state require control_io, except construction/start before workers.
- * Borrows configuration, NodeConnectionMgr, AgentRouting, and Forwarder from RelayAgent. Queued
- * transfer_io notifications retain Forwarder individually. close() drains discovery; clear() releases service metadata after business draining. Each selection owns its map entry
+ * Borrows configuration, NodeConnectionMgr, AgentRouting, and Forwarder from RelayAgent. The owner
+ * drains control producers before Forwarder and joins workers before destroying either module.
+ * Queued transfer notifications borrow Forwarder. Each selection owns its map entry
  * until its coroutine exits; references remain valid across other insertions and erasures.
  */
 class AgentControl
@@ -34,20 +34,16 @@ class AgentControl
     AgentControl(asio::any_io_executor control_executor, asio::any_io_executor transfer_executor,
                  const AgentConfig &config, NodeConnectionMgr &connections, AgentRouting &routing,
                  Forwarder &forwarder);
-    /**
-     * @brief Start optional discovery maintenance once after the owner starts the primary pool.
-     * @param lifetime Owning Agent retained until background task completions.
-     */
-    void start(std::shared_ptr<RelayAgent> lifetime);
+    /** @brief Start optional discovery maintenance once after the owner starts the primary pool. */
+    void start();
     /** @brief Invalidate selections and cancel discovery maintenance on control_io. */
     void stop();
     /**
-     * @brief Stop and drain discovery on control_io after the owner requests routing shutdown.
+     * @brief Drain discovery on control_io after the owner requests control and routing shutdown.
+     * @pre stop() has been called.
      * @return Completes when discovery no longer accesses the borrowed pool or route state.
      */
     asio::awaitable<void> close();
-    /** @brief Clear service metadata after Forwarder drains; selections remove their own waits. */
-    void clear();
     /**
      * @brief Select a path and await its identified entrance entirely on control_io.
      * @param service Discovered service name and transport.
@@ -57,7 +53,7 @@ class AgentControl
      * @throws std::exception On invalidation, missing location, capacity, or deadline expiry.
      */
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                                std::chrono::steady_clock::time_point deadline);
+                                                 std::chrono::steady_clock::time_point deadline);
     /**
      * @brief Register primary services or wake matching entrance selections after identification.
      * @param connection Borrowed connection, valid until this notification returns on control_io.
@@ -91,7 +87,7 @@ class AgentControl
     void update_probe_targets();
     /** @brief Apply a matching service location and publish its availability. */
     void locate_service(const njson &params);
-    /** @brief Clear one service location and invalidate affected selections and forwards. */
+    /** @brief Clear a configured service location and invalidate affected selections and forwards. */
     void forget_service(const ServiceKey &service, std::string reason);
     /** @brief Set a terminal reason and wake matching pending entrance selections. */
     void invalidate_entries(std::string reason, const std::optional<ServiceKey> &service = std::nullopt);

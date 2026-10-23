@@ -302,10 +302,8 @@ int main()
         eventually([=]() { return http_chain_probe(local_http_port, http_origin_port); }, "HTTP proxy chain");
         eventually([=]() { return socks_chain_probe(local_socks_port, echo_port); }, "SOCKS5 proxy chain");
 
-        auto consumer_stopped = asio::co_spawn(control_io, consumer->async_stop(), asio::use_future);
-        auto producer_stopped = asio::co_spawn(control_io, producer->async_stop(), asio::use_future);
-        consumer_stopped.get();
-        producer_stopped.get();
+        consumer->stop();
+        producer->stop();
         node->stop();
         std::promise<void> proxy_stopped;
         auto proxy_stopped_result = proxy_stopped.get_future();

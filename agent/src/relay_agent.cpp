@@ -1,5 +1,6 @@
 #include "relay_agent.h"
 #include "forwarder.h"
+#include <future>
 #include <unordered_set>
 #include <utility>
 
@@ -137,20 +138,20 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
 RelayAgent::RelayAgent(asio::io_context &control_io, asio::io_context &transfer_io, asio::ssl::context &ssl_context,
                        AgentConfig config)
     : control_executor_(control_io.get_executor()), transfer_executor_(transfer_io.get_executor()),
-      config_(std::move(config)),
-      routing_(control_io, config_.routing_max_nodes),
+      config_(std::move(config)), routing_(control_io, config_.routing_max_nodes),
       connections_(*this, control_executor_, ssl_context, config_),
-      forwarder_(std::make_shared<Forwarder>(*this, transfer_executor_, ssl_context, config_.server_name,
-                                            config_.channel.handshake_timeout, config_.connect_timeout,
-                                            config_.relay_open_timeout, config_.services, config_.forwards)),
-      control_(control_executor_, transfer_executor_, config_, connections_, routing_, *forwarder_),
-      stopped_event_(control_executor_)
+      forwarder_(std::make_unique<Forwarder>(*this, transfer_executor_, ssl_context, config_.server_name,
+                                             config_.channel.handshake_timeout, config_.connect_timeout,
+                                             config_.relay_open_timeout, config_.services, config_.forwards)),
+      control_(control_executor_, transfer_executor_, config_, connections_, routing_, *forwarder_)
 {
     if (&control_io == &transfer_io)
     {
         throw std::invalid_argument("Control and transfer channels require distinct io_context instances");
     }
 }
+
+RelayAgent::~RelayAgent() = default;
 
 void RelayAgent::start()
 {
@@ -162,66 +163,41 @@ void RelayAgent::start()
     forwarder_->start();
     state_ = State::Running;
     connections_.start();
-    control_.start(shared_from_this());
+    control_.start();
 }
 
-asio::awaitable<void> RelayAgent::async_stop()
+void RelayAgent::stop()
 {
-    auto self = shared_from_this();
-    co_await asio::co_spawn(control_executor_, stop_on_control_executor(), asio::use_awaitable);
+    if (state_ == State::Stopped)
+    {
+        return;
+    }
+    asio::co_spawn(control_executor_, stop_on_control_executor(), asio::use_future).get();
 }
 
 asio::awaitable<RelaySelection> RelayAgent::select_relay(ServiceKey service, std::string destination,
-                                                       std::chrono::steady_clock::time_point deadline)
+                                                         std::chrono::steady_clock::time_point deadline)
 {
-    auto self = shared_from_this();
-    co_return co_await asio::co_spawn(
-        control_executor_, control_.select_relay(std::move(service), std::move(destination), deadline),
-        asio::use_awaitable);
+    return asio::co_spawn(control_executor_,
+                          control_.select_relay(std::move(service), std::move(destination), deadline),
+                          asio::use_awaitable);
 }
 
 asio::awaitable<void> RelayAgent::stop_on_control_executor()
 {
-    if (state_ == State::Created || state_ == State::Running)
-    {
-        state_ = State::Stopping;
-        PROXY_INFO_PRINT("Agent stopping");
-        control_.stop();
-        routing_.stop();
-        connections_.stop();
-        asio::post(transfer_executor_, [forwarder = forwarder_] { forwarder->invalidate_relays("agent stopping"); });
-        asio::co_spawn(control_executor_, drain_stop(),
-                       [self = shared_from_this()](std::exception_ptr failure) {
-                           self->stop_failure_ = failure;
-                           if (failure)
-                           {
-                               PROXY_ERROR_PRINT("Agent stop failed reason=%s", exception_description(failure).c_str());
-                           }
-                           else
-                           {
-                               self->control_.clear();
-                               self->state_ = State::Stopped;
-                               PROXY_INFO_PRINT("Agent stopped");
-                           }
-                           self->stopped_event_.notify_all();
-                       });
-    }
-    if (!co_await stopped_event_.wait())
-    {
-        throw asio::system_error(asio::error::operation_aborted);
-    }
-    if (stop_failure_)
-    {
-        std::rethrow_exception(stop_failure_);
-    }
-}
+    state_ = State::Stopping;
+    PROXY_INFO_PRINT("Agent stopping");
+    control_.stop();
+    routing_.stop();
+    connections_.stop();
+    asio::post(transfer_executor_, [this] { forwarder_->invalidate_relays("agent stopping"); });
 
-asio::awaitable<void> RelayAgent::drain_stop()
-{
     co_await control_.close();
     co_await routing_.close();
     co_await connections_.close();
     co_await asio::co_spawn(transfer_executor_, forwarder_->async_stop(), asio::use_awaitable);
+    state_ = State::Stopped;
+    PROXY_INFO_PRINT("Agent stopped");
 }
 
 void RelayAgent::connection_ready(const NodeConnection &connection)

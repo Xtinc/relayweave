@@ -3,7 +3,6 @@
 
 #include "member_access.h"
 TEST_MEMBER(RelayAgent, control_)
-TEST_MEMBER(RelayAgent, routing_)
 TEST_MEMBER(RelayAgent, forwarder_)
 TEST_MEMBER(RelayAgent, state_)
 TEST_MEMBER(AgentControl, discovery_active_)
@@ -50,7 +49,7 @@ AgentConfig base_config(std::uint16_t control_port)
     return config;
 }
 
-void verify_listener_rollback(asio::ssl::context &ssl_context)
+void verify_failed_start_cleanup(asio::ssl::context &ssl_context)
 {
     asio::io_context control_io(1);
     asio::io_context transfer_io(1);
@@ -58,12 +57,12 @@ void verify_listener_rollback(asio::ssl::context &ssl_context)
     auto config = base_config(unused_port(control_io));
     config.forwards.push_back(AgentForwardConfig{"echo", "127.0.0.1", forward_port});
     config.forwards.push_back(AgentForwardConfig{"echo", "invalid-address", 12345});
-    auto client = std::make_shared<RelayAgent>(control_io, transfer_io, ssl_context, std::move(config));
+    RelayAgent client(control_io, transfer_io, ssl_context, std::move(config));
 
     bool failed = false;
     try
     {
-        client->start();
+        client.start();
     }
     catch (const std::exception &)
     {
@@ -71,6 +70,17 @@ void verify_listener_rollback(asio::ssl::context &ssl_context)
     }
     require(failed, "Client start unexpectedly succeeded with an invalid listener");
 
+    {
+        auto control_work = asio::make_work_guard(control_io);
+        std::thread control_thread([&] { control_io.run(); });
+        std::thread transfer_thread([&] { transfer_io.run(); });
+        ScopeGuard join_workers([&] {
+            control_work.reset();
+            control_thread.join();
+            transfer_thread.join();
+        });
+        client.stop();
+    }
     tcp::acceptor probe(transfer_io, tcp::endpoint(asio::ip::address_v4::loopback(), forward_port));
 }
 
@@ -84,61 +94,17 @@ void verify_stop_before_start(asio::ssl::context &ssl_context)
                                                base_config(unused_port(control_io)));
     std::weak_ptr<RelayAgent> weak_client = client;
 
-    auto first_stop = asio::co_spawn(control_io, client->async_stop(), asio::use_future);
-    auto second_stop = asio::co_spawn(control_io, client->async_stop(), asio::use_future);
     std::thread control_thread([&control_io]() { control_io.run(); });
     std::thread transfer_thread([&transfer_io]() { transfer_io.run(); });
 
-    first_stop.get();
-    second_stop.get();
-    asio::co_spawn(control_io, client->async_stop(), asio::use_future).get();
-    client.reset();
+    client->stop();
     control_work.reset();
     transfer_work.reset();
     control_thread.join();
     transfer_thread.join();
-    require(weak_client.expired(), "Agent stopped before start was retained by an asynchronous task");
-}
-
-void verify_cancelled_stop_waiter(asio::ssl::context &ssl_context)
-{
-    asio::io_context control(1);
-    asio::io_context transfer(1);
-    auto client = std::make_shared<RelayAgent>(control, transfer, ssl_context, AgentConfig{});
-    const std::weak_ptr<RelayAgent> weak_client = client;
-    asio::cancellation_signal cancellation;
-    auto cancelled = asio::co_spawn(control, client->async_stop(),
-                                    asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
-    control.run_for(5ms);
-    cancellation.emit(asio::cancellation_type::all);
-    control.poll();
-    require(cancelled.wait_for(0ms) == std::future_status::ready,
-            "Cancelled shutdown waiter did not return");
-    bool aborted = false;
-    try
-    {
-        cancelled.get();
-    }
-    catch (const asio::system_error &error)
-    {
-        aborted = error.code() == asio::error::operation_aborted;
-    }
-    require(aborted, "Cancelled shutdown waiter did not preserve cancellation");
-    auto completed = asio::co_spawn(control, client->async_stop(), asio::use_future);
+    client->stop();
     client.reset();
-    const auto deadline = std::chrono::steady_clock::now() + 1s;
-    while (completed.wait_for(0ms) != std::future_status::ready)
-    {
-        require(std::chrono::steady_clock::now() < deadline,
-                "Cancelling one waiter interrupted the owned shutdown task");
-        control.restart();
-        control.run_for(1ms);
-        transfer.restart();
-        transfer.poll();
-    }
-    completed.get();
-    control.poll();
-    require(weak_client.expired(), "Cancelled stop waiter retained the Agent after shutdown");
+    require(weak_client.expired(), "Agent stopped before start was retained by an asynchronous task");
 }
 
 void verify_drain_failure(asio::ssl::context &ssl_context)
@@ -150,49 +116,51 @@ void verify_drain_failure(asio::ssl::context &ssl_context)
     auto client = std::make_shared<RelayAgent>(control, transfer, ssl_context, std::move(config));
     auto &discovery = test_access::RelayAgent_control_(*client);
     test_access::AgentControl_discovery_active_(discovery) = true;
-    auto first = asio::co_spawn(control, client->async_stop(), asio::use_future);
-    auto second = asio::co_spawn(control, client->async_stop(), asio::use_future);
-    control.run_for(5ms);
+    auto control_work = asio::make_work_guard(control);
+    auto first = std::async(std::launch::async, [client] { client->stop(); });
     auto &waiters = test_access::AsyncEvent_waiters_(test_access::AgentControl_discovery_done_(discovery));
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (waiters.empty())
+    {
+        require(std::chrono::steady_clock::now() < deadline, "Stop did not begin draining discovery");
+        control.run_for(1ms);
+    }
     require(waiters.size() == 1, "Stop did not reach the discovery drain");
     waiters.front()->notification.cancel();
     control.poll();
-    auto verify_failure = [&](std::future<void> &result) {
-        require(result.wait_for(0ms) == std::future_status::ready, "Drain failure did not wake stop waiters");
-        bool failed = false;
-        try
-        {
-            result.get();
-        }
-        catch (const asio::system_error &error)
-        {
-            failed = error.code() == asio::error::operation_aborted;
-        }
-        require(failed, "Drain failure was reported as a successful stop");
-    };
-    verify_failure(first);
-    verify_failure(second);
-    auto repeated = asio::co_spawn(control, client->async_stop(), asio::use_future);
-    control.restart();
-    control.poll();
-    verify_failure(repeated);
+    require(first.wait_for(1s) == std::future_status::ready, "Drain failure did not return to the owner");
+    bool failed = false;
+    try
+    {
+        first.get();
+    }
+    catch (const asio::system_error &error)
+    {
+        failed = error.code() == asio::error::operation_aborted;
+    }
+    require(failed, "Drain failure was reported as a successful stop");
     using State = std::remove_cvref_t<decltype(test_access::RelayAgent_state_(*client))>;
     require(test_access::RelayAgent_state_(*client) == State::Stopping &&
                 test_access::AgentControl_service_locations_(discovery).size() == 1,
             "Incomplete shutdown cleared metadata or marked the Agent stopped");
-    auto forwarder = test_access::RelayAgent_forwarder_(*client);
+    auto *forwarder = test_access::RelayAgent_forwarder_(*client).get();
     using ForwarderState = std::remove_cvref_t<decltype(test_access::Forwarder_state_(*forwarder))>;
     require(test_access::Forwarder_state_(*forwarder) == ForwarderState::Created,
             "Failed control drain stopped a dependency that may still receive notifications");
 
     test_access::AgentControl_discovery_active_(discovery) = false;
-    auto routing = asio::co_spawn(control, test_access::RelayAgent_routing_(*client).close(), asio::use_future);
-    auto business = asio::co_spawn(transfer, forwarder->async_stop(), asio::use_future);
-    control.restart();
-    control.run();
-    transfer.run();
-    routing.get();
-    business.get();
+    auto retry = std::async(std::launch::async, [client] { client->stop(); });
+    const auto retry_deadline = std::chrono::steady_clock::now() + 1s;
+    while (retry.wait_for(0ms) != std::future_status::ready)
+    {
+        require(std::chrono::steady_clock::now() < retry_deadline, "Stop retry did not drain the remaining modules");
+        control.run_for(1ms);
+        transfer.poll();
+    }
+    retry.get();
+    require(test_access::RelayAgent_state_(*client) == State::Stopped &&
+                test_access::Forwarder_state_(*forwarder) == ForwarderState::Stopped,
+            "Successful stop retry did not finish cleanup");
     const std::weak_ptr<RelayAgent> weak_client = client;
     client.reset();
     require(weak_client.expired(), "Failed stop retained the Agent after test dependencies drained");
@@ -234,7 +202,7 @@ void verify_stop_and_disconnected_listener(asio::ssl::context &ssl_context)
     probe_io.run();
     rejected.get();
 
-    // Both stop callers must wait for the transfer executor to finish shutdown.
+    // The owner must wait for the transfer executor to finish shutdown.
     std::promise<void> transfer_blocked;
     std::promise<void> release_transfer;
     auto transfer_released = release_transfer.get_future().share();
@@ -245,23 +213,17 @@ void verify_stop_and_disconnected_listener(asio::ssl::context &ssl_context)
     transfer_blocked.get_future().get();
 
     const auto stop_started = std::chrono::steady_clock::now();
-    auto first_stop = asio::co_spawn(control_io, client->async_stop(), asio::use_future);
-    auto second_stop = asio::co_spawn(control_io, client->async_stop(), asio::use_future);
+    auto stopped = std::async(std::launch::async, [client] { client->stop(); });
     client.reset();
-    std::promise<void> stops_dispatched;
-    asio::post(control_io, [&]() { stops_dispatched.set_value(); });
-    stops_dispatched.get_future().get();
-    const auto first_returned_early = first_stop.wait_for(50ms) == std::future_status::ready;
-    const auto second_returned_early = second_stop.wait_for(0ms) == std::future_status::ready;
+    const auto returned_early = stopped.wait_for(50ms) == std::future_status::ready;
     release_transfer.set_value();
-    first_stop.get();
-    second_stop.get();
+    stopped.get();
     control_work.reset();
     transfer_work.reset();
     control_thread.join();
     transfer_thread.join();
     const auto stop_elapsed = std::chrono::steady_clock::now() - stop_started;
-    require(!first_returned_early && !second_returned_early, "Agent stop returned before transfer shutdown completed");
+    require(!returned_early, "Agent stop returned before transfer shutdown completed");
     require(stop_elapsed < 2s, "Client stop did not promptly cancel its retry/listener operations");
     require(weak_client.expired(), "Stopped client was retained by an asynchronous task");
 }
@@ -272,12 +234,11 @@ int main()
     try
     {
         asio::ssl::context ssl_context(asio::ssl::context::tls_client);
-        verify_listener_rollback(ssl_context);
+        verify_failed_start_cleanup(ssl_context);
         verify_stop_before_start(ssl_context);
-        verify_cancelled_stop_waiter(ssl_context);
         verify_drain_failure(ssl_context);
         verify_stop_and_disconnected_listener(ssl_context);
-        std::cout << "[PASS] Client listener rollback, pre-start stop, cancelled waiters, disconnected behavior, and stop lifecycle\n";
+        std::cout << "[PASS] Client failed-start cleanup, pre-start stop, drain retry, disconnected behavior, and blocking stop\n";
         return 0;
     }
     catch (const std::exception &exception)

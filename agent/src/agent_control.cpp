@@ -1,14 +1,14 @@
 #include "agent_control.h"
 #include "agent_routing.h"
-#include "node_connection_mgr.h"
 #include "forwarder.h"
+#include "node_connection_mgr.h"
 
 AgentControl::AgentControl(asio::any_io_executor control_executor, asio::any_io_executor transfer_executor,
                            const AgentConfig &config, NodeConnectionMgr &connections, AgentRouting &routing,
                            Forwarder &forwarder)
-    : control_executor_(std::move(control_executor)), transfer_executor_(std::move(transfer_executor)),
-      config_(config), routing_(routing), forwarder_(forwarder), connections_(connections),
-      discovery_timer_(control_executor_), discovery_done_(control_executor_)
+    : control_executor_(std::move(control_executor)), transfer_executor_(std::move(transfer_executor)), config_(config),
+      routing_(routing), forwarder_(forwarder), connections_(connections), discovery_timer_(control_executor_),
+      discovery_done_(control_executor_)
 {
     for (const auto &forward : config_.forwards)
     {
@@ -16,7 +16,7 @@ AgentControl::AgentControl(asio::any_io_executor control_executor, asio::any_io_
     }
 }
 
-void AgentControl::start(std::shared_ptr<RelayAgent> lifetime)
+void AgentControl::start()
 {
     running_ = true;
     if (config_.forwards.empty())
@@ -27,15 +27,14 @@ void AgentControl::start(std::shared_ptr<RelayAgent> lifetime)
     discovery_active_ = true;
     try
     {
-        asio::co_spawn(control_executor_, discovery_loop(),
-                       [this, keep_alive = std::move(lifetime)](std::exception_ptr failure) {
-                           if (failure && running_)
-                           {
-                               PROXY_ERROR_PRINT("Discovery stopped reason=%s", exception_description(failure).c_str());
-                           }
-                           discovery_active_ = false;
-                           discovery_done_.notify_all();
-                       });
+        asio::co_spawn(control_executor_, discovery_loop(), [this](std::exception_ptr failure) {
+            if (failure && running_)
+            {
+                PROXY_ERROR_PRINT("Discovery stopped reason=%s", exception_description(failure).c_str());
+            }
+            discovery_active_ = false;
+            discovery_done_.notify_all();
+        });
     }
     catch (...)
     {
@@ -46,10 +45,6 @@ void AgentControl::start(std::shared_ptr<RelayAgent> lifetime)
 
 void AgentControl::stop()
 {
-    if (!running_)
-    {
-        return;
-    }
     running_ = false;
     discovery_timer_.cancel();
     invalidate_entries("agent stopping");
@@ -57,16 +52,10 @@ void AgentControl::stop()
 
 asio::awaitable<void> AgentControl::close()
 {
-    stop();
     if (discovery_active_ && !co_await discovery_done_.wait())
     {
         throw asio::system_error(asio::error::operation_aborted);
     }
-}
-
-void AgentControl::clear()
-{
-    service_locations_.clear();
 }
 
 void AgentControl::connection_finished(const NodeConnection &connection)
@@ -118,7 +107,7 @@ asio::awaitable<void> AgentControl::discovery_loop()
         }
         discovery_timer_.expires_at(next_poll);
         const auto [error] = co_await discovery_timer_.async_wait(use_nothrow_awaitable);
-        if ((error && error != asio::error::operation_aborted) || !running_)
+        if (error && error != asio::error::operation_aborted)
         {
             break;
         }
@@ -128,10 +117,11 @@ asio::awaitable<void> AgentControl::discovery_loop()
 void AgentControl::query_topology()
 {
     const auto primary = connections_.primary();
-    if (primary && primary->ready() && !routing_.request_pending(AgentRouting::Clock::now()))
+    const auto now = AgentRouting::Clock::now();
+    if (primary && primary->ready() && !routing_.request_pending(now))
     {
         const auto request = allocate_request_id();
-        routing_.begin_request(request, AgentRouting::Clock::now());
+        routing_.begin_request(request, now);
         primary->send(CtrlMessage{CtrlCommand::TopologyQuery, njson{{"request_id", request}}});
     }
 }
@@ -185,9 +175,7 @@ void AgentControl::connection_ready(const NodeConnection &connection)
 
 void AgentControl::connection_closed(const NodeConnection &connection)
 {
-    asio::post(transfer_executor_, [forwarder = forwarder_.shared_from_this(), id = connection.id()] {
-        forwarder->clear_server(id);
-    });
+    asio::post(transfer_executor_, [&forwarder = forwarder_, id = connection.id()] { forwarder.clear_server(id); });
     if (config_.forwards.empty())
     {
         return;
@@ -210,8 +198,8 @@ void AgentControl::connection_closed(const NodeConnection &connection)
         for (auto &[service, location] : service_locations_)
         {
             location = ServiceLocation{};
-            asio::post(transfer_executor_, [forwarder = forwarder_.shared_from_this(), service] {
-                forwarder->clear_service(service, "primary control disconnected");
+            asio::post(transfer_executor_, [&forwarder = forwarder_, service] {
+                forwarder.clear_service(service, "primary control disconnected");
             });
         }
         update_probe_targets();
@@ -258,22 +246,19 @@ void AgentControl::locate_service(const njson &params)
                      static_cast<unsigned int>(port));
     update_probe_targets();
     asio::post(transfer_executor_,
-               [forwarder = forwarder_.shared_from_this(), service = std::move(service), node = std::move(node)]() mutable {
-                   forwarder->set_service(std::move(service), std::move(node));
+               [&forwarder = forwarder_, service = std::move(service), node = std::move(node)]() mutable {
+                   forwarder.set_service(std::move(service), std::move(node));
                });
 }
 
 void AgentControl::forget_service(const ServiceKey &service, std::string reason)
 {
-    if (const auto location = service_locations_.find(service); location != service_locations_.end())
-    {
-        location->second = ServiceLocation{};
-        invalidate_entries(reason, service);
-        update_probe_targets();
-        asio::post(transfer_executor_, [forwarder = forwarder_.shared_from_this(), service, reason = std::move(reason)] {
-            forwarder->clear_service(service, reason);
-        });
-    }
+    service_locations_.at(service) = ServiceLocation{};
+    invalidate_entries(reason, service);
+    update_probe_targets();
+    asio::post(transfer_executor_, [&forwarder = forwarder_, service, reason = std::move(reason)] {
+        forwarder.clear_service(service, reason);
+    });
 }
 
 void AgentControl::handle_control_message(const NodeConnection &connection, CtrlMessage message)
@@ -300,7 +285,7 @@ void AgentControl::handle_control_message(const NodeConnection &connection, Ctrl
         else
         {
             it->second.location = EntryWait::Location{config::required_string(params, "address", "node.located"),
-                                                       config::required_port(params, "port", "node.located")};
+                                                      config::required_port(params, "port", "node.located")};
         }
         it->second.changed.cancel();
         return;
@@ -331,8 +316,8 @@ void AgentControl::handle_control_message(const NodeConnection &connection, Ctrl
     case CtrlCommand::RelayReady:
     case CtrlCommand::RelayClosed: {
         asio::post(transfer_executor_,
-                   [forwarder = forwarder_.shared_from_this(), route = connection.route(), message = std::move(message)]() mutable {
-                       forwarder->relay_message(std::move(route), std::move(message));
+                   [&forwarder = forwarder_, route = connection.route(), message = std::move(message)]() mutable {
+                       forwarder.relay_message(std::move(route), std::move(message));
                    });
         return;
     }
@@ -352,9 +337,7 @@ void AgentControl::handle_control_message(const NodeConnection &connection, Ctrl
                 {
                     invalidate_entries("topology epoch changed");
                     asio::post(transfer_executor_,
-                               [forwarder = forwarder_.shared_from_this()] {
-                                   forwarder->invalidate_relays("topology epoch changed");
-                               });
+                               [&forwarder = forwarder_] { forwarder.invalidate_relays("topology epoch changed"); });
                 }
                 discovery_timer_.cancel();
             }
@@ -393,8 +376,8 @@ void AgentControl::handle_control_message(const NodeConnection &connection, Ctrl
         {
             const ServiceKey service{config::message_service(params), config::message_protocol(params)};
             const auto location = service_locations_.find(service);
-            const auto request = config::optional_unsigned(params, "request_id");
-            if (location != service_locations_.end() && request && location->second.request == *request)
+            const auto request = config::optional_unsigned(params, "request_id").value_or(0);
+            if (location != service_locations_.end() && request && location->second.request == request)
             {
                 forget_service(service, reason);
             }
@@ -420,13 +403,13 @@ std::uint64_t AgentControl::allocate_request_id()
 }
 
 AgentControl::EntryWait::EntryWait(asio::any_io_executor executor, ServiceKey service, std::string node,
-                                 std::chrono::steady_clock::time_point deadline)
-    : changed(executor), service(std::move(service)), node(std::move(node)), deadline(deadline)
+                                   std::chrono::steady_clock::time_point deadline)
+    : changed(executor, deadline), service(std::move(service)), node(std::move(node)), deadline(deadline)
 {
 }
 
 asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, std::string destination,
-                                                         std::chrono::steady_clock::time_point deadline)
+                                                           std::chrono::steady_clock::time_point deadline)
 {
     const auto location = service_locations_.find(service);
     if (!running_ || location == service_locations_.end() || location->second.node.empty() ||
@@ -437,10 +420,6 @@ asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, s
 
     auto path = routing_.select_path(service, destination);
     const auto entry = path.size() > 1 ? path.front() : destination;
-    if (entry_waits_.size() >= 1000)
-    {
-        throw std::runtime_error("entry lookup capacity reached");
-    }
     if (std::chrono::steady_clock::now() >= deadline)
     {
         throw std::runtime_error("entry control connection timed out");
@@ -451,6 +430,10 @@ asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, s
     if (connection && connection->ready())
     {
         co_return RelaySelection{connection->route(), std::move(path), epoch, std::move(connection)};
+    }
+    if (entry_waits_.size() >= 1000)
+    {
+        throw std::runtime_error("entry lookup capacity reached");
     }
 
     const auto request = allocate_request_id();
@@ -479,11 +462,6 @@ asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, s
             throw std::runtime_error(wait.reason);
         }
 
-        if (routing_.epoch() != epoch)
-        {
-            throw std::runtime_error("route epoch changed");
-        }
-
         if (std::chrono::steady_clock::now() >= deadline)
         {
             if (entry == destination)
@@ -503,7 +481,6 @@ asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, s
         {
             co_return RelaySelection{wait.connection->route(), std::move(path), epoch, wait.connection};
         }
-        wait.changed.expires_at(deadline);
         const auto [error] = co_await wait.changed.async_wait(use_nothrow_awaitable);
 
         if (error && error != asio::error::operation_aborted)

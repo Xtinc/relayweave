@@ -417,7 +417,7 @@ int main()
                     return;
                 try
                 {
-                    asio::co_spawn(control_io, agent->async_stop(), asio::use_future).get();
+                    agent->stop();
                 }
                 catch (...)
                 {
@@ -539,7 +539,7 @@ int main()
         wait_for_cluster("Cluster recovery");
 
         // Move B to the entry node while its old server stays connected.
-        asio::co_spawn(control_io, producer_b->async_stop(), asio::use_future).get();
+        producer_b->stop();
         auto migrated_config = client_config(control_a);
         migrated_config.services.push_back(
             AgentServiceConfig{"service-b", "127.0.0.1", target_b, RelayProtocol::Tcp});
@@ -564,7 +564,7 @@ int main()
                                                        std::move(recovery_config));
         asio::post(control_io, [recovery_client] { recovery_client->start(); });
         wait_for_service(recovery_forward, "Initial connection failure and stale discovery response");
-        asio::co_spawn(control_io, recovery_client->async_stop(), asio::use_future).get();
+        recovery_client->stop();
         discovery_task.get();
         recovery_client.reset();
 

@@ -45,16 +45,17 @@ flowchart TD
 ```
 
 实线表示持有，虚线表示借用。RelayAgent 是唯一组合根，AgentControl 只保存同级模块的引用；
-跨域通知单独捕获 Forwarder 的共享引用，保证已排队的工作存活。NodeConnectionMgr 只借用
+跨域通知捕获 Forwarder 引用，由组合根保证先排空控制生产者、再排空 transfer，并在析构前 join worker。NodeConnectionMgr 只借用
 RelayAgent，不保存反向强引用。连接消息和状态通知经 RelayAgent 分派给 AgentControl，
 连接管理器负责在就绪和完成通知时维护身份索引与池所有权，不注册模块回调。
 
 成员按 Config、Routing、连接池、Forwarder、Control 的依赖顺序构造，析构顺序相反；连接池
-构造时只保存所属 Agent 的引用，完整构造后的 start 才启动任务。async_stop 先排空所有控制侧
+构造时只保存所属 Agent 的引用，完整构造后的 start 才启动任务。stop 先排空所有控制侧
 生产者，再排空业务，确保连接回调完成时 Control 仍存活。外部 TLS context 和两个 io_context
 必须晚于模块任务销毁。
 
-发现任务和连接任务的 completion 在运行期间保活 RelayAgent；连接后台任务不额外持有
+main 按值持有 RelayAgent，RelayAgent 独占持有 Forwarder。发现、连接和转发任务借用各自的拥有者，
+由 stop 等待其完成，不额外保活 Agent 或 Forwarder。连接后台任务不额外持有
 NodeConnection 的 shared_ptr，保证空闲回收的 use_count 判断仍准确。连接池只在 run 完成后
 释放池内强引用；此后外部连接句柄可以晚于 Agent 释放，已排空的连接不再保存 I/O 操作或借用其模块。
 
@@ -88,7 +89,7 @@ AgentControl 使用普通映射保存服务位置，Node ID 和端点由 Service
 
 每条控制连接在可用前都执行 `server.identify/server.identified`。客户端校验服务器返回的 `node_id`：已知位置指定了节点 ID 时，实际连接到其他节点会使该次连接失败。
 
-连接池先按 `node_id` 复用，再按 `host:port` 复用。每个 `NodeConnection` 自己运行连接、接收、清理和重连循环：
+连接池先通过 `find_node` 按 `node_id` 复用并重置空闲计时，再按 `host:port` 复用。每个 `NodeConnection` 自己运行连接、接收、清理和重连循环：
 
 - 初始重连延迟由 `reconnect.initial_delay_ms` 指定；
 - 失败后翻倍，最多到 `reconnect.max_delay_ms`；
@@ -98,7 +99,7 @@ AgentControl 使用普通映射保存服务位置，Node ID 和端点由 Service
 `NodeConnection` 不长期保存强 TLSChannel 引用。每次 `run()` 使用成员中的
 `optional<Operations>` 原位拥有 resolver、socket 和 retry timer；运行开始时构造，连接循环退出时由
 scope guard 清空，`stop()` 因而可以直接取消这些对象而不引用协程栈地址。当前通道仍只保存
-`weak_ptr<TLSChannel>`。协程 completion handler 在任务期间持有 RelayAgent；连接池强持有 NodeConnection，运行协程及其 completion handler 只借用连接。
+`weak_ptr<TLSChannel>`。连接池强持有 NodeConnection，运行协程及其 completion handler 只借用 Agent 和连接，由整体 stop 保证它们存活到任务完成。
 
 连接池直接保存普通 `shared_ptr<NodeConnection>`，每个连接只有一个 shared_ptr 控制块。
 EntryWait 和活动的请求方 AgentSession 保存同一连接的共享引用，EntryWait 只在入口选择期间存在。
@@ -107,6 +108,7 @@ EntryWait 和活动的请求方 AgentSession 保存同一连接的共享引用�
 停止后连接不再 ready，但池内索引与对象保留到 `run()` 完成，随后由 NodeConnectionMgr 的 completion handler 移除。
 同节点新请求遇到停止中的连接时等待其任务退出，再使用原地址重建，整个过程仍受原建立截止时间约束。
 入口查询结果只保存地址与端口，不长期保留 JSON 回复；DNS 和控制接收恢复时检查停止状态，避免启动下一阶段。
+TLS 握手期间的取消由 TLSChannel::start 检查；消息循环只在接收返回后检查停止状态。
 附加节点断线只结束使用它的业务实例；主控制连接恢复后重新注册和发现服务，不设计离线定位。
 
 单条 NodeConnection 的状态转换可以表示为：
@@ -132,6 +134,7 @@ stateDiagram-v2
 Ready 只表示 mTLS 和 `server.identified` 都成功。TCP 已连接或 TLS 已握手但尚未识别节点时，不会注册服务、安装 Forwarder 路由或发送业务请求。
 
 连接失败后的清理顺序为：清除 weak channel、通知 owner 结束使用该控制连接的业务、等待 TLSChannel 断开、等待重连 timer。stop 会同时取消 resolver、socket 和 timer，使协程从任何阶段退出。
+TLSChannel 自行处理正常关闭的 I/O 错误；等待排空的异常直接交给连接池完成回调报告，不吞掉异常继续重连。
 
 ### 路由失效与重新发现
 
@@ -152,6 +155,10 @@ relay.error 的 service unavailable / service protocol mismatch 若仍对应当�
 
 ### 路径缓存与入口等待
 
+AgentRouting 将节点地址、报告年龄和可用带宽保存在同一节点记录中，链路连续保存在 vector 中，
+解析后按 `(source, destination)` 排序并检查重复有向边。快照解析到临时 Snapshot，完整校验后一次移动替换；
+无效响应保留上一份有效拓扑。ProbeSet 每个 Node 生成一条入口指标，候选计算直接遍历有效入口记录。
+
 AgentRouting 独占容量 16、TTL 15 秒的目的 Node LRU；同一目的 Node 的多个服务共享最佳节点序列，
 包括无可用路径的空结果。候选及成本仅用于本次排序和日志，缓存不保存完整候选列表；私有计算只整理当前目的 Node 的候选，
 不维护或公开所有目的节点的候选集合。
@@ -159,10 +166,12 @@ TTL 到期前复用最佳路径，不因普通质量或同 epoch 拓扑刷新延
 必需探测目标实际变化、有效快照的 epoch 改变、primary 失联和停止会使缓存失效。
 算法与实测入口约束见 [图算法与 Agent 接口](RelayWeave设计.md#43-图算法与-agent-接口)。
 
-已经 ready 的入口在校验原截止时间后直接返回，不分配查询编号或等待对象。
+已经 ready 的入口在校验原截止时间后直接返回，不分配查询编号或等待对象，也不占用或受限于等待表容量。
 AgentControl 的 map 按值持有 EntryWait；它只存在于确实需要等待的入口选择期间，拥有原截止时间、通知 timer、
 已定位的端点和可选连接共享句柄。node.located/error 只有来自 primary，且 request_id、node_id、
 未取消状态和期限都匹配时才可推进等待。成功、失败或超时由选择协程的 scope guard 删除表项；整体停机不提前清空等待表，避免悬空引用。
+timer 构造时设置原截止时间，连接事件只取消当前等待以唤醒协程，不重新设置期限。
+epoch 变化、主控断线和停止统一设置等待项的失败原因并唤醒，等待循环只处理该原因和期限。
 停止中的连接保留在池里；其 completion 先通知 AgentControl，等待者释放旧引用、保留端点并被唤醒，
 随后池才删索引。新请求因此可在原预算内重建，不会并行启动相同入口的新旧连接任务。
 
@@ -267,7 +276,7 @@ UDP 请求方的本地监听仍由 DatagramForward 拥有。
 AgentSession 只保存两个控制事件标记 ready、node_closed，以及中止原因 reason。
 ready 表明已收到 relay.ready，node_closed 只表示 Node 已结束业务；reason 为空表示没有中止，
 非空表示已经中止并包含具体原因。cancel 保留首次原因并关闭 I/O，空原因补为默认取消文本，
-后续通知或取消不覆盖原原因。fail 在首次失败发生时调用 cancel，无需保存失败类别。
+后续通知或取消不覆盖原原因。cancel 返回是否首次设置原因，fail 据此只记录首次失败，无需重复检查或保存失败类别。
 活动实例处理关闭/错误通知时先验证 reason、stage，再设置 node_closed，字段错误不留下半更新状态。
 UDP 的 Node 关闭始终中止实例，因此本地发送只检查 ready 和 reason，发送错误统一交给幂等 fail 处理。
 建立期限耗尽的错误仍保留原始异常原因。
@@ -278,6 +287,7 @@ relay.open 是否提交只由 run 协程使用，因此 submitted 留在协程�
 run 末尾统一清理，在本地中止、Node 未关闭且已提交请求或接受 offer 时通知 Node；
 多跳流正常结束须排空本地双向数据并收到 Node 完成通知，之后才能释放入口引用。
 TCP/TLS/UDP 共用 ready 等待；UDP 只在其中补充 attach 重发。
+relay.opened 和多跳流结束各等待一次通知；匹配的回复或取消会唤醒等待，只有 UDP attach 重发需要循环。
 取消和资源回收共用幂等 close_io；Node 已关闭时不反向发送 cancel/reject，不再接受该实例的迟到通知。
 中止时已由 cancel/fail 关闭 I/O，run 收尾仅在正常完成时执行 close_io，避免重复取消和关闭。
 AgentSession 不再绑定协程取消信号；close_io 取消自己的定时器和 resolver、关闭自己的 socket，
@@ -289,14 +299,17 @@ Agent 整体停止仍由 invalidate_entries 设置入口等待原因并唤醒，
 
 业务任务独立启动并由 Forwarder 计数；运行协程持有实例直到清理结束。
 Forwarder 停机同步取消全部已登记实例；Session 建立流程以 reason 检查取消，不重复读取 Forwarder 状态。
-AgentSession 只引用其拥有者 Forwarder，通过接口读取连接选项、申请入口并通知 ready/结束；关闭流程保活 Agent，取消并排空全部业务任务后再完成关闭。
+AgentSession 只引用其拥有者 Forwarder，通过接口读取连接选项、申请入口并通知 ready/结束；main 持有 Agent，关闭流程取消并排空全部业务任务后再返回。
 UDP 本地发送临时保留当前实例，避免业务退出时销毁尚在发送的 socket；不保留额外弱索引或 pending 表。
-DatagramForward 保存当前会话的 shared_ptr；会话仍统一登记在 relays_，清理时按对象身份解除 forward 的引用。
+DatagramForward 保存当前会话的 shared_ptr；会话仍统一登记在 relays_，结束通知删除会话登记并解除 forward 的引用。
+UDP forward 在构造时按配置顺序放入固定 vector，Session 的 forward ID 直接使用下标，运行期间不再增删。
 本地接收协程每包复制一次当前强引用并直接 async_send，不再查 relays_、读取 JSON 元数据或创建发送子协程。
 发送和返回路径复用缓存的二进制头与载荷上限，接收缓冲区仍保留完整 UDP 容量。
-UDP 重试由 Forwarder 拥有的独立协程执行并计入停机排空；服务失效将重试期限提前到当前时刻，
+UDP 重试由 Forwarder 拥有的独立协程执行并计入停机排空；服务失效或停止将重试期限提前到当前时刻，
 使尚未开始等待的任务也能看到唤醒，重试协程退出等待时才清除标记，
 避免旧取消结果覆盖新重试。若服务已恢复，按当前服务位置建立新实例。
+监听循环在异步操作返回后检查停止状态；UDP 建立统一由 open_datagram_forward 检查停止、已有会话和待重试状态。
+启动异常直接向上传播，由 main 调用 stop；监听关闭和重试唤醒统一在 async_stop 中执行。
 
 ## 5. 配置、启动与停止
 
@@ -327,10 +340,11 @@ TCP/TLS 服务尚未定位时关闭当前应用连接，监听保留；UDP 此�
 
 ### RelayAgent 停止流程
 
-async_stop 是唯一公开停止入口，可从任一 executor 调用。它先保活 Agent，再跨到 control_io。
-状态按 Created/Running → Stopping → Stopped 推进；两个排空阶段按协程顺序执行，不保存重复阶段状态。重复调用等待
-同一个 stopped_event，已经 Stopped 时立即完成。实际排空由 Agent 独立持有的任务执行，
-取消某个停止等待者不会中断该任务。尚未启动也需要释放 Forwarder 构造时持有的 work guard。
+`stop()` 是唯一公开停止入口，由 main 在 control_io 和 transfer_io 之外顺序调用，
+不能与 start 或另一次 stop 重叠。main 持有 Agent，通过 `co_spawn(..., use_future).get()`
+阻塞等待 control_io 上的停止协程；两个 worker 必须保持运行。
+状态按 Created/Running → Stopping → Stopped 推进。完成后的重复调用直接返回，worker join 后也可调用。
+尚未启动也需要释放 Forwarder 构造时持有的 work guard。
 
 1. RelayAgent 切换到 Stopping，依次请求 AgentControl 停止发现与入口等待、AgentRouting 停止探测、
    NodeConnectionMgr 停止全部连接；另向 transfer_io 投递建立中业务的取消。
@@ -340,10 +354,14 @@ async_stop 是唯一公开停止入口，可从任一 executor 调用。它先�
 3. 所有控制侧生产者都已退出后，RelayAgent 在 transfer_io 队列尾部
    co_spawn Forwarder::async_stop，确保此前投递的消息先被消费。
 4. Forwarder 关闭本地监听、取消重试和全部 Session，等待监听、重试及业务任务计数归零，释放 work guard。
-5. 全部排空成功后回到 control_io，清空服务元数据，标记 Stopped，通知全部停止等待者。main 在线程 join 后销毁 Agent。
+5. 全部排空成功后回到 control_io，标记 Stopped，外部 stop 返回。服务发现记录和路由缓存随所属模块析构释放。
+   main 在信号等待结束后调用 stop，随后释放外部 work guard、join worker，再销毁 Agent。
 
-排空异常保留在 Agent 中，向并发及后续停止等待者传播同一错误；状态保持 Stopping，不清空元数据，
-也不继续关闭仍可能接收通知的下游依赖。重复调用返回已保存的失败，不自动重试或伪装为已停止。
+main 在 worker 启动前调用 start；启动异常也会先启动两个 worker，再调用 stop 收拢已发布任务，
+完成线程清理后报告原异常。停止异常通过同步调用传播给 main，不再由 detached 信号任务丢弃。
+
+排空异常直接传播给调用方；状态保持 Stopping，不清空元数据，也不继续关闭仍可能接收通知的
+下游依赖。解决排空失败后，可以再次顺序调用 stop 完成清理。
 
 没有固定睡眠排空，也不在模块仍可能回调或投递消息时销毁依赖。建立中失败、解析/握手被取消、
 正常流半关闭以及 UDP 重试均使用相同的拥有关系退出。
@@ -352,8 +370,9 @@ async_stop 是唯一公开停止入口，可从任一 executor 调用。它先�
 
 | 测试 | 验证边界 |
 |---|---|
-| agent_lifecycle | 监听回滚、未启动即停止、重复启动、并发/重复停止、取消等待者不打断停机、排空失败保持状态并传播给所有等待者、释放对象 |
-| node_connection | 实际 mTLS 与身份门槛、就绪入口直接返回、按 Node/端点复用、身份冲突、业务引用防回收、60 秒边界、停止中复用、并发排空及连接句柄晚于 Agent 释放 |
+| agent_lifecycle | 启动失败后停止释放监听、未启动即停止、重复启动、所有者线程阻塞/重复停止、排空失败保持状态与元数据、失败解决后重试排空、释放对象 |
+| agent_process | 真实进程的 SIGTERM/SIGINT 阻塞停止、监听释放和启动失败后的线程清理 |
+| node_connection | 实际 mTLS 与身份门槛、就绪入口直接返回、按 Node/端点复用、身份冲突、业务引用防回收、60 秒边界、停止中复用、TLS 握手中停止、Agent 停止排空及连接句柄晚于 Agent 释放 |
 | agent_session | Node 完成与本地排空、首次原因、错误通知原子性、原截止时间、停止唤醒及入口回复关联 |
 | forwarder | UDP 重试任务所有权、服务恢复时不重叠建立、停止排空 |
 | agent_routing / agent_path_cache | 快照、实测路径、缓存共享/空结果/TTL，以及目标、epoch 和主控断线失效 |

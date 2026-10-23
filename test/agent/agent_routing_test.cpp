@@ -208,11 +208,11 @@ int main()
         require(to_d.size() == 2 && to_d[0].cost < to_d[1].cost &&
                     to_d[1].nodes == std::vector<std::string>({"D"}) && to_d[1].cost == 50.0,
                 "Per-ingress candidates lost an alternative or are not ordered by cost");
-        const std::vector<RouteGraph::Entry> repeated{{"A", 50.0}, {"D", 10.0}, {"A", 3.0}};
-        const auto tied = test_routing::candidates(routing, "D", at(0), repeated);
+        const std::vector<RouteGraph::Entry> tied_access{{"D", 10.0}, {"A", 3.0}};
+        const auto tied = test_routing::candidates(routing, "D", at(0), tied_access);
         require(tied.size() == 2 && tied[0].nodes == path->nodes && tied[1].nodes.front() == "D" &&
                     tied[0].cost == tied[1].cost,
-                "Repeated ingress or equal-cost candidates are not deterministic");
+                "Equal-cost candidates are not ordered deterministically");
         const std::vector<RouteGraph::Entry> only_a{access.front()};
         require(!calculate_path(routing, "D", only_a, at(15)), "Expired snapshot remained routable");
         require(!calculate_path(routing, "A", std::span(access).subspan(1), at(0)), "Reverse edge was invented");
@@ -237,6 +237,18 @@ int main()
                              Json::array({edge("A", "D", 1.0)}));
         invalid["links"][0]["quality"]["confidence"] = 2.0;
         rejects([&] { routing.accept_snapshot(invalid, at(1)); }, "Invalid quality was accepted");
+
+        routing.begin_request(5, at(1));
+        auto duplicate_links = snapshot(5, first.at("nodes"),
+                                        Json::array({edge("A", "D", 1.0), edge("D", "A", 3.0),
+                                                     edge("A", "D", 2.0)}), 2);
+        duplicate_links["epoch"] = 12u;
+        duplicate_links["nodes"][1]["available"] = 0.1;
+        rejects([&] { routing.accept_snapshot(duplicate_links, at(1)); }, "Duplicate directed link was accepted");
+        const auto retained = calculate_path(routing, "D", only_a, at(1));
+        require(retained && retained->cost == path->cost && retained->nodes == path->nodes && routing.epoch() == 11u,
+                "Late snapshot failure replaced the previous topology, availability or epoch");
+        require(!routing.request_pending(at(1)), "Invalid links did not terminate the snapshot request");
 
         test_routing::Fixture one_hop(io, 1);
         one_hop.begin_request(1, at(0));

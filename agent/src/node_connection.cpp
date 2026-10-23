@@ -37,16 +37,14 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
         {
             PROXY_DEBUG_PRINT("Control connecting -> %s:%u", host_.c_str(), static_cast<unsigned int>(port_));
             auto endpoints = co_await operations.resolver.async_resolve(
-                host_, std::to_string(port_),
-                asio::cancel_after(config.connect_timeout, asio::use_awaitable));
+                host_, std::to_string(port_), asio::cancel_after(config.connect_timeout, asio::use_awaitable));
             if (!running_)
             {
                 throw asio::system_error(asio::error::operation_aborted);
             }
             stage = "connect control endpoint";
             const auto endpoint = co_await asio::async_connect(
-                operations.socket, endpoints,
-                asio::cancel_after(config.connect_timeout, asio::use_awaitable));
+                operations.socket, endpoints, asio::cancel_after(config.connect_timeout, asio::use_awaitable));
             if (!running_)
             {
                 throw asio::system_error(asio::error::operation_aborted);
@@ -55,14 +53,10 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
             PROXY_DEBUG_PRINT("Control TCP connected -> %s:%u", endpoint.address().to_string().c_str(),
                               static_cast<unsigned int>(endpoint.port()));
             stage = "start control TLS channel";
-            channel = std::make_shared<TLSChannel>(std::move(operations.socket), ssl_context,
-                                                   TLSChannelRole::C, config.channel);
+            channel = std::make_shared<TLSChannel>(std::move(operations.socket), ssl_context, TLSChannelRole::C,
+                                                   config.channel);
             channel_ = channel;
             co_await channel->start(host_, config.server_name);
-            if (!running_)
-            {
-                throw asio::system_error(asio::error::operation_aborted);
-            }
 
             stage = "identify server node";
             channel->send(CtrlMessage{CtrlCommand::ServerIdentify, njson::object()});
@@ -90,7 +84,7 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
             PROXY_INFO_PRINT("Control [+] node=%s peer=%s", node_id_.c_str(), id_.c_str());
 
             stage = "receive control message";
-            while (running_)
+            for (;;)
             {
                 auto message = co_await channel->async_receive();
                 if (!running_)
@@ -108,13 +102,9 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
                 failure = std::string(stage) + " failed: " + exception.what();
             }
         }
-        catch (const std::exception &exception)
-        {
-            failure = std::string(stage) + " failed: " + exception.what();
-        }
         catch (...)
         {
-            failure = std::string(stage) + " failed: unknown exception";
+            failure = std::string(stage) + " failed: " + exception_description(std::current_exception());
         }
 
         channel_.reset();
@@ -133,15 +123,7 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
 
         if (channel)
         {
-            try
-            {
-                co_await channel->async_disconnect();
-            }
-            catch (const std::exception &exception)
-            {
-                PROXY_ERROR_PRINT("Control close failed peer=%s:%u reason=%s", host_.c_str(),
-                                  static_cast<unsigned int>(port_), exception.what());
-            }
+            co_await channel->async_disconnect();
         }
 
         if (!running_)
@@ -151,21 +133,20 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
 
         if (!failure.empty())
         {
-            PROXY_ERROR_PRINT("Control failed node=%s peer=%s reason=%s retry=%lldms", node_id_.c_str(),
-                              id_.c_str(), failure.c_str(),
-                              static_cast<long long>(
-                                  std::chrono::duration_cast<std::chrono::milliseconds>(reconnect_delay).count()));
+            PROXY_ERROR_PRINT(
+                "Control failed node=%s peer=%s reason=%s retry=%lldms", node_id_.c_str(), id_.c_str(), failure.c_str(),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(reconnect_delay).count()));
         }
         else
         {
-            PROXY_DEBUG_PRINT("Control retry node=%s peer=%s delay=%lldms", node_id_.c_str(), id_.c_str(),
-                              static_cast<long long>(
-                                  std::chrono::duration_cast<std::chrono::milliseconds>(reconnect_delay).count()));
+            PROXY_DEBUG_PRINT(
+                "Control retry node=%s peer=%s delay=%lldms", node_id_.c_str(), id_.c_str(),
+                static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(reconnect_delay).count()));
         }
 
         operations.retry.expires_after(reconnect_delay);
         const auto [error] = co_await operations.retry.async_wait(use_nothrow_awaitable);
-        if (error || !running_)
+        if (error)
         {
             break;
         }
@@ -176,10 +157,6 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
 
 void NodeConnection::stop()
 {
-    if (!running_)
-    {
-        return;
-    }
     running_ = false;
     if (operations_)
     {

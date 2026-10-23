@@ -64,8 +64,9 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 
 ## 回归边界与整理原则
 
-- Agent 连接池（`node_connection`）：真实 mTLS 后仍等待节点识别；就绪连接不创建等待或分配请求编号、Node/端点复用、身份冲突、活动引用防回收、60 秒空闲边界、停止期间复用旧索引、任务完成后重建、并发停止排空，以及连接句柄晚于 Agent 释放。
-- Agent 停止（`agent_lifecycle`）：取消一个停止等待者不打断独立排空任务，其他等待者仍等待依赖退出；排空失败保持 Stopping、保留元数据并向并发及后续等待者传播错误，最终释放 Agent。
+- Agent 连接池（`node_connection`）：真实 mTLS 后仍等待节点识别；就绪连接不创建等待或分配请求编号、Node/端点复用、身份冲突、活动引用防回收、60 秒空闲边界、停止期间复用旧索引、任务完成后重建、Agent 停止排空，以及连接句柄晚于 Agent 释放。
+- Agent 停止（`agent_lifecycle`）：所有者线程顺序调用阻塞 stop，等待控制侧与业务侧排空；完成后重复调用直接返回；排空失败保持 Stopping、保留元数据，解决失败后可再次调用完成排空，最终释放 Agent。
+- Agent 进程（`agent_process`）：真实可执行文件处理 SIGTERM/SIGINT 后阻塞停止并释放监听；启动失败时仍排空、join worker 并返回原异常。
 - Agent 入口（`agent_session`）：回复同时关联 primary 来源、request_id、node_id、原截止时间和取消状态；Session 本地取消保留入口预算，整体停止立即唤醒并排空。
 
 

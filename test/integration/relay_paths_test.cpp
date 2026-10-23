@@ -63,13 +63,13 @@ struct RelayAgentTestAccess
                 }
                 // Clear a UDP relay that may have opened before topology/cache availability.
                 co_await asio::co_spawn(test_access::RelayAgent_transfer_executor_(agent),
-                    [forwarder = test_access::RelayAgent_forwarder_(agent), service]() -> asio::awaitable<void> {
+                    [forwarder = test_access::RelayAgent_forwarder_(agent).get(), service]() -> asio::awaitable<void> {
                         forwarder->clear_service(service);
                         co_return;
                     }, asio::use_awaitable);
                 test_access::AgentRouting_path_cache_(routing(agent)).put(path.back(), path, AgentRouting::Clock::now());
                 // Refresh availability without connecting to the service Node.
-                asio::post(test_access::RelayAgent_transfer_executor_(agent), [forwarder = test_access::RelayAgent_forwarder_(agent), service, node = destination->second.node] {
+                asio::post(test_access::RelayAgent_transfer_executor_(agent), [forwarder = test_access::RelayAgent_forwarder_(agent).get(), service, node = destination->second.node] {
                     forwarder->set_service(service, node);
                 });
                 co_return;
@@ -1156,7 +1156,7 @@ void integration()
                 co_await asio::async_read(app, asio::buffer(received), asio::cancel_after(1s, asio::use_awaitable));
                 require(received == bytes, "Same-Agent Single response did not pass readiness");
             }
-            co_await discovery_agent->async_stop();
+            discovery_agent->stop();
             consumer_agent = std::make_shared<RelayAgent>(agent_control, agent_transfer, client_ssl, consumer_config);
             consumer_agent->start();
             std::size_t protocol_index = 0;
@@ -1275,7 +1275,7 @@ void integration()
                 }
                 ++protocol_index;
             }
-            co_await consumer_agent->async_stop();
+            consumer_agent->stop();
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,
                 njson{{"request_id", 50}, {"service", "auto-bad"}, {"protocol", "tcp"},
                       {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
@@ -1289,7 +1289,7 @@ void integration()
                 njson{{"request_id", 51}, {"service", "auto-tcp"}, {"protocol", "tcp"},
                       {"epoch", epoch}, {"path", {"a", "b", "master"}}}));
             co_await receive(channels[1], CtrlCommand::RelayOpened);
-            co_await agent->async_stop();
+            agent->stop();
             const auto producer_lost = co_await receive(channels[1], CtrlCommand::RelayError);
             require(producer_lost.params->at("reason") == "producer control disconnected",
                     "Producer control loss did not wake the consumer");
@@ -1308,14 +1308,14 @@ void integration()
             live_sockets.push_back(co_await attach_tcp(*live_offer.params, configs[3], RelayAttach::Producer));
             co_await receive(channels[1], CtrlCommand::RelayReady);
             co_await receive(channels[3], CtrlCommand::RelayReady);
-            co_await agent->async_stop();
+            agent->stop();
             if (discovery_agent)
             {
-                co_await discovery_agent->async_stop();
+                discovery_agent->stop();
             }
             if (consumer_agent)
             {
-                co_await consumer_agent->async_stop();
+                consumer_agent->stop();
             }
         };
         auto future = asio::co_spawn(client, scenario(), asio::use_future);
@@ -1329,14 +1329,14 @@ void integration()
             {
                 co_await channel->async_disconnect();
             }
-            co_await agent->async_stop();
+            agent->stop();
             if (discovery_agent)
             {
-                co_await discovery_agent->async_stop();
+                discovery_agent->stop();
             }
             if (consumer_agent)
             {
-                co_await consumer_agent->async_stop();
+                consumer_agent->stop();
             }
         };
         auto stopped = asio::co_spawn(client, cleanup(), asio::use_future);

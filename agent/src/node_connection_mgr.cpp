@@ -15,17 +15,9 @@ void NodeConnectionMgr::start()
 
 std::shared_ptr<NodeConnection> NodeConnectionMgr::ensure_connection(std::string node_id, std::string host, std::uint16_t port)
 {
-    if (stopping_)
+    if (auto connection = find_node(node_id))
     {
-        throw std::runtime_error("connection manager stopping");
-    }
-    if (!node_id.empty())
-    {
-        if (const auto connection = connections_.find_secondary(node_id))
-        {
-            (*connection)->idle_since_.reset();
-            return *connection;
-        }
+        return connection;
     }
 
     const auto id = host + ":" + std::to_string(port);
@@ -52,8 +44,7 @@ std::shared_ptr<NodeConnection> NodeConnectionMgr::ensure_connection(std::string
     try
     {
         asio::co_spawn(executor_, connection->run(ssl_context_, config_, *this, agent_),
-                       [this, keep_alive = agent_.shared_from_this(), connection = connection.get()]
-                       (std::exception_ptr failure) {
+                       [this, connection = connection.get()](std::exception_ptr failure) {
                            connection_finished(*connection, failure);
                        });
     }
@@ -125,9 +116,8 @@ void NodeConnectionMgr::connection_finished(NodeConnection &connection, std::exc
         agent_.connection_closed(connection);
     }
     agent_.connection_finished(connection);
-    const auto id = connection.id();
-    connections_.erase_primary(id);
-    if (failure && !stopping_)
+    connections_.erase_primary(connection.id());
+    if (failure)
     {
         PROXY_ERROR_PRINT("Control stopped reason=%s", exception_description(failure).c_str());
     }
@@ -139,10 +129,6 @@ void NodeConnectionMgr::connection_finished(NodeConnection &connection, std::exc
 
 void NodeConnectionMgr::stop()
 {
-    if (stopping_)
-    {
-        return;
-    }
     stopping_ = true;
     connections_.for_each([](const std::string &, const std::shared_ptr<NodeConnection> &connection) {
         connection->stop();
@@ -155,7 +141,6 @@ void NodeConnectionMgr::stop()
 
 asio::awaitable<void> NodeConnectionMgr::close()
 {
-    stop();
     if (!co_await stopped_event_.wait())
     {
         throw asio::system_error(asio::error::operation_aborted);

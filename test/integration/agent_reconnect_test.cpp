@@ -311,10 +311,8 @@ int main()
         server_udp_thread = std::thread([&server_udp_io]() { server_udp_io.run(); });
         wait_for_round_trip(control_io, forward_port);
 
-        auto consumer_stopped = asio::co_spawn(control_io, consumer->async_stop(), asio::use_future);
-        auto producer_stopped = asio::co_spawn(control_io, producer->async_stop(), asio::use_future);
-        consumer_stopped.get();
-        producer_stopped.get();
+        consumer->stop();
+        producer->stop();
         consumer.reset();
         producer.reset();
         replacement->stop();

@@ -72,8 +72,11 @@ struct ForwarderTestAccess
             }
         }
         const std::weak_ptr<AgentSession> session = forward.relay;
-        owner.clear_service(service);
-        co_await await_transfers(owner.async_stop(), owner.async_stop());
+        if (wait_started || recover)
+        {
+            owner.clear_service(service);
+        }
+        co_await owner.async_stop();
         co_await owner.async_stop();
         if (test_access::Forwarder_state_(owner) != std::remove_cvref_t<decltype(test_access::Forwarder_state_(owner))>::Stopped || test_access::Forwarder_active_tasks_(owner) != 0 || forward.retry_scheduled ||
             forward.relay || !test_access::Forwarder_relays_(owner).empty() || !session.expired())
@@ -100,19 +103,29 @@ int main()
                 asio::io_context control(1);
                 asio::io_context transfer(1);
                 auto agent = std::make_shared<RelayAgent>(control, transfer, ssl, AgentConfig{});
-                auto owner = std::make_shared<Forwarder>(
+                auto owner = std::make_unique<Forwarder>(
                     *agent, transfer.get_executor(), ssl, std::nullopt, 1s, 1s, 2s, std::vector<AgentServiceConfig>{},
                     std::vector<AgentForwardConfig>{{"retry-test", "127.0.0.1", 0, RelayProtocol::Udp}});
-                std::weak_ptr<Forwarder> weak_owner = owner;
                 owner->start();
-                ForwarderTestAccess::prepare(*owner);
+                std::future<void> result;
                 if (!wait_started)
+                {
+                    // Stop may run before the already-owned retry starts its timer wait.
+                    result = asio::co_spawn(transfer,
+                                           ForwarderTestAccess::retry_lifecycle(*owner, wait_started, recover),
+                                           asio::use_future);
+                }
+                ForwarderTestAccess::prepare(*owner);
+                if (!wait_started && recover)
                 {
                     ForwarderTestAccess::cancel_and_recover(*owner, recover);
                 }
-                auto result = asio::co_spawn(transfer,
-                                             ForwarderTestAccess::retry_lifecycle(*owner, wait_started, recover),
-                                             asio::use_future);
+                if (wait_started)
+                {
+                    result = asio::co_spawn(transfer,
+                                           ForwarderTestAccess::retry_lifecycle(*owner, wait_started, recover),
+                                           asio::use_future);
+                }
                 const auto deadline = std::chrono::steady_clock::now() + 2s;
                 while (result.wait_for(0ms) != std::future_status::ready)
                 {
@@ -127,10 +140,6 @@ int main()
                 }
                 result.get();
                 owner.reset();
-                if (!weak_owner.expired())
-                {
-                    throw std::runtime_error("Stopped Forwarder was retained by a retry or listener task");
-                }
             }
         }
         std::cout << "[PASS] UDP retries are owned, recover without overlap and drain before Forwarder destruction\n";

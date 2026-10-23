@@ -3,16 +3,15 @@
 #include "message.h"
 #include <algorithm>
 #include <cmath>
-#include <set>
 #include <sstream>
+#include <tuple>
 
 static std::chrono::milliseconds age(std::uint64_t value)
 {
     return std::chrono::milliseconds(std::min(value, std::uint64_t(std::chrono::milliseconds::max().count())));
 }
 
-AgentRouting::AgentRouting(asio::io_context &io, std::size_t max_nodes)
-    : max_nodes_(max_nodes), probes_(io)
+AgentRouting::AgentRouting(asio::io_context &io, std::size_t max_nodes) : max_nodes_(max_nodes), probes_(io)
 {
     if (max_nodes == 0 || max_nodes > MAX_PATH_NODES)
     {
@@ -34,10 +33,10 @@ bool AgentRouting::set_required_targets(ProbeSet::Targets targets)
 
 void AgentRouting::update_targets()
 {
-    auto targets = nodes_;
-    for (const auto &[id, host] : required_targets_)
+    auto targets = required_targets_;
+    for (const auto &[id, node] : snapshot_.nodes)
     {
-        targets.insert_or_assign(id, host);
+        targets.try_emplace(id, node.address);
     }
     probes_.set_targets(std::move(targets));
 }
@@ -64,10 +63,13 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
     try
     {
         using namespace config;
-        const auto epoch = require_unsigned(snapshot, "epoch", true);
-        const auto version = require_unsigned(snapshot, "snapshot_version", true);
+        Snapshot next;
+        next.epoch = require_unsigned(snapshot, "epoch", true);
+        next.version = require_unsigned(snapshot, "snapshot_version", true);
         const auto created_age = age(require_unsigned(snapshot, "created_age_ms"));
-        if (created_age >= SNAPSHOT_EXPIRY || !snapshot.at("nodes").is_array() || !snapshot.at("links").is_array())
+        const auto &nodes = snapshot.at("nodes");
+        const auto &links = snapshot.at("links");
+        if (created_age >= SNAPSHOT_EXPIRY || !nodes.is_array() || !links.is_array())
         {
             throw std::invalid_argument("Invalid topology snapshot age or arrays");
         }
@@ -78,70 +80,70 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
             return false;
         }
 
-        if (epoch == epoch_ && version < version_)
+        if (next.epoch == snapshot_.epoch && next.version < snapshot_.version)
         {
             return false;
         }
 
-        if (snapshot.at("nodes").size() + snapshot.at("links").size() > MAX_SNAPSHOT_ENTRIES)
+        if (nodes.size() + links.size() > MAX_SNAPSHOT_ENTRIES || nodes.size() > MAX_SNAPSHOT_NODES)
         {
             throw std::invalid_argument("Topology exceeds Agent entry limit");
         }
 
-        std::map<std::string, std::string> nodes;
-        std::vector<Link> links;
-        std::map<std::string, std::chrono::milliseconds> report_ages;
-        std::map<std::string, double> available;
-        std::set<std::pair<std::string, std::string>> edges;
-        for (const auto &node : snapshot.at("nodes"))
+        next.created = pending_.started - created_age;
+        for (const auto &node : nodes)
         {
-            const auto id = required_string(node, "node_id", "topology.snapshot");
-            const auto host = required_string(node, "address", "topology.snapshot");
-            if (!nodes.emplace(id, host).second || nodes.size() > MAX_SNAPSHOT_NODES)
-            {
-                throw std::invalid_argument("Topology contains duplicate or too many nodes");
-            }
-            report_ages[id] = node.at("report_age_ms").is_null() ? std::chrono::milliseconds::max()
-                                                                 : age(require_unsigned(node, "report_age_ms"));
+            auto id = required_string(node, "node_id", "topology.snapshot");
+            Node parsed{required_string(node, "address", "topology.snapshot"),
+                        node.at("report_age_ms").is_null() ? std::chrono::milliseconds::max()
+                                                           : age(require_unsigned(node, "report_age_ms")),
+                        std::nullopt};
             const auto value = node.find("available");
             if (value != node.end() && !value->is_null())
             {
-                if (!value->is_number() || !std::isfinite(value->get<double>()) ||
-                    value->get<double>() < 0.0 || value->get<double>() > 1.0)
+                if (!value->is_number() || !std::isfinite(value->get<double>()) || value->get<double>() < 0.0 ||
+                    value->get<double>() > 1.0)
                 {
                     throw std::invalid_argument("Node available must be a finite number between 0 and 1");
                 }
-                available.emplace(id, value->get<double>());
+                parsed.available = value->get<double>();
+            }
+            if (!next.nodes.emplace(std::move(id), std::move(parsed)).second)
+            {
+                throw std::invalid_argument("Topology contains duplicate nodes");
             }
         }
 
-        for (const auto &entry : snapshot.at("links"))
+        next.links.reserve(links.size());
+        for (const auto &entry : links)
         {
-            const auto source = required_string(entry, "source", "topology.snapshot");
-            const auto target = required_string(entry, "destination", "topology.snapshot");
+            auto source = required_string(entry, "source", "topology.snapshot");
+            auto target = required_string(entry, "destination", "topology.snapshot");
             const auto quality = parse_quality(entry.at("quality"));
-            if (source == target || !nodes.contains(source) || !nodes.contains(target) ||
-                !edges.emplace(source, target).second)
+            const auto link_age = entry.at("age_ms").is_null() ? std::chrono::milliseconds::max()
+                                                               : age(require_unsigned(entry, "age_ms"));
+            if (source == target || !next.nodes.contains(source) || !next.nodes.contains(target))
             {
                 throw std::invalid_argument("Topology contains an invalid directed link");
             }
-            const auto link_age = entry.at("age_ms").is_null() ? std::chrono::milliseconds::max()
-                                                               : age(require_unsigned(entry, "age_ms"));
-            links.push_back({source, target, quality, link_age});
+            next.links.push_back({std::move(source), std::move(target), quality, link_age});
+        }
+        std::sort(next.links.begin(), next.links.end(), [](const Link &left, const Link &right) {
+            return std::tie(left.from, left.to) < std::tie(right.from, right.to);
+        });
+        if (std::adjacent_find(next.links.begin(), next.links.end(), [](const Link &left, const Link &right) {
+                return left.from == right.from && left.to == right.to;
+            }) != next.links.end())
+        {
+            throw std::invalid_argument("Topology contains duplicate directed links");
         }
 
-        nodes_ = std::move(nodes);
-        report_ages_ = std::move(report_ages);
-        available_ = std::move(available);
-        update_targets();
-        links_ = std::move(links);
-        snapshot_at_ = pending_.started - created_age;
-        if (epoch_ != epoch)
+        if (snapshot_.epoch != next.epoch)
         {
             path_cache_.clear();
         }
-        epoch_ = epoch;
-        version_ = version;
+        snapshot_ = std::move(next);
+        update_targets();
         pending_ = Pending{};
         return true;
     }
@@ -155,12 +157,8 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
 void AgentRouting::invalidate_snapshot()
 {
     path_cache_.clear();
-    nodes_.clear();
-    report_ages_.clear();
-    available_.clear();
-    links_.clear();
+    snapshot_ = Snapshot{};
     pending_ = Pending{};
-    epoch_ = version_ = 0;
     update_targets();
 }
 
@@ -176,28 +174,26 @@ void AgentRouting::stop()
 
 asio::awaitable<void> AgentRouting::close()
 {
-    invalidate_snapshot();
-    co_await probes_.close();
+    return probes_.close();
 }
 
 RouteGraph AgentRouting::graph(Clock::time_point now) const
 {
-    if (links_.empty() || now < snapshot_at_)
+    if (snapshot_.links.empty() || now < snapshot_.created)
     {
         return RouteGraph({});
     }
 
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - snapshot_at_);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - snapshot_.created);
     if (elapsed >= SNAPSHOT_EXPIRY)
     {
         return RouteGraph({});
     }
 
     std::vector<RouteGraph::Link> links;
-    for (const auto &link : links_)
+    for (const auto &link : snapshot_.links)
     {
-        const auto report = report_ages_.find(link.from);
-        if (report == report_ages_.end() || report->second >= SNAPSHOT_EXPIRY - elapsed)
+        if (snapshot_.nodes.at(link.from).report_age >= SNAPSHOT_EXPIRY - elapsed)
         {
             continue;
         }
@@ -213,19 +209,18 @@ RouteGraph AgentRouting::graph(Clock::time_point now) const
 
 double AgentRouting::bandwidth_penalty(const std::string &node, Clock::time_point now) const
 {
-    const auto available = available_.find(node);
-    const auto report = report_ages_.find(node);
-    if (available == available_.end() || report == report_ages_.end() || now < snapshot_at_)
+    const auto found = snapshot_.nodes.find(node);
+    if (found == snapshot_.nodes.end() || !found->second.available || now < snapshot_.created)
     {
         return 0.0;
     }
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - snapshot_at_);
-    if (elapsed >= SNAPSHOT_EXPIRY || report->second >= SNAPSHOT_EXPIRY - elapsed)
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - snapshot_.created);
+    if (elapsed >= SNAPSHOT_EXPIRY || found->second.report_age >= SNAPSHOT_EXPIRY - elapsed)
     {
         return 0.0;
     }
     // Charge the destination's headroom; cap saturation at a finite penalty.
-    return 10.0 * (1.0 / std::max(available->second, 0.05) - 1.0);
+    return 10.0 * (1.0 / std::max(*found->second.available, 0.05) - 1.0);
 }
 
 std::vector<RouteGraph::Entry> AgentRouting::measured_entries() const
@@ -247,24 +242,17 @@ std::vector<RouteGraph::Entry> AgentRouting::measured_entries() const
 
 std::vector<RouteGraph::Path> AgentRouting::candidate_paths(const std::string &destination, Clock::time_point now) const
 {
-    const auto entries = measured_entries();
+    auto entries = measured_entries();
     if (entries.empty())
     {
         return {};
     }
 
-    std::map<std::string, double> ingress_costs;
-    for (const auto &entry : entries)
-    {
-        auto &cost = ingress_costs.try_emplace(entry.node, entry.access_cost).first->second;
-        cost = std::min(cost, entry.access_cost);
-    }
-
     const auto routes = graph(now);
     std::vector<RouteGraph::Path> result;
-    for (const auto &[node, cost] : ingress_costs)
+    for (auto &entry : entries)
     {
-        const RouteGraph::Entry entry{node, cost + bandwidth_penalty(node, now)};
+        entry.access_cost += bandwidth_penalty(entry.node, now);
         auto paths = routes.shortest_paths(std::span(&entry, 1), max_nodes_);
         if (const auto path = paths.find(destination); path != paths.end())
         {

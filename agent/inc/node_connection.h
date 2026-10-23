@@ -67,8 +67,8 @@ class NodeConnection
         asio::steady_timer retry;
     };
     /** @brief Run identified receive/retry cycles on control_io, then drain the TLS channel. */
-    asio::awaitable<void> run(asio::ssl::context &ssl_context, const AgentConfig &config,
-                              NodeConnectionMgr &owner, RelayAgent &agent);
+    asio::awaitable<void> run(asio::ssl::context &ssl_context, const AgentConfig &config, NodeConnectionMgr &owner,
+                              RelayAgent &agent);
     /** @brief Idempotently cancel all connection stages on control_io. */
     void stop();
     std::string node_id_;

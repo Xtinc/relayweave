@@ -3,7 +3,10 @@
 #include "xfr_channel.h"
 #include <csignal>
 #include <cstdio>
+#include <future>
 #include <iostream>
+#include <thread>
+#include <vector>
 
 void print_usage(std::string_view program)
 {
@@ -50,26 +53,62 @@ int main(int argc, char *argv[])
             throw std::runtime_error("TLS client private key does not match its certificate");
         }
 
-        auto agent = std::make_shared<RelayAgent>(control_io, transfer_io, ssl_context, std::move(config));
-        agent->start();
-
+        RelayAgent agent(control_io, transfer_io, ssl_context, std::move(config));
         asio::signal_set signals(signal_io, SIGINT, SIGTERM);
-        signals.async_wait([agent, &control_io](const asio::error_code &error, int) {
-            if (!error)
+        auto signal = signals.async_wait(asio::use_future);
+        std::exception_ptr failure;
+        auto control_work = asio::make_work_guard(control_io);
+        // Startup runs before workers, but even partial startup must drain with both workers live.
+        try
+        {
+            agent.start();
+        }
+        catch (...)
+        {
+            failure = std::current_exception();
+        }
+        std::vector<std::thread> workers;
+        workers.reserve(2);
+        ScopeGuard join_workers([&] {
+            control_work.reset();
+            for (auto &worker : workers)
             {
-                asio::co_spawn(control_io, agent->async_stop(), asio::detached);
+                worker.join();
             }
         });
-
-        std::thread control_thread([&control_io]() { control_io.run(); });
-        std::thread transfer_thread([&transfer_io]() {
+        workers.emplace_back([&] { control_io.run(); });
+        workers.emplace_back([&] {
             set_current_thread_scheduler_policy();
             transfer_io.run();
         });
-        signal_io.run();
 
-        control_thread.join();
-        transfer_thread.join();
+        try
+        {
+            if (!failure)
+            {
+                signal_io.run();
+                signal.get();
+            }
+        }
+        catch (...)
+        {
+            failure = std::current_exception();
+        }
+        try
+        {
+            agent.stop();
+        }
+        catch (...)
+        {
+            if (!failure)
+            {
+                failure = std::current_exception();
+            }
+        }
+        if (failure)
+        {
+            std::rethrow_exception(failure);
+        }
         return 0;
     }
     catch (const std::exception &exception)

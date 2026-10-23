@@ -1,12 +1,15 @@
+#include "agent_stop.h"
 #include "node_connection_mgr.h"
 #include "relay_agent.h"
 #include "xfr_channel.h"
 #include "test_data.h"
 #include <future>
 #include <iostream>
+#include <string_view>
 
 #include "member_access.h"
 TEST_MEMBER(NodeConnection, running_)
+TEST_MEMBER(NodeConnection, channel_)
 TEST_MEMBER(RelayAgent, connections_)
 TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(AgentControl, running_)
@@ -125,12 +128,44 @@ asio::awaitable<std::shared_ptr<NodeConnection>> exercise(NodeConnectionMgr &man
     const ServiceKey service{"ready-entry", RelayProtocol::Tcp};
     test_access::AgentControl_running_(control) = true;
     test_access::AgentControl_service_locations_(control)[service] = {0, "entry", "127.0.0.1", port};
+    control.handle_control_message(*manager.primary(), CtrlMessage(CtrlCommand::ServiceError,
+        njson{{"request_id", 0u}, {"service", service.service}, {"protocol", "tcp"}, {"reason", "stale reply"}}));
+    require(test_access::AgentControl_service_locations_(control).at(service).node == "entry",
+            "Unsolicited service error cleared an already located service");
     const auto request = test_access::AgentControl_next_request_id_(control);
     auto selected = co_await agent->select_relay(service, "entry", Clock::now() + 1s);
     require(selected.connection == connection && test_access::AgentControl_entry_waits_(control).empty() &&
                 test_access::AgentControl_next_request_id_(control) == request,
             "Ready entrance allocated an unnecessary request or wait");
     selected.connection.reset();
+
+    // A full lookup table limits new waits, but must not reject a ready entrance.
+    auto &waits = test_access::AgentControl_entry_waits_(control);
+    const auto deadline = Clock::now() + 1s;
+    for (std::uint64_t i = 0; i < 1000; ++i)
+    {
+        waits.try_emplace(request + i, primary.acceptor.get_executor(), service, "pending-entry", deadline);
+    }
+    selected = co_await agent->select_relay(service, "entry", deadline);
+    require(selected.connection == connection && waits.size() == 1000 &&
+                test_access::AgentControl_next_request_id_(control) == request,
+            "Pending lookup capacity rejected a ready entrance or allocated another wait");
+    selected.connection.reset();
+
+    test_access::AgentControl_service_locations_(control).at(service).node = "new-entry";
+    bool full = false;
+    try
+    {
+        co_await agent->select_relay(service, "new-entry", deadline);
+    }
+    catch (const std::runtime_error &error)
+    {
+        full = std::string_view(error.what()) == "entry lookup capacity reached";
+    }
+    require(full && waits.size() == 1000 && test_access::AgentControl_next_request_id_(control) == request,
+            "New entrance lookup bypassed the pending lookup limit");
+    test_access::AgentControl_service_locations_(control).at(service).node = "entry";
+    waits.clear();
 
     bool rejected = false;
     try
@@ -170,11 +205,17 @@ asio::awaitable<std::shared_ptr<NodeConnection>> exercise(NodeConnectionMgr &man
     co_await wait_for([&] { return replacement->ready(); });
     require(entry.accepted == 2, "Finished connection could not be replaced");
 
-    co_await await_transfers(manager.close(), manager.close());
-    co_await manager.close();
+    // A listening TCP endpoint that never speaks TLS leaves the client awaiting its handshake.
+    tcp::acceptor stalled(primary.acceptor.get_executor(), {asio::ip::address_v4::loopback(), 0});
+    auto handshaking = manager.ensure_connection("stalled", "127.0.0.1", stalled.local_endpoint().port());
+    co_await wait_for([&] { return !test_access::NodeConnection_channel_(*handshaking).expired(); });
+    const auto interrupted_channel = test_access::NodeConnection_channel_(*handshaking);
+
+    co_await test_agent::stop_from_owner(agent);
     require(test_access::NodeConnectionMgr_connections_(manager).size() == 0,
-            "Concurrent close returned before every connection finished");
-    co_await agent->async_stop();
+            "Agent stop returned before every connection finished");
+    require(!handshaking->ready() && interrupted_channel.expired(),
+            "Stopping during TLS handshake published readiness or retained the channel");
     primary.stop();
     entry.stop();
     require(!replacement->ready(), "Drained connection remained ready");
@@ -230,7 +271,7 @@ int main()
         require(!retired.expired(), "Connection handle did not survive its drained owner");
         retained.reset();
         require(retired.expired(), "Drained connection outlived its final business handle");
-        std::cout << "[PASS] Node identity, pooled reuse, idle shutdown, concurrent drain and owner release\n";
+        std::cout << "[PASS] Node identity, pooled reuse, idle shutdown, handshake cancellation, blocking drain and owner release\n";
         return 0;
     }
     catch (const std::exception &error)

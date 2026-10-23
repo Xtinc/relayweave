@@ -1,48 +1,44 @@
 #include "agent_session.h"
 #include "forwarder.h"
 #include "xfr_channel.h"
-#include <array>
-#include <cassert>
+#include <algorithm>
 
 using Clock = std::chrono::steady_clock;
 
 AgentSession::AgentSession(Forwarder &owner, std::uint64_t request, ServiceKey service, std::string destination,
                            Clock::time_point deadline)
     : owner(owner), request(request), service(std::move(service)), destination(std::move(destination)),
-      deadline(deadline), data(this->service.protocol == RelayProtocol::Udp
-                                   ? Data(std::in_place_type<DatagramData>, owner.executor())
-                                   : Data(std::in_place_type<StreamData>, owner.executor())),
-      changed(owner.executor())
+      deadline(deadline),
+      data(this->service.protocol == RelayProtocol::Udp ? Data(std::in_place_type<DatagramData>, owner.executor())
+                                                        : Data(std::in_place_type<StreamData>, owner.executor())),
+      changed(owner.executor(), deadline)
 {
 }
 
-void AgentSession::cancel(std::string cause)
+bool AgentSession::cancel(std::string cause)
 {
     if (!reason.empty())
     {
-        return;
+        return false;
     }
 
     reason = cause.empty() ? "relay cancelled" : std::move(cause);
     close_io();
+    return true;
 }
 
 void AgentSession::fail(std::string cause)
 {
-    if (!reason.empty())
+    if (!cancel(cause.empty() ? "relay failed" : std::move(cause)))
     {
         return;
     }
 
-    cancel(cause.empty() ? "relay failed" : std::move(cause));
-    if (owner.running())
-    {
-        const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
-        PROXY_ERROR_PRINT("Relay failed %s %s service=%s request_id=%llu uuid=%llu reason=%s",
-                          relay_protocol_name(service.protocol).data(), producer() ? "producer" : "consumer",
-                          service.service.c_str(), static_cast<unsigned long long>(request),
-                          static_cast<unsigned long long>(uuid), reason.c_str());
-    }
+    const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
+    PROXY_ERROR_PRINT("Relay failed %s %s service=%s request_id=%llu uuid=%llu reason=%s",
+                      relay_protocol_name(service.protocol).data(), producer() ? "producer" : "consumer",
+                      service.service.c_str(), static_cast<unsigned long long>(request),
+                      static_cast<unsigned long long>(uuid), reason.c_str());
 }
 
 void AgentSession::close_io()
@@ -94,14 +90,20 @@ void AgentSession::handle(const CtrlMessage &message)
     }
 
     const auto command = message.type();
-    if (command == CtrlCommand::RelayOpened && endpoint.empty() && reason.empty())
+    if (!reason.empty())
+    {
+        // Local cancellation still accepts the Node's terminal acknowledgement.
+        node_closed = command == CtrlCommand::RelayError || command == CtrlCommand::RelayClosed;
+        return;
+    }
+
+    if (command == CtrlCommand::RelayOpened && endpoint.empty())
     {
         endpoint = p;
         changed.cancel();
     }
-    else if (command == CtrlCommand::RelayReady && !ready && reason.empty())
+    else if (command == CtrlCommand::RelayReady && !ready)
     {
-        assert(!endpoint.empty());
         ready = true;
         PROXY_INFO_PRINT("Relay [+] %s %s service=%s uuid=%llu", relay_protocol_name(service.protocol).data(),
                          producer() ? "producer" : "consumer", service.service.c_str(),
@@ -111,12 +113,6 @@ void AgentSession::handle(const CtrlMessage &message)
     }
     else if (command == CtrlCommand::RelayError || command == CtrlCommand::RelayClosed)
     {
-        if (!reason.empty())
-        {
-            node_closed = true;
-            return;
-        }
-
         auto cause = config::optional_string(p, "reason", "relay closed");
         const bool completed = command == CtrlCommand::RelayClosed && ready && service.protocol != RelayProtocol::Udp &&
                                cause == "stream complete";
@@ -146,18 +142,18 @@ void AgentSession::handle(const CtrlMessage &message)
 
 asio::awaitable<void> AgentSession::run()
 {
+    // relay_finished() removes the owner's references before this coroutine returns.
     auto keep_alive = shared_from_this();
     bool submitted = false;
     std::string stage = "select entry";
     try
     {
-        if (!reason.empty())
-        {
-            throw asio::system_error(asio::error::operation_aborted);
-        }
-
         if (!producer())
         {
+            if (!reason.empty())
+            {
+                throw asio::system_error(asio::error::operation_aborted);
+            }
             // Selection accesses control_io state; attach and transfer stay on transfer_io.
             selection = co_await owner.select_relay(service, destination, deadline);
             if (!reason.empty())
@@ -185,14 +181,10 @@ asio::awaitable<void> AgentSession::run()
             }
 
             submitted = true;
-            while (endpoint.empty() && reason.empty())
+            const auto [error] = co_await changed.async_wait(use_nothrow_awaitable);
+            if (!error || Clock::now() >= deadline)
             {
-                changed.expires_at(deadline);
-                const auto [error] = co_await changed.async_wait(use_nothrow_awaitable);
-                if (!error || Clock::now() >= deadline)
-                {
-                    throw std::runtime_error("relay establishment timed out");
-                }
+                throw std::runtime_error("relay establishment timed out");
             }
         }
 
@@ -224,28 +216,22 @@ asio::awaitable<void> AgentSession::run()
             {
                 co_await relay_tcp(sockets.local, sockets.transfer);
             }
-            if (endpoint.contains("flow_id"))
+            if (endpoint.contains("flow_id") && !node_closed && reason.empty())
             {
                 // Both local directions ended; retain the entry connection while Nodes drain FIN.
-                while (!node_closed && reason.empty())
-                {
-                    changed.expires_at(Clock::time_point::max());
-                    co_await changed.async_wait(use_nothrow_awaitable);
-                }
+                changed.expires_at(Clock::time_point::max());
+                co_await changed.async_wait(use_nothrow_awaitable);
             }
         }
     }
     catch (const std::exception &error)
     {
-        if (reason.empty())
+        auto cause = std::string(error.what());
+        if (!ready && Clock::now() >= deadline)
         {
-            auto cause = std::string(error.what());
-            if (!ready && Clock::now() >= deadline)
-            {
-                cause = "relay establishment deadline exceeded: " + cause;
-            }
-            fail(stage + ": " + cause);
+            cause = "relay establishment deadline exceeded: " + cause;
         }
+        fail(stage + ": " + cause);
     }
 
     const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
@@ -280,7 +266,6 @@ asio::awaitable<void> AgentSession::attach()
     {
         throw asio::system_error(asio::error::operation_aborted);
     }
-    assert(!endpoint.empty());
 
     const auto &server = selection.server;
     const auto port = config::message_data_port(endpoint);
@@ -376,6 +361,10 @@ asio::awaitable<void> AgentSession::attach()
 
     while (!ready && reason.empty())
     {
+        if (Clock::now() >= deadline)
+        {
+            throw std::runtime_error("relay.ready timed out");
+        }
         auto wakeup = deadline;
         if (service.protocol == RelayProtocol::Udp)
         {
@@ -394,10 +383,6 @@ asio::awaitable<void> AgentSession::attach()
         }
         changed.expires_at(wakeup);
         co_await changed.async_wait(use_nothrow_awaitable);
-        if (!ready && reason.empty() && Clock::now() >= deadline)
-        {
-            throw std::runtime_error("relay.ready timed out");
-        }
     }
 
     if (!reason.empty())

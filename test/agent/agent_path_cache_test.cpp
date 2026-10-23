@@ -356,7 +356,6 @@ asio::awaitable<void> verify_cache(ControlPeer &peer, std::shared_ptr<RelayAgent
     co_await open_batch(ports);
     logs.expect_calculations(4);
 
-    co_await agent->async_stop();
     peer.acceptor.close();
 }
 } // namespace
@@ -402,6 +401,7 @@ int main()
             try
             {
                 result.get();
+                agent->stop();
             }
             catch (...)
             {

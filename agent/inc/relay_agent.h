@@ -4,7 +4,6 @@
 #include "agent_control.h"
 #include "agent_routing.h"
 #include "node_connection_mgr.h"
-#include "async_event.h"
 
 struct AgentServiceConfig
 {
@@ -48,10 +47,10 @@ class Forwarder;
  * @brief Own Agent modules and coordinate startup, executor crossing, and shutdown.
  * @details Configuration outlives its borrowers. Control modules run on control_io; Forwarder and
  * business sockets run on transfer_io. Both executors and the external TLS context must outlive
- * async_stop() and all worker threads. Control borrows the earlier-declared pool, routing, and
- * Forwarder; task completions retain the Agent, and shutdown drains producers before borrowers die.
+ * stop() and all worker threads. Control borrows the earlier-declared pool, routing, and
+ * Forwarder. The external owner keeps the Agent alive through stop() and worker joins.
  */
-class RelayAgent : public std::enable_shared_from_this<RelayAgent>
+class RelayAgent
 {
   public:
     /**
@@ -64,17 +63,20 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
      */
     RelayAgent(asio::io_context &control_io, asio::io_context &transfer_io, asio::ssl::context &ssl_context,
                AgentConfig config);
+    ~RelayAgent();
     /**
      * @brief Start local listeners and control tasks once, before workers run.
-     * @throws std::exception On setup failure; keep executors running and await async_stop().
+     * @throws std::exception On setup failure; keep executors running and call stop().
      */
     void start();
     /**
-     * @brief Cancel and drain control tasks, then business tasks; callable from either executor.
-     * @return Completes after all owned tasks drain; concurrent callers await the same completion.
-     * @throws std::exception If draining fails; the failure is preserved and state remains Stopping.
+     * @brief Synchronously cancel and drain control tasks, then business tasks.
+     * @pre Called sequentially by the owner outside Agent executors, without overlapping start();
+     * workers run until draining completes.
+     * @details Completed repeated calls return immediately; incomplete drains may be retried.
+     * @throws std::exception If draining fails; state remains Stopping.
      */
-    asio::awaitable<void> async_stop();
+    void stop();
     /**
      * @brief Select an entrance on control_io and return to the caller's executor.
      * @param service Service name and transport identifying the discovered service.
@@ -84,7 +86,7 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
      * @throws std::exception If selection fails, expires, or is invalidated by shutdown.
      */
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                                std::chrono::steady_clock::time_point deadline);
+                                                 std::chrono::steady_clock::time_point deadline);
 
   private:
     friend class NodeConnectionMgr;
@@ -105,20 +107,16 @@ class RelayAgent : public std::enable_shared_from_this<RelayAgent>
         Stopping,
         Stopped,
     };
-    /** @brief Serialize shutdown and await module drains on control_io. */
+    /** @brief Cancel and drain owned modules on control_io. */
     asio::awaitable<void> stop_on_control_executor();
-    /** @brief Drain dependencies in an independently owned shutdown task on control_io. */
-    asio::awaitable<void> drain_stop();
 
-    asio::any_io_executor control_executor_;
-    asio::any_io_executor transfer_executor_;
+    asio::io_context::executor_type control_executor_;
+    asio::io_context::executor_type transfer_executor_;
     AgentConfig config_;
     AgentRouting routing_;
     NodeConnectionMgr connections_;
-    std::shared_ptr<Forwarder> forwarder_;
+    std::unique_ptr<Forwarder> forwarder_;
     AgentControl control_;
-    AsyncEvent stopped_event_;
-    std::exception_ptr stop_failure_;
     State state_ = State::Created;
 };
 

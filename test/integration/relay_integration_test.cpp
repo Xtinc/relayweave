@@ -651,12 +651,10 @@ int main()
             asio::use_future);
         std::weak_ptr<RelayAgent> weak_consumer = consumer;
         std::weak_ptr<RelayAgent> weak_producer = producer;
-        auto consumer_stopped = asio::co_spawn(control_io, consumer->async_stop(), asio::use_future);
-        auto producer_stopped = asio::co_spawn(control_io, producer->async_stop(), asio::use_future);
+        consumer->stop();
+        producer->stop();
         consumer.reset();
         producer.reset();
-        consumer_stopped.get();
-        producer_stopped.get();
         server->stop();
         stopping_transfer_closed.get();
         asio::post(transfer_tcp_io, [&echo_acceptor]() {

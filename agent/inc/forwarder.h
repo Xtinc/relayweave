@@ -15,7 +15,7 @@ class AgentSession;
  * associations; AgentSession uses lifecycle notifications instead of modifying these containers.
  * async_stop() drains listeners, retries, and business tasks before releasing the transfer work guard.
  */
-class Forwarder : public std::enable_shared_from_this<Forwarder>
+class Forwarder
 {
   public:
     /**
@@ -53,11 +53,6 @@ class Forwarder : public std::enable_shared_from_this<Forwarder>
     {
         return session_options_;
     }
-    /** @brief Inspect lifecycle state on transfer_io. @return True while admitting new business. */
-    bool running() const
-    {
-        return state_ == State::Running;
-    }
     /**
      * @brief Obtain an identified business entrance through RelayAgent's control executor.
      * @param service Discovered service name and protocol.
@@ -66,7 +61,7 @@ class Forwarder : public std::enable_shared_from_this<Forwarder>
      * @return Selection result on transfer_io after control-side lookup/connection completes.
      */
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                                std::chrono::steady_clock::time_point deadline);
+                                                 std::chrono::steady_clock::time_point deadline);
     /**
      * @brief Reset the associated UDP retry delay on transfer_io.
      * @param relay Session that has received ready, borrowed during this notification.
@@ -90,7 +85,10 @@ class Forwarder : public std::enable_shared_from_this<Forwarder>
      * @return False if the channel has expired; true means queued, not acknowledged.
      */
     static bool send_control(const ServerRoute &route, CtrlMessage message);
-    /** @brief Bind listeners and start owned tasks once, before the transfer worker runs. */
+    /**
+     * @brief Bind listeners and start owned tasks once, before the transfer worker runs.
+     * @throws std::exception On setup failure; call async_stop() to drain partial startup.
+     */
     void start();
     /**
      * @brief Publish service availability and trigger eligible UDP forwards on transfer_io.
@@ -122,7 +120,7 @@ class Forwarder : public std::enable_shared_from_this<Forwarder>
     void invalidate_relays(std::string reason);
     /**
      * @brief Cancel listeners, retries and sessions, and await every owned task on transfer_io.
-     * @return Completes after work guard release; repeated/concurrent callers share completion.
+     * @return Completes after work guard release.
      */
     asio::awaitable<void> async_stop();
 
@@ -171,7 +169,7 @@ class Forwarder : public std::enable_shared_from_this<Forwarder>
     std::chrono::steady_clock::duration relay_open_timeout_;
     std::unordered_map<std::string, AgentServiceConfig> services_;
     std::vector<StreamForward> stream_forwards_;
-    std::map<DatagramForwardId, DatagramForward> datagram_forwards_;
+    std::vector<DatagramForward> datagram_forwards_;
     std::unordered_map<ServiceKey, std::string> service_nodes_;
     std::map<std::uint64_t, std::shared_ptr<AgentSession>> relays_;
     std::uint64_t next_request_id_ = 1;

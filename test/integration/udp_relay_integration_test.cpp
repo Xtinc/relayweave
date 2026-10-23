@@ -294,7 +294,7 @@ int main()
         const auto attach_shaped_payload = WireMessage::pack(RelayAttach::to_msg({RelayAttach::Producer, 7, 9}));
         expect_round_trip(probe, attach_shaped_payload);
 
-        asio::co_spawn(producer_control_io, producer->async_stop(), asio::use_future).get();
+        producer->stop();
         producer_control_thread.join();
         producer_transfer_thread.join();
         std::this_thread::sleep_for(300ms);
@@ -314,11 +314,8 @@ int main()
         expect_round_trip(probe, payload);
         expect_round_trip(second_probe, payload);
 
-        auto replacement_stopped =
-            asio::co_spawn(replacement_control_io, replacement->async_stop(), asio::use_future);
-        auto consumer_stopped = asio::co_spawn(consumer_control_io, consumer->async_stop(), asio::use_future);
-        replacement_stopped.get();
-        consumer_stopped.get();
+        replacement->stop();
+        consumer->stop();
         server->stop();
         asio::post(echo_io, [&echo_socket]() {
             asio::error_code ignored;

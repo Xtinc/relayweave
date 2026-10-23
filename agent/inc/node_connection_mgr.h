@@ -12,7 +12,7 @@ class RelayAgent;
  * @brief Own indexed control connections and their background tasks on control_io.
  * @details Borrows its owning RelayAgent, configuration, and TLS context until close() completes.
  * The pool retains stopping connections until run() returns, then notifies the Agent before erasure.
- * Background completions retain RelayAgent without increasing connection use_count().
+ * Background completions borrow the Agent and pooled connection until close() drains them.
  */
 class NodeConnectionMgr
 {
@@ -36,7 +36,8 @@ class NodeConnectionMgr
      * @param host Node control hostname or IP address.
      * @param port Node control TCP port.
      * @return Shared handle, possibly connecting or stopping; readiness requires separate checking.
-     * @throws std::exception On identity conflict, shutdown, or task submission failure.
+     * @pre Called before stop().
+     * @throws std::exception On identity conflict or task submission failure.
      */
     std::shared_ptr<NodeConnection> ensure_connection(std::string node_id, std::string host, std::uint16_t port);
     /**
@@ -58,10 +59,10 @@ class NodeConnectionMgr
      * @param now Current steady-clock time supplied by control maintenance.
      */
     void collect_idle_connections(std::chrono::steady_clock::time_point now);
-    /** @brief Refuse new tasks and cancel all pooled connections on control_io. */
+    /** @brief Cancel all pooled connections after control has stopped admitting selections. */
     void stop();
     /**
-     * @brief Stop and await all connection completions on control_io; supports concurrent callers.
+     * @brief Await all connection completions on control_io after stop().
      * @return Completes after the pool and both indices are empty.
      */
     asio::awaitable<void> close();

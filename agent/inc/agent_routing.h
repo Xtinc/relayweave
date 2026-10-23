@@ -1,12 +1,13 @@
 #ifndef RELAYWEAVE_AGENT_ROUTING_H
 #define RELAYWEAVE_AGENT_ROUTING_H
 
-#include "probe_set.h"
 #include "agent_common.h"
 #include "lru_cache.h"
+#include "probe_set.h"
 #include "route_graph.h"
 #include <chrono>
 #include <nlohmann/json.hpp>
+#include <optional>
 
 class AgentRouting
 {
@@ -27,9 +28,9 @@ class AgentRouting
     void invalidate_snapshot();
     std::uint64_t epoch() const noexcept
     {
-        return epoch_;
+        return snapshot_.epoch;
     }
-    /** @brief Cancel probe refresh on control_io; close() clears cached routes and drains probes. */
+    /** @brief Cancel probe refresh on control_io; close() drains probes. */
     void stop();
     asio::awaitable<bool> refresh_probes();
     // Must be awaited on the Agent control io_context, like refresh_probes().
@@ -59,12 +60,28 @@ class AgentRouting
         Clock::time_point started;
     };
 
+    struct Node
+    {
+        std::string address;
+        std::chrono::milliseconds report_age;
+        std::optional<double> available;
+    };
+
     struct Link
     {
         std::string from;
         std::string to;
         LinkQuality::Summary quality;
         std::chrono::milliseconds age;
+    };
+
+    struct Snapshot
+    {
+        std::map<std::string, Node> nodes;
+        std::vector<Link> links;
+        Clock::time_point created;
+        std::uint64_t epoch = 0;
+        std::uint64_t version = 0;
     };
 
     /** @brief Compute one path per measured ingress to this destination, ordered by cost and Nodes. */
@@ -79,14 +96,8 @@ class AgentRouting
     std::size_t max_nodes_;
     ProbeSet probes_;
     ProbeSet::Targets required_targets_;
-    ProbeSet::Targets nodes_;
-    std::map<std::string, std::chrono::milliseconds> report_ages_;
-    std::map<std::string, double> available_;
-    std::vector<Link> links_;
+    Snapshot snapshot_;
     Pending pending_;
-    Clock::time_point snapshot_at_;
-    std::uint64_t epoch_ = 0;
-    std::uint64_t version_ = 0;
 };
 
 #endif
