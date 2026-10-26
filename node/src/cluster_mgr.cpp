@@ -92,7 +92,6 @@ class ClusterRoom
         const auto target = config::required_string(config::message_params(message), "target", message.command);
         message.params->erase("target");
         (*message.params)["source"] = source;
-        static_cast<void>(WireMessage::pack(message));
 
         if (target != cluster_broadcast_target)
         {
@@ -362,13 +361,15 @@ class ClusterMgr::Connector
     {
     }
 
-    /** @brief Queue a joined control message or report cluster disconnection locally. */
-    void send(CtrlMessage message)
+    /** @brief Submit to a joined TLS channel; return false while connecting or disconnected. */
+    bool send(CtrlMessage message)
     {
         if (auto channel = channel_.lock(); channel && joined_)
+        {
             channel->send(std::move(message));
-        else
-            manager_.receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster disconnected"}}});
+            return true;
+        }
+        return false;
     }
 
     /** @brief Stop retries and cancel current operations and the active TLS channel. */
@@ -679,73 +680,75 @@ asio::awaitable<void> ClusterMgr::deliver_messages(ClusterRoom &room)
             co_return;
         }
 
+        const auto command = message.command;
         try
         {
             room.deliver(config_.node_id, std::move(message));
         }
         catch (const std::exception &exception)
         {
-            receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", exception.what()}}});
+            PROXY_ERROR_PRINT("Cluster delivery failed command=%s reason=%s", command.c_str(), exception.what());
         }
     }
 }
 
-void ClusterMgr::send(std::string target, CtrlMessage message)
+bool ClusterMgr::send(std::string target, CtrlMessage message)
 {
-    std::weak_ptr<ClusterMgr> weak = shared_from_this();
-    asio::post(executor_, [weak, target = std::move(target), message = std::move(message)]() mutable {
-        auto self = weak.lock();
-        if (!self || !self->running_)
-        {
-            return;
-        }
+    if (!running_)
+    {
+        PROXY_DEBUG_PRINT("Cluster send rejected target=%s command=%s reason=stopped", target.c_str(),
+                          message.command.c_str());
+        return false;
+    }
 
-        try
+    const auto command = message.command;
+    try
+    {
+        if (target.empty())
         {
-            if (target.empty())
-            {
-                throw std::invalid_argument("cluster target must not be empty");
-            }
-            if (!message.params)
-            {
-                message.params = njson::object();
-            }
-            if (!message.params->is_object())
-            {
-                throw std::invalid_argument("Cluster message params must be an object");
-            }
-            if (message.command.starts_with("cluster."))
-                throw std::invalid_argument("cluster.* commands are reserved");
-            (*message.params)["target"] = std::move(target);
+            throw std::invalid_argument("cluster target must not be empty");
         }
-        catch (const std::exception &exception)
+        if (!message.params)
         {
-            self->receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", exception.what()}}});
-            return;
+            message.params = njson::object();
         }
+        if (!message.params->is_object())
+        {
+            throw std::invalid_argument("Cluster message params must be an object");
+        }
+        if (message.command.starts_with("cluster."))
+            throw std::invalid_argument("cluster.* commands are reserved");
+        (*message.params)["target"] = target;
+        static_cast<void>(WireMessage::pack(message));
 
-        if (self->config_.role == ClusterConfig::Role::Master)
+        if (config_.role == ClusterConfig::Role::Master)
         {
-            if (!self->outbound_channel_.try_send(asio::error_code{}, std::move(message)))
+            if (outbound_channel_.try_send(asio::error_code{}, std::move(message)))
             {
-                self->receive(
-                    CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster outbound queue is full"}}});
+                return true;
             }
+            PROXY_ERROR_PRINT("Cluster send failed target=%s command=%s reason=outbound queue full", target.c_str(),
+                              command.c_str());
+            return false;
         }
-        else if (self->connector_)
+        if (connector_ && connector_->send(std::move(message)))
         {
-            self->connector_->send(std::move(message));
+            return true;
         }
-        else
-        {
-            self->receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster disconnected"}}});
-        }
-    });
+        PROXY_DEBUG_PRINT("Cluster send rejected target=%s command=%s reason=not connected", target.c_str(),
+                          command.c_str());
+    }
+    catch (const std::exception &exception)
+    {
+        PROXY_ERROR_PRINT("Cluster send failed target=%s command=%s reason=%s", target.c_str(), command.c_str(),
+                          exception.what());
+    }
+    return false;
 }
 
-void ClusterMgr::broadcast(CtrlMessage message)
+bool ClusterMgr::broadcast(CtrlMessage message)
 {
-    send(std::string(cluster_broadcast_target), std::move(message));
+    return send(std::string(cluster_broadcast_target), std::move(message));
 }
 
 void ClusterMgr::receive(CtrlMessage message)

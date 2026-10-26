@@ -107,6 +107,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         owner = make_owner(config);
         auto node = std::make_shared<ClusterMgr>(
             *owner, io.get_executor(), context, std::move(config), channel, 16);
+        require(!node->broadcast(CtrlMessage{"before.start"}), "Stopped cluster accepted a send");
         node->start();
         nodes.push_back(node);
         return node;
@@ -158,12 +159,32 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         require(a_inbox.messages.back().first == "b" &&
                     a_inbox.messages.back().second.params->at("request_id") == 1,
                 "Protocol response lost source or request_id");
-        master->broadcast(CtrlMessage{"master.notice"});
+        require(master->broadcast(CtrlMessage{"master.notice"}), "Master rejected a broadcast submission");
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("master.notice") == 1; });
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("master.notice") == 1; });
-        master->broadcast(CtrlMessage{std::string(CtrlMessage::max_command_length + 1, 'x')});
-        master->broadcast(CtrlMessage{"after.invalid"});
+        require(!master->send({}, CtrlMessage{"invalid.target"}), "Empty target was accepted");
+        require(!master->broadcast(CtrlMessage{"invalid.params", njson::array()}), "Invalid parameters were accepted");
+        require(!master->broadcast(CtrlMessage{"cluster.invalid"}), "Reserved command was accepted");
+        require(!master->broadcast(CtrlMessage{std::string(CtrlMessage::max_command_length + 1, 'x')}),
+                "Encoding failure was reported as a successful submission");
+        require(master->broadcast(CtrlMessage{"after.invalid"}), "Invalid send prevented the next submission");
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("after.invalid") == 1; });
+
+        std::size_t admitted = 0;
+        bool full = false;
+        for (std::size_t i = 0; i < channel.max_queued_messages + 2; ++i)
+        {
+            if (!master->send("b", CtrlMessage{"queued.notice"}))
+            {
+                full = true;
+                break;
+            }
+            ++admitted;
+        }
+        require(full && admitted, "Full master outbox did not reject submission synchronously");
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("queued.notice") == admitted; });
+        require(master->send("b", CtrlMessage{"after.full"}), "Master outbox did not recover");
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("after.full") == 1; });
 
         auto duplicate = co_await connect(context, port);
         duplicate->send(CtrlMessage{"cluster.join", njson{{"node_id", "a"}}});
@@ -245,6 +266,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         tcp::socket stalled(io);
         co_await stalled.async_connect({asio::ip::address_v4::loopback(), port}, asio::use_awaitable);
         co_await master->async_stop();
+        require(!master->send("b", CtrlMessage{"after.stop"}), "Stopped master accepted submission");
         co_await a->async_disconnect();
         co_await b->async_disconnect();
 
@@ -276,6 +298,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         nodes.push_back(handshaking);
         handshaking->start();
         auto silent_socket = co_await silent_master.async_accept(asio::use_awaitable);
+        require(!handshaking->send("master", CtrlMessage{"not.joined"}), "Unjoined slave accepted submission");
         co_await handshaking->async_stop();
     }
     catch (...)
@@ -454,7 +477,8 @@ void verify_relay_node(asio::ssl::context &context, asio::ssl::context &client_c
         }
         require(epoch && epoch != previous_epoch, "Restart failed to publish a fresh membership epoch");
         // Invalid local messages and malformed business requests must leave the slave connected.
-        test_node::cluster(slave).broadcast(CtrlMessage{"cluster.invalid"});
+        require(!test_node::cluster(slave).broadcast(CtrlMessage{"cluster.invalid"}),
+                "Slave accepted a reserved command");
         peer->send(CtrlMessage{"service.lookup", njson{{"target", "slave"}}});
         for (const auto &target : {"slave", "test-master"})
         {
@@ -469,6 +493,8 @@ void verify_relay_node(asio::ssl::context &context, asio::ssl::context &client_c
                         report.params->at("requester_node") == "observer" && !report.params->contains("target"),
                     "Real cluster query lost its routing metadata");
         }
+        require(test_node::cluster(slave).send("test-master", CtrlMessage{"slave.notice"}),
+                "Joined slave rejected a valid submission");
         co_await verify_public_queries(peer, client_context, master, master_port, slave_port);
         co_await peer->async_disconnect();
         co_return epoch;

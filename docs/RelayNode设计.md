@@ -343,7 +343,7 @@ master 接受 socket 后立刻创建 session 并加入 room。session 的读协�
 |---|---|---|---|
 | `cluster.join` | slave → master | `node_id` | TLS 握手后声明节点 ID |
 | `cluster.joined` | master → slave | 无 | 确认加入成功 |
-| `cluster.error` | 本地或 master → slave | `reason` | 重复 ID、未连接或本机编码错误 |
+| `cluster.error` | 本地或 master → slave | `reason` | 入群拒绝或真实集群连接失效 |
 | 任意非 `cluster.*` | 任意节点 → room | 业务参数及必填 `target`；master 写入 `source` | `target=all` 广播，否则按 node_id 定向 |
 
 `node_id` 由配置声明，master 拒绝同时在线的重复 ID，也拒绝保留值 `all`。集群 mTLS 确认对端持有 Server CA 签发的节点证书，但协议没有把证书名称与 `node_id` 绑定。
@@ -352,7 +352,13 @@ master 接受 socket 后立刻创建 session 并加入 room。session 的读协�
 
 广播包含发送者，本地节点和远端节点使用相同的接收路径。定向消息只投递给当前在线的目标 participant；目标不存在时按 best-effort 语义丢弃，不退化成广播。
 
-ClusterMgr::broadcast(message) 等价于 send("all", message)；其他 target 使用 send(target, message) 定向发送。两个接口都返回 `void`，调用返回只表示消息被交给发送机制，不表示远端收到或处理成功。需要结果的业务通过响应消息和 `request_id` 关联。集群不保存历史、不补发，也不自动重发业务消息。
+ClusterMgr::broadcast(message) 等价于 send("all", message)；其他 target 使用 send(target, message) 定向发送。
+两个接口都要求在 control_io 调用并直接返回 bool：master 返回 true 表示本地出站队列已受理，slave 返回 true
+表示消息已交给加入成功的 TLSChannel；均不保证底层 TLS 入队、远端收到或业务执行成功。停止、未连接、
+本地出站队列满、参数或编码错误返回 false，并记录必要原因；这些单条发送失败不生成全局 cluster.error。
+编码检查前移到发送入口，room 不再为已解码的内部消息重复编码校验。
+真正的集群断线继续沿用原有失效通知与业务清理。需要业务结果的调用仍通过响应消息和 request_id 关联。
+集群不保存历史、不补发，也不自动重发业务消息。
 
 #### ClusterMgr::Connector 重连
 
@@ -414,7 +420,7 @@ RelayNode 独占 `ClusterMgr`，ClusterMgr 反向保存非拥有的 `RelayNode&`
 NodeControl 处理服务、节点、集群状态和拓扑查询；NodeLink/Flow 及 `relay.peer.*` 由 RelayNode 交给各自模块处理。
 `cluster.error` 清理本地 Flow 协调、端点授权及多节点业务；物理 Link 仍由成员变化和独立心跳判断失效。`cluster.joined` 及未识别的普通命令在该入口结束处理。
 这条直接关系与 RelayNode 控制状态位于同一串行 executor，生命周期由 RelayNode 的所有权和停止顺序保证。
-发送入口拒绝业务调用使用 `cluster.*` 保留命令，并通过本地 `cluster.error` 报告。
+发送入口拒绝业务调用使用 `cluster.*` 保留命令，记录原因并返回 false。
 
 ### 节点地址发布
 
@@ -2605,7 +2611,7 @@ Agent 和 Dashboard 通过任意普通控制入口发 `topology.query`；入口�
 |---|---|---|
 | `cluster.join` | slave → master 集群控制口 | `node_id`，可含 `address`；地址缺失或空时使用 node_id |
 | `cluster.joined` | master → slave | 无业务参数；本连接的 Node 身份已被接受 |
-| `cluster.error` | master → slave，或本地组件通知 | `reason`；加入冲突、断线、发送失败等控制失效 |
+| `cluster.error` | master → slave，或本地组件通知 | `reason`；加入冲突或实际集群断线；单条发送失败由 bool 返回值报告 |
 
 ClusterSession 在 mTLS 成功后限时等待 join。node_id 不能为空、不能是广播目标 `all`，也不能与在线成员重名；
 成功后 ClusterRoom 绑定连接与 node_id，回复 joined 并发布新 members。master 的本地参与者也在同一个 room 中，
@@ -2989,7 +2995,7 @@ Node 首末节点和两个 Agent 分别计数；表内不包含进程级及共�
 
 | 编号 | 现象 | 影响 | 位置 |
 |---|---|---|---|
-| C1 | `ClusterRoom::deliver` 每条消息 `WireMessage::pack` 后丢弃 | 校验包含按值拷贝及完整 CBOR 编码；远端各自再次编码 | `cluster_mgr.cpp` |
+| C1 | `ClusterMgr::send` 提交前执行 `WireMessage::pack` | 在发送入口报告编码失败；room 不再重复编码校验 | `cluster_mgr.cpp` |
 | C2 | 事件转发复制整份 njson 并追加字段 | 完整 endpoint JSON 深拷贝 | `nodelink_mgr.cpp` |
 | C3 | 成功的 `LinkRequest` 作为链路复用记录保留完整参数 | 长期保留建立期对象及 JSON；失效时清理，不是无期限泄漏 | `nodelink_mgr.cpp` |
 | C4 | `send_all` 先复制公共参数，再分别构造消息 | 产生 1+N 次参数副本 | `nodelink_mgr.cpp` |

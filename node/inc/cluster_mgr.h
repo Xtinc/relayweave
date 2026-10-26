@@ -58,16 +58,18 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
      */
     asio::awaitable<bool> async_stop();
     /**
-     * @brief Queue a unicast on control_io; delivery is not acknowledged by this call.
+     * @brief Submit a unicast directly on control_io; delivery is not acknowledged by this call.
      * @param target Destination Node identity, or the reserved broadcast target where supported.
      * @param message Control message to dispatch; ownership of its parameters may be transferred.
+     * @return True when submitted to the master outbox or a joined slave TLS channel; false on local failure.
      */
-    void send(std::string target, CtrlMessage message);
+    bool send(std::string target, CtrlMessage message);
     /**
      * @brief Queue delivery to all joined participants, including the local master, on control_io.
      * @param message Control message to dispatch; ownership of its parameters may be transferred.
+     * @return Local submission result, with the same meaning as send().
      */
-    void broadcast(CtrlMessage message);
+    bool broadcast(CtrlMessage message);
 
   private:
     class LocalParticipant;

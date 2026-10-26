@@ -164,6 +164,23 @@ void flow_integration()
                 // Ordinary ingress uses the same master Flow transaction and owns its local lifecycle.
                 const auto remote = co_await test_node::open_flow(nodes[1], {"a", "b", "c"}, transport);
                 require_flow(bool(remote), "ingress Flow request failed");
+                require_flow(!test_node::cluster(nodes[0]).send({}, CtrlMessage{"invalid.target"}),
+                             "master accepted an invalid target");
+                require_flow(!test_node::cluster(nodes[1]).broadcast(CtrlMessage{"cluster.invalid"}),
+                             "slave accepted a reserved command");
+                require_flow(!test_node::cluster(nodes[1]).broadcast(
+                                 CtrlMessage{std::string(CtrlMessage::max_command_length + 1, 'x')}),
+                             "slave accepted an unencodable message");
+                bool queue_full = false;
+                for (std::size_t i = 0; i < configs[0].channel.max_queued_messages + 2; ++i)
+                {
+                    if (!test_node::cluster(nodes[0]).send("master", CtrlMessage{"queue.notice"}))
+                    {
+                        queue_full = true;
+                        break;
+                    }
+                }
+                require_flow(queue_full, "master outbox did not report saturation");
                 co_await queued(1, remote, false, {31});
                 co_await receive(3, remote, {31});
                 co_await queued(3, remote, true, {32});
