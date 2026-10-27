@@ -1586,7 +1586,7 @@ T tcp_read / receive / Stream::receive / Stream::route
 | 边界 | 数据内存操作 | 何时允许复用或释放 |
 |---|---|---|
 | 接入 socket → FlowStream | 固定读取缓冲按实际长度复制一次到池块，channel 移动所有权 | 交接完成后源侧可以复用读缓冲 |
-| 本地准入 → 方向队列 | 同一池块移入 Frame，信用按原分配大小计费 | 未准入块只留在唯一发送任务中 |
+| 本地准入 → 方向队列 | 同一池块移入 Frame，本地内存按原分配大小计费，线上信用按载荷视图长度计费 | 未准入块只留在唯一发送任务中 |
 | 方向队列 → Link 队列 → writer | Frame 和 PooledBuffer 移动，载荷无再次复制 | 下游 socket 写完成后释放 |
 | 中间节点接收 → 转发 | TCP 直接读入池块；UDP 校验共享接收数组中的报文后，按实际载荷长度复制到池块，再移动 | 接收数组可立即复用，池块在下游 I/O 完成或关闭排空后释放 |
 | 终点 → 业务 socket | 原池块移入业务域，无出口载荷复制 | 下游写成功后归还池块，再通知退还信用；失败关闭 Flow |
@@ -1713,17 +1713,18 @@ UDP 使用有界队列和逐包丢弃，见 [数量准入、逐 Flow 边界与�
 [`lnk_channel.h`](../protocol/inc/lnk_channel.h)，不从配置读取；同义 Flow 数量上限统一使用 `lnk::max_flow_count`。
 
 窗口使用 **charge（逻辑计费字节）**，包含载荷取整和帧管理计费。标准池实际块尺寸不参与线协议计算。
-设 `a` 为 `PooledBuffer` 的原分配长度，则实际计费为：
+对长度 `x`，统一使用以下取整函数：
 
 ```text
-class(a) = 0                                  ，a = 0
-         = 不小于 max(a, 256) 的最小 2 的幂    ，a > 0
-c        = class(a) + h
+class(x) = 0                                  ，x = 0
+         = 不小于 max(x, 256) 的最小 2 的幂    ，x > 0
+c(x)     = class(x) + h
 ```
 
-切片只缩短载荷视图；原池块大小和计费保持不变。
-当前 TCP 生产路径在首节点按实际读到的 `p` 字节复制，在邻接接收端按帧体长度 `p` 分配，
-故以下 TCP 数值分析可使用 `c(p) = class(p) + 128`。128 是管理计费余量，Node 线协议头另为 32 字节。
+切片只缩短载荷视图；本地内存按原分配长度 `a` 计 `c(a)`，线上信用按载荷视图长度 `p` 计 `c(p)`。
+`Frame::memory_charge()` 用于本地准入和释放，`Frame::charge()` 用于线上信用扣除和归还。
+邻接接收端按帧体长度 `p` 分配，因此接收后两种计费相同；发送端使用切片时，本地内存计费可以更大。
+以下 TCP 线上信用分析使用 `c(p) = class(p) + 128`。128 是管理计费余量，Node 线协议头另为 32 字节。
 
 | DATA 载荷 `p` | 逻辑载荷计费 | 单帧 `c(p)` | 一个初始 W 可容纳的完整帧数 | 对应用户载荷总量 |
 |---|---|---|---|---|
@@ -1747,7 +1748,7 @@ RESET、CREDIT、PING/PONG 不等待 DATA 信用，但仍受控制队列、物�
 | 符号 | Direction 字段 | 含义 |
 |---|---|---|
 | `Q_i` | 由 `received_bytes - released_bytes` 推导，有入边时适用 | 已从上游接纳、尚未完成下游写入的 DATA charge |
-| `B_i` | `buffered_bytes` | 本跳已准入、尚未释放的 DATA 与 FIN charge |
+| `B_i` | `buffered_bytes` | 本跳已准入、尚未释放的 DATA 与 FIN 本地内存 charge |
 | `A_i` | `received_bytes` | 累计从入边接纳的 DATA charge |
 | `R_i` | `released_bytes` | 累计完成下游写入、可重新授给上游的 DATA charge |
 | `G_i` | `receive_limit` | 本节点已发布给上游的累计绝对上限 |
@@ -1786,9 +1787,9 @@ B_i <= W + h
 
 **发送端：本地容量和下游信用分别约束两个阶段。**
 
-首节点从本地 Stream 接手 DATA 后，先满足 `B_i + c <= W` 才能准入本地方向队列；
+首节点从本地 Stream 接手 DATA 后，先满足 `B_i + c(a) <= W` 才能准入本地方向队列；
 缺本地容量时，唯一发送任务持有该未准入池块并等待 `send_space_`。
-对已有出边的节点，方向队首 DATA 仅在 `S_i + c <= L_i` 时进入共享 Link 队列，随后增加 `S_i`。
+对已有出边的节点，方向队首 DATA 仅在 `S_i + c(p) <= L_i` 时进入共享 Link 队列，随后按 `c(p)` 增加 `S_i`。
 缺下游信用时，帧留在本方向的 `pending_frames`，没有进入 Link writer 等待。
 
 对一条相邻边 `j → i`，初始 `L_j = 0`；有效初始 CREDIT 必须为 W。
@@ -2080,7 +2081,7 @@ W >= r × T_i / (8 × η_i)
 
 | 要核对的机制 | 源码位置 |
 |---|---|
-| 原分配长度、逻辑计费与 charge | [`lnk_channel.h`](../protocol/inc/lnk_channel.h)：`PooledBuffer`、`Frame::charge_for_payload/charge` |
+| 原分配长度、线上信用与本地内存计费 | [`lnk_channel.h`](../protocol/inc/lnk_channel.h)：`PooledBuffer`、`Frame::charge_for_payload/charge/memory_charge` |
 | 数量准入、prepare/commit/关闭 | [`flow_protocol.cpp`](../protocol/src/flow_protocol.cpp)：`prepare_flow`、`commit_flow`、`close_flow` |
 | DATA 准入、队首信用检查和接收授信校验 | 同文件：`Stream::try_send`、`receive`、`flush`、`receive_credit` |
 | 写完成、信用刷新与期限 | 同文件：`written`、`Stream::release_buffer`、`publish_credit`、`poll` |
@@ -2811,12 +2812,14 @@ NodeLink 使用明文 TCP/UDP，不含 SSL。一个多节点 TCP Flow 的对象�
 #### 标准池与逻辑计费
 
 标准同步池的配置、跨线程归还及生命周期见 [池缓冲与剩余开销](#池缓冲与剩余开销)，逐 Flow 数量与窗口边界见 [数量准入、逐 Flow 边界与实际占用](#数量准入逐-flow-边界与实际占用)。
-原申请长度用于归还资源和保持稳定信用计费；切片只改变视图，不改变原地址和申请长度：
+原申请长度用于归还资源和本地内存计费；切片只改变视图，不改变原地址和申请长度。
+线上信用只依赖视图长度，保证发送端扣除与接收端归还一致：
 
 ```text
 Frame::charge_for_payload(a) = 128                         , a = 0
                             = 128 + bit_ceil(max(a, 256)) , a > 0
-Frame::charge() = Frame::charge_for_payload(payload.allocation_size())
+Frame::charge() = Frame::charge_for_payload(payload.size())
+Frame::memory_charge() = Frame::charge_for_payload(payload.allocation_size())
 ```
 
 `allocation_size()` 不等于标准池的内部块大小。标准库自行管理 chunk、元数据和高水位缓存，
@@ -3014,7 +3017,7 @@ Node 首末节点和两个 Agent 分别计数；表内不包含进程级及共�
 | H4 | 标准同步池的内部同步 | 分配/归还跨执行域，实际争用需测量；没有自定义全局锁 | `lnk_channel.h` |
 | H5 | 每帧 `map` 查找（Flow、Link、credits） | O(log F) + O(log L)，热路径固定成本 | `flow_protocol.cpp`、`lnk_channel.cpp` |
 | H6 | 端点接收队列按 `Frame` 存储 | 空 DATA 场景帧对象本体可接近 240 KiB，容器开销另计 | `flow_protocol.cpp` |
-| H7 | `Frame::charge()` 把原申请长度映射为逻辑信用单位 | 保持既有信用协议，不代表标准池实际尺寸；切片不改变计费 | `lnk_channel.h` |
+| H7 | `Frame::charge()` 按视图长度计线上信用，`memory_charge()` 按原申请长度计本地内存 | 切片后两端信用一致，本地仍预算完整分配；不代表标准池实际尺寸 | `lnk_channel.h` |
 | H8 | 部分复制/接收缓冲使用 `{}` 零初始化 | 源码要求创建时清零；是否生成实际 memset 需看优化后产物，不是每包成本 | `datagram_mgr.cpp`、`xfr_channel.cpp` |
 
 #### 控制面

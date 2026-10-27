@@ -634,11 +634,12 @@ void FlowProtocol::receive(const NodeLink &link, Frame f)
 
 void FlowProtocol::written(Frame frame)
 {
-    const auto used = frame.charge();
+    const auto memory_bytes = frame.memory_charge();
+    const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
     frame.payload = {};
     if (frame.owner && frame.owner->transport == RelayProtocol::Tcp)
     {
-        stream_.release_buffer(frame.owner, frame.header.reverse, used, frame.header.kind == LnkFrType::Data);
+        stream_.release_buffer(frame.owner, frame.header.reverse, memory_bytes, credit_bytes);
     }
 }
 
@@ -721,7 +722,7 @@ bool FlowProtocol::Stream::route(const std::shared_ptr<FlowState> &s, Frame &f)
         // RESET bypasses DATA credit and closes the Flow in the caller.
         return !output || protocol_.links_.enqueue(*protocol_.links_.connections_.at(output), std::move(f));
     }
-    const auto used = f.charge();
+    const auto used = f.memory_charge();
     auto &direction = s->stream->directions[std::size_t(reverse)];
     if (output)
     {
@@ -922,24 +923,24 @@ void FlowProtocol::Stream::publish_credit(const std::shared_ptr<FlowState> &flow
     }
 }
 
-void FlowProtocol::Stream::release_buffer(const std::shared_ptr<FlowState> &flow, bool reverse, std::size_t bytes,
-                                          bool data)
+void FlowProtocol::Stream::release_buffer(const std::shared_ptr<FlowState> &flow, bool reverse,
+                                          std::size_t memory_bytes, std::size_t credit_bytes)
 {
     if (flow->phase == FlowState::Phase::Closed)
     {
         return;
     }
     auto &direction = flow->stream->directions[std::size_t(reverse)];
-    assert(direction.buffered_bytes >= bytes);
-    direction.buffered_bytes -= bytes;
-    if (data && (reverse ? flow->next : flow->previous))
+    assert(direction.buffered_bytes >= memory_bytes);
+    direction.buffered_bytes -= memory_bytes;
+    if (credit_bytes && (reverse ? flow->next : flow->previous))
     {
-        if (bytes > std::numeric_limits<std::uint64_t>::max() - flow_window_bytes - direction.released_bytes)
+        if (credit_bytes > std::numeric_limits<std::uint64_t>::max() - flow_window_bytes - direction.released_bytes)
         {
             protocol_.fail_flow(flow, "credit", "flow released counter overflow");
             return;
         }
-        direction.released_bytes += bytes;
+        direction.released_bytes += credit_bytes;
         if (direction.released_bytes + flow_window_bytes - direction.receive_limit >= flow_window_bytes / 4 ||
             direction.received_bytes == direction.receive_limit)
         {
@@ -1043,7 +1044,8 @@ asio::awaitable<void> FlowProtocol::Stream::receive_loop(const std::shared_ptr<F
         {
             co_return;
         }
-        const auto used = frame.charge();
+        const auto memory_bytes = frame.memory_charge();
+        const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
         const auto reverse = frame.header.reverse;
         const auto kind = frame.header.kind;
         std::optional<PooledBuffer> data;
@@ -1063,7 +1065,7 @@ asio::awaitable<void> FlowProtocol::Stream::receive_loop(const std::shared_ptr<F
                 co_return;
             }
         }
-        release_buffer(flow, reverse, used, kind == LnkFrType::Data);
+        release_buffer(flow, reverse, memory_bytes, credit_bytes);
         if (kind == LnkFrType::Fin)
         {
             port.receive_queue_.close();

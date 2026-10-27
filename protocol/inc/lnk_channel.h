@@ -145,6 +145,11 @@ struct Frame
     }
     std::size_t charge() const noexcept
     {
+        return charge_for_payload(payload.size());
+    }
+    // Local admission retains the whole allocation, including bytes outside a sliced view.
+    std::size_t memory_charge() const noexcept
+    {
         return charge_for_payload(payload.allocation_size());
     }
 };

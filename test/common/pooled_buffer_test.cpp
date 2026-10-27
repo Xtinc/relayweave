@@ -234,7 +234,11 @@ void logical_charge()
     lnk::Frame frame{};
     frame.payload = PooledBuffer(std::make_shared<std::pmr::synchronized_pool_resource>(), 4137);
     frame.payload.slice(100, 1);
-    require_buffer(frame.charge() == 8320, "slicing changed original-allocation credit charge");
+    require_buffer(frame.charge() == 384, "wire credit included storage outside the payload view");
+    require_buffer(frame.memory_charge() == 8320, "local memory charge ignored sliced-away storage");
+    frame.payload.slice(1, 0);
+    require_buffer(frame.charge() == 128, "empty sliced DATA charged hidden storage to the peer");
+    require_buffer(frame.memory_charge() == 8320, "empty view stopped accounting for its allocation");
 }
 
 void shared_resource_lifetime()

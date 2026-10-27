@@ -118,6 +118,7 @@ struct FlowState
         struct Direction
         {
             std::deque<Frame> pending_frames;
+            // Local allocation charge; the cumulative counters below use wire-credit units.
             std::size_t buffered_bytes = 0;
             std::uint64_t sent_bytes = 0;
             std::uint64_t send_limit = 0;
@@ -198,9 +199,9 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     void invalidate_flows(std::string reason);
     // Data executor: attach the endpoint and start its owned I/O tasks synchronously.
     std::shared_ptr<lnk::FlowStream> bind_stream_flow(std::uint64_t epoch, std::uint64_t id, bool reverse,
-                                                  asio::any_io_executor transfer);
-    std::shared_ptr<lnk::FlowDatagram> bind_datagram_flow(std::uint64_t epoch, std::uint64_t id, bool reverse,
                                                       asio::any_io_executor transfer);
+    std::shared_ptr<lnk::FlowDatagram> bind_datagram_flow(std::uint64_t epoch, std::uint64_t id, bool reverse,
+                                                          asio::any_io_executor transfer);
 
   private:
     friend class LnkChannel;
@@ -212,9 +213,11 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     class Stream
     {
       public:
-        explicit Stream(FlowProtocol &protocol) : protocol_(protocol) {}
+        explicit Stream(FlowProtocol &protocol) : protocol_(protocol)
+        {
+        }
         std::shared_ptr<lnk::FlowStream> bind(const std::shared_ptr<lnk::FlowState> &flow, bool reverse,
-                                            asio::any_io_executor transfer);
+                                              asio::any_io_executor transfer);
         void close(lnk::FlowState &flow);
         void receive(const std::shared_ptr<lnk::FlowState> &flow, lnk::Frame frame);
         bool try_send(const std::shared_ptr<lnk::FlowState> &flow, bool reverse,
@@ -223,7 +226,8 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
         void receive_credit(const lnk::NodeLink &link, const LnkFrameHeader &header);
         void publish_credit(const std::shared_ptr<lnk::FlowState> &flow);
         void publish_credit(const std::shared_ptr<lnk::FlowState> &flow, bool reverse);
-        void release_buffer(const std::shared_ptr<lnk::FlowState> &flow, bool reverse, std::size_t bytes, bool data);
+        void release_buffer(const std::shared_ptr<lnk::FlowState> &flow, bool reverse, std::size_t memory_bytes,
+                            std::size_t credit_bytes);
         void close_port(const std::shared_ptr<lnk::FlowStream> &port, std::string reason);
         void reset_port(const std::shared_ptr<lnk::FlowStream> &port, std::string reason);
 
@@ -240,9 +244,11 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     class Datagram
     {
       public:
-        explicit Datagram(FlowProtocol &protocol) : protocol_(protocol) {}
+        explicit Datagram(FlowProtocol &protocol) : protocol_(protocol)
+        {
+        }
         std::shared_ptr<lnk::FlowDatagram> bind(const std::shared_ptr<lnk::FlowState> &flow, bool reverse,
-                                              asio::any_io_executor transfer);
+                                                asio::any_io_executor transfer);
         void close(lnk::FlowState &flow);
         void receive(const std::shared_ptr<lnk::FlowState> &flow, lnk::Frame frame);
         bool try_send(const std::shared_ptr<lnk::FlowState> &flow, bool reverse, lnk::PooledBuffer &data);
@@ -263,7 +269,7 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     void fail_flow(std::shared_ptr<lnk::FlowState> flow, std::string stage, std::string reason);
 
     std::shared_ptr<lnk::FlowState> require_endpoint_flow(std::uint64_t epoch, std::uint64_t id, bool reverse,
-                                                 RelayProtocol transport);
+                                                          RelayProtocol transport);
     void emit(lnk::ProtocolEvent event);
     void spawn(asio::awaitable<void> task);
     asio::awaitable<void> run();
