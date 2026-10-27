@@ -142,7 +142,11 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     void handle_control_message(SessionId id, const ControlSessionPtr &session, const CtrlMessage &message);
     SessionId allocate_session_id();
 
-    void handle_relay(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message);
+    void handle_relay(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message);
+    /** @brief Send a business notification directly or back through the Agent's primary Node. */
+    bool send_relay(const AgentPeer &route, CtrlMessage message);
+    /** @brief Route incoming business messages without creating remote control sessions. */
+    void handle_cluster_relay(CtrlCommand command, CtrlMessage message);
     void handle_relay_peer(CtrlCommand command, const CtrlMessage &message);
     void start_relay(std::shared_ptr<NodeSession> relay);
     void invalidate_relays(std::string reason = {});
@@ -163,7 +167,6 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     asio::steady_timer control_sessions_done_;
     asio::steady_timer relays_done_;
 
-    SessionId next_session_id_ = 1;
     std::size_t active_control_sessions_ = 0;
     bool stop_ok_ = true;
     std::atomic<State> state_{State::Created};

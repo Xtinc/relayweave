@@ -277,7 +277,7 @@ NodeSession 只存在于单节点业务所在 Node，或多节点的首末 Node�
 #### 普通控制连接的接入与退出
 
 1. control acceptor 接受 socket；先检查 Node 为 Running、Registry 的普通会话容量未满。
-2. 创建 ControlSession，分配非零且进程内不重复的 session_id，向 Registry 登记弱引用并增加任务计数。
+2. 创建 ControlSession，复用随机 ID 生成器分配非零、当前注册表内唯一的 session_id，向 Registry 登记弱引用并增加任务计数。
    握手中的连接计入 control.max_connections；业务任务另按业务容量准入。
 3. 提交唯一会话任务 run_control_session。提交失败立即回滚登记与计数；任务内先通过 TLSChannel::start
    完成 mTLS，随后循环等待 async_receive，只有 Running 时把消息交给 RelayNode 分派。
@@ -2374,10 +2374,10 @@ RelayNode 的启动与业务任务提交用 ScopeGuard 回滚，异常自然向�
 | 故障 | 当前行为 |
 |---|---|
 | RelayAgent 初始服务器不可达 | primary 按配置指数退避重连；连接恢复后注册和发现服务 |
-| 某个附加服务器断线 | 只结束使用该入口的 AgentSession；其他节点继续工作 |
+| Agent 主控制连接断开 | 清空服务位置和路由，取消全部业务；重连后重新注册、发现并建立新业务 |
 | 服务尚未发现 | 每 5 秒经 primary 查询；TCP/TLS 新本地连接直接关闭 |
 | 服务从节点 A 迁移到 B | A 返回 unavailable/mismatch 后清路由并重新发现 B |
-| master 集群端口断线 | slave 每 5 秒重连；普通 Agent 控制连接和 Single 可继续，多节点 Flow 授权与 Multi 业务因集群控制失败而清理 |
+| master 集群端口断线 | slave 每 5 秒重连；本地控制连接及双方均在本节点的 Single 可继续，依赖集群控制的业务清理 |
 | 重复 `node_id` 或保留值 `all` | master 返回 `cluster.error`，拒绝加入 |
 | 普通客户端控制连接断开 | 注销该会话服务，取消相关 Relay |
 | 数据一侧未按时 attach | setup timer 清理 Relay 和已到达的一侧 |
@@ -2445,7 +2445,7 @@ Node、Agent、Dashboard 需要同步升级；不兼容旧的业务分页字段�
 | 字段 | 作用域与含义 |
 |---|---|
 | `request_id` | 请求方分配的关联号，响应原样返回；Agent 实际使用非零值。定位、拓扑、集群状态及 Multi 请求要求非零；注册、本节点查询和 Single open 的解析允许零 |
-| `uuid` | Node 内的本地数据资源 ID；Single 双方共享，Multi 首末各自分配。必须连同控制来源、协议识别，不能视为集群全局 ID |
+| `uuid` | Node 内的本地数据资源 ID；Single 双方共享，Multi 首末各自分配。必须连同业务 Node、协议识别，不能视为集群全局 ID |
 | `ticket` | 本地数据接入凭据，非零 uint64，与 uuid、role 配合；仅在对应资源存在时有效 |
 | UDP `session_id` | Agent→Node 数据报的 8 字节路由身份，每个 role 独立分配；不等于集群查询中的控制会话 session_id |
 | 集群查询 `session_id` | 入口 Node 的普通控制会话 ID，仅用于把跨节点查询响应转回原客户端 |
@@ -2482,7 +2482,7 @@ Node、Agent、Dashboard 需要同步升级；不兼容旧的业务分页字段�
 服务名长度为 1～64 字节，只允许 `A-Z`、`a-z`、`0-9`、`.`、`_`、`-`。服务名在单个 RelayNode Registry 内唯一；注册和使用的协议必须一致。
 
 NodeConnection 完成 mTLS 后发送 `server.identify`，收到 `server.identified` 并确认 node_id 后才成为 Ready。
-primary Ready 后发布 services、查询 forwards 的服务位置和拓扑；附加连接只为实际业务入口服务，不重复注册。
+primary Ready 后发布 services、查询 forwards 的服务位置和拓扑；业务控制消息经 primary 和集群交付实际入口，不建立附加控制连接。
 普通控制 socket 的每条消息由 ControlSession 交给 RelayNode；客户端不能在此连接上直接发送 Link、Flow 或 peer 命令。
 
 RegistryMgr 将服务绑定到注册它的控制会话。同一会话同名同协议重复注册复用原条目，其他会话同名或
@@ -2497,17 +2497,36 @@ RegistryMgr 将服务绑定到注册它的控制会话。同一会话同名同�
 `node.lookup` 与服务发现分开：Agent 先确定路径，再通过 primary 查询首 Node 的实际控制地址。
 primary 从成员表判断 Node 是否在线；自己是目标时直接返回本机 advertise_address/port，否则定向查询目标。
 目标回复自己的控制端点，不能把 topology.members 的数据探测地址直接当成控制端口地址。
-Agent 只接受 primary 上与当前 EntryWait 的 request_id、node_id、期限相符的回复，迟到响应不会创建新连接。
+Agent 不再使用 node.lookup 定位业务入口；该查询仍供内部工具和观测使用。
 普通控制连接上的未知命令或未通过基本字段解析的消息会结束该控制会话，并注销其服务及关联业务；
 已经合法解析的注册冲突、无服务或业务建立失败则由对应 service.error/relay.error 表达。
+
+### Agent 控制经集群转发
+
+Agent 只连接配置的 primary。relay.open/cancel/reject 携带逻辑入口 node_id，primary 本地交付或
+使用 ClusterMgr 定向发送原命令，附带 agent_session_id；relay.open 另带原 Agent 的 accessor。
+入口用 AgentPeer 保存本地弱会话或 `(primary Node ID, Agent 会话 ID)` 回复地址，继续由原有
+NodeSession 和 Single/Multi 控制器管理业务，不创建虚拟 TLS 会话或远端 Agent 注册记录。
+
+opened/offer/ready/error/closed 沿此地址回到 primary，按现存会话转给 Agent；内部 source、target、
+agent_session_id 不外泄。agent_session_id 与 UDP 数据 session_id 独立。primary 不保存远端业务等待表。
+原 Agent 会话已退出时丢弃回复；远端实例由统一的会话退出或成员失联通知清理。
+控制会话使用已有随机 ID 机制，回复地址身份独立于业务 ID。
+数据端点显式返回 data_address，数据面及 opened/attach/ready 流程保持不变。
+
+primary 的 Agent 会话退出后广播内部 relay.detach，入口按回复地址取消关联业务。
+primary 节点离开或集群失联时，使用现有成员与故障通知清理远端来源；Multi 同时撤销 Flow 授权。
+纯本地 Single 不受其他节点的集群失联影响。
+队列拒绝 opened/ready 时回滚本次建立；终结通知只等待本地队列受理，primary 离开或 Node 停止即退出，
+不重试业务建立。正常流结束依靠已有双向 EOF 排空，不因结束 AgentSession 关闭 primary。
 
 ### 业务控制消息
 
 | 命令 | 方向 | 主要字段 | 含义 |
 |---|---|---|---|
-| `relay.open` | Consumer → server | `request_id`, `service`, `protocol`；Multi 另含 `path`, `epoch` | 请求创建本地配对或路径中继 |
-| `relay.opened` | server → Consumer | `request_id`, `service`, `protocol`, `uuid`, `data_port`, `ticket`；UDP 另含 `session_id` | 下发 Consumer 数据连接参数 |
-| `relay.offer` | server → Producer | `service`, `protocol`, `uuid`, `data_port`, `ticket`；UDP 另含 `session_id` | 要求 Producer 建立数据连接 |
+| `relay.open` | Consumer → server | `request_id`, `service`, `protocol`, `node_id`；Multi 另含 `path`, `epoch` | 请求创建本地配对或路径中继 |
+| `relay.opened` | server → Consumer | `request_id`, `service`, `protocol`, `uuid`, `node_id`, `data_address`, `data_port`, `ticket`；UDP 另含 `session_id` | 下发 Consumer 数据连接参数 |
+| `relay.offer` | server → Producer | `service`, `protocol`, `uuid`, `node_id`, `data_address`, `data_port`, `ticket`；UDP 另含 `session_id` | 要求 Producer 建立数据连接 |
 | `relay.ready` | server → 本端 Agent | `uuid`, `protocol`；Multi 另含 `epoch`, `flow_id` | 数据资源已绑定并激活，可以开始业务 |
 | `relay.reject` | Producer → server | `uuid`, `reason` | Producer 无法连接本地目标或数据端口 |
 | `relay.cancel` | client → server | `uuid` 或 `request_id`，可含 `reason` | 取消 Relay 或尚未完成的打开请求 |
@@ -2516,7 +2535,7 @@ Agent 只接受 primary 上与当前 EntryWait 的 request_id、node_id、期限
 
 Single 的 `relay.opened` 与 `relay.offer` 给出同一个 uuid、各 role 不同的 ticket；UDP 的 session_id 也各不相同。
 Multi 首末各返回自己的本地 uuid/ticket/data_port，opened/offer 额外带相同的 epoch/flow_id，供 Agent
-选择多节点复制和校验后续通知。数据主机取发送该消息的已识别控制连接地址，不由 data_port 推导其他 Node。
+选择多节点复制和校验后续通知。数据主机取 data_address，独立于 primary 控制连接的地址。
 
 `relay.offer` 没有 Consumer 的 request_id。Producer Agent 收到后分配自己的本地实例号，并按控制来源及
 uuid 去重；未配置该服务或协议不符时发 `relay.reject`。目标连接、数据连接或握手失败时，建立中的
@@ -2524,7 +2543,7 @@ Producer 也用 reject；运行中的双方失败用 cancel。Node 只接受属�
 的 reject 不再作为建立失败处理。
 
 请求方可以在尚未拿到 uuid 时按 request_id 取消。Forwarder 对 opened/error 按请求号匹配请求方，
-对 ready/closed/error 按已知 uuid 匹配，并同时校验控制来源和协议；同 Agent 同时承担 Single 两个角色时，
+对 ready/closed/error 按已知 uuid 匹配，并同时校验逻辑 Node 和协议；同 Agent 同时承担 Single 两个角色时，
 一个 uuid 通知会作用到两个实例。未匹配的迟到 opened 触发 cancel，由 Node 释放相应接入资源。
 AgentSession 进一步校验消息中存在的 epoch/flow_id，旧 Flow 通知不推进当前实例。
 Agent 每次实例只提交一次 open；UDP 建立期间重发的是数据 attach。Multi 的同请求同参数重复 open

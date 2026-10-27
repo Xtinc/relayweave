@@ -205,14 +205,9 @@ void RelayAgent::connection_ready(const NodeConnection &connection)
     control_.connection_ready(connection);
 }
 
-void RelayAgent::connection_closed(const NodeConnection &connection)
+void RelayAgent::connection_closed()
 {
-    control_.connection_closed(connection);
-}
-
-void RelayAgent::connection_finished(const NodeConnection &connection)
-{
-    control_.connection_finished(connection);
+    control_.connection_closed();
 }
 
 void RelayAgent::handle_control_message(const NodeConnection &connection, CtrlMessage message)

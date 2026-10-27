@@ -177,7 +177,7 @@ asio::awaitable<void> AgentSession::run()
 
             if (!owner.send_control(selection.server, CtrlMessage(CtrlCommand::RelayOpen, std::move(values))))
             {
-                throw std::runtime_error("entry control unavailable");
+                throw std::runtime_error("primary control unavailable");
             }
 
             submitted = true;
@@ -216,12 +216,6 @@ asio::awaitable<void> AgentSession::run()
             {
                 co_await relay_tcp(sockets.local, sockets.transfer);
             }
-            if (endpoint.contains("flow_id") && !node_closed && reason.empty())
-            {
-                // Both local directions ended; retain the entry connection while Nodes drain FIN.
-                changed.expires_at(Clock::time_point::max());
-                co_await changed.async_wait(use_nothrow_awaitable);
-            }
         }
     }
     catch (const std::exception &error)
@@ -255,7 +249,6 @@ asio::awaitable<void> AgentSession::run()
 
     if (reason.empty())
         close_io(); // cancel()/fail() already closed I/O on aborted sessions.
-    selection.connection.reset();
     owner.relay_finished(*this);
 }
 
@@ -267,7 +260,7 @@ asio::awaitable<void> AgentSession::attach()
         throw asio::system_error(asio::error::operation_aborted);
     }
 
-    const auto &server = selection.server;
+    const auto host = config::required_string(endpoint, "data_address", "relay endpoint");
     const auto port = config::message_data_port(endpoint);
     const auto uuid = config::require_unsigned(endpoint, "uuid", true);
     const auto ticket = config::require_unsigned(endpoint, "ticket", true);
@@ -315,8 +308,7 @@ asio::awaitable<void> AgentSession::attach()
             sockets.target->connect(address);
         }
         auto endpoints = co_await sockets.resolver.async_resolve(
-            server.host, std::to_string(port),
-            asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
+            host, std::to_string(port), asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         if (!reason.empty())
         {
             throw asio::system_error(asio::error::operation_aborted);
@@ -338,14 +330,13 @@ asio::awaitable<void> AgentSession::attach()
                                          asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         }
         auto endpoints = co_await sockets.resolver.async_resolve(
-            server.host, std::to_string(port),
-            asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
+            host, std::to_string(port), asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         co_await asio::async_connect(sockets.transfer, endpoints,
                                      asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         if (service.protocol == RelayProtocol::Tls)
         {
             sockets.tls.emplace(std::move(sockets.transfer), options.ssl_context);
-            configure_tls_client(*sockets.tls, server.host, options.server_name);
+            configure_tls_client(*sockets.tls, host, options.server_name);
             co_await sockets.tls->async_handshake(
                 asio::ssl::stream_base::client,
                 asio::cancel_after(remaining(options.handshake_timeout), asio::use_awaitable));

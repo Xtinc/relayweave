@@ -5,7 +5,7 @@
 
 using Clock = std::chrono::steady_clock;
 
-ControlRouterMulti::ControlRouterMulti(NodeSession &relay, const ControlSessionPtr &session, njson params, bool ingress)
+ControlRouterMulti::ControlRouterMulti(NodeSession &relay, const AgentPeer &session, njson params, bool ingress)
     : relay_(relay), session_(session), params_(std::move(params)), changed_(relay.node_.control_executor_),
       ingress_(ingress)
 {
@@ -37,7 +37,7 @@ void ControlRouterMulti::send_peer(CtrlCommand command, njson params) const
 
 std::optional<njson> ControlRouterMulti::status_report() const
 {
-    const auto session = session_.lock();
+    const auto &session = session_;
     if (progress_ != Progress::Ready || stop_requested_ || !session)
     {
         return std::nullopt;
@@ -48,7 +48,7 @@ std::optional<njson> ControlRouterMulti::status_report() const
                  {"protocol", params_.at("protocol")},
                  {"epoch", epoch_},
                  {"flow_id", flow_id_},
-                 {"agent_peer", std::string(session->peer())}};
+                 {"agent_peer", std::string(session.peer())}};
     if (ingress_)
     {
         report["path"] = params_.at("path");
@@ -58,7 +58,7 @@ std::optional<njson> ControlRouterMulti::status_report() const
 
 void ControlRouterMulti::notify_agent() const
 {
-    if (auto session = session_.lock())
+    if (const auto &session = session_; session)
     {
         auto values = std::get<AttachInfo>(relay_.endpoint_).to_params(relay_.protocol());
         values["service"] = params_.at("service");
@@ -69,29 +69,30 @@ void ControlRouterMulti::notify_agent() const
         {
             values["request_id"] = params_.at("request_id");
         }
-        session->send(CtrlMessage(ingress_ ? CtrlCommand::RelayOpened : CtrlCommand::RelayOffer, std::move(values)));
+        relay_.send_agent(session,
+            CtrlMessage(ingress_ ? CtrlCommand::RelayOpened : CtrlCommand::RelayOffer, std::move(values)));
     }
 }
 
 void ControlRouterMulti::ready_agent()
 {
     progress_ = Progress::Ready;
-    if (auto session = session_.lock())
+    if (const auto &session = session_; session)
     {
         njson values{{"uuid", relay_.uuid()},
                      {"protocol", params_.at("protocol")},
                      {"epoch", epoch_},
                      {"flow_id", flow_id_}};
-        session->send(CtrlMessage(CtrlCommand::RelayReady, std::move(values)));
+        relay_.send_agent(session, CtrlMessage(CtrlCommand::RelayReady, std::move(values)));
     }
     PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", params_.at("protocol").get<std::string>().c_str(),
                      params_.at("service").get<std::string>().c_str(),
                      static_cast<unsigned long long>(relay_.uuid()));
 }
 
-void ControlRouterMulti::close_agent() const
+asio::awaitable<void> ControlRouterMulti::close_agent() const
 {
-    if (auto session = session_.lock(); session && (ingress_ || progress_ >= Progress::AgentNotified))
+    if (const auto &session = session_; session && (ingress_ || progress_ >= Progress::AgentNotified))
     {
         const auto *endpoint = std::get_if<AttachInfo>(&relay_.endpoint_);
         auto values = endpoint ? endpoint->to_params(relay_.protocol()) : njson::object();
@@ -109,7 +110,7 @@ void ControlRouterMulti::close_agent() const
             values["request_id"] = params_.at("request_id");
             values["path"] = params_.at("path");
         }
-        session->send(
+        co_await relay_.send_final(session,
             CtrlMessage(ingress_ && progress_ != Progress::Ready ? CtrlCommand::RelayError : CtrlCommand::RelayClosed,
                         std::move(values)));
     }
@@ -130,9 +131,9 @@ void ControlRouterMulti::cancel(std::string stage, std::string reason, bool from
     changed_.cancel();
 }
 
-bool ControlRouterMulti::matches(const ControlSessionPtr &session, const njson &params) const
+bool ControlRouterMulti::matches(const AgentPeer &session, const njson &params) const
 {
-    if (stop_requested_ || session_.lock() != session)
+    if (stop_requested_ || session_ != session)
     {
         return false;
     }
@@ -144,7 +145,7 @@ bool ControlRouterMulti::matches(const ControlSessionPtr &session, const njson &
            (uuid && id && id == *uuid);
 }
 
-bool ControlRouterMulti::handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
+bool ControlRouterMulti::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
 {
     const auto &params = *message.params;
     const bool opening = command == CtrlCommand::RelayOpen;
@@ -183,9 +184,9 @@ bool ControlRouterMulti::handle(CtrlCommand command, const ControlSessionPtr &se
     return true;
 }
 
-void ControlRouterMulti::control_disconnected(const ControlSessionPtr &session)
+void ControlRouterMulti::control_disconnected(const AgentPeer &session)
 {
-    if (session_.lock() == session)
+    if (session_ == session)
     {
         cancel("control", ingress_ ? "consumer control disconnected" : "producer control disconnected");
     }
@@ -193,7 +194,8 @@ void ControlRouterMulti::control_disconnected(const ControlSessionPtr &session)
 
 void ControlRouterMulti::invalidate(std::uint64_t epoch, std::string reason)
 {
-    if (!reason.empty() || epoch_ != epoch)
+    if (!reason.empty() || epoch_ != epoch ||
+        (!session_.node.empty() && !relay_.node_.topology_->members().contains(session_.node)))
     {
         cancel("control", reason.empty() ? "flow epoch changed" : std::move(reason));
     }
@@ -275,11 +277,11 @@ asio::awaitable<void> ControlRouterMulti::run()
             {
                 throw std::runtime_error("route epoch changed or request cancelled");
             }
-            const auto session = session_.lock();
+            const auto &session = session_;
             progress_ = Progress::PeerOpened;
             send_peer(CtrlCommand::RelayPeerOpen, njson{{"service", params_.at("service")},
                                                        {"protocol", params_.at("protocol")},
-                                                       {"accessor", std::string(session->peer())}});
+                                                       {"accessor", std::string(session.peer())}});
         }
         const auto [order, transfer_error, flow_error] =
             co_await asio::experimental::make_parallel_group(
@@ -315,7 +317,7 @@ asio::awaitable<void> ControlRouterMulti::run()
             params_.at("service").get<std::string>().c_str(),
             static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     }
-    close_agent();
+    co_await close_agent();
     if (progress_ >= Progress::PeerOpened && !from_peer_)
     {
         send_peer(CtrlCommand::RelayPeerClose, njson{{"stage", stage_}, {"reason", reason_}});

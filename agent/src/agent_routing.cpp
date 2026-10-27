@@ -138,7 +138,8 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
             throw std::invalid_argument("Topology contains duplicate directed links");
         }
 
-        if (snapshot_.epoch != next.epoch)
+        if (snapshot_.epoch != next.epoch ||
+            std::ranges::any_of(snapshot_.nodes, [&](const auto &node) { return !next.nodes.contains(node.first); }))
         {
             path_cache_.clear();
         }

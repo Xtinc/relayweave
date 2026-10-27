@@ -2,6 +2,7 @@
 #define RELAYWEAVE_NODE_CONNECTION_H
 
 #include "agent_common.h"
+#include "async_event.h"
 
 struct AgentConfig;
 class NodeConnectionMgr;
@@ -10,41 +11,28 @@ class RelayAgent;
 /**
  * @brief Own one Node control connection's DNS, socket, TLS identity, retry, and receive lifecycle.
  * @details Mutable state and operations require control_io. The manager owns this object until run()
- * completes; other executors may retain shared handles without reading mutable state. Operations are
- * owned in-place during run(), while the active TLSChannel is borrowed through a weak pointer.
+ * completes. Operations are owned in-place during run(), while business sessions borrow the active
+ * TLSChannel through a weak pointer.
  */
 class NodeConnection
 {
   public:
     /**
      * @brief Describe an endpoint without starting I/O.
-     * @param node_id Expected Node identity, or empty until primary identification.
      * @param host DNS name or IP address used for connection and TLS verification.
      * @param port Node control TCP port.
      */
-    NodeConnection(std::string node_id, std::string host, std::uint16_t port);
+    NodeConnection(std::string host, std::uint16_t port);
     /** @brief Inspect identified connection readiness on control_io.
      * @return True only while running with a verified server.identified identity.
      */
     bool ready() const noexcept;
-    /** @brief Read the immutable endpoint identity.
-     * @return Borrowed host:port identifier, valid for the connection lifetime.
-     */
-    const std::string &id() const noexcept;
-    /** @brief Read the expected or identified Node on control_io.
+    /** @brief Read the identified primary Node on control_io.
      * @return Borrowed Node ID, possibly empty before primary identification.
      */
     const std::string &node_id() const noexcept;
-    /** @brief Read the immutable control and data hostname.
-     * @return Borrowed hostname valid for the connection lifetime.
-     */
-    const std::string &host() const noexcept;
-    /** @brief Read the immutable control port.
-     * @return Configured control TCP port.
-     */
-    std::uint16_t port() const noexcept;
-    /** @brief Copy entrance metadata on control_io.
-     * @return Endpoint identity, hostname, and weak control channel.
+    /** @brief Copy the primary control route on control_io.
+     * @return Identified Node and weak primary control channel.
      */
     ServerRoute route() const;
     /** @brief Enqueue control output on control_io.
@@ -67,8 +55,7 @@ class NodeConnection
         asio::steady_timer retry;
     };
     /** @brief Run identified receive/retry cycles on control_io, then drain the TLS channel. */
-    asio::awaitable<void> run(asio::ssl::context &ssl_context, const AgentConfig &config, NodeConnectionMgr &owner,
-                              RelayAgent &agent);
+    asio::awaitable<void> run(asio::ssl::context &ssl_context, const AgentConfig &config, RelayAgent &agent);
     /** @brief Idempotently cancel all connection stages on control_io. */
     void stop();
     std::string node_id_;
@@ -79,7 +66,49 @@ class NodeConnection
     std::optional<Operations> operations_;
     bool running_ = true;
     bool connected_ = false;
-    std::optional<std::chrono::steady_clock::time_point> idle_since_;
+};
+
+/**
+ * @brief Own the Agent's sole primary control connection and drain it on control_io.
+ * @details Borrows its Agent, configuration and TLS context until close() completes.
+ */
+class NodeConnectionMgr
+{
+  public:
+    /**
+     * @brief Configure the primary connection owner without starting I/O.
+     * @param agent Owning Agent, borrowed through shutdown.
+     * @param executor Single-threaded control executor.
+     * @param ssl_context Client TLS context, borrowed through shutdown.
+     * @param config Immutable Agent configuration, borrowed through shutdown.
+     */
+    NodeConnectionMgr(RelayAgent &agent, asio::any_io_executor executor, asio::ssl::context &ssl_context,
+                      const AgentConfig &config);
+    /** @brief Start the primary connection once, before workers or on control_io. */
+    void start();
+    /**
+     * @brief Borrow the primary connection on control_io.
+     * @return Current connection, or null before start and after its task drains.
+     */
+    const NodeConnection *primary() const;
+    /** @brief Cancel DNS, retry and the primary TLS channel on control_io. */
+    void stop();
+    /**
+     * @brief Await primary task completion after stop() on control_io.
+     * @return Completes after the connection has drained and been released.
+     */
+    asio::awaitable<void> close();
+
+  private:
+    /** @brief Own and drain the primary connection without completion callbacks. */
+    asio::awaitable<void> run();
+    RelayAgent &agent_;
+    asio::any_io_executor executor_;
+    asio::ssl::context &ssl_context_;
+    const AgentConfig &config_;
+    std::unique_ptr<NodeConnection> primary_;
+    AsyncEvent stopped_event_;
+    bool stopping_ = false;
 };
 
 #endif

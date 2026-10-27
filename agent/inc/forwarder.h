@@ -6,6 +6,7 @@
 #include "xfr_channel.h"
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 
 class AgentSession;
 
@@ -82,6 +83,7 @@ class Forwarder
      * @brief Submit output through a weak control route; TLSChannel serializes its own executor.
      * @param route Entrance metadata with a weak TLS channel.
      * @param message Owned protocol message.
+     * @pre Message parameters are an object and the route identifies a selected Node.
      * @return False if the channel has expired; true means queued, not acknowledged.
      */
     static bool send_control(const ServerRoute &route, CtrlMessage message);
@@ -103,13 +105,17 @@ class Forwarder
      */
     void clear_service(const ServiceKey &service, std::string reason = "service unavailable");
     /**
-     * @brief Cancel sessions using one disconnected control entrance on transfer_io.
-     * @param server_id Immutable host:port connection identifier.
+     * @brief Clear availability, cancel business sessions and wake UDP retries on transfer_io.
      */
-    void clear_server(const std::string &server_id);
+    void control_disconnected();
+    /**
+     * @brief Cancel sessions whose endpoint left the cluster, on transfer_io.
+     * @param nodes Member IDs from the latest accepted topology snapshot.
+     */
+    void retain_nodes(const std::unordered_set<std::string> &nodes);
     /**
      * @brief Match a business message or create its producer session on transfer_io.
-     * @param route Authenticated control source and data hostname.
+     * @param route Primary control source and logical business Node.
      * @param message Owned message, matched by source, protocol, request and/or UUID.
      */
     void relay_message(ServerRoute route, CtrlMessage message);

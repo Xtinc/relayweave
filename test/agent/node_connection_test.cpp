@@ -1,5 +1,5 @@
 #include "agent_stop.h"
-#include "node_connection_mgr.h"
+#include "node_connection.h"
 #include "relay_agent.h"
 #include "xfr_channel.h"
 #include "test_data.h"
@@ -8,15 +8,12 @@
 #include <string_view>
 
 #include "member_access.h"
-TEST_MEMBER(NodeConnection, running_)
 TEST_MEMBER(NodeConnection, channel_)
 TEST_MEMBER(RelayAgent, connections_)
 TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(AgentControl, running_)
 TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(AgentControl, next_request_id_)
-TEST_MEMBER(AgentControl, entry_waits_)
-TEST_MEMBER(NodeConnectionMgr, connections_)
 
 namespace
 {
@@ -74,7 +71,11 @@ class Peer
                 }
                 while (acceptor.is_open())
                 {
-                    co_await channel->async_receive();
+                    const auto message = co_await channel->async_receive();
+                    if (message.type() == CtrlCommand::NodeLookup)
+                    {
+                        ++lookups;
+                    }
                 }
             }
             catch (const asio::system_error &)
@@ -106,120 +107,58 @@ class Peer
     bool hold_identification = false;
     std::size_t accepted = 0;
     std::size_t identified = 0;
+    std::size_t lookups = 0;
 };
 
-asio::awaitable<std::shared_ptr<NodeConnection>> exercise(NodeConnectionMgr &manager, Peer &primary, Peer &entry,
+asio::awaitable<void> exercise(NodeConnectionMgr &manager, Peer &primary, Peer &entry,
                                                         std::shared_ptr<RelayAgent> agent)
 {
+    co_await wait_for([&] { return primary.identified == 1; });
+    require(!manager.primary()->ready(), "Primary became ready before server identification");
+    primary.identify_node();
     co_await wait_for([&] { return manager.primary()->ready(); });
-    const auto port = entry.acceptor.local_endpoint().port();
-    auto connection = manager.ensure_connection("entry", "127.0.0.1", port);
-    require(connection == manager.ensure_connection("entry", "ignored-alias", 1),
-            "Node identity did not reuse the existing connection");
-    require(connection == manager.ensure_connection({}, "127.0.0.1", port),
-            "Endpoint did not reuse the existing connection");
-    co_await wait_for([&] { return entry.identified == 1; });
-    require(!connection->ready(), "TLS connection became ready before node identification");
-    entry.identify_node();
-    co_await wait_for([&] { return connection->ready(); });
-    require(entry.accepted == 1, "Reused connection started duplicate tasks");
-
+    const auto connection = manager.primary();
     auto &control = test_access::RelayAgent_control_(*agent);
-    const ServiceKey service{"ready-entry", RelayProtocol::Tcp};
     test_access::AgentControl_running_(control) = true;
-    test_access::AgentControl_service_locations_(control)[service] = {0, "entry", "127.0.0.1", port};
-    control.handle_control_message(*manager.primary(), CtrlMessage(CtrlCommand::ServiceError,
-        njson{{"request_id", 0u}, {"service", service.service}, {"protocol", "tcp"}, {"reason", "stale reply"}}));
-    require(test_access::AgentControl_service_locations_(control).at(service).node == "entry",
-            "Unsolicited service error cleared an already located service");
+    const ServiceKey service{"ready-entry", RelayProtocol::Tcp};
     const auto request = test_access::AgentControl_next_request_id_(control);
-    auto selected = co_await agent->select_relay(service, "entry", Clock::now() + 1s);
-    require(selected.connection == connection && test_access::AgentControl_entry_waits_(control).empty() &&
-                test_access::AgentControl_next_request_id_(control) == request,
-            "Ready entrance allocated an unnecessary request or wait");
-    selected.connection.reset();
-
-    // A full lookup table limits new waits, but must not reject a ready entrance.
-    auto &waits = test_access::AgentControl_entry_waits_(control);
-    const auto deadline = Clock::now() + 1s;
-    for (std::uint64_t i = 0; i < 1000; ++i)
+    for (unsigned i = 0; i < 10; ++i)
     {
-        waits.try_emplace(request + i, primary.acceptor.get_executor(), service, "pending-entry", deadline);
+        const auto destination = "entry-" + std::to_string(i);
+        test_access::AgentControl_service_locations_(control)[service] =
+            {0, destination, "127.0.0.1"};
+        auto selected = co_await agent->select_relay(service, destination, Clock::now() + 1s);
+        require(selected.server.node == destination &&
+                    selected.server.channel.lock() == test_access::NodeConnection_channel_(*connection).lock(),
+                "Destination selection did not reuse the primary channel");
     }
-    selected = co_await agent->select_relay(service, "entry", deadline);
-    require(selected.connection == connection && waits.size() == 1000 &&
+    require(entry.accepted == 0 && primary.accepted == 1 && primary.lookups == 0 &&
                 test_access::AgentControl_next_request_id_(control) == request,
-            "Pending lookup capacity rejected a ready entrance or allocated another wait");
-    selected.connection.reset();
-
-    test_access::AgentControl_service_locations_(control).at(service).node = "new-entry";
-    bool full = false;
+            "Ten entrances opened extra controls or allocated entry lookup requests");
+    bool expired = false;
     try
     {
-        co_await agent->select_relay(service, "new-entry", deadline);
+        co_await agent->select_relay(service, "entry-9", Clock::now());
     }
-    catch (const std::runtime_error &error)
+    catch (const std::runtime_error &)
     {
-        full = std::string_view(error.what()) == "entry lookup capacity reached";
+        expired = true;
     }
-    require(full && waits.size() == 1000 && test_access::AgentControl_next_request_id_(control) == request,
-            "New entrance lookup bypassed the pending lookup limit");
-    test_access::AgentControl_service_locations_(control).at(service).node = "entry";
-    waits.clear();
-
-    bool rejected = false;
-    try
-    {
-        manager.ensure_connection("another-node", "127.0.0.1", port);
-    }
-    catch (const std::invalid_argument &)
-    {
-        rejected = true;
-    }
-    require(rejected && connection->node_id() == "entry", "Endpoint identity conflict changed a live connection");
-
-    // A retained business handle prevents idle collection, regardless of elapsed time.
-    auto now = Clock::now();
-    manager.collect_idle_connections(now);
-    manager.collect_idle_connections(now + 120s);
-    require(connection->ready(), "Idle collection stopped a connection held by a business");
-    const std::weak_ptr<NodeConnection> old = connection;
-    connection.reset();
-    manager.collect_idle_connections(now);
-    manager.collect_idle_connections(now + 59s);
-    require(test_access::NodeConnection_running_(*old.lock()), "Idle connection stopped before sixty seconds");
-    manager.collect_idle_connections(now + 60s);
-
-    // New requests retain the stopping object until its run task has fully drained.
-    auto stopping = manager.find_node("entry");
-    require(stopping == old.lock() && !stopping->ready(), "Stopping connection disappeared from the index early");
-    require(stopping == manager.ensure_connection("entry", "127.0.0.1", port),
-            "Selection during shutdown started a competing connection");
-    require(entry.accepted == 1 && manager.primary()->ready(), "Idle collection affected primary or duplicated entry");
-    stopping.reset();
-    co_await wait_for([&] { return old.expired(); });
-    require(old.expired(), "Finished connection retained its pool reference");
-    require(!manager.find_node("entry"), "Finished connection retained its Node index");
-    entry.hold_identification = false;
-    auto replacement = manager.ensure_connection("entry", "127.0.0.1", port);
-    co_await wait_for([&] { return replacement->ready(); });
-    require(entry.accepted == 2, "Finished connection could not be replaced");
-
-    // A listening TCP endpoint that never speaks TLS leaves the client awaiting its handshake.
-    tcp::acceptor stalled(primary.acceptor.get_executor(), {asio::ip::address_v4::loopback(), 0});
-    auto handshaking = manager.ensure_connection("stalled", "127.0.0.1", stalled.local_endpoint().port());
-    co_await wait_for([&] { return !test_access::NodeConnection_channel_(*handshaking).expired(); });
-    const auto interrupted_channel = test_access::NodeConnection_channel_(*handshaking);
-
+    require(expired, "Selection renewed an expired establishment budget");
+    primary.node = "replacement-primary";
+    primary.hold_identification = false;
+    primary.channel->disconnect();
+    co_await wait_for([&] { return manager.primary()->ready() && manager.primary()->node_id() == primary.node; });
+    require(manager.primary() == connection, "Reidentification replaced the primary owner");
+    primary.hold_identification = true;
+    primary.channel->disconnect();
+    co_await wait_for([&] { return primary.identified == 3; });
+    require(manager.primary() == connection && !connection->ready(), "Primary retry skipped identification");
+    const auto channel = test_access::NodeConnection_channel_(*connection);
     co_await test_agent::stop_from_owner(agent);
-    require(test_access::NodeConnectionMgr_connections_(manager).size() == 0,
-            "Agent stop returned before every connection finished");
-    require(!handshaking->ready() && interrupted_channel.expired(),
-            "Stopping during TLS handshake published readiness or retained the channel");
+    require(!manager.primary() && channel.expired(), "Stop did not drain the sole primary control");
     primary.stop();
     entry.stop();
-    require(!replacement->ready(), "Drained connection remained ready");
-    co_return replacement;
 }
 } // namespace
 
@@ -239,7 +178,7 @@ int main()
         asio::io_context io(1);
         Peer primary(io, server, "primary");
         Peer entry(io, server, "entry");
-        entry.hold_identification = true;
+        primary.hold_identification = true;
         AgentConfig config;
         config.host = "127.0.0.1";
         config.port = primary.acceptor.local_endpoint().port();
@@ -260,18 +199,14 @@ int main()
             transfer.restart();
             transfer.poll();
         }
-        auto retained = result.get();
+        result.get();
         io.run();
         primary_done.get();
         entry_done.get();
         const std::weak_ptr<RelayAgent> owner = agent;
-        const std::weak_ptr<NodeConnection> retired = retained;
         agent.reset();
         require(owner.expired(), "Drained connection or background task retained the Agent");
-        require(!retired.expired(), "Connection handle did not survive its drained owner");
-        retained.reset();
-        require(retired.expired(), "Drained connection outlived its final business handle");
-        std::cout << "[PASS] Node identity, pooled reuse, idle shutdown, handshake cancellation, blocking drain and owner release\n";
+        std::cout << "[PASS] Primary identification, ten logical entrances, reconnect cancellation, drain and owner release\n";
         return 0;
     }
     catch (const std::exception &error)

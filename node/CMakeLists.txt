@@ -1,5 +1,5 @@
 add_library(relayweave_node_lib
-    src/app_common.cpp
+    src/node_common.cpp
     src/pipeline_mgr.cpp
     src/datagram_mgr.cpp
     src/registry_mgr.cpp

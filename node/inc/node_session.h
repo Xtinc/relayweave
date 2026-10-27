@@ -30,7 +30,7 @@ class NodeSession
      * @param traffic Local service accounting record; ingress instances may omit it when the service is
      * remote.
      */
-    NodeSession(RelayNode &node, const ControlSessionPtr &session, njson params, bool ingress, SRVTrafficPtr traffic = {});
+    NodeSession(RelayNode &node, const AgentPeer &session, njson params, bool ingress, SRVTrafficPtr traffic = {});
     /**
      * @brief Construct a single-node instance borrowing both Agent control sessions.
      * @param node Owning Node, which must outlive this business instance.
@@ -41,7 +41,7 @@ class NodeSession
      * @param traffic Local service accounting record; ingress instances may omit it when the service is
      * remote.
      */
-    NodeSession(RelayNode &node, const ControlSessionPtr &consumer, const ControlSessionPtr &producer,
+    NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer,
                 njson params, SRVTrafficPtr traffic);
     /** @brief Run the controller through setup, transfer, and cancellation-safe resource cleanup. */
     asio::awaitable<void> run();
@@ -55,9 +55,9 @@ class NodeSession
      * @brief Cancel if the disconnected control session belongs to this instance.
      * @param session Agent control session whose identity is checked before applying the message.
      */
-    void control_disconnected(const ControlSessionPtr &session);
+    void control_disconnected(const AgentPeer &session);
     /**
-     * @brief Invalidate a multi-node instance when its epoch or path members become stale.
+     * @brief Invalidate Multi paths or remote Agent peers after cluster membership or control loss.
      * @param epoch Cluster membership epoch that authorizes this Flow.
      * @param reason Diagnostic reason retained for closure or sent to the affected peer.
      */
@@ -70,7 +70,7 @@ class NodeSession
      * @return True if the message belongs to this instance and is consumed, including an ignored matching
      * message.
      */
-    bool handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message);
+    bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message);
     /**
      * @brief Consume matching peer messages until this instance's task has fully drained.
      * @param command Control command already parsed by the caller.
@@ -119,6 +119,10 @@ class NodeSession
     asio::awaitable<void> bridge();
     /** @brief Release the installed resource on its transfer executor after data tasks drain. */
     asio::awaitable<void> close();
+    /** @brief Notify an Agent through its primary Node; throw if local submission fails. */
+    void send_agent(const AgentPeer &route, CtrlMessage message) const;
+    /** @brief Retain a terminal notification until locally submitted, its primary leaves, or this Node stops. */
+    asio::awaitable<void> send_final(const AgentPeer &route, CtrlMessage message) const;
     std::uint64_t uuid() const;
     RelayNode &node_;
     std::variant<ControlRouterSingle, ControlRouterMulti> control_;

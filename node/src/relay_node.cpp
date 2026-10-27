@@ -252,6 +252,17 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
     }
     registry_.remove(id);
     co_await session->async_disconnect();
+    asio::steady_timer retry(control_executor_);
+    while (state_.load() == State::Running && topology_->members().size() > 1 &&
+           !cluster_mgr_->broadcast(CtrlMessage(CtrlCommand::RelayDetach, njson{{"agent_session_id", id}})))
+    {
+        retry.expires_after(std::chrono::milliseconds(10));
+        const auto [error] = co_await retry.async_wait(use_nothrow_awaitable);
+        if (error)
+        {
+            break;
+        }
+    }
     if (!failure.empty() && state_.load() == State::Running)
     {
         PROXY_ERROR_PRINT("Control failed session_id=%llu peer=%.*s reason=%s", static_cast<unsigned long long>(id),
@@ -267,6 +278,11 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
 
 void RelayNode::handle_cluster_message(CtrlCommand command, CtrlMessage message)
 {
+    if (ctrl_command_group(command) == CtrlCommand::Relay && ctrl_command_subgroup(command) != CtrlCommand::RelayPeer)
+    {
+        handle_cluster_relay(command, std::move(message));
+        return;
+    }
     const auto group = ctrl_command_group(command);
     if (group == CtrlCommand::Link || group == CtrlCommand::Flow)
     {
@@ -317,7 +333,27 @@ void RelayNode::handle_control_message(SessionId id, const ControlSessionPtr &se
     case CtrlCommand::RelayOpen:
     case CtrlCommand::RelayReject:
     case CtrlCommand::RelayCancel:
-        handle_relay(command, session, message);
+        if (const auto target = config::optional_string(params, "node_id", config_.cluster.node_id);
+            target != config_.cluster.node_id)
+        {
+            auto values = params;
+            values["agent_session_id"] = id;
+            if (command == CtrlCommand::RelayOpen)
+            {
+                values["accessor"] = std::string(session->peer());
+            }
+            if (!cluster_mgr_->send(target, CtrlMessage(command, std::move(values))) &&
+                command == CtrlCommand::RelayOpen)
+            {
+                auto error = params;
+                error["reason"] = "entry unavailable";
+                session->send(CtrlMessage(CtrlCommand::RelayError, std::move(error)));
+            }
+        }
+        else
+        {
+            handle_relay(command, session, message);
+        }
         return;
     default:
         if (!control_->handle_client(id, session, command, params))
@@ -332,11 +368,7 @@ RelayNode::SessionId RelayNode::allocate_session_id()
     SessionId id;
     do
     {
-        id = next_session_id_++;
-        if (next_session_id_ == 0)
-        {
-            next_session_id_ = 1;
-        }
+        id = generate_random_id();
     } while (registry_.contains(id));
     return id;
 }
@@ -376,7 +408,7 @@ void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
     rollback.dismiss();
 }
 
-void RelayNode::handle_relay(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
+void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
 {
     const auto &params = *message.params;
     if (command != CtrlCommand::RelayOpen)
@@ -438,7 +470,7 @@ void RelayNode::handle_relay(CtrlCommand command, const ControlSessionPtr &sessi
             values["path"] = params.at("path");
             values["stage"] = "validate";
         }
-        session->send(CtrlMessage(CtrlCommand::RelayError, std::move(values)));
+        send_relay(session, CtrlMessage(CtrlCommand::RelayError, std::move(values)));
     }
 }
 
@@ -501,5 +533,67 @@ asio::awaitable<void> RelayNode::stop_relays()
     {
         relays_done_.expires_at(std::chrono::steady_clock::time_point::max());
         co_await relays_done_.async_wait(use_nothrow_awaitable);
+    }
+}
+
+bool RelayNode::send_relay(const AgentPeer &route, CtrlMessage message)
+{
+    auto &params = *message.params;
+    params["node_id"] = config_.cluster.node_id;
+    if (message.type() == CtrlCommand::RelayOpened || message.type() == CtrlCommand::RelayOffer)
+    {
+        params["data_address"] = config_.control.advertise_address;
+    }
+    if (route.node.empty())
+    {
+        const auto session = route.local.lock();
+        if (!session)
+        {
+            return false;
+        }
+        session->send(std::move(message));
+        return true;
+    }
+    params["agent_session_id"] = route.session_id;
+    return cluster_mgr_->send(route.node, std::move(message));
+}
+
+void RelayNode::handle_cluster_relay(CtrlCommand command, CtrlMessage message)
+{
+    auto &params = *message.params;
+    const auto source = params.at("source").get<std::string>();
+    const auto id = config::require_unsigned(params, "agent_session_id", true);
+    switch (command)
+    {
+    case CtrlCommand::RelayOpen:
+    case CtrlCommand::RelayCancel:
+    case CtrlCommand::RelayReject:
+        if (state_.load() == State::Running || command != CtrlCommand::RelayOpen)
+        {
+            handle_relay(command, AgentPeer{source, id, config::optional_string(params, "accessor", "")}, message);
+        }
+        return;
+    case CtrlCommand::RelayDetach:
+        for (const auto &relay : relay_sessions_)
+        {
+            relay->control_disconnected(AgentPeer{source, id, {}});
+        }
+        return;
+    case CtrlCommand::RelayOpened:
+    case CtrlCommand::RelayReady:
+    case CtrlCommand::RelayClosed:
+    case CtrlCommand::RelayError:
+    case CtrlCommand::RelayOffer:
+        if (const auto session = registry_.find_session(id))
+        {
+            params["node_id"] = source;
+            params.erase("source");
+            params.erase("agent_session_id");
+            params.erase("target");
+            session->send(std::move(message));
+        }
+        return;
+    default:
+        return;
     }
 }

@@ -1,13 +1,72 @@
-#ifndef PROXY_APP_COMMON_HEADER
-#define PROXY_APP_COMMON_HEADER
+#ifndef RELAYWEAVE_NODE_COMMON_H
+#define RELAYWEAVE_NODE_COMMON_H
 
 #include "async_event.h"
+#include "tls_channel.h"
 #include "xfr_channel.h"
 #include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
+
+/**
+ * @brief Identify an Agent reply address, locally or through its primary Node, on control_io.
+ * @details Local sessions are borrowed weakly; remote lifetimes follow cluster notifications.
+ */
+struct AgentPeer
+{
+    /**
+     * @brief Borrow a local Agent control session without extending its lifetime.
+     * @param session Original Agent control session, stored weakly.
+     */
+    AgentPeer(const ControlSessionPtr &session) : local(session) {}
+    /**
+     * @brief Describe the original Agent session carried by an authenticated cluster message.
+     * @param node Authenticated primary Node identity.
+     * @param session_id Original Agent session ID allocated by that primary.
+     * @param accessor Original Agent peer address for accounting and status.
+     */
+    AgentPeer(std::string node, std::uint64_t session_id, std::string accessor)
+        : node(std::move(node)), session_id(session_id), accessor(std::move(accessor)) {}
+
+    /**
+     * @brief Compare reply identities independently of business request IDs and UUIDs.
+     * @param other Reply address to compare.
+     * @return True for the same local weak owner or remote primary/session pair.
+     */
+    bool operator==(const AgentPeer &other) const noexcept
+    {
+        if (node != other.node || session_id != other.session_id)
+        {
+            return false;
+        }
+        return !node.empty() || (!local.owner_before(other.local) && !other.local.owner_before(local));
+    }
+    /**
+     * @brief Inspect the locally known reply address.
+     * @return True for a live local session or a remote address awaiting cluster lifetime notifications.
+     */
+    explicit operator bool() const noexcept { return !node.empty() || !local.expired(); }
+    /**
+     * @brief Read the original Agent address for traffic accounting and status reports.
+     * @return Borrowed peer address, or empty after a local session expires.
+     */
+    std::string_view peer() const
+    {
+        if (!node.empty())
+        {
+            return accessor;
+        }
+        const auto session = local.lock();
+        return session ? session->peer() : std::string_view{};
+    }
+
+    std::weak_ptr<ControlSession> local;
+    std::string node;
+    std::uint64_t session_id = 0;
+    std::string accessor;
+};
 
 /** @brief Set service byte rates and burst sizes; a zero rate disables that direction's limit. */
 struct TrafficLimitConfig

@@ -190,7 +190,7 @@ asio::awaitable<void> socks_chain_probe(std::uint16_t proxy_port, std::uint16_t 
 template <typename Probe> void eventually(Probe probe, std::string_view description)
 {
     std::string last_failure;
-    for (int attempt = 0; attempt < 40; ++attempt)
+    for (int attempt = 0; attempt < 100; ++attempt)
     {
         asio::io_context io;
         auto result = asio::co_spawn(io, probe(), asio::use_future);
@@ -299,26 +299,32 @@ int main()
         std::thread transfer_udp_thread([&]() { transfer_udp_io.run(); });
         std::thread proxy_thread([&]() { proxy_io.run(); });
 
+        auto cleanup = [&]() noexcept {
+            consumer->stop();
+            producer->stop();
+            node->stop();
+            std::promise<void> proxy_stopped;
+            auto proxy_stopped_result = proxy_stopped.get_future();
+            asio::post(proxy_io, [&]() {
+                proxy.stop();
+                asio::error_code ignored;
+                http_origin.close(ignored);
+                echo_origin.close(ignored);
+                proxy_stopped.set_value();
+            });
+            proxy_stopped_result.wait();
+            control_thread.join();
+            transfer_tcp_thread.join();
+            transfer_udp_thread.join();
+            proxy_thread.join();
+        };
+        ScopeGuard cleanup_guard([&cleanup]() noexcept { cleanup(); });
+
         eventually([=]() { return http_chain_probe(local_http_port, http_origin_port); }, "HTTP proxy chain");
         eventually([=]() { return socks_chain_probe(local_socks_port, echo_port); }, "SOCKS5 proxy chain");
 
-        consumer->stop();
-        producer->stop();
-        node->stop();
-        std::promise<void> proxy_stopped;
-        auto proxy_stopped_result = proxy_stopped.get_future();
-        asio::post(proxy_io, [&]() {
-            proxy.stop();
-            asio::error_code ignored;
-            http_origin.close(ignored);
-            echo_origin.close(ignored);
-            proxy_stopped.set_value();
-        });
-        proxy_stopped_result.wait();
-        control_thread.join();
-        transfer_tcp_thread.join();
-        transfer_udp_thread.join();
-        proxy_thread.join();
+        cleanup();
+        cleanup_guard.dismiss();
 
         std::cout << "[PASS] HTTP and SOCKS5 application proxy through RelayWeave TLS tunnels\n";
         return 0;

@@ -35,7 +35,18 @@ struct ForwarderTestAccess
         const ServiceKey service{"retry-test", RelayProtocol::Udp};
         auto &forward = test_access::Forwarder_datagram_forwards_(owner).at(0);
         const auto tasks = test_access::Forwarder_active_tasks_(owner);
-        owner.clear_service(service);
+        if (recover)
+        {
+            owner.control_disconnected();
+        }
+        else
+        {
+            owner.clear_service(service);
+        }
+        if (!test_access::Forwarder_service_nodes_(owner).empty())
+        {
+            throw std::runtime_error("Primary disconnection left service availability behind");
+        }
         if (!forward.retry_scheduled)
         {
             throw std::runtime_error("Service loss cleared the retry flag before its task finished");

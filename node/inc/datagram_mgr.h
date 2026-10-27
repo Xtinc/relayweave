@@ -1,7 +1,7 @@
 #ifndef PROXY_DATAGRAM_MANAGER_HEADER
 #define PROXY_DATAGRAM_MANAGER_HEADER
 
-#include "app_common.h"
+#include "node_common.h"
 #include "flow_protocol.h"
 #include "xfr_channel.h"
 

@@ -1,7 +1,7 @@
 #ifndef PROXY_REGISTRY_MGR_H
 #define PROXY_REGISTRY_MGR_H
 
-#include "app_common.h"
+#include "node_common.h"
 #include "dualindex_map.h"
 #include "tls_channel.h"
 #include <map>

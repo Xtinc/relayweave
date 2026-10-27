@@ -3,7 +3,7 @@
 
 #include "agent_control.h"
 #include "agent_routing.h"
-#include "node_connection_mgr.h"
+#include "node_connection.h"
 
 struct AgentServiceConfig
 {
@@ -47,7 +47,7 @@ class Forwarder;
  * @brief Own Agent modules and coordinate startup, executor crossing, and shutdown.
  * @details Configuration outlives its borrowers. Control modules run on control_io; Forwarder and
  * business sockets run on transfer_io. Both executors and the external TLS context must outlive
- * stop() and all worker threads. Control borrows the earlier-declared pool, routing, and
+ * stop() and all worker threads. Control borrows the earlier-declared connection owner, routing, and
  * Forwarder. The external owner keeps the Agent alive through stop() and worker joins.
  */
 class RelayAgent
@@ -82,7 +82,7 @@ class RelayAgent
      * @param service Service name and transport identifying the discovered service.
      * @param destination Expected destination Node identity from Forwarder.
      * @param deadline Absolute steady-clock establishment deadline; never renewed.
-     * @return Path, epoch, entrance metadata, and shared connection handle after identification.
+     * @return Path, epoch, logical entrance, and primary control route.
      * @throws std::exception If selection fails, expires, or is invalidated by shutdown.
      */
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
@@ -91,12 +91,10 @@ class RelayAgent
   private:
     friend class NodeConnectionMgr;
     friend class NodeConnection;
-    /** @brief Dispatch an identified entrance to the control component on control_io. */
+    /** @brief Dispatch primary identification to the control component on control_io. */
     void connection_ready(const NodeConnection &connection);
-    /** @brief Dispatch an entrance disconnect while all peer modules remain alive. */
-    void connection_closed(const NodeConnection &connection);
-    /** @brief Release matching entrance waits before the manager erases a completed connection. */
-    void connection_finished(const NodeConnection &connection);
+    /** @brief Dispatch a primary disconnect while all peer modules remain alive. */
+    void connection_closed();
     /** @brief Deliver authenticated connection messages to the control component on control_io. */
     void handle_control_message(const NodeConnection &connection, CtrlMessage message);
 

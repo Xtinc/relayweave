@@ -3,7 +3,6 @@ add_library(relayweave_agent_lib
     src/relay_agent.cpp
     src/agent_control.cpp
     src/node_connection.cpp
-    src/node_connection_mgr.cpp
     src/forwarder.cpp
     src/agent_session.cpp
 )

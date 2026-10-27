@@ -1,7 +1,7 @@
 #ifndef RELAYWEAVE_STREAM_PIPELINE_H
 #define RELAYWEAVE_STREAM_PIPELINE_H
 
-#include "app_common.h"
+#include "node_common.h"
 #include "flow_protocol.h"
 #include "tls_channel.h"
 #include "xfr_channel.h"

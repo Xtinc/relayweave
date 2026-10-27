@@ -1,5 +1,4 @@
 #include "node_connection.h"
-#include "node_connection_mgr.h"
 #include "relay_agent.h"
 #include <algorithm>
 
@@ -16,13 +15,12 @@ void NodeConnection::Operations::cancel()
     retry.cancel();
 }
 
-NodeConnection::NodeConnection(std::string node_id, std::string host, std::uint16_t port)
-    : node_id_(std::move(node_id)), host_(std::move(host)), port_(port), id_(host_ + ":" + std::to_string(port_))
+NodeConnection::NodeConnection(std::string host, std::uint16_t port)
+    : host_(std::move(host)), port_(port), id_(host_ + ":" + std::to_string(port_))
 {
 }
 
-asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const AgentConfig &config,
-                                          NodeConnectionMgr &owner, RelayAgent &agent)
+asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const AgentConfig &config, RelayAgent &agent)
 {
     operations_.emplace(co_await asio::this_coro::executor);
     auto &operations = *operations_;
@@ -72,15 +70,10 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
 
             const auto identified_node =
                 config::required_string(config::message_params(identified), "node_id", "server.identified");
-            if (!node_id_.empty() && node_id_ != identified_node)
-            {
-                throw std::invalid_argument("Connected server node_id does not match service location");
-            }
-
             node_id_ = identified_node;
             connected_ = true;
             reconnect_delay = config.reconnect_initial_delay;
-            owner.connection_ready(*this);
+            agent.connection_ready(*this);
             PROXY_INFO_PRINT("Control [+] node=%s peer=%s", node_id_.c_str(), id_.c_str());
 
             stage = "receive control message";
@@ -117,7 +110,7 @@ asio::awaitable<void> NodeConnection::run(asio::ssl::context &ssl_context, const
             connected_ = false;
             if (running_)
             {
-                agent.connection_closed(*this);
+                agent.connection_closed();
             }
         }
 
@@ -180,11 +173,6 @@ bool NodeConnection::ready() const noexcept
     return running_ && connected_;
 }
 
-const std::string &NodeConnection::id() const noexcept
-{
-    return id_;
-}
-
 const std::string &NodeConnection::node_id() const noexcept
 {
     return node_id_;
@@ -192,14 +180,70 @@ const std::string &NodeConnection::node_id() const noexcept
 
 ServerRoute NodeConnection::route() const
 {
-    return ServerRoute{id_, host_, channel_};
+    return ServerRoute{channel_, node_id_};
 }
 
-const std::string &NodeConnection::host() const noexcept
+NodeConnectionMgr::NodeConnectionMgr(RelayAgent &agent, asio::any_io_executor executor, asio::ssl::context &ssl_context,
+                                     const AgentConfig &config)
+    : agent_(agent), executor_(std::move(executor)), ssl_context_(ssl_context), config_(config),
+      stopped_event_(executor_)
 {
-    return host_;
 }
-std::uint16_t NodeConnection::port() const noexcept
+
+void NodeConnectionMgr::start()
 {
-    return port_;
+    primary_ = std::make_unique<NodeConnection>(config_.host, config_.port);
+    try
+    {
+        asio::co_spawn(executor_, run(), asio::detached);
+    }
+    catch (...)
+    {
+        primary_.reset();
+        throw;
+    }
+}
+
+asio::awaitable<void> NodeConnectionMgr::run()
+{
+    try
+    {
+        co_await primary_->run(ssl_context_, config_, agent_);
+    }
+    catch (...)
+    {
+        if (!stopping_)
+        {
+            agent_.connection_closed();
+        }
+        PROXY_ERROR_PRINT("Control stopped reason=%s", exception_description(std::current_exception()).c_str());
+    }
+    primary_.reset();
+    stopped_event_.notify_all();
+}
+
+const NodeConnection *NodeConnectionMgr::primary() const
+{
+    return primary_.get();
+}
+
+void NodeConnectionMgr::stop()
+{
+    stopping_ = true;
+    if (primary_)
+    {
+        primary_->stop();
+    }
+    else
+    {
+        stopped_event_.notify_all();
+    }
+}
+
+asio::awaitable<void> NodeConnectionMgr::close()
+{
+    if (!co_await stopped_event_.wait())
+    {
+        throw asio::system_error(asio::error::operation_aborted);
+    }
 }

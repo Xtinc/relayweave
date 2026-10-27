@@ -5,8 +5,6 @@
 #include <functional>
 #include <type_traits>
 
-class NodeConnection;
-
 /** @brief Identify a service by name and Agent-facing transport. */
 struct ServiceKey
 {
@@ -28,21 +26,19 @@ template <> struct std::hash<ServiceKey>
     }
 };
 
-/** @brief Copy an entrance endpoint and weak control channel across execution domains. */
+/** @brief Copy a primary control channel and the logical business Node across execution domains. */
 struct ServerRoute
 {
-    std::string id;
-    std::string host;
     std::weak_ptr<TLSChannel> channel;
+    std::string node;
 };
 
-/** @brief Carry one selected path, epoch, and shared entrance lifetime into a consumer session. */
+/** @brief Carry one selected path, epoch, and primary reply route into a consumer session. */
 struct RelaySelection
 {
     ServerRoute server;
     std::vector<std::string> path;
     std::uint64_t epoch = 0;
-    std::shared_ptr<NodeConnection> connection;
 };
 
 #endif

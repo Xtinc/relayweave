@@ -4,6 +4,7 @@
 #include "relay_node.h"
 
 #include <array>
+#include <asio/experimental/awaitable_operators.hpp>
 #include <chrono>
 #include <filesystem>
 #include <future>
@@ -265,8 +266,11 @@ asio::awaitable<void> verify_topology(asio::ssl::context &context, std::uint16_t
 }
 
 asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context &context,
-                                    std::uint16_t unavailable_port, std::uint16_t service_port)
+                                    asio::ssl::context &client_context, std::uint16_t unavailable_port,
+                                    std::uint16_t service_port)
 {
+    using namespace asio::experimental::awaitable_operators;
+    auto upstream = co_await open_control(client_context, service_port);
     auto socket = co_await acceptor.async_accept(asio::use_awaitable);
     auto channel = std::make_shared<TLSChannel>(std::move(socket), context, TLSChannelRole::S, channel_config());
     co_await channel->start({});
@@ -277,13 +281,14 @@ asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context
             {"node_id", available ? "master" : "unavailable"}, {"address", "127.0.0.1"},
             {"port", available ? service_port : unavailable_port}}});
     };
-    try
-    {
+    auto receive_client = [&]() -> asio::awaitable<void> {
         for (;;)
         {
             auto message = co_await channel->async_receive();
             if (message.command == "server.identify")
+            {
                 channel->send(CtrlMessage{"server.identified", njson{{"node_id", "discovery"}}});
+            }
             else if (message.command == "service.lookup")
             {
                 const auto request = config::require_unsigned(config::message_params(message), "request_id", true);
@@ -294,16 +299,35 @@ asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context
                 }
                 else
                 {
-                    // An old response must not win over the current reachable location.
                     location(previous_request, false);
                     location(request, true);
                 }
             }
+            else if (message.type() == CtrlCommand::RelayOpen && message.params->at("node_id") == "unavailable")
+            {
+                (*message.params)["reason"] = "service unavailable";
+                channel->send(CtrlMessage{CtrlCommand::RelayError, std::move(message.params)});
+            }
+            else if (ctrl_command_group(message.type()) == CtrlCommand::Relay)
+            {
+                upstream->send(std::move(message));
+            }
         }
+    };
+    auto receive_upstream = [&]() -> asio::awaitable<void> {
+        for (;;)
+        {
+            channel->send(co_await upstream->async_receive());
+        }
+    };
+    try
+    {
+        co_await (receive_client() && receive_upstream());
     }
-    catch (const asio::system_error &)
+    catch (const std::exception &)
     {
     }
+    co_await upstream->async_disconnect();
     co_await channel->async_disconnect();
 }
 
@@ -551,19 +575,19 @@ int main()
         wait_for_service(forward_b, "Service migration");
         asio::co_spawn(control_io, verify_two_services(forward_a, forward_b), asio::use_future).get();
 
-        // An unreachable first location must not suppress subsequent discovery.
+        // An unavailable first Node must not suppress subsequent discovery.
         tcp::acceptor discovery_acceptor(control_io, {asio::ip::address_v4::loopback(), 0});
         const auto unavailable = unused_port(control_io, used);
         const auto recovery_forward = unused_port(transfer_io, used);
         auto discovery_task = asio::co_spawn(control_io,
-            discovery_peer(discovery_acceptor, server_context, unavailable, control_a), asio::use_future);
+            discovery_peer(discovery_acceptor, server_context, client_context, unavailable, control_a), asio::use_future);
         auto recovery_config = client_config(discovery_acceptor.local_endpoint().port());
         recovery_config.forwards.push_back(
             AgentForwardConfig{"service-b", "127.0.0.1", recovery_forward, RelayProtocol::Tcp});
         recovery_client = std::make_shared<RelayAgent>(control_io, transfer_io, client_context,
                                                        std::move(recovery_config));
         asio::post(control_io, [recovery_client] { recovery_client->start(); });
-        wait_for_service(recovery_forward, "Initial connection failure and stale discovery response");
+        wait_for_service(recovery_forward, "Unavailable Node and stale discovery response");
         recovery_client->stop();
         discovery_task.get();
         recovery_client.reset();

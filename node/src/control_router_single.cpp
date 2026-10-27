@@ -4,8 +4,8 @@
 
 using Clock = std::chrono::steady_clock;
 
-ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const ControlSessionPtr &consumer,
-                                         const ControlSessionPtr &producer, njson params)
+ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const AgentPeer &consumer,
+                                         const AgentPeer &producer, njson params)
     : relay_(relay), consumer_(consumer), producer_(producer), params_(std::move(params))
 {
     const auto protocol = config::message_protocol(params_);
@@ -16,15 +16,15 @@ ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const ControlSessio
     deadline_ = Clock::now() + timeout;
 }
 
-bool ControlRouterSingle::belongs_to(const ControlSessionPtr &session) const
+bool ControlRouterSingle::belongs_to(const AgentPeer &session) const
 {
-    return consumer_.lock() == session || producer_.lock() == session;
+    return consumer_ == session || producer_ == session;
 }
 
 std::optional<njson> ControlRouterSingle::status_report() const
 {
-    const auto consumer = consumer_.lock();
-    const auto producer = producer_.lock();
+    const auto &consumer = consumer_;
+    const auto &producer = producer_;
     if (!ready_ || stop_requested_ || !consumer || !producer)
     {
         return std::nullopt;
@@ -33,21 +33,21 @@ std::optional<njson> ControlRouterSingle::status_report() const
                  {"service", params_.at("service")},
                  {"protocol", params_.at("protocol")},
                  {"uuid", relay_.uuid()},
-                 {"consumer_peer", std::string(consumer->peer())},
-                 {"producer_peer", std::string(producer->peer())}};
+                 {"consumer_peer", std::string(consumer.peer())},
+                 {"producer_peer", std::string(producer.peer())}};
 }
 
-bool ControlRouterSingle::matches(const ControlSessionPtr &session, const njson &params) const
+bool ControlRouterSingle::matches(const AgentPeer &session, const njson &params) const
 {
     if (stop_requested_ || !belongs_to(session))
         return false;
     const auto uuid = config::optional_unsigned(params, "uuid", true);
     const auto request = config::optional_unsigned(params, "request_id");
     return (uuid && relay_.uuid() == *uuid) ||
-           (request && consumer_.lock() == session && params_.at("request_id") == *request);
+           (request && consumer_ == session && params_.at("request_id") == *request);
 }
 
-bool ControlRouterSingle::handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
+bool ControlRouterSingle::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
 {
     if (command == CtrlCommand::RelayOpen)
     {
@@ -58,7 +58,7 @@ bool ControlRouterSingle::handle(CtrlCommand command, const ControlSessionPtr &s
     {
         return false;
     }
-    if (command == CtrlCommand::RelayReject && (ready_ || producer_.lock() != session))
+    if (command == CtrlCommand::RelayReject && (ready_ || producer_ != session))
     {
         return true;
     }
@@ -67,11 +67,23 @@ bool ControlRouterSingle::handle(CtrlCommand command, const ControlSessionPtr &s
     return true;
 }
 
-void ControlRouterSingle::control_disconnected(const ControlSessionPtr &session)
+void ControlRouterSingle::control_disconnected(const AgentPeer &session)
 {
     if (belongs_to(session))
     {
         cancel("control", "control session disconnected");
+    }
+}
+
+void ControlRouterSingle::invalidate(std::uint64_t, std::string reason)
+{
+    for (const auto *route : {&consumer_, &producer_})
+    {
+        if (!route->node.empty() && (!reason.empty() || !relay_.node_.topology_->members().contains(route->node)))
+        {
+            cancel("control", reason.empty() ? "Agent primary disconnected" : std::move(reason));
+            return;
+        }
     }
 }
 
@@ -89,14 +101,14 @@ void ControlRouterSingle::notify_agents() const
     const auto &pair = std::get<AttachPair>(relay_.endpoint_);
     for (const auto producer : {false, true})
     {
-        if (auto session = producer ? producer_.lock() : consumer_.lock())
+        if (const auto &session = producer ? producer_ : consumer_; session)
         {
             auto values = (producer ? pair.producer : pair.consumer).to_params(relay_.protocol());
             values["service"] = params_.at("service");
             values["protocol"] = params_.at("protocol");
             if (!producer)
                 values["request_id"] = params_.at("request_id");
-            session->send(
+            relay_.send_agent(session,
                 CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
         }
     }
@@ -105,22 +117,24 @@ void ControlRouterSingle::notify_agents() const
 void ControlRouterSingle::ready_agents() const
 {
     const njson values{{"uuid", relay_.uuid()}, {"protocol", params_.at("protocol")}};
-    const auto consumer = consumer_.lock();
+    const auto &consumer = consumer_;
     if (consumer)
     {
-        consumer->send(CtrlMessage(CtrlCommand::RelayReady, values));
+        relay_.send_agent(consumer, CtrlMessage(CtrlCommand::RelayReady, values));
     }
-    if (auto session = producer_.lock(); session && session != consumer)
+    if (const auto &session = producer_; session && session != consumer)
     {
-        session->send(CtrlMessage(CtrlCommand::RelayReady, values));
+        relay_.send_agent(session, CtrlMessage(CtrlCommand::RelayReady, values));
     }
 }
 
-void ControlRouterSingle::close_agents() const
+asio::awaitable<void> ControlRouterSingle::close_agents() const
 {
     const auto protocol = relay_.protocol();
     if (ready_ && protocol != RelayProtocol::Udp)
-        return;
+    {
+        co_return;
+    }
     njson values{{"request_id", params_.at("request_id")},
                  {"service", params_.at("service")},
                  {"protocol", params_.at("protocol")},
@@ -128,11 +142,16 @@ void ControlRouterSingle::close_agents() const
     const auto id = relay_.uuid();
     if (id)
         values["uuid"] = id;
-    const auto consumer = consumer_.lock();
-    if (auto producer = producer_.lock(); producer && producer != consumer && id)
-        producer->send(CtrlMessage(CtrlCommand::RelayClosed, values));
+    const auto &consumer = consumer_;
+    if (const auto &producer = producer_; producer && producer != consumer && id)
+    {
+        co_await relay_.send_final(producer, CtrlMessage(CtrlCommand::RelayClosed, values));
+    }
     if (consumer)
-        consumer->send(CtrlMessage(ready_ ? CtrlCommand::RelayClosed : CtrlCommand::RelayError, std::move(values)));
+    {
+        co_await relay_.send_final(consumer,
+            CtrlMessage(ready_ ? CtrlCommand::RelayClosed : CtrlCommand::RelayError, std::move(values)));
+    }
 }
 
 asio::awaitable<void> ControlRouterSingle::run()
@@ -154,19 +173,19 @@ asio::awaitable<void> ControlRouterSingle::run()
             throw std::runtime_error("relay setup timed out");
         }
         {
-            const auto consumer = consumer_.lock();
+            const auto &consumer = consumer_;
             if (!consumer)
             {
                 throw asio::system_error(asio::error::operation_aborted);
             }
-            co_await relay_.bind_and_activate(std::string(consumer->peer()));
+            co_await relay_.bind_and_activate(std::string(consumer.peer()));
         }
         if (stop_requested_ || Clock::now() >= deadline_)
         {
             throw asio::system_error(asio::error::operation_aborted);
         }
-        ready_ = true;
         ready_agents();
+        ready_ = true;
         PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", params_.at("protocol").get<std::string>().c_str(),
                          params_.at("service").get<std::string>().c_str(),
                          static_cast<unsigned long long>(relay_.uuid()));
@@ -193,5 +212,5 @@ asio::awaitable<void> ControlRouterSingle::run()
                          static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     }
     co_await relay_.close();
-    close_agents();
+    co_await close_agents();
 }

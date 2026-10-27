@@ -1,7 +1,7 @@
 #ifndef RELAYWEAVE_CONTROL_ROUTER_MULTI_H
 #define RELAYWEAVE_CONTROL_ROUTER_MULTI_H
 
-#include "tls_channel.h"
+#include "node_common.h"
 
 class NodeSession;
 
@@ -22,7 +22,7 @@ class ControlRouterMulti
      * ID.
      * @param ingress True for the first Node on the selected path; false for the last Node.
      */
-    ControlRouterMulti(NodeSession &relay, const ControlSessionPtr &session, njson params, bool ingress);
+    ControlRouterMulti(NodeSession &relay, const AgentPeer &session, njson params, bool ingress);
     /** @brief Establish and transfer alongside a Flow watcher, then drain and release resources. */
     asio::awaitable<void> run();
     /**
@@ -33,7 +33,7 @@ class ControlRouterMulti
      * @return True if the message belongs to this instance and is consumed, including an ignored matching
      * message.
      */
-    bool handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message);
+    bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message);
     /**
      * @brief Consume matching authenticated peer messages, including duplicates during cleanup.
      * @param command Control command already parsed by the caller.
@@ -43,12 +43,12 @@ class ControlRouterMulti
      */
     bool handle_peer(CtrlCommand command, const CtrlMessage &message);
     /**
-     * @brief Cancel when the borrowed Agent control session disconnects.
+     * @brief Cancel when the Agent control session disconnects.
      * @param session Agent control session whose identity is checked before applying the message.
      */
-    void control_disconnected(const ControlSessionPtr &session);
+    void control_disconnected(const AgentPeer &session);
     /**
-     * @brief Cancel if the epoch changes or a path member disappears.
+     * @brief Cancel on Flow authorization loss or Agent primary departure.
      * @param epoch Cluster membership epoch that authorizes this Flow.
      * @param reason Diagnostic reason retained for closure or sent to the affected peer.
      */
@@ -78,15 +78,15 @@ class ControlRouterMulti
 
     /** @brief Establish on control_io and bridge data; ingress waits for both FIN directions before Flow close. */
     asio::awaitable<void> establish_and_transfer();
-    bool matches(const ControlSessionPtr &session, const njson &params) const;
+    bool matches(const AgentPeer &session, const njson &params) const;
     /** @brief Await Flow closure on control_io so the parallel group cancels and drains transfer. */
     asio::awaitable<void> watch_flow();
     void notify_agent() const;
-    void close_agent() const;
+    asio::awaitable<void> close_agent() const;
     void ready_agent();
     void send_peer(CtrlCommand command, njson params) const;
     NodeSession &relay_;
-    std::weak_ptr<ControlSession> session_;
+    AgentPeer session_;
     njson params_;
     std::uint64_t epoch_ = 0;
     std::uint64_t flow_id_ = 0;

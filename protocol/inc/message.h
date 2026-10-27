@@ -46,6 +46,7 @@ enum class CtrlCommand : std::uint32_t
     RelayCancel,
     RelayClosed,
     RelayError,
+    RelayDetach,
 
     RelayPeer = 0x01010000u,
     RelayPeerOpen,

@@ -1,7 +1,7 @@
 #include "node_session.h"
 #include "relay_node.h"
 
-NodeSession::NodeSession(RelayNode &node, const ControlSessionPtr &session, njson params, bool ingress,
+NodeSession::NodeSession(RelayNode &node, const AgentPeer &session, njson params, bool ingress,
                          SRVTrafficPtr traffic)
     : node_(node), control_(std::in_place_type<ControlRouterMulti>, *this, session, params, ingress),
       traffic_(std::move(traffic))
@@ -9,7 +9,7 @@ NodeSession::NodeSession(RelayNode &node, const ControlSessionPtr &session, njso
     select_data(config::message_protocol(params));
 }
 
-NodeSession::NodeSession(RelayNode &node, const ControlSessionPtr &consumer, const ControlSessionPtr &producer,
+NodeSession::NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer,
                          njson params, SRVTrafficPtr traffic)
     : node_(node), control_(std::in_place_type<ControlRouterSingle>, *this, consumer, producer, params),
       traffic_(std::move(traffic))
@@ -53,20 +53,17 @@ void NodeSession::cancel(std::string stage, std::string reason)
     std::visit([&](auto &controller) { controller.cancel(std::move(stage), std::move(reason)); }, control_);
 }
 
-void NodeSession::control_disconnected(const ControlSessionPtr &session)
+void NodeSession::control_disconnected(const AgentPeer &session)
 {
     std::visit([&](auto &controller) { controller.control_disconnected(session); }, control_);
 }
 
 void NodeSession::invalidate(std::uint64_t epoch, std::string reason)
 {
-    if (auto *controller = std::get_if<ControlRouterMulti>(&control_))
-    {
-        controller->invalidate(epoch, std::move(reason));
-    }
+    std::visit([&](auto &controller) { controller.invalidate(epoch, std::move(reason)); }, control_);
 }
 
-bool NodeSession::handle(CtrlCommand command, const ControlSessionPtr &session, const CtrlMessage &message)
+bool NodeSession::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
 {
     return std::visit([&](auto &controller) { return controller.handle(command, session, message); }, control_);
 }
@@ -214,4 +211,27 @@ asio::awaitable<void> NodeSession::close()
             co_return;
         },
         asio::use_awaitable);
+}
+
+void NodeSession::send_agent(const AgentPeer &route, CtrlMessage message) const
+{
+    if (!node_.send_relay(route, std::move(message)))
+    {
+        throw std::runtime_error("Agent control unavailable");
+    }
+}
+
+asio::awaitable<void> NodeSession::send_final(const AgentPeer &route, CtrlMessage message) const
+{
+    asio::steady_timer retry(co_await asio::this_coro::executor);
+    while (!node_.send_relay(route, message) && !route.node.empty() &&
+           node_.state_.load() == RelayNode::State::Running && node_.topology_->members().contains(route.node))
+    {
+        retry.expires_after(std::chrono::milliseconds(10));
+        const auto [error] = co_await retry.async_wait(use_nothrow_awaitable);
+        if (error)
+        {
+            co_return;
+        }
+    }
 }

@@ -9,7 +9,7 @@ Agent 路由测试通过夹具检查私有候选计算；生产接口只提供�
 | `common/` | 双索引容器、LRU、缓冲池、AsyncEvent、令牌桶、流量计数 | `common`、`unit` |
 | `protocol/` | 控制/二进制编解码、mTLS、FlowProtocol/NodeLink、Stream/Datagram 端点、TCP/TLS/UDP 复制 | `protocol`，按用例区分 `unit` / `integration` |
 | `route/` | 链路质量、路径算法、DNS 探测生命周期、真实 ICMP | `routing`，真实 ICMP 另标 `icmp` |
-| `agent/` | Agent/Session/Forwarder 生命周期、控制连接池、路由组装和缓存 | `agent`，路由相关另标 `routing` |
+| `agent/` | Agent/Session/Forwarder 生命周期、唯一主控制连接、路由组装和缓存 | `agent`，路由相关另标 `routing` |
 | `node/` | 配置/统计、启动停止、集群控制、共享 NodeLink、Flow、UDP session 路由、拓扑 | `node`，集群相关另标 `cluster` |
 | `proxy/` | HTTP、CONNECT、SOCKS5、请求边界校验、容量、408/504 超时、停止中接入和监听回滚 | `proxy`、`integration` |
 | `integration/` | 单/多节点 TCP/TLS/UDP、恢复、迁移及 Proxy 完整链路 | `end_to_end`、`integration` |
@@ -64,10 +64,11 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 
 ## 回归边界与整理原则
 
-- Agent 连接池（`node_connection`）：真实 mTLS 后仍等待节点识别；就绪连接不创建等待或分配请求编号、Node/端点复用、身份冲突、活动引用防回收、60 秒空闲边界、停止期间复用旧索引、任务完成后重建、Agent 停止排空，以及连接句柄晚于 Agent 释放。
+- Agent 主连接（`node_connection`）：真实 mTLS 后仍等待节点识别；十个逻辑入口共用 primary 且不发 node.lookup；重连重新识别节点身份、未识别连接停止排空及所有者释放。
 - Agent 停止（`agent_lifecycle`）：所有者线程顺序调用阻塞 stop，等待控制侧与业务侧排空；完成后重复调用直接返回；排空失败保持 Stopping、保留元数据，解决失败后可再次调用完成排空，最终释放 Agent。
 - Agent 进程（`agent_process`）：真实可执行文件处理 SIGTERM/SIGINT 后阻塞停止并释放监听；启动失败时仍排空、join worker 并返回原异常。
-- Agent 入口（`agent_session`）：回复同时关联 primary 来源、request_id、node_id、原截止时间和取消状态；Session 本地取消保留入口预算，整体停止立即唤醒并排空。
+- Agent 会话（`agent_session`）：正常关闭保留本地双向排空，数据完成后无需等待额外控制关闭；错误原因、终结通知字段及原建立期限保持正确。
+- Agent 集群控制（`agent_cluster_control`）：十入口单主控并发，Producer/Node 晚上线及 UDP 主动建立；主控断开关闭旧业务、重连重新建立；Single 接入等待、缺失端超时、按请求号取消和远端释放；Multi 同类场景由 `relay_paths` 覆盖。
 
 
 - 公共控制（`cluster_integration`）：本地/远端发现、状态与拓扑查询、认证来源与路由字段清理、错误 requester 和关闭会话的迟到响应；重启后重复验证。

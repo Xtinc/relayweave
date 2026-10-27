@@ -129,13 +129,26 @@ void Forwarder::clear_service(const ServiceKey &service, std::string reason)
     }
 }
 
-void Forwarder::clear_server(const std::string &server_id)
+void Forwarder::control_disconnected()
+{
+    service_nodes_.clear();
+    for (const auto &[request, relay] : relays_)
+    {
+        relay->cancel("primary control disconnected");
+    }
+    for (auto &forward : datagram_forwards_)
+    {
+        forward.retry_timer.expires_at(Clock::now());
+    }
+}
+
+void Forwarder::retain_nodes(const std::unordered_set<std::string> &nodes)
 {
     for (const auto &[request, relay] : relays_)
     {
-        if (relay->selection.server.id == server_id)
+        if (!relay->selection.server.node.empty() && !nodes.contains(relay->selection.server.node))
         {
-            relay->cancel("control disconnected");
+            relay->cancel("business node unavailable");
         }
     }
 }
@@ -389,7 +402,7 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
         }
         for (const auto &[request, active] : relays_)
         {
-            if (active->producer() && active->selection.server.id == route.id && active->endpoint.at("uuid") == *uuid)
+            if (active->producer() && active->selection.server.node == route.node && active->endpoint.at("uuid") == *uuid)
             {
                 return;
             }
@@ -407,7 +420,7 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
     const auto request = config::optional_unsigned(p, "request_id");
     for (const auto &[id, relay] : relays_)
     {
-        if (relay->selection.server.id != route.id || relay->service.protocol != protocol)
+        if (relay->selection.server.node != route.node || relay->service.protocol != protocol)
         {
             continue;
         }
@@ -475,6 +488,7 @@ bool Forwarder::send_control(const ServerRoute &route, CtrlMessage message)
         return false;
     }
 
+    (*message.params)["node_id"] = route.node;
     channel->send(std::move(message));
     return true;
 }

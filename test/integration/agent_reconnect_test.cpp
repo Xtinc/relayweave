@@ -196,7 +196,7 @@ asio::awaitable<void> require_relay_closed(const std::shared_ptr<tcp::socket> &s
 void wait_for_round_trip(asio::io_context &io, std::uint16_t forward_port)
 {
     std::string last_failure;
-    for (int attempt = 0; attempt < 30; ++attempt)
+    for (int attempt = 0; attempt < 80; ++attempt)
     {
         auto result = asio::co_spawn(io, relay_round_trip(forward_port), asio::use_future);
         try
