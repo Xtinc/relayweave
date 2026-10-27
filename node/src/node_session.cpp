@@ -220,18 +220,3 @@ void NodeSession::send_agent(const AgentPeer &route, CtrlMessage message) const
         throw std::runtime_error("Agent control unavailable");
     }
 }
-
-asio::awaitable<void> NodeSession::send_final(const AgentPeer &route, CtrlMessage message) const
-{
-    asio::steady_timer retry(co_await asio::this_coro::executor);
-    while (!node_.send_relay(route, message) && !route.node.empty() &&
-           node_.state_.load() == RelayNode::State::Running && node_.topology_->members().contains(route.node))
-    {
-        retry.expires_after(std::chrono::milliseconds(10));
-        const auto [error] = co_await retry.async_wait(use_nothrow_awaitable);
-        if (error)
-        {
-            co_return;
-        }
-    }
-}

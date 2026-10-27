@@ -575,6 +575,10 @@ void ClusterMgr::start()
             {
                 PROXY_ERROR_PRINT("Cluster close failed reason=%s", exception_description(error).c_str());
             }
+            if (self->running_ && self->config_.role == ClusterConfig::Role::Master)
+            {
+                self->fail(error ? exception_description(error) : "master control loop exited");
+            }
             self->loop_done_.notify_all();
         }
     });
@@ -675,7 +679,7 @@ asio::awaitable<void> ClusterMgr::deliver_messages(ClusterRoom &room)
     for (;;)
     {
         auto [error, message] = co_await outbound_channel_.async_receive(use_nothrow_awaitable);
-        if (error)
+        if (error || !running_)
         {
             co_return;
         }
@@ -692,13 +696,25 @@ asio::awaitable<void> ClusterMgr::deliver_messages(ClusterRoom &room)
     }
 }
 
-bool ClusterMgr::send(std::string target, CtrlMessage message)
+void ClusterMgr::fail(std::string reason)
+{
+    running_ = false;
+    stop_ok_ = false;
+    asio::error_code ignored;
+    acceptor_.close(ignored);
+    outbound_channel_.reset();
+    outbound_channel_.close();
+    // Notify after the caller leaves its current business-container iteration.
+    asio::post(executor_, [self = shared_from_this(), reason = std::move(reason)]() mutable {
+        self->server_.cluster_failed(std::move(reason));
+    });
+}
+
+ClusterMgr::SendResult ClusterMgr::send(std::string target, CtrlMessage message)
 {
     if (!running_)
     {
-        PROXY_DEBUG_PRINT("Cluster send rejected target=%s command=%s reason=stopped", target.c_str(),
-                          message.command.c_str());
-        return false;
+        return SendResult::Stopped;
     }
 
     const auto command = message.command;
@@ -717,36 +733,36 @@ bool ClusterMgr::send(std::string target, CtrlMessage message)
             throw std::invalid_argument("Cluster message params must be an object");
         }
         if (message.command.starts_with("cluster."))
+        {
             throw std::invalid_argument("cluster.* commands are reserved");
+        }
         (*message.params)["target"] = target;
         static_cast<void>(WireMessage::pack(message));
-
-        if (config_.role == ClusterConfig::Role::Master)
-        {
-            if (outbound_channel_.try_send(asio::error_code{}, std::move(message)))
-            {
-                return true;
-            }
-            PROXY_ERROR_PRINT("Cluster send failed target=%s command=%s reason=outbound queue full", target.c_str(),
-                              command.c_str());
-            return false;
-        }
-        if (connector_ && connector_->send(std::move(message)))
-        {
-            return true;
-        }
-        PROXY_DEBUG_PRINT("Cluster send rejected target=%s command=%s reason=not connected", target.c_str(),
-                          command.c_str());
     }
     catch (const std::exception &exception)
     {
-        PROXY_ERROR_PRINT("Cluster send failed target=%s command=%s reason=%s", target.c_str(), command.c_str(),
+        PROXY_ERROR_PRINT("Cluster send rejected target=%s command=%s reason=%s", target.c_str(), command.c_str(),
                           exception.what());
+        return SendResult::InvalidMessage;
     }
-    return false;
+
+    if (config_.role == ClusterConfig::Role::Master)
+    {
+        if (outbound_channel_.try_send(asio::error_code{}, std::move(message)))
+        {
+            return SendResult::Submitted;
+        }
+        fail("master control outbound queue full");
+        return SendResult::QueueFull;
+    }
+    if (connector_ && connector_->send(std::move(message)))
+    {
+        return SendResult::Submitted;
+    }
+    return SendResult::NotConnected;
 }
 
-bool ClusterMgr::broadcast(CtrlMessage message)
+ClusterMgr::SendResult ClusterMgr::broadcast(CtrlMessage message)
 {
     return send(std::string(cluster_broadcast_target), std::move(message));
 }

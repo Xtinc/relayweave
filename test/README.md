@@ -71,9 +71,9 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 - Agent 集群控制（`agent_cluster_control`）：十入口单主控并发，Producer/Node 晚上线及 UDP 主动建立；主控断开关闭旧业务、重连重新建立；Single 接入等待、缺失端超时、按请求号取消和远端释放；Multi 同类场景由 `relay_paths` 覆盖。
 
 
-- 公共控制（`cluster_integration`）：本地/远端发现、状态与拓扑查询、认证来源与路由字段清理、错误 requester 和关闭会话的迟到响应；重启后重复验证。
+- 公共控制（`cluster_integration`）：本地/远端发现、状态与拓扑查询、认证来源与路由字段清理、错误 requester 和关闭会话的迟到响应；重启后重复验证。发送结果区分停止、未连接和非法消息；Master 出站队列溢出关闭控制连接并丢弃待发消息。
 - 运行指标（`node_metrics`）：启动前的无效队列值和运行时间、三个执行域采样、控制探针同时采样服务流量、转发字节计入可用率、分域取消后回调释放且不重调度；`node_flows` 继续验证真实转发计数。
-- 关闭（`node_shutdown`）：运行故障不污染后续正常关闭结果、关闭返回 false 后仍排空其余模块、并发/重复结果一致、无法排空的异常保持 Stopping 并可重试、取消及启动失败清理。
+- 关闭（`node_shutdown`）：普通运行故障不污染后续正常关闭结果、关闭返回 false 后仍排空其余模块、并发/重复结果一致、无法排空的异常保持 Stopping 并可重试、取消及启动失败清理；Master 队列溢出只通知所有者一次并保留失败退出结果，覆盖通知到达时所有者已开始停机的情况。`node_flows` 验证溢出断连在所有者停机前释放远端 Flow 接收者。
 - 进程（`node_process`，Unix/Python）：真实 SIGTERM、未完成 TCP/TLS setup、启动失败退出码与端口重绑，验证线程 join 收尾。
 
 - TCP 复制：两侧读/写失败和限速等待中的对向失败必须排空；正常 EOF 保留反向回传，校验原始异常和实际流量。

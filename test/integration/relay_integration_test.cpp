@@ -604,9 +604,12 @@ int main()
         }
         catch (...)
         {
-            control_io.stop();
-            transfer_tcp_io.stop();
-            transfer_udp_io.stop();
+            // Drain Node owners while all borrowed execution contexts are still alive.
+            server->stop();
+            asio::post(transfer_tcp_io, [&echo_acceptor] {
+                asio::error_code ignored;
+                echo_acceptor.close(ignored);
+            });
             control_thread.join();
             transfer_tcp_thread.join();
             transfer_udp_thread.join();

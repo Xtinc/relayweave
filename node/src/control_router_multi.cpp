@@ -32,7 +32,11 @@ void ControlRouterMulti::send_peer(CtrlCommand command, njson params) const
 {
     params["epoch"] = epoch_;
     params["flow_id"] = flow_id_;
-    relay_.node_.cluster_mgr_->send(peer_, CtrlMessage(command, std::move(params)));
+    if (relay_.node_.cluster_mgr_->send(peer_, CtrlMessage(command, std::move(params))) !=
+            ClusterMgr::SendResult::Submitted && command != CtrlCommand::RelayPeerClose)
+    {
+        throw std::runtime_error("peer control submission failed");
+    }
 }
 
 std::optional<njson> ControlRouterMulti::status_report() const
@@ -90,7 +94,7 @@ void ControlRouterMulti::ready_agent()
                      static_cast<unsigned long long>(relay_.uuid()));
 }
 
-asio::awaitable<void> ControlRouterMulti::close_agent() const
+void ControlRouterMulti::close_agent() const
 {
     if (const auto &session = session_; session && (ingress_ || progress_ >= Progress::AgentNotified))
     {
@@ -110,7 +114,7 @@ asio::awaitable<void> ControlRouterMulti::close_agent() const
             values["request_id"] = params_.at("request_id");
             values["path"] = params_.at("path");
         }
-        co_await relay_.send_final(session,
+        relay_.node_.send_relay(session,
             CtrlMessage(ingress_ && progress_ != Progress::Ready ? CtrlCommand::RelayError : CtrlCommand::RelayClosed,
                         std::move(values)));
     }
@@ -317,7 +321,7 @@ asio::awaitable<void> ControlRouterMulti::run()
             params_.at("service").get<std::string>().c_str(),
             static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     }
-    co_await close_agent();
+    close_agent();
     if (progress_ >= Progress::PeerOpened && !from_peer_)
     {
         send_peer(CtrlCommand::RelayPeerClose, njson{{"stage", stage_}, {"reason", reason_}});

@@ -38,6 +38,16 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
     using message_channel = asio::experimental::channel<void(asio::error_code, CtrlMessage)>;
 
   public:
+    /** @brief Local submission result; success does not acknowledge remote delivery. */
+    enum class SendResult
+    {
+        Submitted = 0,
+        NotConnected = 1,
+        Stopped = 2,
+        InvalidMessage = 3,
+        QueueFull = 4,
+    };
+
     /**
      * @brief Construct cluster control resources without starting the master or slave loop.
      * @param server Owning RelayNode receiving validated cluster messages.
@@ -54,22 +64,22 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
     void start();
     /**
      * @brief Cancel and drain the control loop and member sessions on control_io.
-     * @return False for handled shutdown errors; every normal return guarantees tasks have drained.
+     * @return False after fatal control failure or handled shutdown errors; normal returns guarantee drainage.
      */
     asio::awaitable<bool> async_stop();
     /**
      * @brief Submit a unicast directly on control_io; delivery is not acknowledged by this call.
      * @param target Destination Node identity, or the reserved broadcast target where supported.
      * @param message Control message to dispatch; ownership of its parameters may be transferred.
-     * @return True when submitted to the master outbox or a joined slave TLS channel; false on local failure.
+     * @return Submission status. A full master outbox fails the cluster control module and its Node.
      */
-    bool send(std::string target, CtrlMessage message);
+    SendResult send(std::string target, CtrlMessage message);
     /**
      * @brief Queue delivery to all joined participants, including the local master, on control_io.
      * @param message Control message to dispatch; ownership of its parameters may be transferred.
      * @return Local submission result, with the same meaning as send().
      */
-    bool broadcast(CtrlMessage message);
+    SendResult broadcast(CtrlMessage message);
 
   private:
     class LocalParticipant;
@@ -80,6 +90,8 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
     asio::awaitable<void> accept_sessions(ClusterRoom &room);
     asio::awaitable<void> deliver_messages(ClusterRoom &room);
     void receive(CtrlMessage message);
+    /** @brief Fail a running master: reject submissions, close transport and notify its owner. */
+    void fail(std::string reason);
 
     RelayNode &server_;
     asio::any_io_executor executor_;

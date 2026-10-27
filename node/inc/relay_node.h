@@ -9,6 +9,7 @@
 #include "registry_mgr.h"
 #include "topology.h"
 #include <atomic>
+#include <functional>
 
 class NodeControl;
 class NodeMetrics;
@@ -120,12 +121,13 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
      * @brief Start listeners and publish owned tasks exactly once.
      * @pre Called before worker run() calls, or on control_io, without overlapping stop().
      * @throws std::exception On setup failure; keep executors running and call stop() to drain tasks.
+     * @param failure_handler Optional fatal-error notification on control_io; arrange owner-thread stop().
      */
-    void start();
+    void start(std::function<void(std::string)> failure_handler = {});
     /**
      * @brief Stop admission, cancel relays, and synchronously drain dependencies.
      * @pre Called sequentially by the owner outside server executors, with workers still running.
-     * @return False for a handled shutdown error; completed repeated calls reuse the result.
+     * @return False after fatal control failure or a handled shutdown error; repeated calls reuse the result.
      * @details Submission or drain exceptions leave shutdown retryable in the Stopping state.
      */
     bool stop();
@@ -139,6 +141,8 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     asio::awaitable<void> control_accept_loop();
     asio::awaitable<void> run_control_session(SessionId id, ControlSessionPtr session);
     void handle_cluster_message(CtrlCommand command, CtrlMessage message);
+    /** @brief Stop admission and invalidate business state before notifying the external owner. */
+    void cluster_failed(std::string reason);
     void handle_control_message(SessionId id, const ControlSessionPtr &session, const CtrlMessage &message);
     SessionId allocate_session_id();
 
@@ -170,6 +174,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     std::size_t active_control_sessions_ = 0;
     bool stop_ok_ = true;
     std::atomic<State> state_{State::Created};
+    std::function<void(std::string)> failure_handler_;
 
     RegistryMgr registry_;
     std::shared_ptr<RelayIdAllocator> relay_id_allocator_;

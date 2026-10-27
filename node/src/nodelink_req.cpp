@@ -16,6 +16,16 @@ asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> p
     const auto epoch = topology_.epoch();
     auto request = std::make_shared<RemoteFlow>(control_);
     request->result = {epoch, id, "open", "flow result pending"};
+    const auto submitted = cluster_.send(
+        std::string(topology_.master_id()),
+        CtrlMessage(CtrlCommand::FlowOpen, njson{{"epoch", epoch},
+                                               {"flow_id", id},
+                                               {"path", std::move(path)},
+                                               {"transport", relay_protocol_name(transport)}}));
+    if (submitted != ClusterMgr::SendResult::Submitted)
+    {
+        co_return FlowResult{epoch, id, "open", "cluster control submission failed"};
+    }
     remote_flows_.emplace(id, request);
     bool accepted = false;
     ScopeGuard cleanup([this, id, epoch, &accepted] {
@@ -26,11 +36,6 @@ asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> p
                           CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}}));
         }
     });
-    cluster_.send(std::string(topology_.master_id()),
-                  CtrlMessage(CtrlCommand::FlowOpen, njson{{"epoch", epoch},
-                                                          {"flow_id", id},
-                                                          {"path", std::move(path)},
-                                                          {"transport", relay_protocol_name(transport)}}));
     if (!co_await asio::co_spawn(control_, request->completed.wait(),
                                  asio::cancel_after(std::chrono::seconds(30), asio::use_awaitable)))
     {

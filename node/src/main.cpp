@@ -101,9 +101,19 @@ int main(int argc, char *argv[])
 
             try
             {
-                asio::post(control_io, asio::use_future([node] { node->start(); })).get();
+                asio::post(control_io, asio::use_future([&] {
+                    node->start([&](std::string reason) {
+                        asio::post(signal_io, [&, reason = std::move(reason)] {
+                            failure = std::make_exception_ptr(std::runtime_error(reason));
+                            signals.cancel();
+                        });
+                    });
+                })).get();
                 signal_io.run();
-                signal.get();
+                if (!failure)
+                {
+                    signal.get();
+                }
             }
             catch (...)
             {

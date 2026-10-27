@@ -128,12 +128,12 @@ void ControlRouterSingle::ready_agents() const
     }
 }
 
-asio::awaitable<void> ControlRouterSingle::close_agents() const
+void ControlRouterSingle::close_agents() const
 {
     const auto protocol = relay_.protocol();
     if (ready_ && protocol != RelayProtocol::Udp)
     {
-        co_return;
+        return;
     }
     njson values{{"request_id", params_.at("request_id")},
                  {"service", params_.at("service")},
@@ -145,11 +145,11 @@ asio::awaitable<void> ControlRouterSingle::close_agents() const
     const auto &consumer = consumer_;
     if (const auto &producer = producer_; producer && producer != consumer && id)
     {
-        co_await relay_.send_final(producer, CtrlMessage(CtrlCommand::RelayClosed, values));
+        relay_.node_.send_relay(producer, CtrlMessage(CtrlCommand::RelayClosed, values));
     }
     if (consumer)
     {
-        co_await relay_.send_final(consumer,
+        relay_.node_.send_relay(consumer,
             CtrlMessage(ready_ ? CtrlCommand::RelayClosed : CtrlCommand::RelayError, std::move(values)));
     }
 }
@@ -212,5 +212,5 @@ asio::awaitable<void> ControlRouterSingle::run()
                          static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     }
     co_await relay_.close();
-    co_await close_agents();
+    close_agents();
 }

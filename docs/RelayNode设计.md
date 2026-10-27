@@ -353,9 +353,16 @@ master 接受 socket 后立刻创建 session 并加入 room。session 的读协�
 广播包含发送者，本地节点和远端节点使用相同的接收路径。定向消息只投递给当前在线的目标 participant；目标不存在时按 best-effort 语义丢弃，不退化成广播。
 
 ClusterMgr::broadcast(message) 等价于 send("all", message)；其他 target 使用 send(target, message) 定向发送。
-两个接口都要求在 control_io 调用并直接返回 bool：master 返回 true 表示本地出站队列已受理，slave 返回 true
-表示消息已交给加入成功的 TLSChannel；均不保证底层 TLS 入队、远端收到或业务执行成功。停止、未连接、
-本地出站队列满、参数或编码错误返回 false，并记录必要原因；这些单条发送失败不生成全局 cluster.error。
+两个接口都要求在 control_io 调用，返回 `SendResult`：`Submitted=0`、`NotConnected=1`、
+`Stopped=2`、`InvalidMessage=3`、`QueueFull=4`。master 的 Submitted 表示本地出站队列已受理，
+slave 的 Submitted 表示消息已交给加入成功的 TLSChannel；均不保证底层 TLS 入队、远端收到或业务执行成功。
+参数或编码错误只拒绝当前消息，不关闭健康连接。master 共享出站队列满视为控制模块致命故障：
+立即拒绝后续提交、丢弃待发消息、关闭集群连接，并通知 RelayNode 所有者在执行域外调用 stop()。
+RelayNode 切换 Stopping 并唤醒 Link/Flow 等待者，普通监听和 Registry 统一由 stop_control() 关闭；
+即使所有者已经开始停机，也仍处理已排队的故障通知，避免关闭任务继续等待失效的集群确认。
+致命故障结果由 ClusterMgr 保存，RelayNode 的 stop() 汇总该结果。Node 完成排空后以失败结果退出，
+由已有 systemd Restart=on-failure 策略重启。
+单条 TLSChannel 队列满沿用通道关闭路径，成员离开或 slave 控制失联负责撤销相关业务。
 编码检查前移到发送入口，room 不再为已解码的内部消息重复编码校验。
 真正的集群断线继续沿用原有失效通知与业务清理。需要业务结果的调用仍通过响应消息和 request_id 关联。
 集群不保存历史、不补发，也不自动重发业务消息。
@@ -420,7 +427,7 @@ RelayNode 独占 `ClusterMgr`，ClusterMgr 反向保存非拥有的 `RelayNode&`
 NodeControl 处理服务、节点、集群状态和拓扑查询；NodeLink/Flow 及 `relay.peer.*` 由 RelayNode 交给各自模块处理。
 `cluster.error` 清理本地 Flow 协调、端点授权及多节点业务；物理 Link 仍由成员变化和独立心跳判断失效。`cluster.joined` 及未识别的普通命令在该入口结束处理。
 这条直接关系与 RelayNode 控制状态位于同一串行 executor，生命周期由 RelayNode 的所有权和停止顺序保证。
-发送入口拒绝业务调用使用 `cluster.*` 保留命令，记录原因并返回 false。
+发送入口拒绝业务调用使用 `cluster.*` 保留命令，记录原因并返回 InvalidMessage。
 
 ### 节点地址发布
 
@@ -652,7 +659,7 @@ FlowProtocol 移除本地 Flow 后，retired_ 保存 ID 与 10 秒期限，退�
 并撤销本地授权。Link 失效影响依赖它的 Flow，普通单 Flow RESET 不扩大成共享 Link 故障。
 
 成员/地址/epoch 失效撤销相关 Link 和 Flow；cluster.error 清理本地 Flow 与授权，物理 Link 继续由
-成员更新或独立心跳收敛。集群发送队列溢出报告本地 ClusterError，但未主动断开全部集群连接，远端旧 Flow 的回收依赖显式关闭、控制失联或路径失效，没有运行期租约。
+成员更新或独立心跳收敛。单条集群 TLS 队列溢出关闭该连接；master 共享出站队列溢出关闭全部集群连接并使 Node 停机，远端据控制失联回收旧 Flow。没有运行期租约。
 远程 open 最多等待 30 秒，Link 与 prepare/commit 的分段期限及 NodeSession 外层 deadline 见 [容量与超时配置](#容量与超时配置)。
 
 ### 查询与观测
@@ -2229,13 +2236,13 @@ manager、ClusterMgr、NodeMetrics、Topology、NodeLinkMgr/FlowProtocol 和借�
 普通 TLS context、四个服务 io_context 由 main 保活，集群 context 由 Node 自己持有，见 [RelayNode 的包含关系与借用关系](#relaynode-的包含关系与借用关系)。
 
 main 给 control/TCP/UDP/cluster_data 建立四个 work guard 并启动四个 worker，通过 control_io 的
-post 提交 start 并等待结果。主线程运行等待进程信号的 signal_io，正常运行共五个线程。
+post 提交 start 并等待结果。主线程运行 signal_io，等待进程信号或 Node 致命故障通知，正常运行共五个线程。
 
 | RelayNode 状态 | 进入条件 | 可以做什么与退出条件 |
 |---|---|---|
 | Created | 构造成功，尚未 start | 允许启动一次；直接 stop 不必调度各域任务，进入 Stopped |
 | Running | start 的部件启动阶段成功，准备接受普通控制连接 | 普通业务与 peer.open 可创建实例；不保证 slave 已加入集群或服务已经注册 |
-| Stopping | 外部 stop 开始，或 start 部分失败 | 拒绝新业务，排空已发布任务，保留关闭所需的依赖；无法确认排空时保持该状态并允许顺序重试 stop |
+| Stopping | 外部 stop 开始、start 部分失败，或 master 控制模块致命故障 | 拒绝新业务，排空已发布任务，保留关闭所需的依赖；无法确认排空时保持该状态并允许顺序重试 stop |
 | Stopped | stop 所有阶段完成，包括已处理错误后返回 false | 顺序重复 stop 复用原结果；不能重新 start |
 
 start 按以下顺序执行；各部件在对应步骤发布自己的后台任务：
@@ -2278,7 +2285,7 @@ Running 是本机接受业务的状态，不是集群握手完成或单条业务
 ### RelayNode 停止流程
 
 `RelayNode::stop()` 是同步收敛接口，由 `control_io`、`transfer_tcp_io`、`transfer_udp_io`、`cluster_data_io` 之外的所有者线程顺序调用，且不能与 start() 重叠。
-main 在信号等待结束或启动失败后顺序调用 stop()。stop 不支持并发调用；信号回调和工作线程不调用该接口。
+main 在收到信号、Node 致命故障通知或启动失败后顺序调用 stop()。stop 不支持并发调用；信号回调和工作线程不调用该接口。
 以 Stopped 状态复用顺序重复调用的结果；control、TCP/TLS、UDP 阶段依次执行，返回 bool 表示是否正常关闭：
 
 ```mermaid
@@ -2325,8 +2332,8 @@ session 并等待退出。ClusterMgr 不维护额外的业务收件箱；停止�
 数据域的指标取消处理可以迟到，但不得重新调度或访问已停止的 Registry/FlowProtocol。
 
 需要等待排空的模块关闭接口返回 `asio::awaitable<bool>`，模块内部记录错误，对外只交付关闭结果。
-正常返回（包括 false）均保证所属任务已经退出；false 表示关闭阶段发生了已处理的错误。
-运行期间已经记录的错误不会单独使随后完成排空的关闭返回 false。调用方取消不会中断模块排空，
+正常返回（包括 false）均保证所属任务已经退出；false 表示关闭阶段发生了已处理的错误，或 master 控制模块发生致命故障。
+普通历史运行错误不会单独使随后完成排空的关闭返回 false；master 控制模块致命故障会保留失败结果，确保进程失败退出。调用方取消不会中断模块排空，
 并发、重复关闭等待同一完成条件，并保持同一关闭结果。
 
 NodeLinkMgr 接收 FlowProtocol 的关闭结果后，仍等待通知和 Flow 控制任务退出。
@@ -2335,7 +2342,7 @@ Topology 和 ClusterMgr 的完成事件在后台协程退出时唤醒等待者�
 RelayNode 依次调用 NodeLinkMgr、Topology、ClusterMgr，不因某一步返回 false 而跳过后续模块或会话排空，
 随后完成 TCP/TLS、UDP 停止，设置 Stopped 并返回汇总结果，不保存或重抛模块历史运行异常。
 任务提交或排空本身失败时，异常交给外层，Node 保持 Stopping，后续顺序调用 stop() 可以再次进入关闭流程。
-main 的信号等待只交付信号结果，stop() 在回调外调用；先释放 work guard、join 全部线程，再结束 Node 生命周期。
+main 等待系统信号或 Node 致命故障通知，stop() 在回调外调用；先释放 work guard、join 全部线程，再结束 Node 生命周期。
 正常关闭退出 0，已完成但关闭结果为 false 时退出 1；启动异常在清理与 join 后报告原始原因。
 已取消的指标处理函数可以迟到，但只释放模块自身，不再访问注册表或协议服务；不使用 io_context.stop() 跳过排空，也不增加全局强停超时。
 
@@ -2517,8 +2524,8 @@ agent_session_id 不外泄。agent_session_id 与 UDP 数据 session_id 独立�
 primary 的 Agent 会话退出后广播内部 relay.detach，入口按回复地址取消关联业务。
 primary 节点离开或集群失联时，使用现有成员与故障通知清理远端来源；Multi 同时撤销 Flow 授权。
 纯本地 Single 不受其他节点的集群失联影响。
-队列拒绝 opened/ready 时回滚本次建立；终结通知只等待本地队列受理，primary 离开或 Node 停止即退出，
-不重试业务建立。正常流结束依靠已有双向 EOF 排空，不因结束 AgentSession 关闭 primary。
+提交 opened/ready 失败时回滚本次建立；终结通知和 relay.detach 只尝试提交一次，通信故障由集群层统一触发失效清理，
+不轮询队列、不重试单条消息。正常流结束依靠已有双向 EOF 排空，不因结束 AgentSession 关闭 primary。
 
 ### 业务控制消息
 
@@ -2630,7 +2637,7 @@ Agent 和 Dashboard 通过任意普通控制入口发 `topology.query`；入口�
 |---|---|---|
 | `cluster.join` | slave → master 集群控制口 | `node_id`，可含 `address`；地址缺失或空时使用 node_id |
 | `cluster.joined` | master → slave | 无业务参数；本连接的 Node 身份已被接受 |
-| `cluster.error` | master → slave，或本地组件通知 | `reason`；加入冲突或实际集群断线；单条发送失败由 bool 返回值报告 |
+| `cluster.error` | master → slave，或本地组件通知 | `reason`；加入冲突或实际集群断线；单条提交结果由 SendResult 报告 |
 
 ClusterSession 在 mTLS 成功后限时等待 join。node_id 不能为空、不能是广播目标 `all`，也不能与在线成员重名；
 成功后 ClusterRoom 绑定连接与 node_id，回复 joined 并发布新 members。master 的本地参与者也在同一个 room 中，

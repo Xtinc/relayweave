@@ -158,7 +158,7 @@ class NodeLinkMgr
         std::uint8_t ready = 0;
         bool completed = false;
     };
-    void send_both(const LinkRequest &request, CtrlCommand command);
+    bool send_both(const LinkRequest &request, CtrlCommand command);
     void finish_link(std::shared_ptr<LinkRequest> request, std::string stage, std::string reason);
     using LinkKey = std::tuple<std::string, std::string, RelayProtocol>;
     static LinkKey link_key(const njson &params);
@@ -206,7 +206,7 @@ class NodeLinkMgr
     void flow_closed(std::uint64_t id, std::string reason);
     void fail_remote_flows(const std::string &reason);
     void arm_flow_timeout(const std::shared_ptr<FlowRequest> &request);
-    void send_all(const FlowRequest &request, CtrlCommand command);
+    bool send_all(const FlowRequest &request, CtrlCommand command);
     void finish_flow(std::shared_ptr<FlowRequest> request, std::string stage, std::string reason);
     void released(std::shared_ptr<FlowRequest> request, std::string error = {});
     bool valid_flow(const njson &params) const;

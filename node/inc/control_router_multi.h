@@ -82,7 +82,7 @@ class ControlRouterMulti
     /** @brief Await Flow closure on control_io so the parallel group cancels and drains transfer. */
     asio::awaitable<void> watch_flow();
     void notify_agent() const;
-    asio::awaitable<void> close_agent() const;
+    void close_agent() const;
     void ready_agent();
     void send_peer(CtrlCommand command, njson params) const;
     NodeSession &relay_;

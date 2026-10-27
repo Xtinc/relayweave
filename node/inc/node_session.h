@@ -121,8 +121,6 @@ class NodeSession
     asio::awaitable<void> close();
     /** @brief Notify an Agent through its primary Node; throw if local submission fails. */
     void send_agent(const AgentPeer &route, CtrlMessage message) const;
-    /** @brief Retain a terminal notification until locally submitted, its primary leaves, or this Node stops. */
-    asio::awaitable<void> send_final(const AgentPeer &route, CtrlMessage message) const;
     std::uint64_t uuid() const;
     RelayNode &node_;
     std::variant<ControlRouterSingle, ControlRouterMulti> control_;

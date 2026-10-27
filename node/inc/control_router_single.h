@@ -60,7 +60,7 @@ class ControlRouterSingle
     /** @brief Send one ready notification when both roles share the same control connection. */
     void ready_agents() const;
     /** @brief Notify setup failures and UDP closure; ready streams carry normal EOF through data sockets. */
-    asio::awaitable<void> close_agents() const;
+    void close_agents() const;
     NodeSession &relay_;
     AgentPeer consumer_;
     AgentPeer producer_;

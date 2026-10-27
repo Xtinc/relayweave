@@ -292,7 +292,12 @@ asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::stri
             const auto &peer = node == left ? right : left;
             prepare["peer"] = peer;
             prepare["peer_address"] = members.at(peer);
-            cluster_.send(node, CtrlMessage(CtrlCommand::LinkPrepare, std::move(prepare)));
+            if (cluster_.send(node, CtrlMessage(CtrlCommand::LinkPrepare, std::move(prepare))) !=
+                ClusterMgr::SendResult::Submitted)
+            {
+                finish_link(request, "control", "cluster control submission failed");
+                break;
+            }
         }
     }
     if (request->completed)
@@ -308,10 +313,12 @@ asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::stri
     co_return request->result;
 }
 
-void NodeLinkMgr::send_both(const LinkRequest &request, CtrlCommand command)
+bool NodeLinkMgr::send_both(const LinkRequest &request, CtrlCommand command)
 {
-    cluster_.send(request.params.at("left"), CtrlMessage(command, request.params));
-    cluster_.send(request.params.at("right"), CtrlMessage(command, request.params));
+    return cluster_.send(request.params.at("left"), CtrlMessage(command, request.params)) ==
+               ClusterMgr::SendResult::Submitted &&
+           cluster_.send(request.params.at("right"), CtrlMessage(command, request.params)) ==
+               ClusterMgr::SendResult::Submitted;
 }
 
 void NodeLinkMgr::finish_link(std::shared_ptr<LinkRequest> request, std::string stage, std::string reason)
@@ -455,7 +462,10 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
                 request->prepared |= bit;
                 if (request->prepared == 3)
                 {
-                    send_both(*request, CtrlCommand::LinkConnect);
+                    if (!send_both(*request, CtrlCommand::LinkConnect))
+                    {
+                        finish_link(request, "control", "cluster control submission failed");
+                    }
                 }
             }
         }
@@ -705,7 +715,10 @@ asio::awaitable<FlowResult> NodeLinkMgr::establish_flow(std::shared_ptr<FlowRequ
 
     r->result.stage = "prepare";
     arm_flow_timeout(r);
-    send_all(*r, CtrlCommand::FlowPrepare);
+    if (!send_all(*r, CtrlCommand::FlowPrepare))
+    {
+        finish_flow(r, "control", "cluster control submission failed");
+    }
     co_await r->completed_event.wait();
 
     if (!r->completed)
@@ -715,7 +728,7 @@ asio::awaitable<FlowResult> NodeLinkMgr::establish_flow(std::shared_ptr<FlowRequ
     co_return r->result;
 }
 
-void NodeLinkMgr::send_all(const FlowRequest &r, CtrlCommand command)
+bool NodeLinkMgr::send_all(const FlowRequest &r, CtrlCommand command)
 {
     auto p = r.params;
     if (command == CtrlCommand::FlowPrepare)
@@ -731,8 +744,12 @@ void NodeLinkMgr::send_all(const FlowRequest &r, CtrlCommand command)
     }
     for (const auto &node : p.at("path"))
     {
-        cluster_.send(node.get<std::string>(), CtrlMessage(command, p));
+        if (cluster_.send(node.get<std::string>(), CtrlMessage(command, p)) != ClusterMgr::SendResult::Submitted)
+        {
+            return false;
+        }
     }
+    return true;
 }
 
 void NodeLinkMgr::finish_flow(std::shared_ptr<FlowRequest> r, std::string stage, std::string reason)
@@ -938,7 +955,10 @@ void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
             if (r->prepared == all)
             {
                 r->result.stage = "commit";
-                send_all(*r, CtrlCommand::FlowCommit);
+                if (!send_all(*r, CtrlCommand::FlowCommit))
+                {
+                    finish_flow(r, "control", "cluster control submission failed");
+                }
             }
         }
         else if (!r->completed && type == CtrlCommand::FlowCommitted && r->result.stage == "commit" &&
@@ -961,8 +981,12 @@ asio::awaitable<void> NodeLinkMgr::close_flow(std::uint64_t epoch, std::uint64_t
 {
     if (!topology_.is_master())
     {
-        cluster_.send(std::string(topology_.master_id()),
-                      CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}}));
+        if (cluster_.send(std::string(topology_.master_id()),
+                          CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}})) !=
+            ClusterMgr::SendResult::Submitted)
+        {
+            co_return;
+        }
         co_await asio::co_spawn(control_, wait_flow_closed(epoch, id), asio::cancel_after(10s, asio::use_awaitable));
         co_return;
     }
@@ -1045,6 +1069,14 @@ void NodeLinkMgr::control_failed(std::string reason)
     if (!running_)
     {
         return;
+    }
+    for (auto it = link_requests_.begin(); it != link_requests_.end();)
+    {
+        auto request = (it++)->second;
+        if (!request->completed)
+        {
+            finish_link(request, "control", reason);
+        }
     }
     while (!flow_requests_.empty())
     {

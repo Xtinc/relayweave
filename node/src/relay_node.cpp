@@ -61,13 +61,14 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
 
 RelayNode::~RelayNode() = default;
 
-void RelayNode::start()
+void RelayNode::start(std::function<void(std::string)> failure_handler)
 {
     if (state_.load() != State::Created)
     {
         throw std::logic_error("RelayWeave Node can only be started once");
     }
 
+    failure_handler_ = std::move(failure_handler);
     ScopeGuard rollback([this]() noexcept {
         state_.store(State::Stopping);
         asio::error_code ignored;
@@ -252,16 +253,9 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
     }
     registry_.remove(id);
     co_await session->async_disconnect();
-    asio::steady_timer retry(control_executor_);
-    while (state_.load() == State::Running && topology_->members().size() > 1 &&
-           !cluster_mgr_->broadcast(CtrlMessage(CtrlCommand::RelayDetach, njson{{"agent_session_id", id}})))
+    if (state_.load() == State::Running && topology_->members().size() > 1)
     {
-        retry.expires_after(std::chrono::milliseconds(10));
-        const auto [error] = co_await retry.async_wait(use_nothrow_awaitable);
-        if (error)
-        {
-            break;
-        }
+        cluster_mgr_->broadcast(CtrlMessage(CtrlCommand::RelayDetach, njson{{"agent_session_id", id}}));
     }
     if (!failure.empty() && state_.load() == State::Running)
     {
@@ -273,6 +267,24 @@ asio::awaitable<void> RelayNode::run_control_session(SessionId id, ControlSessio
         PROXY_INFO_PRINT("Control [x] session_id=%llu peer=%.*s reason=%s", static_cast<unsigned long long>(id),
                          static_cast<int>(session->peer().size()), session->peer().data(),
                          state_.load() != State::Running ? "node stopping" : "channel closed");
+    }
+}
+
+void RelayNode::cluster_failed(std::string reason)
+{
+    const auto state = state_.load();
+    if (state != State::Running && state != State::Stopping)
+    {
+        return;
+    }
+    state_.store(State::Stopping);
+    // Wake Flow cleanup before stop_control() waits for the relay tasks to exit.
+    nodelink_mgr_->control_failed(reason);
+    invalidate_relays(reason);
+    PROXY_ERROR_PRINT("Node failed reason=%s", reason.c_str());
+    if (failure_handler_)
+    {
+        failure_handler_(std::move(reason));
     }
 }
 
@@ -342,7 +354,8 @@ void RelayNode::handle_control_message(SessionId id, const ControlSessionPtr &se
             {
                 values["accessor"] = std::string(session->peer());
             }
-            if (!cluster_mgr_->send(target, CtrlMessage(command, std::move(values))) &&
+            if (cluster_mgr_->send(target, CtrlMessage(command, std::move(values))) !=
+                    ClusterMgr::SendResult::Submitted &&
                 command == CtrlCommand::RelayOpen)
             {
                 auto error = params;
@@ -555,7 +568,7 @@ bool RelayNode::send_relay(const AgentPeer &route, CtrlMessage message)
         return true;
     }
     params["agent_session_id"] = route.session_id;
-    return cluster_mgr_->send(route.node, std::move(message));
+    return cluster_mgr_->send(route.node, std::move(message)) == ClusterMgr::SendResult::Submitted;
 }
 
 void RelayNode::handle_cluster_relay(CtrlCommand command, CtrlMessage message)

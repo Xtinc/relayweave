@@ -62,9 +62,11 @@ struct ShutdownNode
         workers.emplace_back([this] { data.run(); });
     }
 
-    void start()
+    void start(std::function<void(std::string)> failure_handler = {})
     {
-        asio::post(control, asio::use_future([this] { node->start(); })).get();
+        asio::post(control, asio::use_future([this, handler = std::move(failure_handler)]() mutable {
+            node->start(std::move(handler));
+        })).get();
     }
 
     ~ShutdownNode()
@@ -259,6 +261,48 @@ static void failed_start_drains_published_tasks()
     asio::ip::udp::socket udp(f.data, {asio::ip::address_v4::loopback(), config.cluster.udp_port});
 }
 
+static void master_overflow_stops_node(bool already_stopping)
+{
+    std::promise<std::string> failure;
+    auto failed = failure.get_future();
+    unsigned notifications = 0;
+    ShutdownNode f;
+    f.start([&](std::string reason) {
+        if (++notifications == 1)
+        {
+            failure.set_value(std::move(reason));
+        }
+    });
+    asio::post(f.control, asio::use_future([&] {
+        auto &cluster = test_node::cluster(f.node);
+        const auto limit = test_access::RelayNode_config_(*f.node).channel.max_queued_messages;
+        auto result = ClusterMgr::SendResult::Submitted;
+        // Stay in one control handler so the consumer cannot drain between submissions.
+        for (std::size_t i = 0; i < limit + 2 && result == ClusterMgr::SendResult::Submitted; ++i)
+        {
+            result = cluster.broadcast(CtrlMessage{"overflow.notice"});
+        }
+        require_shutdown(result == ClusterMgr::SendResult::QueueFull, "Overflow did not return QueueFull");
+        require_shutdown(cluster.broadcast(CtrlMessage{"after.overflow"}) == ClusterMgr::SendResult::Stopped,
+                         "Failed master continued accepting messages");
+        if (already_stopping)
+        {
+            // The owner can enter stop() before the posted failure notification runs.
+            using State = decltype(test_access::RelayNode_state_(*f.node).load());
+            test_access::RelayNode_state_(*f.node).store(State::Stopping);
+        }
+    })).get();
+    require_shutdown(failed.wait_for(2s) == std::future_status::ready, "Fatal error did not notify the Node owner");
+    require_shutdown(failed.get() == "master control outbound queue full", "Fatal error lost its cause");
+    require_shutdown(!f.node->stop() && !f.node->stop(), "Fatal shutdown did not preserve its failure result");
+    asio::post(f.control, asio::use_future([&] {
+        using State = decltype(test_access::RelayNode_state_(*f.node).load());
+        require_shutdown(notifications == 1 && test_access::RelayNode_state_(*f.node).load() == State::Stopped &&
+                             test_access::AsyncEvent_notified_(test_access::ClusterMgr_loop_done_(test_node::cluster(f.node))),
+                         "Fatal shutdown did not drain once to Stopped");
+    })).get();
+}
+
 int main()
 {
     try
@@ -268,6 +312,8 @@ int main()
         drain_failure_preserves_stopping();
         concurrent_module_close();
         failed_start_drains_published_tasks();
+        master_overflow_stops_node(false);
+        master_overflow_stops_node(true);
         std::cout << "[PASS] Shutdown results, runtime failures, concurrent/cancelled drain and retry\n";
         return 0;
     }

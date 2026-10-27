@@ -164,23 +164,13 @@ void flow_integration()
                 // Ordinary ingress uses the same master Flow transaction and owns its local lifecycle.
                 const auto remote = co_await test_node::open_flow(nodes[1], {"a", "b", "c"}, transport);
                 require_flow(bool(remote), "ingress Flow request failed");
-                require_flow(!test_node::cluster(nodes[0]).send({}, CtrlMessage{"invalid.target"}),
+                require_flow(test_node::cluster(nodes[0]).send({}, CtrlMessage{"invalid.target"}) == ClusterMgr::SendResult::InvalidMessage,
                              "master accepted an invalid target");
-                require_flow(!test_node::cluster(nodes[1]).broadcast(CtrlMessage{"cluster.invalid"}),
+                require_flow(test_node::cluster(nodes[1]).broadcast(CtrlMessage{"cluster.invalid"}) == ClusterMgr::SendResult::InvalidMessage,
                              "slave accepted a reserved command");
-                require_flow(!test_node::cluster(nodes[1]).broadcast(
-                                 CtrlMessage{std::string(CtrlMessage::max_command_length + 1, 'x')}),
+                require_flow(test_node::cluster(nodes[1]).broadcast(
+                                 CtrlMessage{std::string(CtrlMessage::max_command_length + 1, 'x')}) == ClusterMgr::SendResult::InvalidMessage,
                              "slave accepted an unencodable message");
-                bool queue_full = false;
-                for (std::size_t i = 0; i < configs[0].channel.max_queued_messages + 2; ++i)
-                {
-                    if (!test_node::cluster(nodes[0]).send("master", CtrlMessage{"queue.notice"}))
-                    {
-                        queue_full = true;
-                        break;
-                    }
-                }
-                require_flow(queue_full, "master outbox did not report saturation");
                 co_await queued(1, remote, false, {31});
                 co_await receive(3, remote, {31});
                 co_await queued(3, remote, true, {32});
@@ -401,10 +391,21 @@ void flow_integration()
         auto receiver = asio::co_spawn(control, test_node::receive_flow(nodes[1], live.epoch, live.id), asio::use_future);
         auto pending =
             asio::co_spawn(control, test_node::open_flow(nodes[0], {"a", "b", "d"}, RelayProtocol::Udp), asio::use_future);
-        nodes[0]->stop();
+        asio::post(control, asio::use_future([&] {
+            auto &cluster = test_node::cluster(nodes[0]);
+            auto result = ClusterMgr::SendResult::Submitted;
+            for (std::size_t i = 0; i < configs[0].channel.max_queued_messages + 2 &&
+                                    result == ClusterMgr::SendResult::Submitted; ++i)
+            {
+                result = cluster.broadcast(CtrlMessage{"overflow.notice"});
+            }
+            require_flow(result == ClusterMgr::SendResult::QueueFull, "master overflow did not fail control");
+        })).get();
+        require_flow(receiver.wait_for(3s) == std::future_status::ready,
+                     "master control failure retained a remote receiver before owner shutdown");
+        require_flow(!nodes[0]->stop(), "master control failure was reported as a successful shutdown");
         const auto stopped = pending.get();
         require_flow(bool(stopped) || !stopped.reason.empty(), "stop left open unresolved");
-        require_flow(receiver.wait_for(3s) == std::future_status::ready, "master stop retained a remote receiver");
         bool invalidated = false;
         try
         {
@@ -414,7 +415,7 @@ void flow_integration()
         {
             invalidated = true;
         }
-        require_flow(invalidated, "master stop left a remote Flow active");
+        require_flow(invalidated, "master control failure left a remote Flow active");
     }
     catch (...)
     {
