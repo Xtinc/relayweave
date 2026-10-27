@@ -1,65 +1,7 @@
 #include "node_session.h"
 #include "relay_node.h"
-#include <type_traits>
 
-namespace
-{
-// Run one synchronous data operation, then return its result or exception to control_io.
-template <typename Function>
-auto invoke_on(asio::any_io_executor executor, Function function)
-{
-    using Result = std::invoke_result_t<Function>;
-    auto initiate = [executor, function = std::move(function)](auto handler) mutable {
-        const auto reply_executor = asio::get_associated_executor(handler);
-        asio::dispatch(executor, [function = std::move(function), handler = std::move(handler),
-                                  reply_executor, work = asio::make_work_guard(reply_executor)]() mutable {
-            std::exception_ptr error;
-            if constexpr (std::is_void_v<Result>)
-            {
-                try
-                {
-                    function();
-                }
-                catch (...)
-                {
-                    error = std::current_exception();
-                }
-                asio::post(reply_executor, [handler = std::move(handler), error, work = std::move(work)]() mutable {
-                    std::move(handler)(error);
-                });
-            }
-            else
-            {
-                Result result{};
-                try
-                {
-                    result = function();
-                }
-                catch (...)
-                {
-                    error = std::current_exception();
-                }
-                asio::post(reply_executor, [handler = std::move(handler), error, result = std::move(result),
-                                            work = std::move(work)]() mutable {
-                    std::move(handler)(error, std::move(result));
-                });
-            }
-        });
-    };
-    if constexpr (std::is_void_v<Result>)
-    {
-        return asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr)>(
-            std::move(initiate), asio::use_awaitable);
-    }
-    else
-    {
-        return asio::async_initiate<decltype(asio::use_awaitable), void(std::exception_ptr, Result)>(
-            std::move(initiate), asio::use_awaitable);
-    }
-}
-} // namespace
-
-NodeSession::NodeSession(RelayNode &node, const ControlSessionPtr &session, njson params, bool ingress,
+NodeSession::NodeSession(RelayNode &node, const AgentPeer &session, njson params, bool ingress,
                          SRVTrafficPtr traffic)
     : node_(node), control_(std::in_place_type<ControlRouterMulti>, *this, session, params, ingress),
       traffic_(std::move(traffic))
@@ -67,7 +9,7 @@ NodeSession::NodeSession(RelayNode &node, const ControlSessionPtr &session, njso
     select_data(config::message_protocol(params));
 }
 
-NodeSession::NodeSession(RelayNode &node, const ControlSessionPtr &consumer, const ControlSessionPtr &producer,
+NodeSession::NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer,
                          njson params, SRVTrafficPtr traffic)
     : node_(node), control_(std::in_place_type<ControlRouterSingle>, *this, consumer, producer, params),
       traffic_(std::move(traffic))
@@ -111,81 +53,134 @@ void NodeSession::cancel(std::string stage, std::string reason)
     std::visit([&](auto &controller) { controller.cancel(std::move(stage), std::move(reason)); }, control_);
 }
 
-bool NodeSession::belongs_to(const ControlSessionPtr &session) const
+void NodeSession::control_disconnected(const AgentPeer &session)
 {
-    return std::visit([&](const auto &controller) { return controller.belongs_to(session); }, control_);
+    std::visit([&](auto &controller) { controller.control_disconnected(session); }, control_);
 }
 
-bool NodeSession::handle(const ControlSessionPtr &session, const CtrlMessage &message)
+void NodeSession::invalidate(std::uint64_t epoch, std::string reason)
 {
-    return std::visit([&](auto &controller) { return controller.handle(session, message); }, control_);
+    std::visit([&](auto &controller) { controller.invalidate(epoch, std::move(reason)); }, control_);
+}
+
+bool NodeSession::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
+{
+    return std::visit([&](auto &controller) { return controller.handle(command, session, message); }, control_);
+}
+
+bool NodeSession::handle_peer(CtrlCommand command, const CtrlMessage &message)
+{
+    if (auto *controller = std::get_if<ControlRouterMulti>(&control_))
+    {
+        return controller->handle_peer(command, message);
+    }
+    return false;
+}
+
+RelayProtocol NodeSession::protocol() const noexcept
+{
+    if (std::holds_alternative<DatagramMgr *>(data_))
+    {
+        return RelayProtocol::Udp;
+    }
+    return std::holds_alternative<TlsPipeline *>(data_) ? RelayProtocol::Tls : RelayProtocol::Tcp;
+}
+
+bool NodeSession::is_multi() const noexcept
+{
+    return std::holds_alternative<ControlRouterMulti>(control_);
+}
+
+asio::cancellation_slot NodeSession::cancellation_slot() noexcept
+{
+    return cancellation_.slot();
 }
 
 std::uint64_t NodeSession::uuid() const
 {
-    if (endpoint_.empty())
+    if (const auto *endpoint = std::get_if<AttachInfo>(&endpoint_))
     {
-        return 0;
+        return endpoint->uuid;
     }
-    const auto &endpoint = std::holds_alternative<ControlRouterSingle>(control_) ? endpoint_.at("consumer") : endpoint_;
-    return config::require_unsigned(endpoint, "uuid", true);
+    if (const auto *pair = std::get_if<AttachPair>(&endpoint_))
+    {
+        return pair->consumer.uuid;
+    }
+    return 0;
 }
 
 asio::awaitable<void> NodeSession::install(int role)
 {
-    endpoint_ = co_await invoke_on(data_executor(),
-        [data = data_, role, single = std::holds_alternative<ControlRouterSingle>(control_)] {
-            return std::visit([&](auto *manager) {
-                return single ? manager->install_local_pair() : manager->install_remote_pair(role);
-            }, data);
-        });
+    endpoint_ = co_await asio::co_spawn(
+        data_executor(),
+        [data = data_, role, single = !is_multi()]() -> asio::awaitable<Attachment> {
+            co_return std::visit(
+                [&](auto *manager) -> Attachment {
+                    if (single)
+                    {
+                        return manager->install_local_pair();
+                    }
+                    return manager->install_remote_pair(role);
+                },
+                data);
+        },
+        asio::use_awaitable);
 }
 
 asio::awaitable<bool> NodeSession::wait_attach(std::chrono::steady_clock::time_point deadline)
 {
     return std::visit(
         [&](auto *manager) {
-            auto task = std::holds_alternative<ControlRouterSingle>(control_) ? manager->wait_local_pair(uuid())
-                                                                              : manager->wait_remote_pair(uuid());
+            auto task = is_multi() ? manager->wait_remote_pair(uuid()) : manager->wait_local_pair(uuid());
             return asio::co_spawn(data_executor(), std::move(task), asio::cancel_at(deadline, asio::use_awaitable));
+        },
+        data_);
+}
+
+asio::awaitable<void> NodeSession::bind_and_activate(std::string accessor)
+{
+    return std::visit(
+        [&](auto *manager) {
+            return asio::co_spawn(
+                data_executor(),
+                [manager, id = uuid(), traffic = traffic_, accessor = std::move(accessor)]() -> asio::awaitable<void> {
+                    manager->bind_local_pair(id, traffic, accessor);
+                    manager->activate_local_pair(id);
+                    co_return;
+                },
+                asio::use_awaitable);
         },
         data_);
 }
 
 asio::awaitable<void> NodeSession::bind(std::string accessor, std::uint64_t epoch, std::uint64_t flow_id)
 {
-    auto *channel = std::holds_alternative<ControlRouterMulti>(control_) ? &node_.nodelink_mgr_->channel() : nullptr;
-    // Copy immutable binding values before crossing to the owning data executor.
-    return invoke_on(data_executor(), [data = data_, id = uuid(), epoch, flow_id, channel,
-                                       traffic = traffic_, accessor = std::move(accessor)] {
-        std::visit([&](auto *manager) {
-            if (channel)
-                manager->bind_remote_pair(id, *channel, epoch, flow_id, traffic, accessor);
-            else
-                manager->bind_local_pair(id, traffic, accessor);
-        }, data);
-    });
+    return std::visit(
+        [&](auto *manager) {
+            return asio::co_spawn(data_executor(),
+                                  manager->bind_remote_pair(uuid(), node_.nodelink_mgr_->protocol(), epoch, flow_id,
+                                                            traffic_, std::move(accessor)),
+                                  asio::use_awaitable);
+        },
+        data_);
 }
 
 asio::awaitable<void> NodeSession::activate()
 {
-    return invoke_on(data_executor(), [data = data_, id = uuid(),
-                                       single = std::holds_alternative<ControlRouterSingle>(control_)] {
-        std::visit([&](auto *manager) {
-            if (single)
-                manager->activate_local_pair(id);
-            else
-                manager->activate_remote_pair(id);
-        }, data);
-    });
+    return asio::co_spawn(
+        data_executor(),
+        [data = data_, id = uuid()]() -> asio::awaitable<void> {
+            std::visit([&](auto *manager) { manager->activate_remote_pair(id); }, data);
+            co_return;
+        },
+        asio::use_awaitable);
 }
 
 asio::awaitable<void> NodeSession::bridge()
 {
     return std::visit(
         [&](auto *manager) {
-            auto task = std::holds_alternative<ControlRouterSingle>(control_) ? manager->run_local_pair(uuid())
-                                                                              : manager->run_remote_pair(uuid());
+            auto task = is_multi() ? manager->run_remote_pair(uuid()) : manager->run_local_pair(uuid());
             return asio::co_spawn(data_executor(), std::move(task), asio::use_awaitable);
         },
         data_);
@@ -193,17 +188,35 @@ asio::awaitable<void> NodeSession::bridge()
 
 asio::awaitable<void> NodeSession::close()
 {
-    if (endpoint_.empty())
+    const auto id = uuid();
+    if (!id)
     {
         co_return;
     }
-    co_await invoke_on(data_executor(), [data = data_, id = uuid(),
-                                        single = std::holds_alternative<ControlRouterSingle>(control_)] {
-        std::visit([&](auto *manager) {
-            if (single)
-                manager->close_local_pair(id);
-            else
-                manager->close_remote_pair(id);
-        }, data);
-    });
+    co_await asio::co_spawn(
+        data_executor(),
+        [data = data_, id, single = !is_multi()]() -> asio::awaitable<void> {
+            std::visit(
+                [&](auto *manager) {
+                    if (single)
+                    {
+                        manager->close_local_pair(id);
+                    }
+                    else
+                    {
+                        manager->close_remote_pair(id);
+                    }
+                },
+                data);
+            co_return;
+        },
+        asio::use_awaitable);
+}
+
+void NodeSession::send_agent(const AgentPeer &route, CtrlMessage message) const
+{
+    if (!node_.send_relay(route, std::move(message)))
+    {
+        throw std::runtime_error("Agent control unavailable");
+    }
 }

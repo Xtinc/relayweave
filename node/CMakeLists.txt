@@ -1,18 +1,18 @@
 add_library(relayweave_node_lib
-    src/app_common.cpp
+    src/node_common.cpp
     src/pipeline_mgr.cpp
     src/datagram_mgr.cpp
     src/registry_mgr.cpp
     src/control_router_single.cpp
     src/control_router_multi.cpp
     src/node_session.cpp
-    src/relay_endpoint.cpp
     src/node_config.cpp
+    src/node_control.cpp
     src/relay_node.cpp
     src/cluster_mgr.cpp
     src/topology.cpp
     src/nodelink_mgr.cpp
-    src/nodelink_requests.cpp
+    src/nodelink_req.cpp
 )
 target_link_libraries(relayweave_node_lib PUBLIC
     relayweave_protocol

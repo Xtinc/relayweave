@@ -11,6 +11,11 @@ using DecodeLengthFunction = decltype(&WireMessage::decode_length);
 static_assert(std::is_invocable_r_v<std::uint32_t, DecodeLengthFunction, const WireMessage::Header &>);
 static_assert(!std::is_invocable_v<DecodeLengthFunction,
                                    const std::array<std::uint8_t, WireMessage::header_length - 1> &>);
+static_assert(ctrl_command_group(CtrlCommand::RelayPeerOpen) == CtrlCommand::Relay);
+static_assert(ctrl_command_subgroup(CtrlCommand::RelayPeerOpen) == CtrlCommand::RelayPeer);
+static_assert(ctrl_command_subgroup(CtrlCommand::RelayOpen) == CtrlCommand::Relay);
+static_assert(ctrl_command_group(CtrlCommand::Unknown) == CtrlCommand::Unknown);
+static_assert(ctrl_command_subgroup(CtrlCommand::Unknown) == CtrlCommand::Unknown);
 
 namespace
 {
@@ -51,20 +56,54 @@ void test_control_commands()
     require(known.type() == CtrlCommand::RelayOpen, "Known control command was not parsed");
     require(known.params && known.params->at("request_id") == 42, "Control message params were changed");
 
-    for (const auto &[command, name] : std::initializer_list<std::pair<CtrlCommand, std::string_view>>{
-             {CtrlCommand::TopologyMembers, "topology.members"},
-             {CtrlCommand::TopologyReport, "topology.report"},
-             {CtrlCommand::TopologyQuery, "topology.query"},
-             {CtrlCommand::TopologySnapshot, "topology.snapshot"}})
+    struct CommandCase
     {
-        const CtrlMessage topology{command};
-        require(topology.command == name && topology.type() == command, "Topology command mapping is inconsistent");
+        CtrlCommand command;
+        std::string_view name;
+        CtrlCommand group;
+        CtrlCommand subgroup;
+    };
+    for (const auto &[command, name, group, subgroup] : {
+             CommandCase{CtrlCommand::Ping, "ping", CtrlCommand::Heartbeat, CtrlCommand::Heartbeat},
+             CommandCase{CtrlCommand::RelayOpen, "relay.open", CtrlCommand::Relay, CtrlCommand::Relay},
+             CommandCase{CtrlCommand::RelayPeerOpen, "relay.peer.open", CtrlCommand::Relay, CtrlCommand::RelayPeer},
+             CommandCase{CtrlCommand::RelayPeerAttached, "relay.peer.attached", CtrlCommand::Relay, CtrlCommand::RelayPeer},
+             CommandCase{CtrlCommand::RelayPeerReady, "relay.peer.ready", CtrlCommand::Relay, CtrlCommand::RelayPeer},
+             CommandCase{CtrlCommand::RelayPeerFinished, "relay.peer.finished", CtrlCommand::Relay, CtrlCommand::RelayPeer},
+             CommandCase{CtrlCommand::RelayPeerClose, "relay.peer.close", CtrlCommand::Relay, CtrlCommand::RelayPeer},
+             CommandCase{CtrlCommand::LinkPrepare, "link.prepare", CtrlCommand::Link, CtrlCommand::Link},
+             CommandCase{CtrlCommand::LinkAttached, "link.attached", CtrlCommand::Link, CtrlCommand::Link},
+             CommandCase{CtrlCommand::FlowOpen, "flow.open", CtrlCommand::Flow, CtrlCommand::Flow},
+             CommandCase{CtrlCommand::FlowOpened, "flow.opened", CtrlCommand::Flow, CtrlCommand::Flow},
+             CommandCase{CtrlCommand::FlowClose, "flow.close", CtrlCommand::Flow, CtrlCommand::Flow},
+             CommandCase{CtrlCommand::FlowCloseRequest, "flow.close.request", CtrlCommand::Flow, CtrlCommand::Flow},
+             CommandCase{CtrlCommand::ClusterJoined, "cluster.joined", CtrlCommand::Cluster, CtrlCommand::Cluster},
+             CommandCase{CtrlCommand::TopologyMembers, "topology.members", CtrlCommand::Topology, CtrlCommand::Topology},
+             CommandCase{CtrlCommand::TopologyReport, "topology.report", CtrlCommand::Topology, CtrlCommand::Topology},
+             CommandCase{CtrlCommand::TopologyQuery, "topology.query", CtrlCommand::Topology, CtrlCommand::Topology},
+             CommandCase{CtrlCommand::TopologySnapshot, "topology.snapshot", CtrlCommand::Topology, CtrlCommand::Topology},
+             CommandCase{CtrlCommand::ServerIdentified, "server.identified", CtrlCommand::Server, CtrlCommand::Server},
+             CommandCase{CtrlCommand::ServerStatusQuery, "server.status.query", CtrlCommand::Server, CtrlCommand::Server},
+             CommandCase{CtrlCommand::ServerTrafficReported, "server.traffic.reported", CtrlCommand::Server, CtrlCommand::Server},
+             CommandCase{CtrlCommand::ServiceListed, "service.listed", CtrlCommand::Service, CtrlCommand::Service},
+             CommandCase{CtrlCommand::NodeLocated, "node.located", CtrlCommand::Node, CtrlCommand::Node}})
+    {
+        const auto message = unpack_message(WireMessage::pack(CtrlMessage{command}));
+        require(message.command == name && message.type() == command, "Control command wire mapping is inconsistent");
+        require(ctrl_command_group(message.type()) == group && ctrl_command_subgroup(message.type()) == subgroup,
+                "Control command was assigned to the wrong group or subgroup");
     }
+
+    require(parse_ctrl_command("relay.peer.unknown") == CtrlCommand::Unknown &&
+                parse_ctrl_command("flow.unknown") == CtrlCommand::Unknown,
+            "Unknown commands acquired a known command group");
 
     const CtrlMessage custom{"app.custom", njson{{"value", true}}};
     require(custom.type() == CtrlCommand::Unknown, "Custom control command was treated as a built-in command");
     require_throws([]() { static_cast<void>(CtrlMessage{CtrlCommand::Unknown}); },
                    "Unknown control command was serialized");
+    require_throws([]() { static_cast<void>(CtrlMessage{CtrlCommand::RelayPeer}); },
+                   "A classification-only enum value was serialized as a command");
 }
 
 void test_common_json_validation()
@@ -365,6 +404,19 @@ void test_message_fragmentation()
     require(recovered && recovered->params == message.params, "Decode failure left assembly state active");
 }
 
+void test_message_size_estimate()
+{
+    for (const auto &params : {njson{{"value", "small"}},
+                               njson{{"value", std::string(140000, 'x')}, {"float", 1.5},
+                                     {"binary", njson::binary({0, 1, 255})}, {"nested", njson::array({true, 23, 256})}}})
+    {
+        const CtrlMessage message{"test.message", params};
+        const auto size = njson::to_cbor(njson{{"command", message.command}, {"params", params}}).size();
+        WireMessage::validate(message, size + 256);
+        require_throws([&] { WireMessage::validate(message, size - 1); }, "Size estimate admitted an oversized message");
+    }
+}
+
 void test_udp_session_header()
 {
     constexpr std::uint64_t session_id = 0x0102030405060708ULL;
@@ -412,6 +464,7 @@ int main()
         test_attach_validation();
         test_frame_validation();
         test_message_fragmentation();
+        test_message_size_estimate();
         test_udp_session_header();
         test_protocol_selection();
         std::cout << "[PASS] relay framing, UDP session header, and validation\n";

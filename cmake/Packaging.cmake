@@ -1,4 +1,4 @@
-set(RELAYWEAVE_PACKAGE_RELEASE "2" CACHE STRING "Debian package revision")
+set(RELAYWEAVE_PACKAGE_RELEASE "3" CACHE STRING "Debian package revision")
 set(RELAYWEAVE_PACKAGE_MAINTAINER "xtc <784092840@qq.com>" CACHE STRING "Debian package maintainer")
 
 set(CPACK_GENERATOR "DEB")

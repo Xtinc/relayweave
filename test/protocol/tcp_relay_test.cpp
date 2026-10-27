@@ -85,7 +85,12 @@ void write_failure()
         sockets.poll();
         (fail_left ? sockets.left : sockets.right).shutdown(tcp::socket::shutdown_send);
         asio::write(fail_left ? sockets.right_peer : sockets.left_peer, asio::buffer("request", 7));
+#if defined(_WIN32)
+        // Winsock reports WSAESHUTDOWN when writing after shutdown_send.
+        sockets.require_failure(result, asio::error::shut_down);
+#else
         sockets.require_failure(result, asio::error::broken_pipe);
+#endif
     }
 }
 
@@ -113,37 +118,46 @@ void half_close()
     for (const bool request_from_left : {false, true})
     {
         Sockets sockets;
-        TrafficCounter outgoing, incoming;
-        auto result = asio::co_spawn(sockets.io,
-            relay_tcp(sockets.left, sockets.right, nullptr, nullptr, &outgoing, &incoming), asio::use_future);
+        TrafficCounter outgoing;
+        TrafficCounter incoming;
+        bool relay_completed = false;
         auto &requester = request_from_left ? sockets.left_peer : sockets.right_peer;
         auto &responder = request_from_left ? sockets.right_peer : sockets.left_peer;
-        asio::write(requester, asio::buffer("request", 7));
-        requester.shutdown(tcp::socket::shutdown_send);
-        sockets.poll();
-        require(result.wait_for(0ms) != std::future_status::ready,
-                "TCP EOF terminated the reverse direction");
-        responder.non_blocking(true);
-        std::array<char, 7> request{};
-        asio::error_code error;
-        const auto received = asio::read(responder, asio::buffer(request), error);
-        require(!error && received == request.size() && std::string(request.data(), request.size()) == "request",
-                "TCP request was not drained before FIN");
-        char byte;
-        responder.read_some(asio::buffer(&byte, 1), error);
-        require(error == asio::error::eof, "TCP EOF did not half-close the destination");
-        asio::write(responder, asio::buffer("reply", 5));
-        responder.shutdown(tcp::socket::shutdown_send);
-        sockets.poll();
-        require(result.wait_for(0ms) == std::future_status::ready, "TCP did not drain both FIN directions");
+
+        auto transfer = [&]() -> asio::awaitable<void> {
+            co_await relay_tcp(sockets.left, sockets.right, nullptr, nullptr, &outgoing, &incoming);
+            relay_completed = true;
+        };
+        auto business = [&]() -> asio::awaitable<void> {
+            co_await asio::async_write(requester, asio::buffer("request", 7), asio::use_awaitable);
+            requester.shutdown(tcp::socket::shutdown_send);
+            std::array<char, 7> request{};
+            const auto received = co_await asio::async_read(responder, asio::buffer(request), asio::use_awaitable);
+            require(received == request.size() && std::string(request.data(), request.size()) == "request",
+                    "TCP request was not drained before FIN");
+            char byte;
+            const auto [request_error, request_size] = co_await responder.async_read_some(
+                asio::buffer(&byte, 1), asio::as_tuple(asio::use_awaitable));
+            require(request_error == asio::error::eof && request_size == 0,
+                    "TCP EOF did not half-close the destination");
+            require(!relay_completed, "TCP EOF terminated the reverse direction");
+
+            co_await asio::async_write(responder, asio::buffer("reply", 5), asio::use_awaitable);
+            responder.shutdown(tcp::socket::shutdown_send);
+            std::array<char, 5> reply{};
+            const auto replied = co_await asio::async_read(requester, asio::buffer(reply), asio::use_awaitable);
+            require(replied == reply.size() && std::string(reply.data(), reply.size()) == "reply",
+                    "TCP response was lost after request EOF");
+            const auto [reply_error, reply_size] = co_await requester.async_read_some(
+                asio::buffer(&byte, 1), asio::as_tuple(asio::use_awaitable));
+            require(reply_error == asio::error::eof && reply_size == 0, "TCP reverse FIN was not forwarded");
+        };
+        // Both tasks run on sockets.io; wait for I/O completion rather than one poll of the backend.
+        auto result = asio::co_spawn(sockets.io, await_transfers(transfer(), business()),
+                                    asio::cancel_after(2s, asio::use_future));
+        sockets.io.run();
         result.get();
-        requester.non_blocking(true);
-        std::array<char, 5> reply{};
-        const auto replied = asio::read(requester, asio::buffer(reply), error);
-        require(!error && replied == reply.size() && std::string(reply.data(), reply.size()) == "reply",
-                "TCP response was lost after request EOF");
-        requester.read_some(asio::buffer(&byte, 1), error);
-        require(error == asio::error::eof, "TCP reverse FIN was not forwarded");
+        require(relay_completed, "TCP did not drain both FIN directions");
         require(outgoing.total() == (request_from_left ? 7u : 5u) &&
                 incoming.total() == (request_from_left ? 5u : 7u), "TCP traffic accounting changed");
     }

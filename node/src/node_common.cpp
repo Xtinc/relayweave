@@ -1,8 +1,22 @@
-#include "app_common.h"
+#include "node_common.h"
 #include <algorithm>
 #include <limits>
 #include <openssl/rand.h>
 #include <stdexcept>
+
+njson AttachInfo::to_params(RelayProtocol protocol) const
+{
+    njson params{{"uuid", uuid}, {"ticket", ticket}, {"data_port", data_port}};
+    if (protocol == RelayProtocol::Udp)
+    {
+        params["session_id"] = session_id;
+    }
+    else if (protocol == RelayProtocol::Tls)
+    {
+        params["tls_framing"] = std::string(tls_data_framing);
+    }
+    return params;
+}
 
 ServiceTraffic::ServiceTraffic() : last_sample_(Clock::now())
 {
@@ -77,6 +91,27 @@ std::uint64_t ServiceTraffic::rounded_ema(double value) noexcept
         return std::numeric_limits<std::uint64_t>::max();
     }
     return value <= 0.0 ? 0 : static_cast<std::uint64_t>(value + 0.5);
+}
+
+void RelayEndpoint::bind(const TrafficLimitConfig &limits, SRVTrafficPtr service_traffic, std::string client)
+{
+    if (closed)
+    {
+        throw std::runtime_error("relay endpoint is closed");
+    }
+    rx_limiter = TokenBucket(limits.rx_bytes_per_second, limits.rx_burst_bytes);
+    tx_limiter = TokenBucket(limits.tx_bytes_per_second, limits.tx_burst_bytes);
+    traffic = std::move(service_traffic);
+    accessor = std::move(client);
+}
+
+void RelayEndpoint::count(bool from_agent, std::size_t size)
+{
+    if (traffic)
+    {
+        const bool rx = from_agent == (role == RelayAttach::Producer);
+        (rx ? traffic->rx : traffic->tx).add(size);
+    }
 }
 
 std::uint64_t RelayIdAllocator::allocate()

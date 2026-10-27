@@ -154,17 +154,24 @@ TokenBucket::Clock::duration TokenBucket::duration_for(double bytes) const noexc
     return std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(rounded));
 }
 
-static asio::awaitable<bool> wait_for_limit(TokenBucket &limiter, asio::steady_timer &timer, std::size_t bytes)
+asio::awaitable<void> TokenBucket::consume(std::size_t bytes)
 {
-    const auto now = std::chrono::steady_clock::now();
-    const auto target = limiter.reserve(bytes, now);
+    if (rate_ == 0 || bytes == 0)
+    {
+        co_return;
+    }
+    const auto now = Clock::now();
+    const auto target = reserve(bytes, now);
     if (target <= now)
     {
-        co_return true;
+        co_return;
     }
-    timer.expires_at(target);
-    auto [error] = co_await timer.async_wait(use_nothrow_awaitable);
-    co_return !error;
+    if (!timer_)
+    {
+        timer_.emplace(co_await asio::this_coro::executor);
+    }
+    timer_->expires_at(target);
+    co_await timer_->async_wait(asio::use_awaitable);
 }
 
 template <class From, class To>
@@ -183,8 +190,7 @@ static void log_transfer_end(const asio::error_code &error, const char *protocol
 static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, TokenBucket *limiter,
                                           TrafficCounter *traffic)
 {
-    asio::steady_timer timer(from.get_executor());
-    std::array<std::uint8_t, 64 * 1024> buffer{};
+    std::array<std::uint8_t, 32 * 1024> buffer{};
     for (;;)
     {
         auto [er, nr] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
@@ -204,9 +210,9 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
             throw asio::system_error(er, "read TCP stream");
         }
 
-        if (limiter && !limiter->try_consume(nr) && !co_await wait_for_limit(*limiter, timer, nr))
+        if (limiter)
         {
-            throw asio::system_error(asio::error::operation_aborted, "wait for TCP rate limit");
+            co_await limiter->consume(nr);
         }
 
         auto [ew, nw] = co_await asio::async_write(to, asio::buffer(buffer.data(), nr), use_nothrow_awaitable);
@@ -284,7 +290,6 @@ asio::awaitable<void> finish_tls_data(tls_stream &stream)
 template <typename From, typename To>
 static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limiter, TrafficCounter *traffic)
 {
-    asio::steady_timer timer(from.get_executor());
     std::array<std::uint8_t, tls_data_maximum_payload> buffer{};
     for (;;)
     {
@@ -324,9 +329,9 @@ static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limit
             }
             co_return;
         }
-        if (limiter && !limiter->try_consume(size) && !co_await wait_for_limit(*limiter, timer, size))
+        if (limiter)
         {
-            throw asio::system_error(asio::error::operation_aborted, "wait for TLS rate limit");
+            co_await limiter->consume(size);
         }
         if constexpr (std::is_same_v<To, tls_stream>)
         {

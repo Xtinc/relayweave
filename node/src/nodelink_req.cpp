@@ -1,11 +1,10 @@
-#include "app_common.h"
+#include "node_common.h"
 #include "nodelink_mgr.h"
 
-// Remote callers use the same master FlowRequest as local callers. These messages contain no Relay/Agent state.
 asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> path, RelayProtocol transport)
 {
     if (path.size() < 2 || path.front() != config_.node_id || transport == RelayProtocol::Tls || !topology_.epoch() ||
-        remote_flows_.size() >= 1000)
+        remote_flows_.size() >= lnk::max_flow_count)
     {
         co_return FlowResult{0, 0, "open", "requires a current ingress and tcp/udp flow"};
     }
@@ -17,6 +16,16 @@ asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> p
     const auto epoch = topology_.epoch();
     auto request = std::make_shared<RemoteFlow>(control_);
     request->result = {epoch, id, "open", "flow result pending"};
+    const auto submitted = cluster_.send(
+        std::string(topology_.master_id()),
+        CtrlMessage(CtrlCommand::FlowOpen, njson{{"epoch", epoch},
+                                               {"flow_id", id},
+                                               {"path", std::move(path)},
+                                               {"transport", relay_protocol_name(transport)}}));
+    if (submitted != ClusterMgr::SendResult::Submitted)
+    {
+        co_return FlowResult{epoch, id, "open", "cluster control submission failed"};
+    }
     remote_flows_.emplace(id, request);
     bool accepted = false;
     ScopeGuard cleanup([this, id, epoch, &accepted] {
@@ -24,15 +33,9 @@ asio::awaitable<FlowResult> NodeLinkMgr::request_flow(std::vector<std::string> p
         if (!accepted)
         {
             cluster_.send(std::string(topology_.master_id()),
-                          CtrlMessage("flow.close.request", njson{{"epoch", epoch}, {"flow_id", id}}));
+                          CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}}));
         }
     });
-    cluster_.send(std::string(topology_.master_id()),
-                  CtrlMessage("flow.open", njson{{"epoch", epoch},
-                                                 {"flow_id", id},
-                                                 {"path", std::move(path)},
-                                                 {"transport", relay_protocol_name(transport)}}));
-    // Bound the remote reply as well as the existing master link/flow deadlines.
     if (!co_await asio::co_spawn(control_, request->completed.wait(),
                                  asio::cancel_after(std::chrono::seconds(30), asio::use_awaitable)))
     {
@@ -56,13 +59,13 @@ asio::awaitable<void> NodeLinkMgr::reply_flow(std::shared_ptr<FlowRequest> reque
         }
     }
     const auto &result = request->result;
-    cluster_.send(std::move(target), CtrlMessage("flow.opened", njson{{"epoch", result.epoch},
-                                                                      {"flow_id", result.id},
-                                                                      {"stage", result.stage},
-                                                                      {"reason", result.reason}}));
+    cluster_.send(std::move(target), CtrlMessage(CtrlCommand::FlowOpened, njson{{"epoch", result.epoch},
+                                                                            {"flow_id", result.id},
+                                                                            {"stage", result.stage},
+                                                                            {"reason", result.reason}}));
 }
 
-void NodeLinkMgr::handle_flow_request(CtrlMessage message)
+void NodeLinkMgr::handle_flow_request(CtrlCommand command, CtrlMessage message)
 {
     const auto &p = config::message_params(message);
     try
@@ -70,7 +73,7 @@ void NodeLinkMgr::handle_flow_request(CtrlMessage message)
         const auto id = config::require_unsigned(p, "flow_id", true);
         const auto epoch = config::require_unsigned(p, "epoch", true);
         const auto source = config::required_string(p, "source", message.command);
-        if (message.command == "flow.opened")
+        if (command == CtrlCommand::FlowOpened)
         {
             const auto it = remote_flows_.find(id);
             if (source == topology_.master_id() && it != remote_flows_.end() && it->second->result.epoch == epoch)
@@ -84,7 +87,7 @@ void NodeLinkMgr::handle_flow_request(CtrlMessage message)
         {
             return;
         }
-        if (message.command == "flow.close.request")
+        if (command == CtrlCommand::FlowCloseRequest)
         {
             const auto it = flow_requests_.find(id);
             if (it != flow_requests_.end() && it->second->result.epoch == epoch &&
@@ -99,7 +102,6 @@ void NodeLinkMgr::handle_flow_request(CtrlMessage message)
         {
             throw std::runtime_error("invalid flow requester or epoch");
         }
-        // Reserve the existing FlowRequest synchronously, before a subsequent cancel can arrive.
         auto request = create_flow(path, parse_relay_protocol(p.at("transport").get<std::string>()), id);
         ++flow_tasks_;
         try
@@ -122,13 +124,13 @@ void NodeLinkMgr::handle_flow_request(CtrlMessage message)
     }
     catch (const std::exception &error)
     {
-        if (message.command == "flow.open")
+        if (command == CtrlCommand::FlowOpen)
         {
             cluster_.send(p.at("source").get<std::string>(),
-                          CtrlMessage("flow.opened", njson{{"epoch", p.at("epoch")},
-                                                           {"flow_id", p.at("flow_id")},
-                                                           {"stage", "open"},
-                                                           {"reason", error.what()}}));
+                          CtrlMessage(CtrlCommand::FlowOpened, njson{{"epoch", p.at("epoch")},
+                                                                    {"flow_id", p.at("flow_id")},
+                                                                    {"stage", "open"},
+                                                                    {"reason", error.what()}}));
         }
         else
         {

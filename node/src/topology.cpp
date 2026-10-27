@@ -1,5 +1,6 @@
 #include "topology.h"
 #include "link_quality.h"
+#include "node_control.h"
 
 #include <algorithm>
 #include <cmath>
@@ -102,7 +103,7 @@ void validate_snapshot_link(const njson &link, std::string_view location)
     static_cast<void>(optional_age(link, "age_ms", location));
     static_cast<void>(parse_quality(link.at("quality")));
 }
-} // namespace
+}
 
 void Topology::validate_snapshot(const njson &params, std::string_view location)
 {
@@ -144,19 +145,14 @@ void Topology::validate_snapshot(const njson &params, std::string_view location)
 }
 
 Topology::Topology(asio::io_context &io_context, std::string node_id, bool master, ClusterMgr &cluster_mgr,
-                   const std::atomic<std::uint32_t> &control_queue_delay_us,
-                   const std::atomic<std::uint32_t> &transfer_tcp_queue_delay_us,
-                   const std::atomic<std::uint32_t> &transfer_udp_queue_delay_us, const double &available)
+                   const NodeMetrics &metrics)
     : io_context_(io_context), node_id_(std::move(node_id)), master_(master), cluster_mgr_(cluster_mgr),
-      control_queue_delay_us_(control_queue_delay_us), transfer_tcp_queue_delay_us_(transfer_tcp_queue_delay_us),
-      transfer_udp_queue_delay_us_(transfer_udp_queue_delay_us), available_(available), wake_timer_(io_context),
-      finished_wait_(io_context), probes_(io_context)
+      metrics_(metrics), wake_timer_(io_context), finished_(io_context.get_executor()), probes_(io_context)
 {
     if (node_id_.empty())
     {
         throw std::invalid_argument("Topology requires a node ID");
     }
-    finished_wait_.expires_at(Clock::time_point::max());
 }
 
 void Topology::start()
@@ -168,35 +164,43 @@ void Topology::start()
     state_ = State::Running;
     try
     {
-        asio::co_spawn(io_context_, run(), asio::detached);
+        asio::co_spawn(io_context_, run(), [this](std::exception_ptr error) {
+            drain_error_ = error;
+            if (error)
+            {
+                PROXY_ERROR_PRINT("Topology close failed reason=%s", exception_description(error).c_str());
+            }
+            finished_.notify_all();
+        });
     }
     catch (...)
     {
         state_ = State::Stopped;
+        finished_.notify_all();
         throw;
     }
 }
 
-asio::awaitable<void> Topology::close()
+asio::awaitable<bool> Topology::close()
 {
-    co_await asio::dispatch(io_context_, asio::use_awaitable);
+    co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     if (state_ == State::Created)
     {
         state_ = State::Stopped;
-        co_return;
+        finished_.notify_all();
     }
-    if (state_ == State::Stopped)
+    else if (state_ == State::Running)
     {
-        co_return;
+        state_ = State::Stopping;
+        probes_.stop();
+        wake();
     }
-    state_ = State::Stopping;
-    probes_.stop();
-    wake();
-    auto [error] = co_await finished_wait_.async_wait(use_nothrow_awaitable);
-    if (error && error != asio::error::operation_aborted)
+    co_await finished_.wait();
+    if (drain_error_)
     {
-        throw asio::system_error(error, "Topology close wait failed");
+        std::rethrow_exception(drain_error_);
     }
+    co_return true;
 }
 
 bool Topology::is_master() const noexcept
@@ -352,25 +356,13 @@ asio::awaitable<void> Topology::run()
             }
         }
     }
-    catch (const std::exception &exception)
-    {
-        PROXY_ERROR_PRINT("Topology failed reason=%s", exception.what());
-    }
     catch (...)
     {
-        PROXY_ERROR_PRINT("Topology failed reason=unknown exception");
+        PROXY_ERROR_PRINT("Topology failed reason=%s", exception_description(std::current_exception()).c_str());
     }
 
-    try
-    {
-        co_await probes_.close();
-    }
-    catch (const std::exception &exception)
-    {
-        PROXY_ERROR_PRINT("Topology close failed reason=%s", exception.what());
-    }
+    co_await probes_.close();
     state_ = State::Stopped;
-    finished_wait_.cancel();
 }
 
 void Topology::send_report()
@@ -400,17 +392,16 @@ void Topology::send_report()
                               {"quality", quality_json(assessment.quality)}});
     }
     ++report_sequence_;
-    cluster_mgr_.send(
-        master_id_,
-        CtrlMessage{CtrlCommand::TopologyReport,
-                    njson{{"epoch", epoch_},
-                          {"members_version", members_version_},
-                          {"sequence", report_sequence_},
-                          {"control_queue_delay_us", control_queue_delay_us_.load(std::memory_order_relaxed)},
-                          {"transfer_tcp_queue_delay_us", transfer_tcp_queue_delay_us_.load(std::memory_order_relaxed)},
-                          {"transfer_udp_queue_delay_us", transfer_udp_queue_delay_us_.load(std::memory_order_relaxed)},
-                          {"available", available_},
-                          {"links", std::move(links)}}});
+    const auto delays = metrics_.queue_delays();
+    cluster_mgr_.send(master_id_, CtrlMessage{CtrlCommand::TopologyReport,
+                                              njson{{"epoch", epoch_},
+                                                    {"members_version", members_version_},
+                                                    {"sequence", report_sequence_},
+                                                    {"control_queue_delay_us", delays.control_queue_delay_us},
+                                                    {"transfer_tcp_queue_delay_us", delays.transfer_tcp_queue_delay_us},
+                                                    {"transfer_udp_queue_delay_us", delays.transfer_udp_queue_delay_us},
+                                                    {"available", metrics_.available()},
+                                                    {"links", std::move(links)}}});
 }
 
 void Topology::rebuild_snapshot()

@@ -71,6 +71,12 @@ static constexpr std::pair<CtrlCommand, std::string_view> ctrl_commands[] = {
     {CtrlCommand::RelayCancel, "relay.cancel"},
     {CtrlCommand::RelayClosed, "relay.closed"},
     {CtrlCommand::RelayError, "relay.error"},
+    {CtrlCommand::RelayDetach, "relay.detach"},
+    {CtrlCommand::RelayPeerOpen, "relay.peer.open"},
+    {CtrlCommand::RelayPeerAttached, "relay.peer.attached"},
+    {CtrlCommand::RelayPeerReady, "relay.peer.ready"},
+    {CtrlCommand::RelayPeerFinished, "relay.peer.finished"},
+    {CtrlCommand::RelayPeerClose, "relay.peer.close"},
     {CtrlCommand::LinkPrepare, "link.prepare"},
     {CtrlCommand::LinkPrepared, "link.prepared"},
     {CtrlCommand::LinkConnect, "link.connect"},
@@ -87,10 +93,30 @@ static constexpr std::pair<CtrlCommand, std::string_view> ctrl_commands[] = {
     {CtrlCommand::FlowError, "flow.error"},
     {CtrlCommand::FlowClose, "flow.close"},
     {CtrlCommand::FlowClosed, "flow.closed"},
+    {CtrlCommand::FlowOpen, "flow.open"},
+    {CtrlCommand::FlowOpened, "flow.opened"},
+    {CtrlCommand::FlowCloseRequest, "flow.close.request"},
     {CtrlCommand::ClusterJoin, "cluster.join"},
     {CtrlCommand::ClusterJoined, "cluster.joined"},
     {CtrlCommand::ClusterError, "cluster.error"},
 };
+
+static_assert(
+    [] {
+        for (std::size_t i = 0; i < std::size(ctrl_commands); ++i)
+        {
+            for (std::size_t j = i + 1; j < std::size(ctrl_commands); ++j)
+            {
+                if (ctrl_commands[i].first == ctrl_commands[j].first ||
+                    ctrl_commands[i].second == ctrl_commands[j].second)
+                {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }(),
+    "Control command values and wire names must be unique");
 
 std::string_view ctrl_command_name(CtrlCommand command) noexcept
 {
@@ -440,7 +466,7 @@ static bool validate_command(std::string_view command)
     });
 }
 
-static njson make_message_json(CtrlMessage message)
+static void validate_message(const CtrlMessage &message)
 {
     if (!validate_command(message.command))
     {
@@ -451,7 +477,11 @@ static njson make_message_json(CtrlMessage message)
     {
         throw std::invalid_argument("Message params must be an object");
     }
+}
 
+static njson make_message_json(CtrlMessage message)
+{
+    validate_message(message);
     njson root = njson::object();
     root["command"] = std::move(message.command);
     if (message.params)
@@ -533,6 +563,41 @@ static void append_frame(BytesBuf &frames, const BytesBuf &payload)
     const auto header = encode_length(static_cast<std::uint32_t>(payload.size()));
     frames.insert(frames.end(), header.begin(), header.end());
     frames.insert(frames.end(), payload.begin(), payload.end());
+}
+
+namespace
+{
+// Conservatively allow 9 bytes for each scalar or length prefix. Strings and
+// binary retain their byte lengths; binary may also carry a 9-byte subtype tag.
+std::size_t estimate_cbor_size(const njson &value)
+{
+    std::size_t size = 9;
+    if (value.is_string())
+        return size + value.get_ref<const njson::string_t &>().size();
+    if (value.is_binary())
+        return size + 9 + value.get_binary().size();
+    if (value.is_object())
+    {
+        for (const auto &[key, child] : value.items())
+            size += 9 + key.size() + estimate_cbor_size(child);
+    }
+    else if (value.is_array())
+    {
+        for (const auto &child : value)
+            size += estimate_cbor_size(child);
+    }
+    return size;
+}
+
+} // namespace
+
+void WireMessage::validate(const CtrlMessage &message, std::size_t maximum_length)
+{
+    validate_message(message);
+    // Generous allowance for the fixed command/params envelope, without building a JSON copy.
+    const auto size = 64 + message.command.size() + (message.params ? estimate_cbor_size(*message.params) : 0);
+    if (size > maximum_length)
+        throw std::length_error("Control message exceeds estimated size budget");
 }
 
 BytesBuf WireMessage::pack(CtrlMessage message)
@@ -724,6 +789,12 @@ void LnkFrameHeader::validate() const
     }
     switch (kind)
     {
+    case LnkFrType::Credit:
+        if (!id || !sequence || body_length)
+        {
+            throw std::invalid_argument("invalid NodeFlow credit header");
+        }
+        break;
     case LnkFrType::Data:
     case LnkFrType::Fin:
     case LnkFrType::Reset:
@@ -781,23 +852,4 @@ LnkFrameHeader LnkFrameHeader::decode(std::span<const std::uint8_t, length> head
                           decode_lnk_integer(header.subspan<24, 8>())};
     result.validate();
     return result;
-}
-
-bool FlowFrame::validate() const noexcept
-{
-    if (!epoch || !flow_id)
-    {
-        return false;
-    }
-    switch (kind)
-    {
-    case LnkFrType::Data:
-        return reason.empty() && payload.size() <= LnkFrameHeader::maximum_payload;
-    case LnkFrType::Fin:
-        return payload.empty() && reason.empty();
-    case LnkFrType::Reset:
-        return payload.empty() && reason.size() <= LnkFrameHeader::maximum_reason;
-    default:
-        return false;
-    }
 }

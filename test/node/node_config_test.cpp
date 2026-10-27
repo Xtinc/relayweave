@@ -86,19 +86,52 @@ void verify_server_config()
     // relocated fixture cannot find its certificates.
     write_candidate(baseline);
     static_cast<void>(load_node_config(temporary));
-    const auto require_rejected = [&](njson candidate, std::string_view description) {
+    const auto require_rejected = [&](njson candidate, std::string_view description,
+                                      std::string_view expected_reason = {}) {
         write_candidate(candidate);
         bool rejected = false;
         try
         {
             static_cast<void>(load_node_config(temporary));
         }
-        catch (const std::exception &)
+        catch (const std::exception &error)
         {
             rejected = true;
+            require(expected_reason.empty() ||
+                        std::string_view(error.what()).find(expected_reason) != std::string_view::npos,
+                    "Unexpected rejection reason: " + std::string(error.what()));
         }
         require(rejected, "Invalid server configuration was accepted: " + std::string(description));
     };
+    for (const auto *direction : {"rx", "tx"})
+    {
+        const auto rate = std::string(direction) + "_bytes_per_second";
+        const auto burst = std::string(direction) + "_max_burst_bytes";
+        const auto reason = "udp." + burst + " must be explicitly configured and positive";
+        auto candidate = baseline;
+        candidate["udp"].erase(burst);
+        require_rejected(candidate, "missing burst for limited UDP", reason);
+        candidate["udp"][burst] = 0;
+        require_rejected(candidate, "zero burst for limited UDP", reason);
+
+        candidate["udp"][burst] = 1;
+        write_candidate(candidate);
+        static_cast<void>(load_node_config(temporary));
+
+        candidate["udp"][rate] = 0;
+        candidate["udp"][burst] = 0;
+        write_candidate(candidate);
+        static_cast<void>(load_node_config(temporary));
+        candidate["udp"].erase(burst);
+        write_candidate(candidate);
+        static_cast<void>(load_node_config(temporary));
+    }
+    for (const auto *field : {"flow_window_bytes", "flow_buffer_budget_bytes"})
+    {
+        auto candidate = baseline;
+        candidate["cluster"][field] = 524288;
+        require_rejected(candidate, "Flow control uses fixed constants");
+    }
 
     for (const auto &invalid : {njson(0), njson(-1), njson(1.5), njson(true), njson("100"), njson(nullptr)})
     {
@@ -180,6 +213,18 @@ void verify_server_config()
         auto candidate = baseline;
         candidate["cluster"]["node_id"] = "all";
         require_rejected(std::move(candidate), "reserved cluster node_id");
+    }
+    {
+        auto candidate = baseline;
+        candidate["cluster"]["node_id"] = std::string(cluster_max_node_id_length, 'n');
+        write_candidate(candidate);
+        require(load_node_config(temporary).cluster.node_id.size() == cluster_max_node_id_length,
+                "Maximum-length cluster node_id was rejected");
+        candidate["cluster"]["node_id"] = std::string(cluster_max_node_id_length + 1, 'n');
+        require_rejected(candidate, "oversized cluster node_id", "must not exceed 256 bytes");
+        // A multibyte identity is bounded by encoded bytes, not character count.
+        candidate["cluster"]["node_id"] = std::string(cluster_max_node_id_length - 1, 'n') + "中";
+        require_rejected(candidate, "oversized UTF-8 cluster node_id", "must not exceed 256 bytes");
     }
     {
         auto candidate = baseline;

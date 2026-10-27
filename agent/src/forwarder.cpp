@@ -23,8 +23,8 @@ Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ss
                      std::chrono::steady_clock::duration connect_timeout,
                      std::chrono::steady_clock::duration relay_open_timeout, std::vector<AgentServiceConfig> services,
                      std::vector<AgentForwardConfig> forwards)
-    : agent_(agent), transfer_work_(asio::make_work_guard(std::move(executor))), ssl_context_(ssl_context),
-      server_name_(std::move(server_name)), handshake_timeout_(handshake_timeout), connect_timeout_(connect_timeout),
+    : agent_(agent), transfer_work_(asio::make_work_guard(std::move(executor))),
+      session_options_{ssl_context, std::move(server_name), handshake_timeout, connect_timeout},
       relay_open_timeout_(relay_open_timeout), stopped_event_(transfer_work_.get_executor())
 {
     for (auto &service : services)
@@ -33,8 +33,10 @@ Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ss
         services_.emplace(std::move(name), std::move(service));
     }
 
-    stream_forwards_.reserve(forwards.size());
-    DatagramForwardId datagram_forward_id = 0;
+    const auto datagram_count = std::count_if(
+        forwards.begin(), forwards.end(), [](const auto &forward) { return forward.protocol == RelayProtocol::Udp; });
+    stream_forwards_.reserve(forwards.size() - datagram_count);
+    datagram_forwards_.reserve(datagram_count);
     for (auto &forward : forwards)
     {
         if (forward.protocol != RelayProtocol::Udp)
@@ -43,54 +45,28 @@ Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ss
         }
         else
         {
-            const auto id = datagram_forward_id++;
-            datagram_forwards_.try_emplace(id, transfer_work_.get_executor(), std::move(forward));
+            datagram_forwards_.emplace_back(transfer_work_.get_executor(), std::move(forward));
         }
     }
 }
 
 void Forwarder::start()
 {
-    if (state_ != State::Created)
+    for (auto &forward : stream_forwards_)
     {
-        throw std::logic_error("Forwarder can only be started once");
+        const tcp::endpoint endpoint(asio::ip::make_address(forward.config.listen_address), forward.config.listen_port);
+        forward.acceptor.open(endpoint.protocol());
+        forward.acceptor.set_option(asio::socket_base::reuse_address(true));
+        forward.acceptor.bind(endpoint);
+        forward.acceptor.listen();
     }
 
-    try
+    for (auto &forward : datagram_forwards_)
     {
-        for (auto &forward : stream_forwards_)
-        {
-            const tcp::endpoint endpoint(asio::ip::make_address(forward.config.listen_address),
-                                         forward.config.listen_port);
-            forward.acceptor.open(endpoint.protocol());
-            forward.acceptor.set_option(asio::socket_base::reuse_address(true));
-            forward.acceptor.bind(endpoint);
-            forward.acceptor.listen();
-        }
-
-        for (auto &[id, forward] : datagram_forwards_)
-        {
-            const udp::endpoint endpoint(asio::ip::make_address(forward.config.listen_address),
-                                         forward.config.listen_port);
-            forward.listener_socket.open(endpoint.protocol());
-            forward.listener_socket.set_option(asio::socket_base::reuse_address(true));
-            forward.listener_socket.bind(endpoint);
-        }
-    }
-    catch (...)
-    {
-        for (auto &forward : stream_forwards_)
-        {
-            asio::error_code ignored;
-            forward.acceptor.close(ignored);
-        }
-
-        for (auto &[id, forward] : datagram_forwards_)
-        {
-            asio::error_code ignored;
-            forward.listener_socket.close(ignored);
-        }
-        throw;
+        const udp::endpoint endpoint(asio::ip::make_address(forward.config.listen_address), forward.config.listen_port);
+        forward.listener_socket.open(endpoint.protocol());
+        forward.listener_socket.set_option(asio::socket_base::reuse_address(true));
+        forward.listener_socket.bind(endpoint);
     }
 
     state_ = State::Running;
@@ -102,8 +78,9 @@ void Forwarder::start()
         spawn_task(accept_stream(forward), "Local stream accept loop");
     }
 
-    for (auto &[id, forward] : datagram_forwards_)
+    for (DatagramForwardId id = 0; id < datagram_forwards_.size(); ++id)
     {
+        const auto &forward = datagram_forwards_[id];
         PROXY_INFO_PRINT("Forward listening udp %s:%u -> service=%s", forward.config.listen_address.c_str(),
                          static_cast<unsigned int>(forward.config.listen_port), forward.config.service.c_str());
         spawn_task(receive_local_datagrams(id), "Local UDP receive loop");
@@ -112,15 +89,15 @@ void Forwarder::start()
 
 void Forwarder::set_service(ServiceKey service, std::string node)
 {
-    if (state_ != State::Running)
+    service_nodes_.insert_or_assign(service, std::move(node));
+    if (service.protocol != RelayProtocol::Udp)
     {
         return;
     }
 
-    service_nodes_.insert_or_assign(service, std::move(node));
-    for (auto &[id, forward] : datagram_forwards_)
+    for (DatagramForwardId id = 0; id < datagram_forwards_.size(); ++id)
     {
-        if (forward.config.service == service.service && service.protocol == RelayProtocol::Udp)
+        if (datagram_forwards_[id].config.service == service.service)
         {
             open_datagram_forward(id);
         }
@@ -141,7 +118,7 @@ void Forwarder::clear_service(const ServiceKey &service, std::string reason)
 
     if (service.protocol == RelayProtocol::Udp)
     {
-        for (auto &[id, forward] : datagram_forwards_)
+        for (auto &forward : datagram_forwards_)
         {
             if (forward.config.service == service.service)
             {
@@ -152,22 +129,35 @@ void Forwarder::clear_service(const ServiceKey &service, std::string reason)
     }
 }
 
-void Forwarder::clear_server(const std::string &server_id)
+void Forwarder::control_disconnected()
+{
+    service_nodes_.clear();
+    for (const auto &[request, relay] : relays_)
+    {
+        relay->cancel("primary control disconnected");
+    }
+    for (auto &forward : datagram_forwards_)
+    {
+        forward.retry_timer.expires_at(Clock::now());
+    }
+}
+
+void Forwarder::retain_nodes(const std::unordered_set<std::string> &nodes)
 {
     for (const auto &[request, relay] : relays_)
     {
-        if (relay->selection.server.id == server_id)
+        if (!relay->selection.server.node.empty() && !nodes.contains(relay->selection.server.node))
         {
-            relay->cancel("control disconnected");
+            relay->cancel("business node unavailable");
         }
     }
 }
 
-void Forwarder::invalidate_relays(std::string reason, const std::optional<ServiceKey> &service)
+void Forwarder::invalidate_relays(std::string reason)
 {
     for (const auto &[request, relay] : relays_)
     {
-        if (!relay->producer() && !relay->ready && (!service || relay->service == *service))
+        if (!relay->producer() && !relay->ready)
         {
             relay->cancel(reason);
         }
@@ -176,31 +166,23 @@ void Forwarder::invalidate_relays(std::string reason, const std::optional<Servic
 
 asio::awaitable<void> Forwarder::async_stop()
 {
-    if (state_ == State::Stopped)
+    state_ = State::Stopping;
+    for (auto &forward : stream_forwards_)
     {
-        co_return;
+        asio::error_code ignored;
+        forward.acceptor.close(ignored);
     }
-
-    if (state_ != State::Stopping)
+    for (auto &forward : datagram_forwards_)
     {
-        state_ = State::Stopping;
-        for (auto &forward : stream_forwards_)
-        {
-            asio::error_code ignored;
-            forward.acceptor.close(ignored);
-        }
-        for (auto &[id, forward] : datagram_forwards_)
-        {
-            asio::error_code ignored;
-            forward.listener_socket.close(ignored);
-            forward.retry_timer.cancel();
-        }
-        for (const auto &[request, relay] : relays_)
-        {
-            relay->cancel("agent stopping");
-        }
-        finish_if_stopped();
+        asio::error_code ignored;
+        forward.listener_socket.close(ignored);
+        forward.retry_timer.expires_at(Clock::now());
     }
+    for (const auto &[request, relay] : relays_)
+    {
+        relay->cancel("agent stopping");
+    }
+    finish_if_stopped();
 
     if (!co_await stopped_event_.wait())
     {
@@ -210,15 +192,16 @@ asio::awaitable<void> Forwarder::async_stop()
 
 asio::awaitable<void> Forwarder::accept_stream(StreamForward &forward)
 {
+    const ServiceKey service{forward.config.service, forward.config.protocol};
     for (;;)
     {
         auto [error, socket] = co_await forward.acceptor.async_accept(use_nothrow_awaitable);
+        if (state_ != State::Running)
+        {
+            co_return;
+        }
         if (error)
         {
-            if (!forward.acceptor.is_open() || error == asio::error::operation_aborted)
-            {
-                co_return;
-            }
             PROXY_ERROR_PRINT("Forward accept failed %s service=%s listen=%s:%u reason=%s",
                               relay_protocol_name(forward.config.protocol).data(), forward.config.service.c_str(),
                               forward.config.listen_address.c_str(),
@@ -226,7 +209,6 @@ asio::awaitable<void> Forwarder::accept_stream(StreamForward &forward)
             continue;
         }
 
-        const ServiceKey service{forward.config.service, forward.config.protocol};
         const auto destination = service_nodes_.find(service);
         if (destination == service_nodes_.end())
         {
@@ -244,19 +226,19 @@ asio::awaitable<void> Forwarder::accept_stream(StreamForward &forward)
 
 asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forward_id)
 {
-    auto &forward = datagram_forwards_.at(forward_id);
+    auto &forward = datagram_forwards_[forward_id];
     std::array<std::uint8_t, DatagramHeader::maximum_user_payload + 1> payload;
     for (;;)
     {
         udp::endpoint source;
         const auto [error, size] =
             co_await forward.listener_socket.async_receive_from(asio::buffer(payload), source, use_nothrow_awaitable);
+        if (state_ != State::Running)
+        {
+            co_return;
+        }
         if (error)
         {
-            if (!forward.listener_socket.is_open() || error == asio::error::operation_aborted)
-            {
-                co_return;
-            }
             if (error != asio::error::message_size)
             {
                 PROXY_ERROR_PRINT("Forward receive failed udp service=%s listen=%s:%u reason=%s",
@@ -287,6 +269,10 @@ asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forwa
 
         const std::array buffers{asio::buffer(sockets.session_header), asio::buffer(payload.data(), size)};
         const auto [send_error, sent] = co_await sockets.transfer.async_send(buffers, use_nothrow_awaitable);
+        if (state_ != State::Running)
+        {
+            co_return;
+        }
         if (send_error || sent != sockets.session_header.size() + size)
         {
             relay->fail("send relay datagram: " + (send_error ? send_error.message() : "truncated datagram"));
@@ -296,7 +282,7 @@ asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forwa
 
 void Forwarder::open_datagram_forward(DatagramForwardId forward_id)
 {
-    auto &forward = datagram_forwards_.at(forward_id);
+    auto &forward = datagram_forwards_[forward_id];
     if (state_ != State::Running || forward.relay || forward.retry_scheduled)
     {
         return;
@@ -317,9 +303,8 @@ void Forwarder::open_datagram_forward(DatagramForwardId forward_id)
 
 void Forwarder::schedule_datagram_retry(DatagramForwardId forward_id)
 {
-    auto &forward = datagram_forwards_.at(forward_id);
-    if (state_ != State::Running || forward.retry_scheduled ||
-        !service_nodes_.contains(ServiceKey{forward.config.service, RelayProtocol::Udp}))
+    auto &forward = datagram_forwards_[forward_id];
+    if (state_ != State::Running || !service_nodes_.contains(ServiceKey{forward.config.service, RelayProtocol::Udp}))
     {
         return;
     }
@@ -340,13 +325,7 @@ void Forwarder::schedule_datagram_retry(DatagramForwardId forward_id)
 
 asio::awaitable<void> Forwarder::retry_datagram_forward(DatagramForwardId forward_id)
 {
-    auto &forward = datagram_forwards_.at(forward_id);
-    if (state_ != State::Running || !service_nodes_.contains(ServiceKey{forward.config.service, RelayProtocol::Udp}))
-    {
-        forward.retry_scheduled = false;
-        co_return;
-    }
-
+    auto &forward = datagram_forwards_[forward_id];
     const auto [error] = co_await forward.retry_timer.async_wait(use_nothrow_awaitable);
     forward.retry_scheduled = false;
     if (error && error != asio::error::operation_aborted)
@@ -359,7 +338,7 @@ asio::awaitable<void> Forwarder::retry_datagram_forward(DatagramForwardId forwar
 
 void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
 {
-    if (state_ != State::Running || relays_.size() >= 1000)
+    if (relays_.size() >= 1000)
     {
         if (relay->forward)
         {
@@ -378,7 +357,7 @@ void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
     relays_.emplace(relay->request, relay);
     if (relay->forward)
     {
-        datagram_forwards_.at(*relay->forward).relay = relay;
+        datagram_forwards_[*relay->forward].relay = relay;
     }
 
     try
@@ -390,7 +369,7 @@ void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
         relays_.erase(relay->request);
         if (relay->forward)
         {
-            datagram_forwards_.at(*relay->forward).relay.reset();
+            datagram_forwards_[*relay->forward].relay.reset();
         }
         throw;
     }
@@ -423,7 +402,7 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
         }
         for (const auto &[request, active] : relays_)
         {
-            if (active->producer() && active->selection.server.id == route.id && active->endpoint.at("uuid") == *uuid)
+            if (active->producer() && active->selection.server.node == route.node && active->endpoint.at("uuid") == *uuid)
             {
                 return;
             }
@@ -439,10 +418,9 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
     }
 
     const auto request = config::optional_unsigned(p, "request_id");
-    bool matched = false;
     for (const auto &[id, relay] : relays_)
     {
-        if (relay->selection.server.id != route.id || relay->service.protocol != protocol)
+        if (relay->selection.server.node != route.node || relay->service.protocol != protocol)
         {
             continue;
         }
@@ -454,11 +432,14 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
         {
             // A single-node relay may have both roles in this Agent and share one UUID.
             relay->handle(message);
-            matched = true;
+            if (command == CtrlCommand::RelayOpened)
+            {
+                return;
+            }
         }
     }
 
-    if (!matched && command == CtrlCommand::RelayOpened && uuid)
+    if (command == CtrlCommand::RelayOpened && uuid)
     {
         send_control(route, CtrlMessage(CtrlCommand::RelayCancel, njson{{"uuid", *uuid}}));
     }
@@ -469,17 +450,16 @@ void Forwarder::spawn_task(asio::awaitable<void> task, std::string_view context)
     ++active_tasks_;
     try
     {
-        asio::co_spawn(transfer_work_.get_executor(), std::move(task),
-                       [self = shared_from_this(), context](std::exception_ptr failure) {
-                           if (failure && self->state_ == State::Running)
-                           {
-                               PROXY_ERROR_PRINT("%.*s stopped reason=%s", static_cast<int>(context.size()),
-                                                 context.data(), exception_description(failure).c_str());
-                           }
-                           assert(self->active_tasks_ != 0);
-                           --self->active_tasks_;
-                           self->finish_if_stopped();
-                       });
+        asio::co_spawn(transfer_work_.get_executor(), std::move(task), [this, context](std::exception_ptr failure) {
+            if (failure)
+            {
+                PROXY_ERROR_PRINT("%.*s stopped reason=%s", static_cast<int>(context.size()), context.data(),
+                                  exception_description(failure).c_str());
+            }
+            assert(active_tasks_ != 0);
+            --active_tasks_;
+            finish_if_stopped();
+        });
     }
     catch (...)
     {
@@ -508,22 +488,79 @@ bool Forwarder::send_control(const ServerRoute &route, CtrlMessage message)
         return false;
     }
 
+    (*message.params)["node_id"] = route.node;
     channel->send(std::move(message));
     return true;
 }
 
 std::uint64_t Forwarder::allocate_request_id()
 {
-    for (;;)
+    const auto request = next_request_id_++;
+    if (next_request_id_ == 0)
     {
-        const auto request = next_request_id_++;
-        if (next_request_id_ == 0)
+        next_request_id_ = 1;
+    }
+    return request;
+}
+
+asio::awaitable<RelaySelection> Forwarder::select_relay(ServiceKey service, std::string destination,
+                                                        Clock::time_point deadline)
+{
+    return agent_.select_relay(std::move(service), std::move(destination), deadline);
+}
+
+void Forwarder::relay_ready(const AgentSession &relay)
+{
+    if (relay.forward)
+    {
+        datagram_forwards_[*relay.forward].retry_delay = std::chrono::milliseconds(500);
+    }
+}
+
+void Forwarder::relay_finished(const AgentSession &relay)
+{
+    relays_.erase(relay.request);
+    if (relay.forward)
+    {
+        auto &listener = datagram_forwards_[*relay.forward];
+        listener.relay.reset();
+        schedule_datagram_retry(*relay.forward);
+    }
+}
+
+asio::awaitable<void> Forwarder::receive_datagrams(AgentSession &relay)
+{
+    auto &sockets = std::get<AgentSession::DatagramData>(relay.data);
+    auto &listener = datagram_forwards_[*relay.forward];
+    const auto &header = sockets.session_header;
+    std::array<std::uint8_t, DatagramHeader::maximum_wire_payload + 1> buffer;
+    while (relay.reason.empty())
+    {
+        const auto [error, size] = co_await sockets.transfer.async_receive(asio::buffer(buffer), use_nothrow_awaitable);
+        if (!relay.reason.empty())
         {
-            next_request_id_ = 1;
+            co_return;
         }
-        if (!relays_.contains(request))
+        if (error == asio::error::message_size)
         {
-            return request;
+            continue;
+        }
+        if (error)
+        {
+            throw asio::system_error(error);
+        }
+        if (size < header.size() || size > header.size() + sockets.maximum_payload ||
+            !std::equal(header.begin(), header.end(), buffer.begin()) || !listener.local_peer)
+        {
+            continue;
+        }
+        const auto peer = *listener.local_peer;
+        const auto payload_size = size - header.size();
+        const auto sent = co_await listener.listener_socket.async_send_to(
+            asio::buffer(buffer.data() + header.size(), payload_size), peer, asio::use_awaitable);
+        if (sent != payload_size)
+        {
+            throw std::runtime_error("truncated local datagram");
         }
     }
 }

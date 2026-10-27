@@ -5,24 +5,41 @@
 #include <random>
 #include <set>
 
+/**
+ * @brief Define a master-room participant on control_io.
+ * @details The room retains participants until their connection tasks leave; delivery only
+ * queues a message, and stop() requests shutdown without waiting for connection drainage.
+ */
 class ClusterParticipant
 {
   public:
+    /** @brief Destroy a participant after its owned connection work has drained. */
     virtual ~ClusterParticipant() = default;
+    /** @brief Borrow the joined node identity, or an empty identity before join completes. */
     virtual std::string_view node_id() const noexcept = 0;
+    /** @brief Borrow the participant's advertised Node address. */
     virtual std::string_view address() const noexcept = 0;
+    /** @brief Queue a control message for this participant on control_io. */
     virtual void deliver(CtrlMessage message) = 0;
+    /** @brief Request participant shutdown on control_io. */
     virtual void stop() = 0;
 };
 
+/**
+ * @brief Own master participants, publish membership, and authenticate message sources.
+ * @details All access requires control_io. The master accept loop owns this room and drains
+ * remote sessions before destruction; sessions borrow the room until they leave.
+ */
 class ClusterRoom
 {
   public:
+    /** @brief Initialize a master room with one membership epoch and an empty participant set. */
     ClusterRoom(asio::any_io_executor executor, std::string master_id, std::uint64_t epoch)
         : master_id_(std::move(master_id)), epoch_(epoch), changed_(executor)
     {
     }
 
+    /** @brief Retain a participant and publish membership if its identity is already known. */
     void join(const std::shared_ptr<ClusterParticipant> &participant)
     {
         participants_.insert(participant);
@@ -32,18 +49,22 @@ class ClusterRoom
         }
     }
 
+    /** @brief Publish membership after a remote participant finishes joining. */
     void ready()
     {
         publish_members();
     }
 
+    /** @brief Return whether a nonempty, nonreserved node identity is unused. */
     bool available(std::string_view node_id) const
     {
-        return !node_id.empty() && node_id != cluster_broadcast_target &&
-               std::ranges::none_of(participants_,
-                                    [&](const auto &participant) { return participant->node_id() == node_id; });
+        return !node_id.empty() && node_id.size() <= cluster_max_node_id_length &&
+               node_id != cluster_broadcast_target && std::ranges::none_of(participants_, [&](const auto &participant) {
+                   return participant->node_id() == node_id;
+               });
     }
 
+    /** @brief Release a participant, wake shutdown, and publish membership when appropriate. */
     void leave(const std::shared_ptr<ClusterParticipant> &participant)
     {
         const auto was_ready = !participant->node_id().empty();
@@ -55,11 +76,13 @@ class ClusterRoom
         }
     }
 
+    /** @brief Return participant count, including unjoined sessions and the local master. */
     std::size_t size() const noexcept
     {
         return participants_.size();
     }
 
+    /** @brief Validate routing, stamp the authenticated source, and deliver unicast or broadcast. */
     void deliver(std::string_view source, CtrlMessage message)
     {
         if (message.command.starts_with("cluster."))
@@ -67,10 +90,20 @@ class ClusterRoom
             throw std::invalid_argument("cluster.* commands are reserved");
         }
 
+        try
+        {
+            WireMessage::validate(message, cluster_max_message_length);
+        }
+        catch (const std::length_error &exception)
+        {
+            PROXY_ERROR_PRINT("Cluster message rejected source=%.*s reason=%s", static_cast<int>(source.size()),
+                              source.data(), exception.what());
+            return;
+        }
+
         const auto target = config::required_string(config::message_params(message), "target", message.command);
         message.params->erase("target");
         (*message.params)["source"] = source;
-        static_cast<void>(WireMessage::pack(message));
 
         if (target != cluster_broadcast_target)
         {
@@ -92,6 +125,7 @@ class ClusterRoom
         }
     }
 
+    /** @brief Stop remote participants and await their removal before releasing the room. */
     asio::awaitable<void> async_stop()
     {
         stopping_ = true;
@@ -140,9 +174,15 @@ class ClusterRoom
     bool stopping_ = false;
 };
 
+/**
+ * @brief Own one remote member's TLS channel and join/read lifecycle on the master.
+ * @details The room retains this participant; reader completion removes it only after TLS
+ * drainage. The room and borrowed TLS context must outlive the session task.
+ */
 class ClusterSession : public ClusterParticipant, public std::enable_shared_from_this<ClusterSession>
 {
   public:
+    /** @brief Adopt an accepted socket and borrow its master room and TLS context. */
     ClusterSession(asio::ip::tcp::socket socket, asio::ssl::context &context, ClusterRoom &room,
                    TLSChannelConfig config)
         : channel_(std::make_shared<TLSChannel>(std::move(socket), context, TLSChannelRole::S, config)), room_(room),
@@ -150,6 +190,7 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
     {
     }
 
+    /** @brief Launch the independent reader on the channel executor and leave the room on completion. */
     void start()
     {
         std::weak_ptr<ClusterSession> weak = shared_from_this();
@@ -161,21 +202,25 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
         });
     }
 
+    /** @copydoc ClusterParticipant::node_id */
     std::string_view node_id() const noexcept override
     {
         return node_id_;
     }
 
+    /** @copydoc ClusterParticipant::address */
     std::string_view address() const noexcept override
     {
         return address_;
     }
 
+    /** @copydoc ClusterParticipant::deliver */
     void deliver(CtrlMessage message) override
     {
         channel_->send(std::move(message));
     }
 
+    /** @copydoc ClusterParticipant::stop */
     void stop() override
     {
         stopping_ = true;
@@ -197,7 +242,7 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
             auto node_id = config::required_string(config::message_params(join), "node_id", "cluster.join");
             if (!room_.available(node_id))
             {
-                deliver(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "duplicate node_id"}}});
+                deliver(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "invalid or duplicate node_id"}}});
                 co_await channel_->async_receive(join_timeout_);
             }
             else
@@ -248,29 +293,35 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
     bool stopping_ = false;
 };
 
+/** @brief Represent the master locally on control_io, delivering directly to its borrowed ClusterMgr. */
 class ClusterMgr::LocalParticipant : public ClusterParticipant
 {
   public:
+    /** @brief Retain master identity and borrow the manager that receives local messages. */
     LocalParticipant(std::string node_id, std::string address, ClusterMgr &manager)
         : node_id_(std::move(node_id)), address_(std::move(address)), manager_(manager)
     {
     }
 
+    /** @copydoc ClusterParticipant::address */
     std::string_view address() const noexcept override
     {
         return address_;
     }
 
+    /** @copydoc ClusterParticipant::node_id */
     std::string_view node_id() const noexcept override
     {
         return node_id_;
     }
 
+    /** @copydoc ClusterParticipant::deliver */
     void deliver(CtrlMessage message) override
     {
         manager_.receive(std::move(message));
     }
 
+    /** @brief Keep the local participant until room drainage releases it; no socket is owned. */
     void stop() override
     {
     }
@@ -281,17 +332,26 @@ class ClusterMgr::LocalParticipant : public ClusterParticipant
     ClusterMgr &manager_;
 };
 
+/**
+ * @brief Reconnect a slave to the master and receive cluster messages on control_io.
+ * @details Owned by slave_loop for its complete run(). ClusterMgr borrows it for stop();
+ * run() exposes temporary cancellation state only on this executor and clears it on exit.
+ * Failed channels drain before retry, and control failure invalidates old Flow authorization.
+ */
 class ClusterMgr::Connector
 {
     using tcp = asio::ip::tcp;
 
+    /** @brief Hold resolver, socket, and retry timer for one Connector run() lifetime. */
     struct ConnectOperations
     {
+        /** @brief Construct all cancellable connection operations on control_io. */
         explicit ConnectOperations(asio::any_io_executor executor)
             : resolver(executor), socket(executor), retry(executor)
         {
         }
 
+        /** @brief Cancel resolution, connection, and retry waiting on their owning executor. */
         void cancel()
         {
             resolver.cancel();
@@ -306,20 +366,25 @@ class ClusterMgr::Connector
     };
 
   public:
+    /** @brief Borrow manager, TLS context, and configuration for the slave loop's lifetime. */
     Connector(asio::any_io_executor executor, asio::ssl::context &context, const ClusterConfig &config,
               const TLSChannelConfig &channel_config, ClusterMgr &manager)
         : executor_(executor), context_(context), config_(config), channel_config_(channel_config), manager_(manager)
     {
     }
 
-    void send(CtrlMessage message)
+    /** @brief Submit to a joined TLS channel; return false while connecting or disconnected. */
+    bool send(CtrlMessage message)
     {
         if (auto channel = channel_.lock(); channel && joined_)
+        {
             channel->send(std::move(message));
-        else
-            manager_.receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster disconnected"}}});
+            return true;
+        }
+        return false;
     }
 
+    /** @brief Stop retries and cancel current operations and the active TLS channel. */
     void stop()
     {
         running_ = false;
@@ -339,6 +404,7 @@ class ClusterMgr::Connector
         }
     }
 
+    /** @brief Resolve, connect, join, and receive repeatedly, draining each channel before retry. */
     asio::awaitable<void> run()
     {
         ConnectOperations operations(executor_);
@@ -347,7 +413,6 @@ class ClusterMgr::Connector
         constexpr auto retry_interval = std::chrono::seconds(5);
         while (running_)
         {
-            // Release this attempt's channel before waiting to reconnect.
             {
                 std::shared_ptr<TLSChannel> channel;
                 try
@@ -420,7 +485,6 @@ class ClusterMgr::Connector
                     PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=%s", config_.node_id.c_str(),
                                      config_.address.c_str(), static_cast<unsigned int>(config_.control_port),
                                      running_ ? "channel closed" : "node stopping");
-                    // Invalidate old Flows before reconnecting, including receive-side/heartbeat failures.
                     joined_ = false;
                     if (running_)
                     {
@@ -463,12 +527,17 @@ class ClusterMgr::Connector
 ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::ssl::context &context,
                        ClusterConfig config, TLSChannelConfig channel, std::size_t max_connections)
     : server_(server), executor_(executor), context_(context), config_(std::move(config)), channel_config_(channel),
-      max_connections_(max_connections), acceptor_(executor), loop_done_(executor, 1),
+      max_connections_(max_connections), acceptor_(executor), loop_done_(executor),
       outbound_channel_(executor, channel.max_queued_messages)
 {
     if (config_.node_id.empty() || config_.address.empty())
     {
         throw std::invalid_argument("cluster node_id and address are required");
+    }
+
+    if (config_.node_id.size() > cluster_max_node_id_length)
+    {
+        throw std::invalid_argument("cluster node_id must not exceed 256 bytes");
     }
 
     if (config_.node_id == cluster_broadcast_target)
@@ -493,55 +562,65 @@ ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::
 
 void ClusterMgr::start()
 {
-    if (running_)
+    if (started_)
     {
         throw std::logic_error("Cluster already started");
     }
 
+    ScopeGuard rollback([this]() noexcept {
+        running_ = false;
+        asio::error_code ignored;
+        acceptor_.close(ignored);
+    });
     if (config_.role == ClusterConfig::Role::Master)
     {
-        ScopeGuard close_acceptor([this]() noexcept {
-            asio::error_code ignored;
-            acceptor_.close(ignored);
-        });
         tcp::endpoint endpoint(asio::ip::make_address(config_.address), config_.control_port);
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(tcp::acceptor::reuse_address(true));
         acceptor_.bind(endpoint);
         acceptor_.listen();
-        close_acceptor.dismiss();
     }
 
     running_ = true;
-    ScopeGuard rollback([this]() noexcept {
-        running_ = false;
-        asio::error_code ignored;
-        acceptor_.close(ignored);
-        outbound_channel_.close();
-    });
     std::weak_ptr<ClusterMgr> weak = shared_from_this();
     auto loop = config_.role == ClusterConfig::Role::Master ? accept_loop() : slave_loop();
     asio::co_spawn(executor_, std::move(loop), [weak](std::exception_ptr error) {
         if (auto self = weak.lock())
         {
-            self->loop_done_.try_send(asio::error_code{}, std::move(error));
+            self->drain_error_ = error;
+            if (error)
+            {
+                PROXY_ERROR_PRINT("Cluster close failed reason=%s", exception_description(error).c_str());
+            }
+            if (self->running_ && self->config_.role == ClusterConfig::Role::Master)
+            {
+                self->fail(error ? exception_description(error) : "master control loop exited");
+            }
+            self->loop_done_.notify_all();
         }
     });
+    started_ = true;
     rollback.dismiss();
 }
 
-asio::awaitable<void> ClusterMgr::async_stop()
+asio::awaitable<bool> ClusterMgr::async_stop()
 {
-    if (!running_)
+    co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
+    if (!started_)
     {
-        co_return;
+        co_return true;
     }
 
     running_ = false;
     if (config_.role == ClusterConfig::Role::Master)
     {
-        asio::error_code ignored;
-        acceptor_.close(ignored);
+        asio::error_code error;
+        acceptor_.close(error);
+        if (error)
+        {
+            stop_ok_ = false;
+            PROXY_ERROR_PRINT("Cluster listener close failed reason=%s", error.message().c_str());
+        }
         outbound_channel_.close();
     }
 
@@ -550,11 +629,12 @@ asio::awaitable<void> ClusterMgr::async_stop()
         connector_->stop();
     }
 
-    auto loop_error = co_await loop_done_.async_receive(asio::use_awaitable);
-    if (loop_error)
+    co_await loop_done_.wait();
+    if (drain_error_)
     {
-        std::rethrow_exception(loop_error);
+        std::rethrow_exception(drain_error_);
     }
+    co_return stop_ok_;
 }
 
 asio::awaitable<void> ClusterMgr::accept_loop()
@@ -562,7 +642,6 @@ asio::awaitable<void> ClusterMgr::accept_loop()
     ClusterRoom room(executor_, config_.node_id, epoch_);
     room.join(std::make_shared<LocalParticipant>(config_.node_id, config_.advertise_address, *this));
 
-    std::exception_ptr error;
     try
     {
         using namespace asio::experimental::awaitable_operators;
@@ -570,11 +649,9 @@ asio::awaitable<void> ClusterMgr::accept_loop()
     }
     catch (...)
     {
-        error = std::current_exception();
+        PROXY_ERROR_PRINT("Cluster failed reason=%s", exception_description(std::current_exception()).c_str());
     }
     co_await room.async_stop();
-    if (error)
-        std::rethrow_exception(error);
 }
 
 asio::awaitable<void> ClusterMgr::slave_loop()
@@ -619,78 +696,92 @@ asio::awaitable<void> ClusterMgr::deliver_messages(ClusterRoom &room)
     for (;;)
     {
         auto [error, message] = co_await outbound_channel_.async_receive(use_nothrow_awaitable);
-        if (error)
+        if (error || !running_)
         {
             co_return;
         }
 
+        const auto command = message.command;
         try
         {
             room.deliver(config_.node_id, std::move(message));
         }
         catch (const std::exception &exception)
         {
-            receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", exception.what()}}});
+            PROXY_ERROR_PRINT("Cluster delivery failed command=%s reason=%s", command.c_str(), exception.what());
         }
     }
 }
 
-void ClusterMgr::send(std::string target, CtrlMessage message)
+void ClusterMgr::fail(std::string reason)
 {
-    std::weak_ptr<ClusterMgr> weak = shared_from_this();
-    asio::post(executor_, [weak, target = std::move(target), message = std::move(message)]() mutable {
-        auto self = weak.lock();
-        if (!self || !self->running_)
-        {
-            return;
-        }
-
-        try
-        {
-            if (target.empty())
-            {
-                throw std::invalid_argument("cluster target must not be empty");
-            }
-            if (!message.params)
-            {
-                message.params = njson::object();
-            }
-            if (!message.params->is_object())
-            {
-                throw std::invalid_argument("Cluster message params must be an object");
-            }
-            if (message.command.starts_with("cluster."))
-                throw std::invalid_argument("cluster.* commands are reserved");
-            (*message.params)["target"] = std::move(target);
-        }
-        catch (const std::exception &exception)
-        {
-            self->receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", exception.what()}}});
-            return;
-        }
-
-        if (self->config_.role == ClusterConfig::Role::Master)
-        {
-            if (!self->outbound_channel_.try_send(asio::error_code{}, std::move(message)))
-            {
-                self->receive(
-                    CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster outbound queue is full"}}});
-            }
-        }
-        else if (self->connector_)
-        {
-            self->connector_->send(std::move(message));
-        }
-        else
-        {
-            self->receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster disconnected"}}});
-        }
+    running_ = false;
+    stop_ok_ = false;
+    asio::error_code ignored;
+    acceptor_.close(ignored);
+    outbound_channel_.reset();
+    outbound_channel_.close();
+    // Notify after the caller leaves its current business-container iteration.
+    asio::post(executor_, [self = shared_from_this(), reason = std::move(reason)]() mutable {
+        self->server_.cluster_failed(std::move(reason));
     });
 }
 
-void ClusterMgr::broadcast(CtrlMessage message)
+ClusterMgr::SendResult ClusterMgr::send(std::string target, CtrlMessage message)
 {
-    send(std::string(cluster_broadcast_target), std::move(message));
+    if (!running_)
+    {
+        return SendResult::Stopped;
+    }
+
+    const auto command = message.command;
+    try
+    {
+        if (target.empty())
+        {
+            throw std::invalid_argument("cluster target must not be empty");
+        }
+        if (!message.params)
+        {
+            message.params = njson::object();
+        }
+        if (!message.params->is_object())
+        {
+            throw std::invalid_argument("Cluster message params must be an object");
+        }
+        if (message.command.starts_with("cluster."))
+        {
+            throw std::invalid_argument("cluster.* commands are reserved");
+        }
+        (*message.params)["target"] = target;
+        WireMessage::validate(message, cluster_max_message_length);
+    }
+    catch (const std::exception &exception)
+    {
+        PROXY_ERROR_PRINT("Cluster send rejected target=%s command=%s reason=%s", target.c_str(), command.c_str(),
+                          exception.what());
+        return SendResult::InvalidMessage;
+    }
+
+    if (config_.role == ClusterConfig::Role::Master)
+    {
+        if (outbound_channel_.try_send(asio::error_code{}, std::move(message)))
+        {
+            return SendResult::Submitted;
+        }
+        fail("master control outbound queue full");
+        return SendResult::QueueFull;
+    }
+    if (connector_ && connector_->send(std::move(message)))
+    {
+        return SendResult::Submitted;
+    }
+    return SendResult::NotConnected;
+}
+
+ClusterMgr::SendResult ClusterMgr::broadcast(CtrlMessage message)
+{
+    return send(std::string(cluster_broadcast_target), std::move(message));
 }
 
 void ClusterMgr::receive(CtrlMessage message)
@@ -707,7 +798,7 @@ void ClusterMgr::receive(CtrlMessage message)
         {
             static_cast<void>(config::required_string(config::message_params(message), "source", message.command));
         }
-        server_.handle_cluster_message(std::move(message));
+        server_.handle_cluster_message(command, std::move(message));
     }
     catch (const std::exception &exception)
     {

@@ -2,14 +2,21 @@
 #define RELAYWEAVE_TEST_NODE_FIXTURE_H
 
 #include "node_test_config.h"
+#include "node_control.h"
 #include "member_access.h"
+#include "flow_test_io.h"
 
 TEST_MEMBER(RelayNode, nodelink_mgr_)
 TEST_MEMBER(RelayNode, cluster_mgr_)
+TEST_MEMBER(RelayNode, metrics_)
 TEST_MEMBER(NodeLinkMgr, link_requests_)
 
 namespace test_node
 {
+inline NodeMetrics &metrics(const std::shared_ptr<RelayNode> &node)
+{
+    return *test_access::RelayNode_metrics_(*node);
+}
 inline NodeLinkMgr &links(const std::shared_ptr<RelayNode> &node)
 {
     return *test_access::RelayNode_nodelink_mgr_(*node);
@@ -33,13 +40,21 @@ inline asio::awaitable<void> close_flow(std::shared_ptr<RelayNode> node, std::ui
 {
     co_await links(node).close_flow(epoch, id);
 }
-inline asio::awaitable<FlowSendStatus> send_flow(std::shared_ptr<RelayNode> node, FlowFrame frame)
+inline asio::awaitable<bool> send_data(std::shared_ptr<RelayNode> node, std::uint64_t epoch,
+                                      std::uint64_t id, bool reverse, BytesBuf payload)
 {
-    co_return co_await links(node).channel().async_send_flow(std::move(frame));
+    co_return co_await test_flow::send_data(links(node).protocol().shared_from_this(), epoch, id, reverse,
+                                          std::move(payload));
 }
-inline asio::awaitable<FlowFrame> receive_flow(std::shared_ptr<RelayNode> node, std::uint64_t epoch, std::uint64_t id)
+inline asio::awaitable<test_flow::Port> port(std::shared_ptr<RelayNode> node, std::uint64_t epoch,
+                                          std::uint64_t id, bool reverse)
 {
-    co_return co_await links(node).channel().receive_flow(epoch, id);
+    co_return co_await test_flow::port(links(node).protocol().shared_from_this(), epoch, id, reverse);
+}
+inline asio::awaitable<std::optional<BytesBuf>> receive_flow(std::shared_ptr<RelayNode> node, std::uint64_t epoch,
+                                                           std::uint64_t id)
+{
+    co_return co_await test_flow::receive(links(node).protocol().shared_from_this(), epoch, id);
 }
 inline asio::awaitable<void> close_link(std::shared_ptr<RelayNode> node, std::uint64_t id)
 {
@@ -51,7 +66,7 @@ inline asio::awaitable<void> close_link(std::shared_ptr<RelayNode> node, std::ui
         {
             auto params = request->params;
             params["source"] = params.at("left");
-            manager.handle(CtrlMessage(CtrlCommand::LinkClosed, std::move(params)));
+            manager.handle(CtrlCommand::LinkClosed, CtrlMessage(CtrlCommand::LinkClosed, std::move(params)));
             break;
         }
     }

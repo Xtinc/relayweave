@@ -1,5 +1,8 @@
 #include "agent_routing.h"
 #include "link_quality.h"
+#include "member_access.h"
+
+TEST_MEMBER(AgentRouting, candidate_paths)
 #include <asio/experimental/awaitable_operators.hpp>
 
 #include <algorithm>
@@ -20,9 +23,9 @@ void require(bool condition, const char *message)
 
 std::optional<RouteGraph::Path> best_candidate(const AgentRouting &routing, std::string_view destination)
 {
-    const auto paths = routing.candidate_paths(AgentRouting::Clock::now());
-    const auto found = paths.find(std::string(destination));
-    return found == paths.end() ? std::nullopt : std::optional(found->second.front());
+    const auto paths = test_access::AgentRouting_candidate_paths(
+        routing, std::string(destination), AgentRouting::Clock::now());
+    return paths.empty() ? std::nullopt : std::optional(paths.front());
 }
 
 asio::awaitable<void> wait(std::chrono::milliseconds duration)
@@ -146,7 +149,7 @@ asio::awaitable<void> verify(asio::io_context &io)
         std::rethrow_exception(shared_failure);
     }
 
-    AgentRouting routing(io, false, 2);
+    AgentRouting routing(io, 2);
     routing.set_required_targets({{"entry", "127.0.0.1"}});
     auto now = AgentRouting::Clock::now();
     routing.begin_request(1, now);
@@ -155,10 +158,12 @@ asio::awaitable<void> verify(asio::io_context &io)
     quality.confidence = 1.0;
     quality.usable = true;
     using Json = nlohmann::json;
+    // IPv4 probes cannot measure the IPv6-only destination, so the first route
+    // must use the measured entry and the reported Node link.
     const Json snapshot{
         {"request_id", 1u}, {"epoch", 1u}, {"snapshot_version", 1u}, {"created_age_ms", 0u},
         {"nodes", Json::array({{{"node_id", "entry"}, {"address", "127.0.0.1"}, {"report_age_ms", 0u}},
-                               {{"node_id", "service"}, {"address", "127.0.0.2"}, {"report_age_ms", 0u}}})},
+                               {{"node_id", "service"}, {"address", "::1"}, {"report_age_ms", 0u}}})},
         {"links", Json::array({{{"source", "entry"}, {"destination", "service"},
                                {"age_ms", 0u}, {"quality", quality_json(quality)}}})}};
     routing.accept_snapshot(snapshot, now);
@@ -190,10 +195,12 @@ asio::awaitable<void> verify(asio::io_context &io)
     }
     require(!best_candidate(routing, "service"), "Closed Agent retained a usable local route");
 
-    AgentRouting candidates(io, true, 2);
+    AgentRouting candidates(io, 2);
     now = AgentRouting::Clock::now();
     candidates.begin_request(1, now);
-    candidates.accept_snapshot(snapshot, now);
+    auto measured_snapshot = snapshot;
+    measured_snapshot["nodes"][1]["address"] = "127.0.0.2";
+    candidates.accept_snapshot(measured_snapshot, now);
     failure = nullptr;
     try
     {
@@ -213,7 +220,7 @@ asio::awaitable<void> verify(asio::io_context &io)
         std::rethrow_exception(failure);
     }
 
-    auto changed = std::make_shared<AgentRouting>(io, false, 2);
+    auto changed = std::make_shared<AgentRouting>(io, 2);
     changed->set_required_targets({{"entry", "localhost"}});
     asio::post(io, [changed] { changed->set_required_targets({{"service", "127.0.0.1"}}); });
     failure = nullptr;

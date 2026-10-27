@@ -13,7 +13,7 @@ int main()
     try
     {
         LnkFrameHeader f{LnkFrType::Data, true, 4096, 0x0102030405060708, 0x1112131415161718};
-        const LnkFrameHeader::Buffer expected{0x4e, 1,    1,    1,    0,    0,    0x10, 0,    1, 2, 3, 4, 5, 6, 7, 8,
+        const LnkFrameHeader::Buffer expected{0x4e, 2,    1,    1,    0,    0,    0x10, 0,    1, 2, 3, 4, 5, 6, 7, 8,
                                               0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0, 0, 0, 0, 0, 0, 0, 0};
         check(f.encode() == expected);
         auto parsed = LnkFrameHeader::decode(expected);
@@ -35,6 +35,9 @@ int main()
             check(parsed.kind == kind && parsed.id == f.id && parsed.sequence == f.sequence &&
                   parsed.body_length == f.body_length);
         }
+        const auto credit = LnkFrameHeader{LnkFrType::Credit, true, 0, 7, 9, 1048576};
+        parsed = LnkFrameHeader::decode(credit.encode());
+        check(parsed.kind == LnkFrType::Credit && parsed.reverse && parsed.sequence == 1048576);
         // Malformed headers must fail before the caller allocates or reads a body.
         for (int invalid = 0; invalid < 11; ++invalid)
         {
@@ -46,7 +49,7 @@ int main()
             }
             if (invalid == 1)
             {
-                bytes[1] = 2;
+                bytes[1] = 1;
             }
             if (invalid == 2)
             {
@@ -95,7 +98,10 @@ int main()
             check(rejected);
         }
         for (const auto bad :
-             {LnkFrameHeader{LnkFrType::Ping, false, 0, 7}, LnkFrameHeader{LnkFrType::Pong, true, 0, 7, 0, 1},
+             {LnkFrameHeader{LnkFrType::Credit, false, 0, 7, 9, 0},
+              LnkFrameHeader{LnkFrType::Credit, false, 1, 7, 9, 1},
+              LnkFrameHeader{LnkFrType::Credit, false, 0, 7, 0, 1},
+              LnkFrameHeader{LnkFrType::Ping, false, 0, 7}, LnkFrameHeader{LnkFrType::Pong, true, 0, 7, 0, 1},
               LnkFrameHeader{LnkFrType::Attach, false, 0, 7}, LnkFrameHeader{LnkFrType::Reset, false, 513, 7, 9},
               LnkFrameHeader{LnkFrType::Data, false, LnkFrameHeader::maximum_payload + 1, 7, 9}})
         {
@@ -109,57 +115,6 @@ int main()
                 rejected = true;
             }
             check(rejected);
-        }
-        static_assert(noexcept(FlowFrame{}.validate()));
-        for (const auto &frame : {FlowFrame{7, 9, false, LnkFrType::Data, {}, {}},
-                                  FlowFrame{7, 9, true, LnkFrType::Data, BytesBuf(4096), {}},
-                                  FlowFrame{7, 9, true, LnkFrType::Data, BytesBuf(4097), {}},
-                                  FlowFrame{7, 9, true, LnkFrType::Data, BytesBuf(LnkFrameHeader::maximum_payload), {}},
-                                  FlowFrame{7, 9, false, LnkFrType::Fin, {}, {}},
-                                  FlowFrame{7, 9, true, LnkFrType::Reset, {}, std::string(512, 'x')}})
-        {
-            check(frame.validate());
-        }
-        for (int invalid = 0; invalid < 8; ++invalid)
-        {
-            FlowFrame frame{7, 9, false, LnkFrType::Data, {0, 255, 3}, {}};
-            if (invalid == 0)
-            {
-                frame.payload.resize(LnkFrameHeader::maximum_payload + 1);
-            }
-            if (invalid == 1)
-            {
-                frame.reason = "unexpected DATA reason";
-            }
-            if (invalid == 2)
-            {
-                frame.kind = LnkFrType::Fin;
-            }
-            if (invalid == 3)
-            {
-                frame.kind = LnkFrType::Ping;
-            }
-            if (invalid == 4)
-            {
-                frame.flow_id = 0;
-            }
-            if (invalid == 5)
-            {
-                frame.epoch = 0;
-            }
-            if (invalid == 6)
-            {
-                frame.kind = LnkFrType::Reset;
-                frame.payload.clear();
-                frame.reason.resize(513);
-            }
-            if (invalid == 7)
-            {
-                frame.kind = LnkFrType::Fin;
-                frame.payload.clear();
-                frame.reason = "unexpected FIN reason";
-            }
-            check(!frame.validate());
         }
         std::cout << "[PASS] binary Node frame headers\n";
     }

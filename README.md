@@ -3,25 +3,49 @@
 本文是项目的编码风格约束，适用于贡献者和 AI 编码工具。新增与修改代码应遵循本文，异步代码参考
 `protocol/src/xfr_channel.cpp` 和 `protocol/src/tls_channel.cpp` 的既有风格。
 
-设计、配置、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)，测试分组与运行入口见 [测试目录](test/README.md)。
+系统、链路质量与推荐路径见 [RelayWeave 设计](docs/RelayWeave设计.md)；
+Agent 的部件、连接池、业务生命周期及停止顺序见 [RelayAgent 设计](docs/RelayAgent设计.md)；
+Node 的部件结构、完整业务流程、配置与协议集中见 [RelayNode 设计](docs/RelayNode设计.md)，
+执行域见其中的[部件结构与执行域](docs/RelayNode设计.md#1-部件结构与执行域)，
+内存分配、协程数量及性能复核见[资源模型与验证](docs/RelayNode设计.md#8-资源模型与验证)。
+测试分组与运行入口见 [测试目录](test/README.md)。
 RelayNode 直接持有 node/nodelink_mgr，统一协调 NodeLink 建连与 NodeFlow 路径事务，层次与 Pipeline/DatagramMgr 一致。
-NodeLink 共享 TCP/UDP 通道与 NodeFlow 分派由管理器直接持有的 protocol/lnk_channel 管理；protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBOR。
+NodeLinkMgr 直接持有 protocol/FlowProtocol；协议服务持有 lnk_channel 的邻接 TCP/UDP 传输并统一管理 Flow。
+部件通过 FlowStream/FlowDatagram 收发，层次与接口见 [设计文档中的协议边界](docs/RelayNode设计.md#flowprotocol端点与本地逻辑流状态)。
+protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBOR。
 控制通知使用有界协程收发接口，数据域直接逐跳分派，不通过模块回调注册。
 Flow 提交后不做周期续租；控制连接断开、epoch/路径成员失效、NodeLink 断开或显式关闭时清理。
 超时仅用于建立阶段和关闭确认，NodeLink 与集群控制连接使用各自的心跳检测失联。
 NodeSession 按所选路径直接持有 ControlRouterSingle 或 ControlRouterMulti，两者都在 control_io 协调业务；多跳首尾通过集群单播通信。
 RelayNode 直接持有唯一 RegistryMgr 和 NodeSession 容器，负责全局业务创建、查找分派和停止排空；控制器只推进自己的实例。
+NodeControl 借用注册表、拓扑和业务元数据，统一处理公共注册、查询与集群响应回送；NodeMetrics 拥有队列探针、流量采样和运行指标。
+两者统一声明和实现在 `node_control.h/.cpp` 中，保持各自的所有权和执行域。
+重复请求、peer 身份匹配、控制断线与 epoch 失效判断通过 NodeSession 交给控制器，RelayNode 不读取控制器内部状态。
 master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
 Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
+RelayAgent 直接持有 AgentControl、NodeConnectionMgr、AgentRouting 和 Forwarder，配置保留在 relay_agent.h/.cpp。
+AgentControl 借用同级模块，负责发现与入口等待；连接池拥有控制连接，AgentRouting 拥有目的 Node 路径缓存。
 Agent 服务发现只保存目的 Node 位置，选路后才取得实际入口控制连接；发现继续使用主控，不提供主控离线定位。
 Forwarder 拥有长期本地监听和业务容器，AgentSession 统一一次 TCP/TLS/UDP 接入与复制；UDP 服务离线时只保留本地 forward。
 单跳和多跳 TCP/TLS 均保留双向半关闭，UDP 单节点用户载荷上限为 65499 字节、多节点为 65467 字节；服务限速和统计保留在端点，
-共享通道、路径事务、数据热路径和生命周期统一见 [RelayWeave 设计](docs/RelayWeave设计.md)。
+共享通道、路径事务、数据热路径和生命周期统一见 [RelayNode 设计](docs/RelayNode设计.md)。
+多节点 TCP/TLS 使用逐跳双向信用窗口，拥塞时等待；UDP 满队列丢包而不关闭健康 Flow。
+固定窗口、预算和协议升级边界见 [共享数据面容量与信用算法](docs/RelayNode设计.md#5-逐跳信用流控与容量)；
+TCP 共享发送队列按流标签交错插入，算法、接口与实现比较见 [FairQueue](docs/FairQueue.md)。
 部署见 [打包与安装](docs/RelayWeave打包与安装.md)、[证书制作与部署](docs/证书制作与部署.md)
 和 [管理面板部署说明](dashboard/README.md)。
 
 ## C++ / Asio 编码约束
 
+- 类与结构体说明、对外接口统一使用 Doxygen 风格的英文注释（`/** ... */`），以 `@brief` 概括职责或行为。
+  类说明应交代所有权、依赖生命周期和执行域；有参数的对外接口必须逐个使用 `@param` 说明参数含义、单位、有效范围或所有权，
+  有返回值的对外接口必须使用 `@return` 说明结果含义及失败或空值情况，协程说明等待完成后的结果。
+  私有接口及实现内部类的接口可使用简短的 `@brief`，无需逐项列出参数和返回值；保留必要的执行域、生命周期与取消约束。
+  按需使用 `@pre`、`@throws` 说明调用前提、异常、取消与排空语义，模板参数使用 `@tparam`；不逐字段或逐语句复述代码。
+  注释集中在声明处，实现在 `.cpp` 内的局部类也遵循同一规则；覆盖的接口可使用 `@copydoc` 复用基类契约。
+  移除零散的行内、语句旁及分段说明注释；必要的设计原因和执行器约束归入对应类或接口的 Doxygen 注释，
+  跨模块流程、容量推导和历史验证记录按职责归入设计文档：Node 相关内容由 `docs/RelayNode设计.md` 维护，
+  Agent 由 `docs/RelayAgent设计.md` 维护，系统与通用约束由 `docs/RelayWeave设计.md` 维护，避免多处维护同一说明。
 - 每条普通变量声明只声明一个变量，并独占一行，适用于局部变量、成员变量和全局变量。
   即使类型相同，也不得使用逗号连写，例如 `bool left_ready = false, right_ready = false;` 应拆成两行独立声明。
 - 头文件避免重复包含应使用防卫式声明，不使用 `#pragma once`。

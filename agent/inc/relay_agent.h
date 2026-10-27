@@ -1,16 +1,9 @@
 #ifndef RELAYWEAVE_RELAY_AGENT_H
 #define RELAYWEAVE_RELAY_AGENT_H
 
+#include "agent_control.h"
 #include "agent_routing.h"
-#include "async_event.h"
-#include "dualindex_map.h"
-#include "lru_cache.h"
-#include "tls_channel.h"
-#include <exception>
-#include <functional>
-#include <map>
-#include <string_view>
-#include <type_traits>
+#include "node_connection.h"
 
 struct AgentServiceConfig
 {
@@ -49,133 +42,80 @@ struct AgentConfig
 AgentConfig load_agent_config(const std::filesystem::path &path);
 
 class Forwarder;
-class AgentSession;
-class NodeConnection;
 
-struct ServiceKey
-{
-    std::string service;
-    RelayProtocol protocol;
-    bool operator==(const ServiceKey &) const = default;
-};
-
-template <> struct std::hash<ServiceKey>
-{
-    std::size_t operator()(const ServiceKey &key) const
-    {
-        using ProtocolType = std::underlying_type_t<RelayProtocol>;
-        auto result = std::hash<std::string>{}(key.service);
-        const auto protocol = std::hash<ProtocolType>{}(static_cast<ProtocolType>(key.protocol));
-        result ^= protocol + 0x9e3779b9U + (result << 6) + (result >> 2);
-        return result;
-    }
-};
-
-struct ServerRoute
-{
-    std::string id;
-    std::string host;
-    std::weak_ptr<TLSChannel> channel;
-};
-
-struct RelaySelection
-{
-    ServerRoute server;
-    std::vector<std::string> path;
-    std::uint64_t epoch = 0;
-    std::shared_ptr<NodeConnection> connection;
-};
-
-class RelayAgent : public std::enable_shared_from_this<RelayAgent>
+/**
+ * @brief Own Agent modules and coordinate startup, executor crossing, and shutdown.
+ * @details Configuration outlives its borrowers. Control modules run on control_io; Forwarder and
+ * business sockets run on transfer_io. Both executors and the external TLS context must outlive
+ * stop() and all worker threads. Control borrows the earlier-declared connection owner, routing, and
+ * Forwarder. The external owner keeps the Agent alive through stop() and worker joins.
+ */
+class RelayAgent
 {
   public:
+    /**
+     * @brief Construct modules without starting control connections or local listeners.
+     * @param control_io Single-threaded control execution domain.
+     * @param transfer_io Distinct single-threaded business execution domain.
+     * @param ssl_context Borrowed client TLS context, valid through shutdown.
+     * @param config Validated configuration, owned by value.
+     * @throws std::invalid_argument If execution domains overlap.
+     */
     RelayAgent(asio::io_context &control_io, asio::io_context &transfer_io, asio::ssl::context &ssl_context,
                AgentConfig config);
-
+    ~RelayAgent();
+    /**
+     * @brief Start local listeners and control tasks once, before workers run.
+     * @throws std::exception On setup failure; keep executors running and call stop().
+     */
     void start();
-    asio::awaitable<void> async_stop();
+    /**
+     * @brief Synchronously cancel and drain control tasks, then business tasks.
+     * @pre Called sequentially by the owner outside Agent executors, without overlapping start();
+     * workers run until draining completes.
+     * @details Completed repeated calls return immediately; incomplete drains may be retried.
+     * @throws std::exception If draining fails; state remains Stopping.
+     */
+    void stop();
+    /**
+     * @brief Select an entrance on control_io and return to the caller's executor.
+     * @param service Service name and transport identifying the discovered service.
+     * @param destination Expected destination Node identity from Forwarder.
+     * @param deadline Absolute steady-clock establishment deadline; never renewed.
+     * @return Path, epoch, logical entrance, and primary control route.
+     * @throws std::exception If selection fails, expires, or is invalidated by shutdown.
+     */
+    asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
+                                                 std::chrono::steady_clock::time_point deadline);
 
   private:
+    friend class NodeConnectionMgr;
     friend class NodeConnection;
-    friend class Forwarder;
-    friend class AgentSession;
-    static constexpr std::size_t MAX_LOGGED_CANDIDATES = 3;
-    static constexpr std::size_t PATH_CACHE_CAPACITY = 16;
-    static constexpr auto PATH_CACHE_TTL = std::chrono::seconds(15);
-    static constexpr auto CONNECTION_IDLE_TIMEOUT = std::chrono::seconds(60);
+    /** @brief Dispatch primary identification to the control component on control_io. */
+    void connection_ready(const NodeConnection &connection);
+    /** @brief Dispatch a primary disconnect while all peer modules remain alive. */
+    void connection_closed();
+    /** @brief Deliver authenticated connection messages to the control component on control_io. */
+    void handle_control_message(const NodeConnection &connection, CtrlMessage message);
 
     enum class State
     {
         Created,
         Running,
-        StoppingControl,
-        StoppingForwarder,
+        Stopping,
         Stopped,
     };
-
-    asio::awaitable<void> discovery_loop();
-    std::shared_ptr<NodeConnection> ensure_connection(std::string node_id, std::string host, std::uint16_t port);
-    void connection_ready(NodeConnection &connection, const std::shared_ptr<TLSChannel> &channel);
-    void connection_closed(const NodeConnection &connection);
-    void connection_finished(NodeConnection &connection, std::exception_ptr failure);
-    void collect_idle_connections(std::chrono::steady_clock::time_point now);
-    void spawn_control_task(asio::awaitable<void> task, std::string_view context, NodeConnection *connection = nullptr);
-    void query_services(bool refresh = false);
-    void query_topology();
-    void update_probe_targets();
-    std::vector<std::string> calculate_service_paths(const ServiceKey &service, const std::string &destination);
-    asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                                 std::chrono::steady_clock::time_point deadline);
-    void invalidate_entries(std::string reason, const std::optional<ServiceKey> &service = std::nullopt);
-    struct EntryWait
-    {
-        EntryWait(asio::any_io_executor executor, ServiceKey service, std::string node,
-                  std::chrono::steady_clock::time_point deadline);
-        asio::steady_timer changed;
-        ServiceKey service;
-        std::string node;
-        std::chrono::steady_clock::time_point deadline;
-        struct Location
-        {
-            std::string address;
-            std::uint16_t port;
-        };
-        std::optional<Location> location;
-        std::shared_ptr<NodeConnection> connection;
-        std::string reason;
-    };
-    std::map<std::uint64_t, std::shared_ptr<EntryWait>> entry_waits_;
-    void locate_service(const njson &params);
-    void forget_service(const ServiceKey &service, std::string reason);
-    void handle_control_message(const NodeConnection &connection, CtrlMessage message);
-    std::uint64_t allocate_request_id();
+    /** @brief Cancel and drain owned modules on control_io. */
     asio::awaitable<void> stop_on_control_executor();
-    void try_stop_forwarder();
-    void complete_stop() noexcept;
 
-    asio::any_io_executor control_executor_;
-    asio::any_io_executor transfer_executor_;
-    asio::ssl::context &ssl_context_;
+    asio::io_context::executor_type control_executor_;
+    asio::io_context::executor_type transfer_executor_;
     AgentConfig config_;
     AgentRouting routing_;
-    // Confined to control_executor_; TTL is independent of topology/probe validity.
-    LRUCache<std::string, std::vector<RouteGraph::Path>> path_cache_{PATH_CACHE_CAPACITY, PATH_CACHE_TTL};
-    asio::steady_timer discovery_timer_;
-    std::shared_ptr<Forwarder> forwarder_;
-    std::string primary_connection_id_;
-    DualIndexMap<std::string, std::string, std::shared_ptr<NodeConnection>, SecondaryKeyMode::Unique> connections_;
-    struct ServiceLocation
-    {
-        std::uint64_t request = 0;
-        std::string address;
-        std::uint16_t port = 0;
-    };
-    // The secondary key is the service Node ID, independent of control connections.
-    DualIndexMap<ServiceKey, std::string, ServiceLocation> service_locations_;
-    std::uint64_t next_request_id_ = 1;
-    std::size_t active_tasks_ = 0;
-    AsyncEvent stopped_event_;
+    NodeConnectionMgr connections_;
+    std::unique_ptr<Forwarder> forwarder_;
+    AgentControl control_;
     State state_ = State::Created;
 };
 
-#endif // RELAYWEAVE_RELAY_AGENT_H
+#endif

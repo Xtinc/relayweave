@@ -84,12 +84,13 @@ include(cmake/Packaging.cmake)
             self.assertEqual(installed_launcher.stat().st_mode & 0o777, 0o755)
 
 
-class IcmpPackagingTest(unittest.TestCase):
+class MaintainerScriptsTest(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.work = Path(directory.name)
         self.calls = self.work / 'systemctl.calls'
+        self.system_calls = self.work / 'system.calls'
         systemctl = self.work / 'systemctl'
         systemctl.write_text('''#!/bin/sh
 printf '%s\\n' "$*" >> "$MOCK_CALLS"
@@ -100,13 +101,26 @@ case "$1" in
             --property=CapabilityBoundingSet) printf '%s\\n' "$MOCK_BOUNDING" ;;
         esac ;;
     is-active) [ "$MOCK_ACTIVE" = yes ] ;;
+    is-enabled) [ "$MOCK_ENABLED" = yes ] ;;
 esac
 ''')
         systemctl.chmod(0o755)
+        # Dashboard configuration must never create host users or directories.
+        for command in ('getent', 'adduser', 'install'):
+            mock = self.work / command
+            mock.write_text('''#!/bin/sh
+printf '%s\\n' "${0##*/} $*" >> "$MOCK_SYSTEM_CALLS"
+if [ "${0##*/}" = getent ]; then
+    [ "$MOCK_DASHBOARD_USER_EXISTS" = yes ]
+fi
+''')
+            mock.chmod(0o755)
 
-    def configure(self, role, *, upgrade=False, active=False, ambient=True,
-                  bounding=True, unit_capability=True):
+    def configure(self, role, *, previous_version=None, active=False, enabled=True,
+                  ambient=True, bounding=True, unit_capability=True,
+                  dashboard_user_exists=True):
         self.calls.write_text('')
+        self.system_calls.write_text('')
         source = ROOT / 'packaging' / role
         unit = (source / f'relayweave-{role}.service').read_text()
         if not unit_capability:
@@ -121,30 +135,63 @@ esac
         postinst.write_text(script)
         environment = dict(os.environ, PATH=f'{self.work}{os.pathsep}{os.environ["PATH"]}',
                            MOCK_CALLS=str(self.calls), MOCK_ACTIVE='yes' if active else 'no',
+                           MOCK_ENABLED='yes' if enabled else 'no',
+                           MOCK_SYSTEM_CALLS=str(self.system_calls),
+                           MOCK_DASHBOARD_USER_EXISTS='yes' if dashboard_user_exists else 'no',
                            MOCK_AMBIENT='cap_net_raw cap_net_bind_service' if ambient else '',
                            MOCK_BOUNDING='cap_net_raw cap_net_bind_service' if bounding else '')
         arguments = ['sh', str(postinst), 'configure']
-        if upgrade:
-            arguments.append('1.0.1-1')
-        result = subprocess.run(arguments, env=environment, capture_output=True, text=True)
+        if previous_version is not None:
+            arguments.append(previous_version)
+        result = subprocess.run(arguments, env=environment, capture_output=True, text=True,
+                                timeout=5)
         return result, self.calls.read_text().splitlines()
 
+    def expected_reload_calls(self, role):
+        calls = ['daemon-reload']
+        if role in ('node', 'agent'):
+            calls.extend([
+                f'show relayweave-{role}.service --property=AmbientCapabilities --value',
+                f'show relayweave-{role}.service --property=CapabilityBoundingSet --value',
+            ])
+        return calls
+
     def test_first_install_enables_without_starting(self):
-        for role in ('node', 'agent'):
+        for role in ('node', 'agent', 'proxy', 'dashboard'):
             with self.subTest(role=role):
                 result, calls = self.configure(role)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f'enable relayweave-{role}.service', calls)
-                self.assertFalse(any(call.startswith(('start ', 'restart ')) for call in calls))
+                self.assertEqual(calls, self.expected_reload_calls(role) +
+                                 [f'enable relayweave-{role}.service'])
 
-    def test_upgrade_restarts_only_active_service(self):
-        for role in ('node', 'agent'):
-            for active in (False, True):
-                with self.subTest(role=role, active=active):
-                    result, calls = self.configure(role, upgrade=True, active=active)
-                    self.assertEqual(result.returncode, 0, result.stderr)
-                    self.assertEqual(f'restart relayweave-{role}.service' in calls, active)
-                    self.assertFalse(any(call.startswith('enable ') for call in calls))
+    def test_upgrade_and_reinstall_preserve_service_state(self):
+        for role in ('node', 'agent', 'proxy', 'dashboard'):
+            for previous_version in ('1.0.5-2', '1.0.5-3'):
+                for active in (False, True):
+                    for enabled in (False, True):
+                        with self.subTest(role=role, previous_version=previous_version,
+                                          active=active, enabled=enabled):
+                            result, calls = self.configure(
+                                role, previous_version=previous_version,
+                                active=active, enabled=enabled)
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            # Only read/reload operations are allowed: no start,
+                            # stop, restart, reload, enable or disable commands.
+                            self.assertEqual(calls, self.expected_reload_calls(role))
+
+    def test_dashboard_initializes_user_and_certificate_directory(self):
+        for user_exists in (False, True):
+            with self.subTest(user_exists=user_exists):
+                result, _ = self.configure('dashboard', dashboard_user_exists=user_exists)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                expected = ['getent passwd relayweave-dashboard']
+                if not user_exists:
+                    expected.append('adduser --system --group --home '
+                                    '/var/lib/relayweave-dashboard --no-create-home '
+                                    'relayweave-dashboard')
+                expected.append('install -d -o root -g relayweave-dashboard -m 0750 '
+                                '/etc/relayweave/dashboard-certs')
+                self.assertEqual(self.system_calls.read_text().splitlines(), expected)
 
     def test_missing_packaged_capability_rejects_configuration(self):
         for role in ('node', 'agent'):
@@ -154,15 +201,15 @@ esac
                 self.assertIn('CAP_NET_RAW', result.stderr)
                 self.assertEqual(calls, [])
 
-    def test_override_removing_either_capability_rejects_before_restart(self):
+    def test_override_removing_either_capability_rejects_configuration(self):
         for role in ('node', 'agent'):
             for missing in ('ambient', 'bounding'):
                 with self.subTest(role=role, missing=missing):
-                    result, calls = self.configure(role, upgrade=True, active=True,
+                    result, calls = self.configure(role, previous_version='1.0.5-2', active=True,
                                                    **{missing: False})
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn('CAP_NET_RAW', result.stderr)
-                    self.assertFalse(any(call.startswith(('enable ', 'restart ')) for call in calls))
+                    self.assertEqual(calls, self.expected_reload_calls(role))
 
 
 if __name__ == '__main__':

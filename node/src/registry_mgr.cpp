@@ -161,10 +161,6 @@ std::vector<std::string> RegistryMgr::service_names()
 
 void RegistryMgr::stop()
 {
-    if (stopped_)
-    {
-        return;
-    }
     stopped_ = true;
 
     for (const auto &[_, session_entry] : sessions_)

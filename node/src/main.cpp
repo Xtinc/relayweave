@@ -1,7 +1,9 @@
 #include "relay_node.h"
 #include "relayweave_version.h"
 #include <csignal>
+#include <future>
 #include <iostream>
+#include <thread>
 
 void print_usage(std::string_view program)
 {
@@ -65,33 +67,75 @@ int main(int argc, char *argv[])
 
         auto node = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data_io,
                                                 ssl_context, std::move(config));
-        node->start();
-
         asio::signal_set signals(signal_io, SIGINT, SIGTERM);
-        signals.async_wait([node](const asio::error_code &ec, int) {
-            if (!ec)
+        auto signal = signals.async_wait(asio::use_future);
+        std::exception_ptr failure;
+        bool stopped = false;
+        {
+            auto control_work = asio::make_work_guard(control_io);
+            auto tcp_work = asio::make_work_guard(transfer_tcp_io);
+            auto udp_work = asio::make_work_guard(transfer_udp_io);
+            auto data_work = asio::make_work_guard(cluster_data_io);
+            std::vector<std::thread> workers;
+            workers.reserve(4);
+            ScopeGuard join_workers([&] {
+                control_work.reset();
+                tcp_work.reset();
+                udp_work.reset();
+                data_work.reset();
+                for (auto &worker : workers)
+                {
+                    worker.join();
+                }
+            });
+            workers.emplace_back([&] { control_io.run(); });
+            workers.emplace_back([&] {
+                set_current_thread_scheduler_policy();
+                transfer_tcp_io.run();
+            });
+            workers.emplace_back([&] {
+                set_current_thread_scheduler_policy();
+                transfer_udp_io.run();
+            });
+            workers.emplace_back([&] { cluster_data_io.run(); });
+
+            try
             {
-                node->stop();
+                asio::post(control_io, asio::use_future([&] {
+                    node->start([&](std::string reason) {
+                        asio::post(signal_io, [&, reason = std::move(reason)] {
+                            failure = std::make_exception_ptr(std::runtime_error(reason));
+                            signals.cancel();
+                        });
+                    });
+                })).get();
+                signal_io.run();
+                if (!failure)
+                {
+                    signal.get();
+                }
             }
-        });
-
-        std::thread control_thread([&control_io]() { control_io.run(); });
-        std::thread transfer_tcp_thread([&transfer_tcp_io]() {
-            set_current_thread_scheduler_policy();
-            transfer_tcp_io.run();
-        });
-        std::thread transfer_udp_thread([&transfer_udp_io]() {
-            set_current_thread_scheduler_policy();
-            transfer_udp_io.run();
-        });
-        std::thread cluster_data_thread([&]() { cluster_data_io.run(); });
-        signal_io.run();
-
-        cluster_data_thread.join();
-        control_thread.join();
-        transfer_tcp_thread.join();
-        transfer_udp_thread.join();
-        return 0;
+            catch (...)
+            {
+                failure = std::current_exception();
+            }
+            try
+            {
+                stopped = node->stop();
+            }
+            catch (...)
+            {
+                if (!failure)
+                {
+                    failure = std::current_exception();
+                }
+            }
+        }
+        if (failure)
+        {
+            std::rethrow_exception(failure);
+        }
+        return stopped ? 0 : 1;
     }
     catch (const std::exception &exception)
     {

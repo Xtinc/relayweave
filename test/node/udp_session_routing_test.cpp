@@ -209,6 +209,8 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     const auto producer_ticket = producer_params.at("ticket").get<std::uint64_t>();
     require(consumer_id != 0 && producer_id != 0 && consumer_id != producer_id,
             "UDP sides did not receive distinct non-zero session IDs");
+    require(!consumer_params.contains("tls_framing") && !producer_params.contains("tls_framing"),
+            "UDP attachment contains TLS framing");
     require(consumer_ticket != 0 && producer_ticket != 0 && consumer_ticket != producer_ticket,
             "UDP sides did not receive distinct non-zero attach tickets");
 

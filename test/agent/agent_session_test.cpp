@@ -6,11 +6,6 @@
 #include <string_view>
 
 #include "member_access.h"
-TEST_MEMBER(RelayAgent, state_)
-TEST_MEMBER(RelayAgent, service_locations_)
-TEST_MEMBER(RelayAgent, entry_waits_)
-TEST_MEMBER(RelayAgent, connections_)
-TEST_MEMBER(RelayAgent, forwarder_)
 TEST_MEMBER(AgentSession, target)
 TEST_MEMBER(AgentSession, selection)
 TEST_MEMBER(AgentSession, endpoint)
@@ -23,35 +18,6 @@ TEST_MEMBER(AgentSession, handle)
 
 namespace
 {
-struct RelayAgentTestAccess
-{
-    static std::shared_ptr<Forwarder> prepare(RelayAgent &agent, std::uint16_t port)
-    {
-        const ServiceKey service{"entry-wait", RelayProtocol::Tcp};
-        test_access::RelayAgent_state_(agent) = std::remove_cvref_t<decltype(test_access::RelayAgent_state_(agent))>::Running;
-        *test_access::RelayAgent_service_locations_(agent).find_primary(service) = {0, "127.0.0.1", port};
-        test_access::RelayAgent_service_locations_(agent).set_secondary(service, "pending-node");
-        return test_access::RelayAgent_forwarder_(agent);
-    }
-
-    static std::chrono::steady_clock::time_point pending_deadline(const RelayAgent &agent)
-    {
-        if (test_access::RelayAgent_entry_waits_(agent).size() != 1)
-        {
-            throw std::runtime_error("Expected one pending entry lookup");
-        }
-        return test_access::RelayAgent_entry_waits_(agent).begin()->second->deadline;
-    }
-
-    static void verify_released(const RelayAgent &agent)
-    {
-        if (!test_access::RelayAgent_entry_waits_(agent).empty() || test_access::RelayAgent_connections_(agent).size() != 0)
-        {
-            throw std::runtime_error("Cancelled entry lookup retained its wait or connection");
-        }
-    }
-};
-
 struct AgentSessionTestAccess
 {
     static std::shared_ptr<AgentSession> producer(Forwarder &owner, std::uint16_t target_port,
@@ -60,9 +26,7 @@ struct AgentSessionTestAccess
         auto session = std::make_shared<AgentSession>(owner, 7, ServiceKey{"drain-test", RelayProtocol::Tcp},
                                                      std::string{}, std::chrono::steady_clock::now() + std::chrono::seconds(2));
         test_access::AgentSession_target(*session) = AgentServiceConfig{"drain-test", "127.0.0.1", target_port};
-        test_access::AgentSession_selection(*session).server.id = "test-node";
-        test_access::AgentSession_selection(*session).server.host = "127.0.0.1";
-        test_access::AgentSession_endpoint(*session) = njson{{"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
+        test_access::AgentSession_endpoint(*session) = njson{{"data_address", "127.0.0.1"}, {"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
                                  {"flow_id", std::uint64_t{3}}, {"data_port", entry_port}};
         return session;
     }
@@ -176,12 +140,14 @@ using namespace std::chrono_literals;
 enum class End
 {
     Normal,
+    LateNodeClose,
     Reset,
     Cancel,
     CancelEmpty,
 };
 
-asio::awaitable<void> exchange(AgentSession &session, tcp::acceptor &target, tcp::acceptor &entry, End end)
+asio::awaitable<void> exchange(AgentSession &session, tcp::acceptor &target, tcp::acceptor &entry, End end,
+                               const bool &session_finished)
 {
     auto application = co_await target.async_accept(asio::cancel_after(1s, asio::use_awaitable));
     auto node = co_await entry.async_accept(asio::cancel_after(1s, asio::use_awaitable));
@@ -194,11 +160,14 @@ asio::awaitable<void> exchange(AgentSession &session, tcp::acceptor &target, tcp
     }
     AgentSessionTestAccess::ready(session);
 
-    if (end == End::Normal)
+    if (end == End::Normal || end == End::LateNodeClose)
     {
         const std::array<std::uint8_t, 3> payload{1, 2, 3};
         co_await asio::async_write(node, asio::buffer(payload), asio::use_awaitable);
-        AgentSessionTestAccess::closed(session);
+        if (end == End::Normal)
+        {
+            AgentSessionTestAccess::closed(session);
+        }
         node.shutdown(tcp::socket::shutdown_send);
         std::array<std::uint8_t, 3> received;
         co_await asio::async_read(application, asio::buffer(received), asio::cancel_after(1s, asio::use_awaitable));
@@ -214,6 +183,27 @@ asio::awaitable<void> exchange(AgentSession &session, tcp::acceptor &target, tcp
             throw std::runtime_error("Node FIN did not finish the local direction");
         }
         application.shutdown(tcp::socket::shutdown_send);
+        if (end == End::LateNodeClose)
+        {
+            const auto [node_error, node_size] = co_await node.async_read_some(
+                asio::buffer(byte), asio::cancel_after(1s, use_nothrow_awaitable));
+            if (node_error != asio::error::eof)
+            {
+                throw std::runtime_error("Local FIN did not reach the Node");
+            }
+            asio::steady_timer observe(co_await asio::this_coro::executor, 20ms);
+            co_await observe.async_wait(asio::use_awaitable);
+            if (!session_finished)
+            {
+                throw std::runtime_error("Completed data transfer waited for an unnecessary control notification");
+            }
+            AgentSessionTestAccess::closed(session);
+        }
+    }
+    else if (end == End::CancelEmpty)
+    {
+        session.cancel("");
+        AgentSessionTestAccess::closed(session);
     }
     else
     {
@@ -225,7 +215,7 @@ asio::awaitable<void> exchange(AgentSession &session, tcp::acceptor &target, tcp
         }
         else
         {
-            session.cancel(end == End::CancelEmpty ? "" : "test stop");
+            session.cancel("test stop");
         }
     }
 }
@@ -234,7 +224,7 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
                                asio::ssl::context &ssl, End end)
 {
     auto agent = std::make_shared<RelayAgent>(control, transfer, ssl, AgentConfig{});
-    auto owner = std::make_shared<Forwarder>(*agent, transfer.get_executor(), ssl, std::nullopt,
+    auto owner = std::make_unique<Forwarder>(*agent, transfer.get_executor(), ssl, std::nullopt,
                                             1s, 1s, 2s, std::vector<AgentServiceConfig>{},
                                             std::vector<AgentForwardConfig>{});
     owner->start();
@@ -246,8 +236,13 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
     tcp::acceptor target(transfer, {asio::ip::address_v4::loopback(), 0});
     tcp::acceptor entry(transfer, {asio::ip::address_v4::loopback(), 0});
     auto session = AgentSessionTestAccess::producer(*owner, target.local_endpoint().port(), entry.local_endpoint().port());
-    co_await await_transfers(session->run(), exchange(*session, target, entry, end));
-    if (end != End::Normal)
+    bool session_finished = false;
+    const auto run_session = [&]() -> asio::awaitable<void> {
+        co_await session->run();
+        session_finished = true;
+    };
+    co_await await_transfers(run_session(), exchange(*session, target, entry, end, session_finished));
+    if (end != End::Normal && end != End::LateNodeClose)
     {
         session->cancel("late cancellation");
     }
@@ -256,71 +251,6 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
     co_await owner->async_stop();
 }
 
-asio::awaitable<void> exercise_entry_wait(asio::io_context &control, asio::io_context &transfer,
-                                         asio::ssl::context &ssl, bool stop_agent)
-{
-    tcp::acceptor reserve(transfer, {asio::ip::address_v4::loopback(), 0});
-    const auto forward_port = reserve.local_endpoint().port();
-    reserve.close();
-    tcp::acceptor entry(control, {asio::ip::address_v4::loopback(), 0});
-    AgentConfig config;
-    config.connect_timeout = 4s;
-    config.channel.handshake_timeout = 4s;
-    config.relay_open_timeout = 2s;
-    config.forwards.push_back({"entry-wait", "127.0.0.1", forward_port, RelayProtocol::Tcp});
-    auto agent = std::make_shared<RelayAgent>(control, transfer, ssl, std::move(config));
-    auto owner = RelayAgentTestAccess::prepare(*agent, entry.local_endpoint().port());
-    tcp::socket application(transfer);
-    co_await asio::co_spawn(
-        transfer,
-        [owner, &application, forward_port]() -> asio::awaitable<void> {
-            owner->start();
-            owner->set_service(ServiceKey{"entry-wait", RelayProtocol::Tcp}, "pending-node");
-            co_await application.async_connect({asio::ip::address_v4::loopback(), forward_port}, asio::use_awaitable);
-        },
-        asio::use_awaitable);
-
-    // Accept TCP but leave the control TLS handshake pending throughout the lookup.
-    auto peer = co_await entry.async_accept(asio::cancel_after(2s, asio::use_awaitable));
-    const auto deadline = RelayAgentTestAccess::pending_deadline(*agent);
-    if (stop_agent)
-    {
-        co_await agent->async_stop();
-        if (std::chrono::steady_clock::now() >= deadline)
-        {
-            throw std::runtime_error("Agent shutdown waited for the entry lookup deadline");
-        }
-    }
-    else
-    {
-        co_await asio::co_spawn(
-            transfer,
-            [owner, &application]() -> asio::awaitable<void> {
-                owner->clear_service(ServiceKey{"entry-wait", RelayProtocol::Tcp});
-                std::array<std::uint8_t, 1> byte;
-                const auto [error, size] = co_await application.async_read_some(
-                    asio::buffer(byte), asio::cancel_after(1s, use_nothrow_awaitable));
-                if (error != asio::error::eof)
-                {
-                    throw std::runtime_error("Local cancellation did not close the application socket");
-                }
-            },
-            asio::use_awaitable);
-        asio::steady_timer observe(control, 50ms);
-        co_await observe.async_wait(asio::use_awaitable);
-        if (RelayAgentTestAccess::pending_deadline(*agent) != deadline)
-        {
-            throw std::runtime_error("Local cancellation reset the entry lookup deadline");
-        }
-        co_await asio::co_spawn(transfer, owner->async_stop(), asio::use_awaitable);
-        if (std::chrono::steady_clock::now() < deadline)
-        {
-            throw std::runtime_error("Local cancellation interrupted the independent entry lookup");
-        }
-        co_await agent->async_stop();
-    }
-    RelayAgentTestAccess::verify_released(*agent);
-}
 } // namespace
 
 int main()
@@ -328,7 +258,7 @@ int main()
     try
     {
         asio::ssl::context ssl(asio::ssl::context::tls_client);
-        for (const auto end : {End::Normal, End::Reset, End::Cancel, End::CancelEmpty})
+        for (const auto end : {End::Normal, End::LateNodeClose, End::Reset, End::Cancel, End::CancelEmpty})
         {
             asio::io_context control(1);
             asio::io_context transfer(1);
@@ -336,29 +266,9 @@ int main()
             transfer.run();
             result.get();
         }
-        for (const bool stop_agent : {false, true})
-        {
-            asio::io_context control(1);
-            asio::io_context transfer(1);
-            auto result = asio::co_spawn(control, exercise_entry_wait(control, transfer, ssl, stop_agent), asio::use_future);
-            const auto deadline = std::chrono::steady_clock::now() + 5s;
-            while (result.wait_for(0ms) != std::future_status::ready)
-            {
-                if (std::chrono::steady_clock::now() >= deadline)
-                {
-                    throw std::runtime_error("Entry cancellation regression did not finish");
-                }
-                control.restart();
-                control.run_for(5ms);
-                transfer.restart();
-                transfer.poll();
-            }
-            result.get();
-        }
         std::cout << "[PASS] Node completion retains local drain success, failure and first cancellation cause\n";
         std::cout << "[PASS] Invalid terminal metadata preserves state and permits a later valid notification\n";
         std::cout << "[PASS] Establishment deadline preserves the original attachment failure\n";
-        std::cout << "[PASS] Entry waits retain their deadline after local cancellation and wake on Agent shutdown\n";
         return 0;
     }
     catch (const std::exception &error)

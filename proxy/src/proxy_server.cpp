@@ -15,11 +15,10 @@ namespace
 {
 using tcp = asio::ip::tcp;
 
-enum class SessionProtocol
+const char *proxy_protocol_name(ProxyProtocol protocol)
 {
-    Http,
-    Socks5,
-};
+    return protocol == ProxyProtocol::Http ? "http" : "socks5";
+}
 
 struct HttpFailure : std::runtime_error
 {
@@ -191,9 +190,17 @@ ParsedHttpRequest parse_http_request(std::string_view header)
     {
         throw HttpFailure(400, "unsupported HTTP request line");
     }
+    if (target.find('#') != std::string_view::npos ||
+        std::ranges::any_of(target, [](unsigned char ch) { return ch <= 0x20 || ch == 0x7f; }))
+    {
+        throw HttpFailure(400, "invalid HTTP request target");
+    }
 
     std::vector<std::pair<std::string_view, std::string_view>> headers;
+    std::vector<std::string_view> connection_options;
     std::optional<std::string_view> host_header;
+    std::optional<std::uint64_t> content_length;
+    bool transfer_encoding = false;
     std::size_t cursor = request_end + 2;
     while (cursor < header.size())
     {
@@ -231,12 +238,50 @@ ParsedHttpRequest parse_http_request(std::string_view header)
             }
             host_header = value;
         }
+        else if (ascii_iequal(name, "Content-Length"))
+        {
+            std::uint64_t length = 0;
+            const auto [end, error] = std::from_chars(value.data(), value.data() + value.size(), length);
+            if (error != std::errc{} || end != value.data() + value.size() ||
+                (content_length && *content_length != length))
+            {
+                throw HttpFailure(400, "invalid or conflicting Content-Length");
+            }
+            content_length = length;
+        }
+        else if (ascii_iequal(name, "Transfer-Encoding"))
+        {
+            transfer_encoding = true;
+        }
+        else if (ascii_iequal(name, "Connection"))
+        {
+            auto remaining = value;
+            while (!remaining.empty())
+            {
+                const auto comma = remaining.find(',');
+                const auto option = trim_ows(remaining.substr(0, comma));
+                if (ascii_iequal(option, "Content-Length") || ascii_iequal(option, "Transfer-Encoding"))
+                {
+                    throw HttpFailure(400, "Connection cannot remove HTTP body framing");
+                }
+                connection_options.push_back(option);
+                if (comma == std::string_view::npos)
+                {
+                    break;
+                }
+                remaining.remove_prefix(comma + 1);
+            }
+        }
         headers.emplace_back(name, value);
         cursor = line_end + 2;
     }
     if (cursor != header.size())
     {
         throw HttpFailure(400, "invalid HTTP header block");
+    }
+    if (content_length && transfer_encoding)
+    {
+        throw HttpFailure(400, "Content-Length and Transfer-Encoding cannot be combined");
     }
 
     ParsedHttpRequest result;
@@ -250,32 +295,20 @@ ParsedHttpRequest parse_http_request(std::string_view header)
     else if (ascii_istarts_with(target, "http://"))
     {
         auto remainder = target.substr(7);
-        const auto delimiter = remainder.find_first_of("/?#");
+        const auto delimiter = remainder.find_first_of("/?");
         const auto authority = remainder.substr(0, delimiter);
         result.authority = parse_authority(authority, 80);
         if (delimiter == std::string_view::npos)
         {
             outbound_target = "/";
         }
-        else if (remainder[delimiter] == '#')
-        {
-            throw HttpFailure(400, "HTTP request target must not contain a fragment");
-        }
         else if (remainder[delimiter] == '?')
         {
             outbound_target = "/" + std::string(remainder.substr(delimiter));
-            if (outbound_target.find('#') != std::string::npos)
-            {
-                throw HttpFailure(400, "HTTP request target must not contain a fragment");
-            }
         }
         else
         {
             outbound_target = std::string(remainder.substr(delimiter));
-            if (outbound_target.find('#') != std::string::npos)
-            {
-                throw HttpFailure(400, "HTTP request target must not contain a fragment");
-            }
         }
     }
     else
@@ -290,31 +323,6 @@ ParsedHttpRequest parse_http_request(std::string_view header)
 
     if (!result.connect)
     {
-        const auto named_by_connection = [&headers](std::string_view candidate) {
-            for (const auto &[name, value] : headers)
-            {
-                if (!ascii_iequal(name, "Connection"))
-                {
-                    continue;
-                }
-                auto remaining = value;
-                while (!remaining.empty())
-                {
-                    const auto comma = remaining.find(',');
-                    if (ascii_iequal(trim_ows(remaining.substr(0, comma)), candidate))
-                    {
-                        return true;
-                    }
-                    if (comma == std::string_view::npos)
-                    {
-                        break;
-                    }
-                    remaining.remove_prefix(comma + 1);
-                }
-            }
-            return false;
-        };
-
         result.outbound_header.reserve(header.size() + 32);
         result.outbound_header = result.method + " " + outbound_target + " " + std::string(version) + "\r\n";
         result.outbound_header += "Host: " + result.authority.header + "\r\n";
@@ -322,7 +330,7 @@ ParsedHttpRequest parse_http_request(std::string_view header)
         {
             if (ascii_iequal(name, "Host") || ascii_iequal(name, "Connection") ||
                 ascii_iequal(name, "Proxy-Connection") || ascii_iequal(name, "Proxy-Authorization") ||
-                named_by_connection(name))
+                std::ranges::any_of(connection_options, [name](auto option) { return ascii_iequal(name, option); }))
             {
                 continue;
             }
@@ -378,7 +386,7 @@ std::uint8_t socks_reply_for(const asio::error_code &error)
 class ProxySession
 {
   public:
-    ProxySession(tcp::socket client, SessionProtocol protocol, const ProxyConfig &config)
+    ProxySession(tcp::socket client, ProxyProtocol protocol, const ProxyConfig &config)
         : client_(std::move(client)), upstream_(client_.get_executor()), resolver_(client_.get_executor()),
           protocol_(protocol), config_(config), peer_(socket_peer(client_))
     {
@@ -386,7 +394,7 @@ class ProxySession
 
     asio::awaitable<void> run()
     {
-        return protocol_ == SessionProtocol::Http ? run_http() : run_socks5();
+        return protocol_ == ProxyProtocol::Http ? run_http() : run_socks5();
     }
 
     const std::string &peer() const noexcept
@@ -396,7 +404,7 @@ class ProxySession
 
     const char *protocol_name() const noexcept
     {
-        return protocol_ == SessionProtocol::Http ? "http" : "socks5";
+        return proxy_protocol_name(protocol_);
     }
 
     void cancel() noexcept
@@ -408,12 +416,39 @@ class ProxySession
     }
 
   private:
-    asio::awaitable<void> connect_upstream(const std::string &host, std::uint16_t port)
+    asio::awaitable<asio::error_code> connect_upstream(const std::string &host, std::uint16_t port)
     {
-        auto endpoints = co_await resolver_.async_resolve(
-            host, std::to_string(port), asio::cancel_after(config_.connect_timeout, asio::use_awaitable));
-        co_await asio::async_connect(upstream_, endpoints,
-                                     asio::cancel_after(config_.connect_timeout, asio::use_awaitable));
+        if (!client_.is_open())
+        {
+            co_return asio::error::operation_aborted;
+        }
+        auto [error, endpoints] = co_await resolver_.async_resolve(
+            host, std::to_string(port), asio::cancel_after(config_.connect_timeout, use_nothrow_awaitable));
+        if (!client_.is_open())
+        {
+            co_return asio::error::operation_aborted;
+        }
+        if (!error)
+        {
+            const auto [connect_error, endpoint] = co_await asio::async_connect(
+                upstream_, endpoints, asio::cancel_after(config_.connect_timeout, use_nothrow_awaitable));
+            error = connect_error;
+            if (!client_.is_open())
+            {
+                co_return asio::error::operation_aborted;
+            }
+        }
+        // Only cancel_after cancels I/O while the client is still open; cancel() closes it.
+        if (error == asio::error::operation_aborted)
+        {
+            error = asio::error::timed_out;
+        }
+        if (error)
+        {
+            PROXY_ERROR_PRINT("Proxy connect failed %s -> %s:%u reason=%s", protocol_name(), host.c_str(),
+                              static_cast<unsigned int>(port), error.message().c_str());
+        }
+        co_return error;
     }
 
     asio::awaitable<void> send_http_error(unsigned int status)
@@ -421,46 +456,36 @@ class ProxySession
         const auto reason = http_reason(status);
         const auto response =
             "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
-        auto [error, _] = co_await asio::async_write(
-            client_, asio::buffer(response),
-            asio::cancel_after(config_.handshake_timeout, asio::as_tuple(asio::use_awaitable)));
-        static_cast<void>(error);
+        co_await asio::async_write(client_, asio::buffer(response),
+                                   asio::cancel_after(config_.handshake_timeout, use_nothrow_awaitable));
     }
 
     asio::awaitable<void> run_http()
     {
         std::string input;
         input.reserve(std::min<std::size_t>(config_.http.max_header_bytes, 4096));
-        std::size_t header_size = 0;
-        unsigned int failure_status = 0;
-        try
+        const auto [read_error, header_size] = co_await asio::async_read_until(
+            client_, asio::dynamic_buffer(input, config_.http.max_header_bytes), "\r\n\r\n",
+            asio::cancel_after(config_.handshake_timeout, use_nothrow_awaitable));
+        if (!client_.is_open())
         {
-            header_size = co_await asio::async_read_until(
-                client_, asio::dynamic_buffer(input, config_.http.max_header_bytes), "\r\n\r\n",
-                asio::cancel_after(config_.handshake_timeout, asio::use_awaitable));
-        }
-        catch (const asio::system_error &exception)
-        {
-            if (exception.code() == asio::error::not_found)
-            {
-                failure_status = 431;
-            }
-            else if (exception.code() == asio::error::timed_out)
-            {
-                failure_status = 408;
-            }
-        }
-        if (failure_status != 0)
-        {
-            co_await send_http_error(failure_status);
             co_return;
         }
-        if (header_size == 0)
+        if (read_error)
         {
+            if (read_error == asio::error::not_found)
+            {
+                co_await send_http_error(431);
+            }
+            else if (read_error == asio::error::operation_aborted || read_error == asio::error::timed_out)
+            {
+                co_await send_http_error(408);
+            }
             co_return;
         }
 
         ParsedHttpRequest request;
+        unsigned int failure_status = 0;
         try
         {
             request = parse_http_request(std::string_view(input).substr(0, header_size));
@@ -476,20 +501,12 @@ class ProxySession
             co_return;
         }
 
-        asio::error_code connect_error;
-        try
+        if (const auto error = co_await connect_upstream(request.authority.host, request.authority.port); error)
         {
-            co_await connect_upstream(request.authority.host, request.authority.port);
-        }
-        catch (const asio::system_error &exception)
-        {
-            PROXY_ERROR_PRINT("Proxy connect failed http -> %s:%u reason=%s", request.authority.host.c_str(),
-                              static_cast<unsigned int>(request.authority.port), exception.what());
-            connect_error = exception.code();
-        }
-        if (connect_error)
-        {
-            co_await send_http_error(connect_error == asio::error::timed_out ? 504 : 502);
+            if (error != asio::error::operation_aborted)
+            {
+                co_await send_http_error(error == asio::error::timed_out ? 504 : 502);
+            }
             co_return;
         }
 
@@ -517,7 +534,7 @@ class ProxySession
         co_await relay_tcp(client_, upstream_);
     }
 
-    template <std::size_t N> asio::awaitable<void> read_socks(std::array<std::uint8_t, N> &buffer)
+    template <class Buffer> asio::awaitable<void> read_socks(Buffer &buffer)
     {
         co_await asio::async_read(client_, asio::buffer(buffer),
                                   asio::cancel_after(config_.handshake_timeout, asio::use_awaitable));
@@ -560,8 +577,7 @@ class ProxySession
             co_return;
         }
         std::vector<std::uint8_t> methods(greeting[1]);
-        co_await asio::async_read(client_, asio::buffer(methods),
-                                  asio::cancel_after(config_.handshake_timeout, asio::use_awaitable));
+        co_await read_socks(methods);
         if (std::ranges::find(methods, std::uint8_t{0x00}) == methods.end())
         {
             constexpr std::array<std::uint8_t, 2> rejected{0x05, 0xff};
@@ -606,8 +622,7 @@ class ProxySession
                 co_return;
             }
             std::vector<std::uint8_t> name(length[0]);
-            co_await asio::async_read(client_, asio::buffer(name),
-                                      asio::cancel_after(config_.handshake_timeout, asio::use_awaitable));
+            co_await read_socks(name);
             if (std::ranges::any_of(name, [](std::uint8_t ch) { return ch <= 0x20 || ch >= 0x7f; }))
             {
                 co_await send_socks_reply(0x08);
@@ -630,20 +645,12 @@ class ProxySession
             co_return;
         }
 
-        asio::error_code connect_error;
-        try
+        if (const auto error = co_await connect_upstream(host, port); error)
         {
-            co_await connect_upstream(host, port);
-        }
-        catch (const asio::system_error &exception)
-        {
-            PROXY_ERROR_PRINT("Proxy connect failed socks5 -> %s:%u reason=%s", host.c_str(),
-                              static_cast<unsigned int>(port), exception.what());
-            connect_error = exception.code();
-        }
-        if (connect_error)
-        {
-            co_await send_socks_reply(socks_reply_for(connect_error));
+            if (error != asio::error::operation_aborted)
+            {
+                co_await send_socks_reply(socks_reply_for(error));
+            }
             co_return;
         }
 
@@ -660,7 +667,7 @@ class ProxySession
     tcp::socket client_;
     tcp::socket upstream_;
     tcp::resolver resolver_;
-    SessionProtocol protocol_;
+    ProxyProtocol protocol_;
     const ProxyConfig &config_;
     std::string peer_;
 };
@@ -752,22 +759,17 @@ void ProxyServer::start()
                      static_cast<unsigned int>(config_.socks5.port));
     PROXY_INFO_PRINT("Proxy listening http %s:%u", config_.http.address.c_str(),
                      static_cast<unsigned int>(config_.http.port));
-    asio::co_spawn(executor_, accept_loop(socks5_acceptor_, ListenerProtocol::Socks5),
-                   [self = shared_from_this()](std::exception_ptr failure) {
-                       if (failure && self->running_)
-                       {
-                           PROXY_ERROR_PRINT("Proxy accept stopped socks5 reason=%s",
-                                             exception_description(failure).c_str());
-                       }
-                   });
-    asio::co_spawn(executor_, accept_loop(http_acceptor_, ListenerProtocol::Http),
-                   [self = shared_from_this()](std::exception_ptr failure) {
-                       if (failure && self->running_)
-                       {
-                           PROXY_ERROR_PRINT("Proxy accept stopped http reason=%s",
-                                             exception_description(failure).c_str());
-                       }
-                   });
+    for (const auto protocol : {ProxyProtocol::Socks5, ProxyProtocol::Http})
+    {
+        auto &acceptor = protocol == ProxyProtocol::Http ? http_acceptor_ : socks5_acceptor_;
+        asio::co_spawn(executor_, accept_loop(acceptor, protocol), [protocol](std::exception_ptr failure) {
+            if (failure)
+            {
+                PROXY_ERROR_PRINT("Proxy accept stopped %s reason=%s", proxy_protocol_name(protocol),
+                                  exception_description(failure).c_str());
+            }
+        });
+    }
 }
 
 void ProxyServer::stop()
@@ -787,36 +789,31 @@ void ProxyServer::stop()
     PROXY_INFO_PRINT("Proxy stopping");
 }
 
-asio::awaitable<void> ProxyServer::accept_loop(tcp::acceptor &acceptor, ListenerProtocol protocol)
+asio::awaitable<void> ProxyServer::accept_loop(tcp::acceptor &acceptor, ProxyProtocol protocol)
 {
     while (running_)
     {
         auto [error, socket] = co_await acceptor.async_accept(asio::as_tuple(asio::use_awaitable));
+        if (!running_)
+        {
+            co_return;
+        }
         if (error)
         {
-            if (!running_ || error == asio::error::operation_aborted)
-            {
-                co_return;
-            }
-            PROXY_ERROR_PRINT("Proxy accept failed %s reason=%s",
-                              protocol == ListenerProtocol::Http ? "http" : "socks5", error.message().c_str());
+            PROXY_ERROR_PRINT("Proxy accept failed %s reason=%s", proxy_protocol_name(protocol),
+                              error.message().c_str());
             continue;
         }
         if (sessions_.size() >= config_.max_connections)
         {
             PROXY_ERROR_PRINT("Proxy rejected active=%zu limit=%zu", sessions_.size(), config_.max_connections);
-            asio::error_code ignored;
-            socket.close(ignored);
             continue;
         }
 
-        const auto session_protocol =
-            protocol == ListenerProtocol::Http ? SessionProtocol::Http : SessionProtocol::Socks5;
-        auto session = std::make_shared<ProxySession>(std::move(socket), session_protocol, config_);
+        auto session = std::make_shared<ProxySession>(std::move(socket), protocol, config_);
         sessions_.insert(session);
-        asio::co_spawn(executor_, session->run(), [self = shared_from_this(), session](std::exception_ptr failure) {
-            self->session_finished(session, failure);
-        });
+        asio::co_spawn(executor_, session->run(),
+                       [this, session](std::exception_ptr failure) { session_finished(session, failure); });
     }
 }
 

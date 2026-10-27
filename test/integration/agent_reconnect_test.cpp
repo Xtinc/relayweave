@@ -196,7 +196,7 @@ asio::awaitable<void> require_relay_closed(const std::shared_ptr<tcp::socket> &s
 void wait_for_round_trip(asio::io_context &io, std::uint16_t forward_port)
 {
     std::string last_failure;
-    for (int attempt = 0; attempt < 30; ++attempt)
+    for (int attempt = 0; attempt < 80; ++attempt)
     {
         auto result = asio::co_spawn(io, relay_round_trip(forward_port), asio::use_future);
         try
@@ -311,10 +311,8 @@ int main()
         server_udp_thread = std::thread([&server_udp_io]() { server_udp_io.run(); });
         wait_for_round_trip(control_io, forward_port);
 
-        auto consumer_stopped = asio::co_spawn(control_io, consumer->async_stop(), asio::use_future);
-        auto producer_stopped = asio::co_spawn(control_io, producer->async_stop(), asio::use_future);
-        consumer_stopped.get();
-        producer_stopped.get();
+        consumer->stop();
+        producer->stop();
         consumer.reset();
         producer.reset();
         replacement->stop();

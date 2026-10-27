@@ -1,4 +1,4 @@
-#include "lnk_channel.h"
+#include "flow_test_io.h"
 #include <future>
 #include <iostream>
 using namespace std::chrono_literals;
@@ -16,36 +16,10 @@ asio::awaitable<void> pause_channel(std::chrono::milliseconds duration)
     co_await timer.async_wait(asio::use_awaitable);
 }
 
-void check_cancelled_submission(bool borrowed)
-{
-    asio::io_context caller(1), data(1);
-    auto channel = std::make_shared<LnkChannel>(data.get_executor(), caller.get_executor(), "a", "127.0.0.1", 0,
-                                               "127.0.0.1", 0);
-    asio::cancellation_signal cancellation;
-    auto submit = [&]() -> asio::awaitable<FlowSendStatus> {
-        FlowFrame frame{7, 999, false, LnkFrType::Data, {1, 2, 3}};
-        const auto status = borrowed ? co_await channel->async_send_flow_data(7, 999, false, frame.payload)
-                                     : co_await channel->async_send_flow(std::move(frame));
-        const auto state = co_await asio::this_coro::cancellation_state;
-        check_channel(state.cancelled() != asio::cancellation_type::none, "submission lost caller cancellation");
-        co_return status;
-    };
-    auto result = asio::co_spawn(caller, submit(),
-                                 asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
-    caller.poll(); // Dispatch submission while the data executor is still paused.
-    cancellation.emit(asio::cancellation_type::all);
-    data.run();
-    caller.run();
-    check_channel(result.get() == FlowSendStatus::Closed, "cancelled submission lost its enqueue result");
-    check_channel(caller.stopped() && data.stopped(), "submission retained executor work");
-}
-
 int main()
 {
     try
     {
-        check_cancelled_submission(false);
-        check_cancelled_submission(true);
         asio::io_context io(1);
         auto guard = asio::make_work_guard(io);
         asio::io_context submit_io(1);
@@ -56,11 +30,11 @@ int main()
         asio::ip::udp::socket udp_probe(io, {asio::ip::address_v4::loopback(), 0});
         auto up = udp_probe.local_endpoint().port();
         udp_probe.close();
-        auto a = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "a", "127.0.0.1", tp, "127.0.0.1", up);
-        auto b = std::make_shared<LnkChannel>(io.get_executor(), io.get_executor(), "b", "127.0.0.2", tp, "127.0.0.2", up);
+        auto a = std::make_shared<FlowProtocol>(io.get_executor(), io.get_executor(), "a", "127.0.0.1", tp, "127.0.0.1", up);
+        auto b = std::make_shared<FlowProtocol>(io.get_executor(), io.get_executor(), "b", "127.0.0.2", tp, "127.0.0.2", up);
         std::vector<CtrlMessage> events;
-        std::future<FlowFrame> stopped_receiver;
-        FlowFrame retained_frame;
+        std::future<std::optional<BytesBuf>> stopped_receiver;
+        std::optional<BytesBuf> retained_payload;
         auto link_ready = [&] {
             const auto ready = std::ranges::count_if(events, [](const auto &message) {
                 return message.type() == CtrlCommand::LinkReady && message.params->at("id") == 101;
@@ -71,8 +45,8 @@ int main()
             });
             return ready == 2 && !failed;
         };
-        a->start();
-        b->start();
+        a->links().start();
+        b->links().start();
         a->activate();
         a->activate(); // Repeated activation must preserve a single set of data tasks.
         b->activate();
@@ -89,23 +63,15 @@ int main()
         };
         auto install = [&](std::uint64_t id) {
             auto p = params(id, 10000);
-            a->prepare_flow(p);
-            b->prepare_flow(p);
+            test_flow::prepare(a, p);
+            test_flow::prepare(b, p);
             a->commit_flow(id);
             b->commit_flow(id);
         };
-        auto submit = [&](FlowFrame frame) -> asio::awaitable<FlowSendStatus> {
+        auto submit = [&](BytesBuf payload) -> asio::awaitable<void> {
             check_channel(submit_io.get_executor().running_in_this_thread(), "wrong submission executor");
-            const auto status = co_await a->async_send_flow(std::move(frame));
+            check_channel(co_await test_flow::send_data(a, 7, 202, false, std::move(payload)), "stream send failed");
             check_channel(submit_io.get_executor().running_in_this_thread(), "send resumed on the data executor");
-            co_return status;
-        };
-        auto submit_data = [&](std::uint64_t epoch, std::uint64_t id, bool reverse,
-                               std::span<const std::uint8_t> payload) -> asio::awaitable<FlowSendStatus> {
-            check_channel(submit_io.get_executor().running_in_this_thread(), "wrong borrowed submission executor");
-            const auto status = co_await a->async_send_flow_data(epoch, id, reverse, payload);
-            check_channel(submit_io.get_executor().running_in_this_thread(), "borrowed send resumed on the data executor");
-            co_return status;
         };
         auto scenario = [&]() -> asio::awaitable<void> {
             njson link{{"epoch", std::uint64_t(7)},
@@ -118,20 +84,20 @@ int main()
                        {"token", "test-credential"},
                        {"peer", "b"},
                        {"peer_address", "127.0.0.2"}};
-            a->prepare(link);
+            test_flow::prepare_link(a, link);
             link["peer"] = "a";
             link["peer_address"] = "127.0.0.1";
-            b->prepare(link);
-            a->connect(101);
-            b->connect(101);
+            test_flow::prepare_link(b, link);
+            a->links().connect(101);
+            b->links().connect(101);
             for (int i = 0; i < 200 && !link_ready(); ++i)
             {
                 co_await pause_channel(5ms);
             }
             check_channel(link_ready(), "standalone NodeLink not Ready");
             auto p = params(201, 1);
-            a->prepare_flow(p);
-            b->prepare_flow(p);
+            test_flow::prepare(a, p);
+            test_flow::prepare(b, p);
             co_await pause_channel(150ms);
             check_channel(std::ranges::count_if(events,
                                                [](const auto &message) {
@@ -142,181 +108,149 @@ int main()
                           "short preparation deadline did not wake the heartbeat monitor");
             a->commit_flow(201);
             b->commit_flow(201);
-            check_channel(a->send_flow({7, 201, false, LnkFrType::Data, {1}, {}}) == FlowSendStatus::Closed,
+            check_channel(co_await test_flow::throws<std::runtime_error>(test_flow::port(a, 7, 201, false)),
                           "expired preparation revived");
-            a->prepare_flow(p);
+            test_flow::prepare(a, p);
             co_await pause_channel(5ms);
             check_channel(events.back().type() == CtrlCommand::FlowError, "retired prepare not rejected");
             install(202);
-            check_channel(a->send_flow({7, 202, true, LnkFrType::Data, {99}, {}}) == FlowSendStatus::Invalid,
+            check_channel(co_await test_flow::throws<std::invalid_argument>(test_flow::port(a, 7, 202, true)),
                           "wrong injection direction accepted");
-            check_channel(a->send_flow({7, 999, false, LnkFrType::Data, {98}, {}}) == FlowSendStatus::Closed,
+            check_channel(co_await test_flow::throws<std::runtime_error>(test_flow::port(a, 7, 999, false)),
                           "unknown flow accepted");
-            check_channel(a->send_flow({8, 202, false, LnkFrType::Data, {97}, {}}) == FlowSendStatus::Closed,
+            check_channel(co_await test_flow::throws<std::runtime_error>(test_flow::port(a, 8, 202, false)),
                           "stale epoch accepted");
-            for (auto frame : {FlowFrame{7, 202, false, LnkFrType::Data,
-                                         BytesBuf(LnkFrameHeader::maximum_payload + 1), {}},
-                               FlowFrame{7, 202, false, LnkFrType::Data, {1}, "invalid reason"},
-                               FlowFrame{7, 202, false, LnkFrType::Fin, {1}, {}},
-                               FlowFrame{7, 202, false, LnkFrType::Reset, {}, std::string(513, 'x')},
-                               FlowFrame{7, 202, false, LnkFrType::Ping, {}, {}}})
-            {
-                auto result = co_await a->async_send_flow(std::move(frame));
-                check_channel(result == FlowSendStatus::Invalid, "local format validation admitted invalid data");
-            }
             const BytesBuf oversized(LnkFrameHeader::maximum_payload + 1, 0xff);
-            check_channel(co_await a->async_send_flow_data(7, 202, false, oversized) == FlowSendStatus::Invalid,
-                          "borrowed submission admitted oversized data");
-            check_channel(co_await a->async_send_flow_data(7, 202, true, {}) == FlowSendStatus::Invalid,
-                          "borrowed submission admitted wrong direction");
-            check_channel(co_await a->async_send_flow_data(8, 202, false, {}) == FlowSendStatus::Closed,
-                          "borrowed submission admitted stale epoch");
-            check_channel(co_await a->async_send_flow_data(7, 999, false, {}) == FlowSendStatus::Closed,
-                          "borrowed submission admitted unknown flow");
-            FlowFrame valid{7, 202, false, LnkFrType::Data, {2}, {}};
-            check_channel(co_await a->async_send_flow(std::move(valid)) == FlowSendStatus::Queued,
-                          "valid frame not queued");
+            check_channel(co_await test_flow::throws<std::invalid_argument>(
+                              test_flow::send_data(a, 7, 202, false, oversized)),
+                          "stream admitted oversized data");
+            check_channel(co_await test_flow::send_data(a, 7, 202, false, {2}), "valid data not sent");
             check_channel(io.get_executor().running_in_this_thread(), "same-executor send changed executor");
-            auto f = co_await b->receive_flow(7, 202);
-            check_channel(f.payload == BytesBuf{2}, "wrong incoming identity delivered");
+            auto f = co_await test_flow::receive(b, 7, 202);
+            check_channel(f == BytesBuf{2}, "wrong incoming identity delivered");
             for (auto size : {std::size_t{}, std::size_t{4097}, LnkFrameHeader::maximum_payload})
             {
-                const BytesBuf payload(size, 0xa5);
-                FlowFrame frame{7, 202, false, LnkFrType::Data, payload, {}};
-                const auto status = co_await asio::co_spawn(submit_io, submit(std::move(frame)), asio::use_awaitable);
-                check_channel(status == FlowSendStatus::Queued, "cross-executor frame not queued");
-                f = co_await b->receive_flow(7, 202);
-                check_channel(f.payload == payload, "cross-executor payload changed");
-                BytesBuf borrowed = payload;
-                check_channel(co_await asio::co_spawn(submit_io, submit_data(7, 202, false, borrowed),
-                                                      asio::use_awaitable) == FlowSendStatus::Queued,
-                              "borrowed cross-executor frame not queued");
-                std::ranges::fill(borrowed, 0x5a); // Reuse immediately after submission completes.
-                f = co_await b->receive_flow(7, 202);
-                check_channel(f.payload == payload, "queued frame retained the caller's borrowed buffer");
+                BytesBuf payload(size, 0xa5);
+                const auto expected = payload;
+                co_await asio::co_spawn(submit_io, submit(payload), asio::use_awaitable);
+                std::ranges::fill(payload, 0x5a); // Reuse immediately after submission completes.
+                f = co_await test_flow::receive(b, 7, 202);
+                check_channel(f == expected, "cross-executor send retained or changed the caller's bytes");
             }
-            FlowFrame stale{8, 202, false, LnkFrType::Data};
-            check_channel(co_await asio::co_spawn(submit_io, submit(std::move(stale)), asio::use_awaitable) ==
-                              FlowSendStatus::Closed,
-                          "cross-executor stale epoch accepted");
+            check_channel(co_await asio::co_spawn(submit_io,
+                              test_flow::throws<std::runtime_error>(test_flow::port(a, 8, 202, false)),
+                              asio::use_awaitable), "cross-executor stale epoch accepted");
             a->close_flow(202);
             b->close_flow(202);
-            b->prepare_flow(params(202, 10000));
+            test_flow::prepare(b, params(202, 10000));
             b->commit_flow(202);
-            check_channel(b->send_flow({7, 202, true, LnkFrType::Data, {3}, {}}) == FlowSendStatus::Closed,
+            check_channel(co_await test_flow::throws<std::runtime_error>(test_flow::port(b, 7, 202, true)),
                           "closed flow revived");
             install(203);
-            check_channel(a->send_flow({7, 203, false, LnkFrType::Fin, {}, {}}) == FlowSendStatus::Queued,
+            check_channel(test_flow::try_finish(a, 203, false),
                           "FIN rejected");
-            f = co_await b->receive_flow(7, 203);
-            check_channel(f.kind == LnkFrType::Fin, "FIN lost");
-            check_channel(co_await a->async_send_flow_data(7, 203, false, {}) == FlowSendStatus::Invalid,
-                          "borrowed DATA accepted after FIN");
-            auto reset_receiver = asio::co_spawn(io, b->receive_flow(7, 203), asio::use_future);
-            co_await asio::post(asio::use_awaitable); // Start the receiver before RESET closes the flow.
-            check_channel(a->send_flow({7, 203, false, LnkFrType::Reset, {}, "reset after FIN"}) == FlowSendStatus::Queued,
-                          "RESET after FIN rejected");
+            f = co_await test_flow::receive(b, 7, 203);
+            check_channel(!f, "FIN lost");
+            check_channel(co_await test_flow::throws<std::runtime_error>(test_flow::send_data(a, 7, 203, false, {})),
+                          "DATA accepted after FIN");
+            co_await test_flow::reset(a, 7, 203, false, "reset after FIN");
             co_await pause_channel(20ms);
-            check_channel(reset_receiver.wait_for(0ms) == std::future_status::ready, "RESET did not wake receiver");
-            std::string reset_reason;
-            try
-            {
-                static_cast<void>(reset_receiver.get());
-            }
-            catch (const std::exception &e)
-            {
-                reset_reason = e.what();
-            }
-            check_channel(reset_reason == "reset after FIN", "RESET did not preserve receiver failure reason");
-            check_channel(b->send_flow({7, 203, true, LnkFrType::Data, {4}, {}}) == FlowSendStatus::Closed,
+            // FIN ended the receive loop; RESET must still close the Flow and its reverse direction.
+            check_channel(std::ranges::any_of(events, [](const auto &event) {
+                return event.type() == CtrlCommand::FlowClosed && event.params->at("flow_id") == 203 &&
+                       event.params->at("reason") == "reset after FIN";
+            }), "RESET after FIN did not preserve close reason");
+            check_channel(co_await test_flow::throws<std::runtime_error>(test_flow::port(b, 7, 203, true)),
                           "RESET left reverse direction alive");
 
             // Keep many short responses buffered together, as with a browser opening parallel connections.
-            install(300);
             for (std::uint64_t id = 400; id < 448; ++id)
             {
                 install(id);
-                for (int index = 0; index < 48; ++index)
+                for (std::size_t index = 0; index < test_flow::window_bytes / (8192 + lnk::Frame::buffer_overhead); ++index)
                 {
                     BytesBuf payload(8192, static_cast<std::uint8_t>(id));
                     payload.front() = static_cast<std::uint8_t>(index);
-                    check_channel(a->send_flow({7, id, false, LnkFrType::Data, std::move(payload), {}}) ==
-                                      FlowSendStatus::Queued, "parallel response burst was rejected at sender");
+                    check_channel(test_flow::try_send_data(a, id, false, std::move(payload)), "parallel response burst was rejected at sender");
                 }
-                check_channel(a->send_flow({7, id, false, LnkFrType::Fin, {}, {}}) == FlowSendStatus::Queued,
+                check_channel(test_flow::try_finish(a, id, false),
                               "parallel response FIN was rejected");
-                // The shared FIFO marker proves this response is buffered before submitting the next one.
-                check_channel(a->send_flow({7, 300, false, LnkFrType::Data, {1}, {}}) == FlowSendStatus::Queued,
-                              "parallel response marker was rejected");
-                static_cast<void>(co_await b->receive_flow(7, 300));
             }
             for (std::uint64_t id = 400; id < 448; ++id)
             {
-                for (int index = 0; index < 48; ++index)
+                for (std::size_t index = 0; index < test_flow::window_bytes / (8192 + lnk::Frame::buffer_overhead); ++index)
                 {
-                    auto frame = co_await b->receive_flow(7, id);
+                    auto frame = co_await test_flow::receive(b, 7, id);
                     BytesBuf expected(8192, static_cast<std::uint8_t>(id));
                     expected.front() = static_cast<std::uint8_t>(index);
-                    check_channel(frame.kind == LnkFrType::Data && frame.payload == expected,
+                    check_channel(frame == expected,
                                   "parallel response burst lost or reordered bytes");
                 }
-                check_channel((co_await b->receive_flow(7, id)).kind == LnkFrType::Fin,
+                check_channel(!(co_await test_flow::receive(b, 7, id)),
                               "parallel response burst lost FIN");
-                check_channel(b->send_flow({7, id, true, LnkFrType::Data, {2}, {}}) == FlowSendStatus::Queued &&
-                              b->send_flow({7, id, true, LnkFrType::Fin, {}, {}}) == FlowSendStatus::Queued,
+                check_channel(test_flow::try_send_data(b, id, true, {2}) &&
+                              test_flow::try_finish(b, id, true),
                               "parallel response burst closed the reverse direction");
-                check_channel((co_await a->receive_flow(7, id)).payload == BytesBuf{2} &&
-                              (co_await a->receive_flow(7, id)).kind == LnkFrType::Fin,
+                check_channel((co_await test_flow::receive(a, 7, id)) == BytesBuf{2} &&
+                              !(co_await test_flow::receive(a, 7, id)),
                               "parallel response burst lost reverse data or FIN");
                 a->close_flow(id);
                 b->close_flow(id);
             }
-            a->close_flow(300);
-            b->close_flow(300);
             check_channel(link_ready(), "parallel response bursts closed the shared NodeLink");
 
             install(207);
             install(208);
             for (int i = 0; i < 128; ++i)
             {
-                check_channel(a->send_flow({7, 207, false, LnkFrType::Data, {9}, {}}) == FlowSendStatus::Queued,
-                              "could not fill endpoint receive queue");
+                check_channel(test_flow::try_send_data(a, 207, false, {9}),
+                              "could not buffer DATA at the endpoint");
             }
-            // The marker uses the same TCP FIFO; receiving it proves all preceding frames reached the endpoint.
-            check_channel(a->send_flow({7, 208, false, LnkFrType::Data, {10}, {}}) == FlowSendStatus::Queued,
-                          "full-queue marker rejected");
-            static_cast<void>(co_await b->receive_flow(7, 208));
-            check_channel(a->send_flow({7, 207, false, LnkFrType::Reset, {}, "reset with full receive queue"}) ==
-                              FlowSendStatus::Queued,
-                          "RESET rejected with full endpoint queue");
-            check_channel(a->send_flow({7, 208, false, LnkFrType::Data, {11}, {}}) == FlowSendStatus::Queued,
-                          "RESET marker rejected");
-            static_cast<void>(co_await b->receive_flow(7, 208));
-            co_await pause_channel(5ms);
-            check_channel(std::ranges::count_if(events,
-                                               [](const auto &message) {
-                                                   return message.type() == CtrlCommand::FlowError &&
-                                                          message.params->at("flow_id") == 207 &&
-                                                          message.params->at("reason") == "reset with full receive queue";
-                                               }) == 2,
+            // Another Flow can overtake these frames. Wait for this Flow's actual admission.
+            const auto buffered = test_access::FlowProtocol_flows_(*b).at(207);
+            const auto expected = 128 * lnk::Frame::charge_for_payload(1);
+            const auto receive_deadline = lnk::Clock::now() + 1s;
+            while (buffered->stream->directions[0].received_bytes < expected && lnk::Clock::now() < receive_deadline)
+            {
+                co_await pause_channel(1ms);
+            }
+            check_channel(buffered->stream->directions[0].received_bytes == expected,
+                          "DATA did not reach the endpoint before RESET");
+            co_await test_flow::reset(a, 7, 207, false, "reset with buffered receive queue");
+            check_channel(test_flow::try_send_data(a, 208, false, {11}),
+                          "healthy Flow was rejected after RESET");
+            check_channel((co_await test_flow::receive(b, 7, 208)) == BytesBuf{11},
+                          "healthy Flow lost data after RESET");
+            const auto reset_errors = [&] {
+                return std::ranges::count_if(events, [](const auto &message) {
+                    return message.type() == CtrlCommand::FlowError && message.params->at("flow_id") == 207 &&
+                           message.params->at("reason") == "reset with buffered receive queue";
+                });
+            };
+            const auto reset_deadline = lnk::Clock::now() + 1s;
+            while (reset_errors() < 2 && lnk::Clock::now() < reset_deadline)
+            {
+                co_await pause_channel(1ms);
+            }
+            check_channel(reset_errors() == 2,
                           "endpoint queue capacity replaced RESET reason");
             check_channel(link_ready(), "RESET closed shared NodeLink");
             a->close_flow(208);
             b->close_flow(208);
             install(204);
-            FlowSendStatus full = FlowSendStatus::Queued;
+            bool full = false;
             // No executor yield: fill exactly the transport admission queue before its writer runs.
-            for (int i = 0; i < 260; ++i)
+            for (int i = 0; i < 10000; ++i)
             {
-                full = a->send_flow({7, 204, false, LnkFrType::Data, {5}, {}});
-                if (full != FlowSendStatus::Queued)
+                full = !test_flow::try_send_data(a, 204, false, {5});
+                if (full)
                 {
                     break;
                 }
             }
-            check_channel(full == FlowSendStatus::CapacityExceeded, "bounded admission did not reject the frame");
-            check_channel(a->send_flow({7, 204, false, LnkFrType::Data, {6}, {}}) == FlowSendStatus::Closed,
-                          "capacity exhaustion left flow open for retry");
+            check_channel(full, "bounded admission did not suspend the frame");
+            check_channel(!test_flow::try_send_data(a, 204, false, {6}),
+                          "capacity exhaustion closed the flow");
             check_channel(link_ready(), "flow congestion closed physical NodeLink");
             a->close_flow(204);
             b->close_flow(204);
@@ -325,7 +259,7 @@ int main()
             bool cancelled = false;
             asio::steady_timer received(io);
             received.expires_at(std::chrono::steady_clock::time_point::max());
-            asio::co_spawn(io, b->receive_flow(7, 205), [&](std::exception_ptr error, FlowFrame) {
+            asio::co_spawn(io, test_flow::receive(b, 7, 205), [&](std::exception_ptr error, std::optional<BytesBuf>) {
                 cancelled = bool(error);
                 received.cancel();
             });
@@ -343,25 +277,25 @@ int main()
             check_channel(link_ready(), "control failure closed shared NodeLink");
             a->commit_flow(205);
             b->commit_flow(205);
-            check_channel(a->send_flow({7, 205, false, LnkFrType::Data, {6}, {}}) == FlowSendStatus::Closed,
+            check_channel(co_await test_flow::throws<std::runtime_error>(test_flow::port(a, 7, 205, false)),
                           "invalidated flow revived by commit");
             install(206);
-            check_channel(a->send_flow({7, 206, false, LnkFrType::Data, {7}, {}}) == FlowSendStatus::Queued,
+            check_channel(test_flow::try_send_data(a, 206, false, {7}),
                           "fresh identity failed");
-            f = co_await b->receive_flow(7, 206);
-            check_channel(f.payload == BytesBuf{7}, "fresh identity received old data");
-            retained_frame = std::move(f);
-            check_channel(a->send_flow({7, 206, false, LnkFrType::Data, {8}, {}}) == FlowSendStatus::Queued,
+            f = co_await test_flow::receive(b, 7, 206);
+            check_channel(f == BytesBuf{7}, "fresh identity received old data");
+            retained_payload = std::move(f);
+            check_channel(test_flow::try_send_data(a, 206, false, {8}),
                           "could not queue a pooled frame before shutdown");
             co_await pause_channel(20ms);
-            stopped_receiver = asio::co_spawn(io, a->receive_flow(7, 206), asio::use_future);
+            stopped_receiver = asio::co_spawn(io, test_flow::receive(a, 7, 206), asio::use_future);
         };
-        auto observe = [&](std::shared_ptr<LnkChannel> channel) -> asio::awaitable<void> {
+        auto observe = [&](std::shared_ptr<FlowProtocol> channel) -> asio::awaitable<void> {
             try
             {
                 for (;;)
                 {
-                    events.push_back(co_await channel->receive_event());
+                    events.push_back(co_await test_flow::event(channel));
                 }
             }
             catch (const asio::system_error &e)
@@ -387,8 +321,8 @@ int main()
             failure = std::current_exception();
         }
         auto stop = [&]() -> asio::awaitable<void> {
-            co_await a->stop();
-            co_await b->stop();
+            check_channel(co_await a->stop(), "first data service shutdown failed");
+            check_channel(co_await b->stop(), "second data service shutdown failed");
         };
         asio::co_spawn(io, stop(), asio::use_future).get();
         guard.reset();
@@ -412,12 +346,12 @@ int main()
         }
         check_channel(stopped, "stop did not release the business flow receiver");
         check_channel(io.stopped(), "channel shutdown retained tasks");
-        const std::weak_ptr<LnkChannel> released_a = a;
-        const std::weak_ptr<LnkChannel> released_b = b;
+        const std::weak_ptr<FlowProtocol> released_a = a;
+        const std::weak_ptr<FlowProtocol> released_b = b;
         a.reset();
         b.reset();
         check_channel(released_a.expired() && released_b.expired(), "shutdown retained a payload pool owner");
-        check_channel(retained_frame.payload == BytesBuf{7}, "public payload depended on a destroyed internal pool");
+        check_channel(retained_payload == BytesBuf{7}, "copied payload changed after protocol shutdown");
         std::cout << "[PASS] forwarding identities, FIN/RESET, bounded admission and control cleanup\n";
     }
     catch (const std::exception &e)

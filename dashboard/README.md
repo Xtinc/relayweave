@@ -87,9 +87,10 @@ TCP, and UDP executor queue delays every five seconds. The Master replaces a
 complete versioned snapshot after membership or report changes; raw ICMP
 samples are not centralized.
 
-The page starts with cluster status, followed by the selected Node's five
-health metrics and responsive queue/bandwidth charts, the cluster-wide Current Flows
-metro map, then registered services. The map shows established TCP/TLS/UDP
+The page starts with cluster status and the cluster-wide Current Flows metro
+map, followed by the selected Node's five compact health metrics and responsive
+queue/bandwidth charts, then registered services. The Node picker belongs to
+the health section; the header identifies the collection entry. The map shows established TCP/TLS/UDP
 businesses, independently of the selected health Node. Agent route calculations,
 per-ingress candidate costs, and connection establishment are recorded in Agent logs. Topology collection still supplies
 current membership and queue values; the API retains link quality data. The score
@@ -119,20 +120,129 @@ no inferred route. Disconnects clear current availability; membership or epoch
 changes invalidate old rounds. Empty reports remove closed businesses.
 
 `/api/snapshot` includes `flow_map`: collection state, missing Nodes, unmatched
-count, business/route counts, route details and escaped SVG. Optional
+count, business/route counts, route details, Node station summaries and escaped SVG. Optional
 `flow_service` and `flow_protocol` query parameters filter the map in Python.
 Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
 Agents, service, protocol and ordered Node path merge and list every business ID.
 Agent stations are identified by attachment Node plus control IP:port; Nodes
-share stations. Geometry and colors are deterministic, and count-only refreshes
-retain coordinates. The map always fits all current routes and preserves valid
-route selection. Click a route or legend entry for details. Current Flows has
-no filter, pan, or zoom controls. Flow data is only held in memory
+share stations. Geometry is undirected: reversing a route does not create a
+parallel line between the same stations.
+
+### Map drawing rules
+
+The constants and routing helpers in [`flow_map.py`](flow_map.py) are the source
+of geometry and width policy. The pipeline is fixed: stable station placement →
+station-to-station routing → union of shared geometry → connection weighting →
+SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
+
+1. **Stable placement.** Nodes occupy deterministic grid slots. Removed Nodes
+   reserve their slots for the Dashboard process lifetime; active Agents also
+   retain coordinates. New stations use free space, reserving symbol and label
+   bounds. Connection counts, capacity values, route order and viewport size
+   do not move existing stations. Geometry changes only when route IDs or Node
+   membership change; count and capacity refreshes reuse it.
+2. **Four approaches.** Nodes use their north/south/east/west center axes, without
+   parallel approach offsets. Node–Node hops prefer the dominant displacement
+   axis, with vertical ties. Node–Agent hops prefer vertical when
+   `abs(dy) >= 0.6 * abs(dx)`, so lower Agents join a south trunk. A clear
+   Node–Agent hop branches from that axis at the Agent's row/column with one
+   rounded turn; it does not introduce an intermediate shared spine.
+3. **Valid metro corridors.** Tracks are horizontal/vertical. Routing first tries
+   clear simple candidates, preferring fewer turns and then shorter distance.
+   Normal approach arms extend 64 units from Nodes. If these candidates are
+   blocked, a coordinate-grid search finds a valid corridor with the fewest turns,
+   then shortest distance for those ports. A blocked approach port triggers a
+   search from the station center instead. Obstacle and unrelated-track rules
+   take precedence over the preferred approach; the renderer never deliberately
+   accepts an obstructed candidate. Clearances reserve room for the maximum
+   capped stroke and rounded corners, independently of current counts.
+4. **Shared trunks, not accidental connections.** Hops incident to a common
+   station may use the same centerline. Unrelated station pairs may cross
+   perpendicularly but cannot share a collinear interval. Coincident straight
+   sections are split at overlap boundaries and rendered once; identical rounded
+   curves are also rendered once. A perpendicular crossing does not join routes
+   or combine their counts. Redundant points and short collinear spurs are removed
+   before rounding; turn radius is at most 24 units and half either adjacent leg.
+   Segments use flush end caps at joins, preventing the neutral track underlay
+   from forming little arrow-shaped protrusions over neighboring color bands.
+   A straight trunk with unchanged route contributions remains one continuous
+   painted path through side branches. Narrow branches are painted before wider
+   trunks, so their inner ends disappear under the trunk and visibly meet its
+   edge. When widths are both capped, the greater connection total is painted
+   on top; stable track ID breaks remaining ties.
+   Turns remain rounded; there are no directional arrows. Text does not cause
+   route detours.
+5. **Count once, then compute width.** Each merged section uses the sum of its
+   distinct routes' business counts. If both incident hops of one route use the
+   same section, that route contributes once. Width is
+   `3 + 0.8 * sqrt(min(count, 100))` SVG units:
+
+   | Connections on the section | Width |
+   |---|---|
+   | 1 | 3.80 |
+   | 10 | 5.53 |
+   | 20 | 6.58 |
+   | 30 | 7.38 |
+   | 40 | 8.06 |
+   | 50 | 8.66 |
+   | 75 | 9.93 |
+   | 100 or more | 11.00 |
+
+   Counts are summed **before** applying the rule: two routes of six connections
+   produce 12 connections and width approximately 5.77, rather than adding their individual widths.
+   The cap keeps tracks narrower than the 14-unit Agent squares.
+6. **Proportional color bands.** Each route receives
+   `track_width * route_count / total_count`, ordered by stable route ID. Three
+   connections and one connection yield 75% and 25% bands. Counts above 100 keep
+   the width capped while their actual counts determine color shares.
+   `flow_map.shared_tracks` exposes the same totals,
+   widths, route counts and shares used by SVG.
+7. **Station size and capacity.** Nodes use an 18-unit-radius capacity ring with
+   a 7-unit track with flat arc ends for a sharp used/remaining boundary.
+   The station body has no outer outline or blank halo; its
+   radius matches the capacity ring's outer edge (currently 21.5). Incoming
+   tracks meet that edge directly. The capacity ring shows bandwidth
+   used (`1 - available`); the center shows estimated remaining capacity. No used
+   arc is drawn at 100% headroom. Status is green at 30% or above, amber from
+   10% to 30%, red below 10%, and gray with a dash for unknown capacity. Agent
+   squares are 14 units. All dimensions scale together when zoomed.
+
+Shortened station labels retain their full names in hover titles. The map uses
+background-colored label outlines where tracks pass behind text.
+
+The Node-provided `available` ratio is
+already in `topology.snapshot`; Dashboard retains it in `topology.nodes` and
+`flow_map.nodes`. This is remaining configured Node bandwidth, not measured
+NodeLink capacity or an absolute Mbps value. Snapshot/source-report ages of
+15 seconds or a collection disconnect invalidate the ratio.
+
+`flow_map.nodes` includes `node_id`, `available`, `connection_count`, `partial`
+and `route_ids`. Stations include idle topology members. Connection count sums
+the displayed businesses that traverse the Node once each, including intermediate
+Nodes; it does not sum both incident hops. Pending or disconnected collections
+have unknown counts, and partial rounds expose known counts as lower bounds.
+These counts describe businesses rather than physical NodeLinks.
+
+Routes use a restrained transit palette, matching line swatches in the legend.
+The map uses a subtle dot grid and theme-aware station, label and ring colors.
+Stations remain above all tracks. The map and legend are display-only: clicking
+routes, stations or legend entries does not select, highlight or open details.
+Route geometry has no transparent click targets or keyboard button roles. Legend
+labels retain endpoint/path hover titles.
+
+Node stations show their name and capacity, without connection-count labels
+or click actions. Route details, protocol UUIDs, epochs and Flow IDs remain
+available in the API. The initial map automatically
+fits the available area without scrollbars, reserving room for Agents when only
+idle Nodes are present. Zoom buttons, directional buttons
+and Fit adjust the view explicitly; hovering, dragging and the mouse wheel do
+not change the map view. Default fitting caps enlargement at 125% so small maps
+keep comfortable Node and text sizes; resizing refits the available area.
+All snapshot refreshes preserve the current view, including route and membership
+changes. Fit explicitly reframes all current stations and routes, including new
+endpoints outside the existing view. Flow data is only held in memory
 and is not added to SQLite history.
 
-Run the live three-Node tests with `RELAYWEAVE_NODE_BINARY` set to the built
-`relayweave-node` executable:
-`python -m unittest discover -s dashboard -p 'test_flow_integration.py' -v`.
 Age includes query and page-assembly time and uses a monotonic clock. This topology is observational only and is
 not used to route Relay traffic.
 
@@ -140,7 +250,7 @@ ICMP probing by Nodes and Agents requires `CAP_NET_RAW`. Their packaged services
 retain it in both AmbientCapabilities and CapabilityBoundingSet, and installation
 and provisioning check the effective capability. The Dashboard itself needs no raw
 socket capability. Quality and route design is documented in
-[RelayWeave 设计](../docs/RelayWeave设计.md#77-链路质量与推荐路径).
+[RelayWeave 设计](../docs/RelayWeave设计.md#4-路由面测量拓扑与路径决策).
 
 ## 独立服务部署
 
@@ -171,7 +281,7 @@ sudo apt install ./build-package/packages/relayweave-dashboard_*_all.deb
 cpack --config build/CPackConfig.cmake -G DEB -D CPACK_COMPONENTS_ALL=dashboard
 ```
 
-此包安装 `relayweave-dashboard.service`、专用系统用户 `relayweave-dashboard` 和 Python 代码，运行时使用系统的 `/usr/bin/python3` 和发行版提供的 Flask、cbor2、Waitress，不绑定构建机器上的 Python 版本；不安装或修改 Node/Agent 配置。首次安装会启用开机启动，但不会立即启动；先完成配置和证书准备。升级会重启已经运行的看板服务。
+此包安装 `relayweave-dashboard.service`、专用系统用户 `relayweave-dashboard` 和 Python 代码，运行时使用系统的 `/usr/bin/python3` 和发行版提供的 Flask、cbor2、Waitress，不绑定构建机器上的 Python 版本；不安装或修改 Node/Agent 配置。首次安装会启用开机启动，但不会立即启动；先完成配置和证书准备。升级或重复安装不启动或重启看板服务，也不改变原有开机启动设置。软件文件在安装时更新；需要加载新程序时执行 `sudo systemctl restart relayweave-dashboard`，或等待下次开机启动服务。
 
 | 内容 | 路径 |
 |---|---|
@@ -275,7 +385,15 @@ Dashboard 打包时仅复制 Python 源码，不探测或绑定构建机的 Pyth
 
 ```bash
 python -m unittest discover -s dashboard -p 'test_*.py'
-python test/tools/dashboard_service_smoke.py --build-dir build
+```
+
+日常 Dashboard 修改只运行这些本地测试，不需要编译 Node/Agent 或执行仓库全量验证。
+测试覆盖 API、采集状态、车站余量与路线连接数、历史范围/保留、位置缓存及 Python 侧协议解析。
+Dashboard 测试不启动 Node/Agent 或 HTTP 服务子进程；采集器停止检查只使用本地 socket。
+
+仅在修改跨组件转发或服务部署时，额外运行仓库中的冒烟脚本：
+
+```bash
 python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 ```
 
@@ -283,9 +401,10 @@ python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 
 ## Dashboard design
 
-The header selector chooses the node shown by the metric tiles and charts.
+The Node health selector chooses the node shown by the metric tiles and queue chart.
 The registered-services table combines services from all discovered nodes.
-Five health metrics follow the table; queue-delay and per-service bandwidth
+The cluster Flow map comes first, with five compact health metrics below it;
+queue-delay and per-service bandwidth
 charts share a row on wide screens and stack on narrow screens.
 Queue history is sampled from the Master's immutable
 topology snapshots rather than duplicated `server.cluster` fields.

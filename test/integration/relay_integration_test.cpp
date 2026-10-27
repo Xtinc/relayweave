@@ -240,6 +240,11 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
             "Producer and Consumer received different relay UUIDs");
     require(params_of(first_opened).at("ticket").get<uint64_t>() != params_of(first_offer).at("ticket").get<uint64_t>(),
             "Producer and Consumer received the same relay ticket");
+    for (const auto *message : {&first_opened, &first_offer})
+    {
+        require(!params_of(*message).contains("session_id") && !params_of(*message).contains("tls_framing"),
+                "TCP attachment contains fields from another transport");
+    }
 
     consumer->send(CtrlMessage{"server.traffic", njson{{"request_id", 310U}}});
     const auto pending_traffic = co_await receive_command(consumer, "server.traffic.reported");
@@ -599,9 +604,12 @@ int main()
         }
         catch (...)
         {
-            control_io.stop();
-            transfer_tcp_io.stop();
-            transfer_udp_io.stop();
+            // Drain Node owners while all borrowed execution contexts are still alive.
+            server->stop();
+            asio::post(transfer_tcp_io, [&echo_acceptor] {
+                asio::error_code ignored;
+                echo_acceptor.close(ignored);
+            });
             control_thread.join();
             transfer_tcp_thread.join();
             transfer_udp_thread.join();
@@ -646,12 +654,10 @@ int main()
             asio::use_future);
         std::weak_ptr<RelayAgent> weak_consumer = consumer;
         std::weak_ptr<RelayAgent> weak_producer = producer;
-        auto consumer_stopped = asio::co_spawn(control_io, consumer->async_stop(), asio::use_future);
-        auto producer_stopped = asio::co_spawn(control_io, producer->async_stop(), asio::use_future);
+        consumer->stop();
+        producer->stop();
         consumer.reset();
         producer.reset();
-        consumer_stopped.get();
-        producer_stopped.get();
         server->stop();
         stopping_transfer_closed.get();
         asio::post(transfer_tcp_io, [&echo_acceptor]() {
