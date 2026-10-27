@@ -1,13 +1,18 @@
 #ifndef PROXY_CLUSTER_MGR_H
 #define PROXY_CLUSTER_MGR_H
 
-#include "tls_channel.h"
 #include "async_event.h"
+#include "tls_channel.h"
 
 class RelayNode;
 class ClusterRoom;
 
 inline constexpr std::string_view cluster_broadcast_target = "all";
+inline constexpr std::size_t cluster_max_node_id_length = 256;
+inline constexpr std::size_t cluster_message_headroom = 1024;
+inline constexpr std::size_t cluster_max_message_length = WireMessage::max_message_length - cluster_message_headroom;
+// Allow space for the identity and a generous routing-envelope overhead.
+static_assert(cluster_message_headroom >= cluster_max_node_id_length + 64);
 
 /** @brief Configure the Node role, identity, master control endpoint, and local NodeLink ports. */
 struct ClusterConfig

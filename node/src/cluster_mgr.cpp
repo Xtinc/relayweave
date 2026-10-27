@@ -58,9 +58,10 @@ class ClusterRoom
     /** @brief Return whether a nonempty, nonreserved node identity is unused. */
     bool available(std::string_view node_id) const
     {
-        return !node_id.empty() && node_id != cluster_broadcast_target &&
-               std::ranges::none_of(participants_,
-                                    [&](const auto &participant) { return participant->node_id() == node_id; });
+        return !node_id.empty() && node_id.size() <= cluster_max_node_id_length &&
+               node_id != cluster_broadcast_target && std::ranges::none_of(participants_, [&](const auto &participant) {
+                   return participant->node_id() == node_id;
+               });
     }
 
     /** @brief Release a participant, wake shutdown, and publish membership when appropriate. */
@@ -87,6 +88,17 @@ class ClusterRoom
         if (message.command.starts_with("cluster."))
         {
             throw std::invalid_argument("cluster.* commands are reserved");
+        }
+
+        try
+        {
+            WireMessage::validate(message, cluster_max_message_length);
+        }
+        catch (const std::length_error &exception)
+        {
+            PROXY_ERROR_PRINT("Cluster message rejected source=%.*s reason=%s", static_cast<int>(source.size()),
+                              source.data(), exception.what());
+            return;
         }
 
         const auto target = config::required_string(config::message_params(message), "target", message.command);
@@ -230,7 +242,7 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
             auto node_id = config::required_string(config::message_params(join), "node_id", "cluster.join");
             if (!room_.available(node_id))
             {
-                deliver(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "duplicate node_id"}}});
+                deliver(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "invalid or duplicate node_id"}}});
                 co_await channel_->async_receive(join_timeout_);
             }
             else
@@ -523,6 +535,11 @@ ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::
         throw std::invalid_argument("cluster node_id and address are required");
     }
 
+    if (config_.node_id.size() > cluster_max_node_id_length)
+    {
+        throw std::invalid_argument("cluster node_id must not exceed 256 bytes");
+    }
+
     if (config_.node_id == cluster_broadcast_target)
     {
         throw std::invalid_argument("cluster node_id must not be all");
@@ -737,7 +754,7 @@ ClusterMgr::SendResult ClusterMgr::send(std::string target, CtrlMessage message)
             throw std::invalid_argument("cluster.* commands are reserved");
         }
         (*message.params)["target"] = target;
-        static_cast<void>(WireMessage::pack(message));
+        WireMessage::validate(message, cluster_max_message_length);
     }
     catch (const std::exception &exception)
     {

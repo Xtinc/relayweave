@@ -404,6 +404,19 @@ void test_message_fragmentation()
     require(recovered && recovered->params == message.params, "Decode failure left assembly state active");
 }
 
+void test_message_size_estimate()
+{
+    for (const auto &params : {njson{{"value", "small"}},
+                               njson{{"value", std::string(140000, 'x')}, {"float", 1.5},
+                                     {"binary", njson::binary({0, 1, 255})}, {"nested", njson::array({true, 23, 256})}}})
+    {
+        const CtrlMessage message{"test.message", params};
+        const auto size = njson::to_cbor(njson{{"command", message.command}, {"params", params}}).size();
+        WireMessage::validate(message, size + 256);
+        require_throws([&] { WireMessage::validate(message, size - 1); }, "Size estimate admitted an oversized message");
+    }
+}
+
 void test_udp_session_header()
 {
     constexpr std::uint64_t session_id = 0x0102030405060708ULL;
@@ -451,6 +464,7 @@ int main()
         test_attach_validation();
         test_frame_validation();
         test_message_fragmentation();
+        test_message_size_estimate();
         test_udp_session_header();
         test_protocol_selection();
         std::cout << "[PASS] relay framing, UDP session header, and validation\n";

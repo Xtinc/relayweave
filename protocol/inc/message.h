@@ -178,6 +178,7 @@ struct WireMessage
     static constexpr std::size_t fragment_payload_length = max_payload_length - 64;
     using Header = std::array<std::uint8_t, header_length>;
     static std::uint32_t decode_length(std::span<const std::uint8_t, header_length> header);
+    static void validate(const CtrlMessage &message, std::size_t maximum_length = max_message_length);
     static BytesBuf pack(CtrlMessage message);
 };
 

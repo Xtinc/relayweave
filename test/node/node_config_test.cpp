@@ -216,6 +216,18 @@ void verify_server_config()
     }
     {
         auto candidate = baseline;
+        candidate["cluster"]["node_id"] = std::string(cluster_max_node_id_length, 'n');
+        write_candidate(candidate);
+        require(load_node_config(temporary).cluster.node_id.size() == cluster_max_node_id_length,
+                "Maximum-length cluster node_id was rejected");
+        candidate["cluster"]["node_id"] = std::string(cluster_max_node_id_length + 1, 'n');
+        require_rejected(candidate, "oversized cluster node_id", "must not exceed 256 bytes");
+        // A multibyte identity is bounded by encoded bytes, not character count.
+        candidate["cluster"]["node_id"] = std::string(cluster_max_node_id_length - 1, 'n') + "中";
+        require_rejected(candidate, "oversized UTF-8 cluster node_id", "must not exceed 256 bytes");
+    }
+    {
+        auto candidate = baseline;
         candidate["certificate"].erase("server_ca_file");
         require_rejected(std::move(candidate), "missing cluster trust CA");
     }

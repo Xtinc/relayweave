@@ -11,7 +11,7 @@ relayweave_test(node_metrics node_metrics_test.cpp
 relayweave_test(node_relay_capacity node_relay_capacity_test.cpp
     LIBRARIES relayweave_node_lib LABELS node integration)
 
-relayweave_test(cluster_integration cluster_integration_test.cpp TIMEOUT 35
+relayweave_test(cluster_integration cluster_integration_test.cpp TIMEOUT 90
     LIBRARIES relayweave_node_lib LABELS node cluster integration)
 relayweave_test(node_links node_links_test.cpp TIMEOUT 90
     LIBRARIES relayweave_node_lib LABELS node cluster integration)

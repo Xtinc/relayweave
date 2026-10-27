@@ -19,6 +19,11 @@ void require(bool value, const char *reason)
         throw std::runtime_error(reason);
 }
 
+CtrlMessage budget_message(std::string target, std::size_t payload_size)
+{
+    return CtrlMessage{"budget.notice", njson{{"target", std::move(target)}, {"value", std::string(payload_size, 'x')}}};
+}
+
 struct Inbox
 {
     std::deque<std::pair<std::string, CtrlMessage>> messages;
@@ -86,7 +91,8 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
     channel.handshake_timeout = 300ms;
     channel.disconnect_timeout = 100ms;
     channel.heartbeat_interval = 100ms;
-    channel.heartbeat_timeout = 2s;
+    // Full-budget CBOR encoding can occupy this single executor for seconds in Debug builds.
+    channel.heartbeat_timeout = 30s;
 
     Inbox a_inbox;
     Inbox b_inbox;
@@ -170,6 +176,44 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         require(master->broadcast(CtrlMessage{"after.invalid"}) == ClusterMgr::SendResult::Submitted, "Invalid send prevented the next submission");
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("after.invalid") == 1; });
 
+        // Leave room for conservative estimation of this message's small envelope.
+        // Authentication by the largest identity must still fit the final wire budget.
+        const auto legal_size = cluster_max_message_length - 256;
+        const std::string longest_id(cluster_max_node_id_length, 'n');
+        auto large = co_await connect(context, port);
+        large->send(CtrlMessage{CtrlCommand::ClusterJoin, njson{{"node_id", longest_id}}});
+        Inbox large_inbox;
+        co_await receive_until(large, large_inbox, [&] { return large_inbox.count("cluster.joined") == 1; });
+        auto receive_budget = [&](const std::shared_ptr<TLSChannel> &peer, Inbox &inbox) -> asio::awaitable<void> {
+            co_await receive_until(peer, inbox, [&] { return inbox.count("budget.notice") == 1; });
+            const auto &[source, message] = inbox.messages.back();
+            require(source == longest_id && !message.params->contains("target"),
+                    "Boundary message lost authentication or leaked its target");
+            require(message.params->at("value").get_ref<const std::string &>().size() == legal_size,
+                    "Boundary message changed its payload");
+            inbox.messages.pop_back();
+        };
+        large->send(budget_message("b", legal_size));
+        co_await receive_budget(b, b_inbox);
+        large->send(budget_message("all", legal_size));
+        co_await receive_budget(a, a_inbox);
+        co_await receive_budget(b, b_inbox);
+        co_await receive_budget(large, large_inbox);
+
+        // Fits the incoming wire limit, but the largest authenticated source would push it over.
+        large->send(budget_message("b", WireMessage::max_message_length - 128));
+        large->send(CtrlMessage{"budget.barrier", njson{{"target", "b"}}});
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("budget.barrier") == 1; });
+        require(b_inbox.count("budget.notice") == 0, "Oversized input was forwarded to a healthy target");
+        require(master->send("b", budget_message("b", cluster_max_message_length)) ==
+                    ClusterMgr::SendResult::InvalidMessage, "Local send consumed the reserved routing budget");
+        require(master->send("b", budget_message("b", legal_size)) ==
+                    ClusterMgr::SendResult::Submitted, "Local send rejected a legal near-limit input");
+        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("budget.notice") == 1; });
+        require(b_inbox.messages.back().first == "master", "Maximum local send lost its source");
+        b_inbox.messages.pop_back();
+        co_await large->async_disconnect();
+
         auto duplicate = co_await connect(context, port);
         duplicate->send(CtrlMessage{"cluster.join", njson{{"node_id", "a"}}});
         require((co_await duplicate->async_receive()).type() == CtrlCommand::ClusterError,
@@ -184,6 +228,13 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         reserved->send(CtrlMessage{"ignored"});
         co_await asio::co_spawn(io, reserved->async_wait_closed(), asio::cancel_after(1s, asio::use_awaitable));
         co_await reserved->async_disconnect();
+
+        auto oversized_id = co_await connect(context, port);
+        oversized_id->send(CtrlMessage{CtrlCommand::ClusterJoin,
+                                      njson{{"node_id", std::string(cluster_max_node_id_length + 1, 'n')}}});
+        require((co_await oversized_id->async_receive()).type() == CtrlCommand::ClusterError,
+                "Oversized remote identity joined the cluster");
+        co_await oversized_id->async_disconnect();
 
         // A server certificate is a valid member identity; ordinary client identities are rejected.
         for (auto *invalid_context : {&client_context, &anonymous_context})

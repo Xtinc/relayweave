@@ -346,7 +346,8 @@ master 接受 socket 后立刻创建 session 并加入 room。session 的读协�
 | `cluster.error` | 本地或 master → slave | `reason` | 入群拒绝或真实集群连接失效 |
 | 任意非 `cluster.*` | 任意节点 → room | 业务参数及必填 `target`；master 写入 `source` | `target=all` 广播，否则按 node_id 定向 |
 
-`node_id` 由配置声明，master 拒绝同时在线的重复 ID，也拒绝保留值 `all`。集群 mTLS 确认对端持有 Server CA 签发的节点证书，但协议没有把证书名称与 `node_id` 绑定。
+`node_id` 由配置声明，编码长度最多 256 字节；配置加载、ClusterMgr 构造及远端入群均执行该限制。
+master 拒绝同时在线的重复 ID，也拒绝保留值 `all`。集群 mTLS 确认对端持有 Server CA 签发的节点证书，但协议没有把证书名称与 `node_id` 绑定。
 
 业务消息使用 `CtrlMessage {command, params}`。发送方写入 `params.target`，其中 `all` 表示广播，其他值表示目标节点 ID。master 根据已加入的 session 覆盖写入 `params.source`，调用者不能伪造来源；路由前删除 `target`，RelayNode 接收认证 `source` 和业务字段。业务消息的 `params` 必须是对象，`cluster.*` 命令、`source` 和 `target` 字段由集群层保留。
 
@@ -2432,6 +2433,16 @@ NodeLinkMgr 先按大类进入 Link 或 Flow；Flow 入口再区分远程请求�
 - 收到第 0 页时开始新组；后续页必须连续且总页数一致。末页到达时仍缺页则丢弃整条消息，保持连接。业务处理器只接收重组后的完整 `CtrlMessage`。
 - Node 间转发也先接收完整消息，再修改路由字段并自动重新拆分，不需要业务模块预估内部路由开销。
 
+集群业务消息（含 `command`、`params` 和 `target`）的估算预算为 **16 MiB − 1 KiB**，
+最终输出上限保持 **16 MiB**。预留的 1 KiB 属于路由层，业务不能占用；超过输入上限的数据需由调用方拆成业务消息。
+`source` 最多 256 字节，连同少量 CBOR 结构开销由 1 KiB 预留覆盖；删除 `target` 再写入 `source`
+不会增加 params 的字段数量。
+ClusterRoom 在改写前统一检查输入预算，远端消息、本地消息及成员公告共用这一入口；超限消息丢弃并记录日志，
+来源和目标连接继续工作。本地提交额外预检查，以便同步返回 InvalidMessage。
+检查直接读取消息，不复制 JSON 或构造编码缓冲：固定消息外层预估 64 字节，params 内的标量和容器头各按 9 字节，
+字符串和字段名按字节长度加 9，二进制按字节长度加 18（含可选 subtype 标签）。估算不追求精确占满预算。
+TLS 和消息重组统一保留原来的 16 MiB 上限，无集群专用配置或解码分支；实际打包仍执行最终大小限制。
+
 Node、Agent、Dashboard 需要同步升级；不兼容旧的业务分页字段和大消息解码方式。
 
 控制消息按组件分成以下几组。普通客户端控制和集群控制均使用 mTLS；数据 socket 上的 attach 是
@@ -3048,7 +3059,7 @@ Node 首末节点和两个 Agent 分别计数；表内不包含进程级及共�
 
 | 对象 | 接口与资源约束 |
 |---|---|
-| 控制消息 | 分发前校验编码和长度；逻辑消息上限 16 MiB；每连接拥有独立有界队列，溢出关闭该通道 |
+| 控制消息 | 集群入口估算预算为 16 MiB − 1 KiB；最终消息上限 16 MiB；每连接拥有独立有界队列，溢出关闭该通道 |
 | 服务与业务索引 | Agent 请求表按请求身份 O(log n) 查找；Node 请求身份包含控制会话；同一 Agent 双角色允许共享 uuid |
 | Link 复用记录 | master 保存成功 LinkRequest 的完整授权与地址快照；master 可以不是 Link 的数据端点 |
 | Link/Flow JSON | 普通 JSON 复制为深拷贝；事务确认包含接收端校验所需的身份与授权字段 |
@@ -3120,6 +3131,8 @@ UDP 包长使用 64/512/1400 B 和最大合法载荷 65,467 B，后者不是 65,
 | `TLSChannelConfig::max_queued_messages` | 100 | [`tls_channel.h`](../protocol/inc/tls_channel.h) |
 | `WireMessage::max_payload_length` | 64 KiB | [`message.h`](../protocol/inc/message.h) |
 | `WireMessage::max_message_length` | 16 MiB | `message.h` |
+| `cluster_max_message_length` / `cluster_message_headroom` | 16 MiB − 1 KiB / 1 KiB | [`cluster_mgr.h`](../node/inc/cluster_mgr.h) |
+| `cluster_max_node_id_length` | 256 字节 | `cluster_mgr.h` |
 | `LnkFrameHeader` | 32 B，`maximum_payload` 65,467 | `message.h` |
 | `DatagramHeader` | 8 B，`maximum_user_payload` 65,499 | `message.h` |
 | `NodeLinkMgr::max_flow_nodes` | 8 | [`nodelink_mgr.h`](../node/inc/nodelink_mgr.h) |

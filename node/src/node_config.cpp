@@ -63,6 +63,10 @@ ClusterConfig parse_cluster_config(const njson &root)
     }
     result.role = role == "master" ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave;
     result.node_id = required_string(cluster, "node_id", "cluster");
+    if (result.node_id.size() > cluster_max_node_id_length)
+    {
+        throw std::invalid_argument("cluster.node_id must not exceed 256 bytes");
+    }
     if (result.node_id == cluster_broadcast_target)
     {
         throw std::invalid_argument("cluster.node_id must not be all");
