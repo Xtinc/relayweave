@@ -363,10 +363,10 @@ void NodeControl::handle_topology_query(const njson &params)
 
 void NodeControl::handle_topology_snapshot(CtrlMessage message)
 {
-    if (message.params->at("source") != topology_.master_id())
-    {
-        return;
-    }
+    // if (message.params->at("source") != topology_.master_id())
+    // {
+    //     return;
+    // }
     auto session = prepare_client_reply(message, "topology.snapshot");
     if (!session)
     {

@@ -5,7 +5,9 @@
   "proxy": {
     "max_connections": 512,
     "handshake_timeout_ms": 10000,
-    "connect_timeout_ms": 10000
+    "connect_timeout_ms": 10000,
+    "udp_max_targets": 256,
+    "udp_target_timeout_ms": 60000
   },
   "socks5": {
     "address": "127.0.0.1",

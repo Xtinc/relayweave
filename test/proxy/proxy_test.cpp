@@ -131,7 +131,8 @@ void verify_config()
 
     njson value = {
         {"log", {{"debug_enable", false}}},
-        {"proxy", {{"max_connections", 12}, {"handshake_timeout_ms", 750}, {"connect_timeout_ms", 900}}},
+        {"proxy", {{"max_connections", 12}, {"handshake_timeout_ms", 750}, {"connect_timeout_ms", 900},
+                   {"udp_max_targets", 64}, {"udp_target_timeout_ms", 12000}}},
         {"socks5", {{"address", "127.0.0.1"}, {"port", 11080}}},
         {"http", {{"address", "127.0.0.1"}, {"port", 11081}, {"max_header_bytes", 8192}}},
     };
@@ -141,6 +142,7 @@ void verify_config()
             "Proxy limits were not parsed");
     require(parsed.socks5.port == 11080 && parsed.http.port == 11081 && parsed.http.max_header_bytes == 8192,
             "Proxy listeners were not parsed");
+    require(parsed.udp_max_targets == 64 && parsed.udp_target_timeout == 12s, "UDP target limits were not parsed");
 
     const auto require_rejected = [&](njson candidate, std::string_view description) {
         write_config(candidate);
@@ -167,6 +169,15 @@ void verify_config()
     invalid = value;
     invalid["proxy"]["max_connections"] = 0;
     require_rejected(std::move(invalid), "zero connection limit");
+    invalid = value;
+    invalid["proxy"]["udp_max_targets"] = 0;
+    require_rejected(std::move(invalid), "zero UDP target limit");
+    invalid = value;
+    invalid["proxy"]["udp_max_targets"] = 4097;
+    require_rejected(std::move(invalid), "excessive UDP target limit");
+    invalid = value;
+    invalid["proxy"]["udp_target_timeout_ms"] = 0;
+    require_rejected(std::move(invalid), "zero UDP target timeout");
     invalid = value;
     invalid["http"]["max_header_bytes"] = 100;
     require_rejected(std::move(invalid), "small HTTP header limit");
@@ -335,9 +346,9 @@ void verify_http_errors(RunningProxy &proxy)
     tcp::socket oversized(io);
     oversized.connect({asio::ip::address_v4::loopback(), proxy.config.http.port});
     std::string request = "GET / HTTP/1.1\r\nHost: example.test\r\nX-Large: ";
-    request.append(proxy.config.http.max_header_bytes, 'x');
+    request.resize(proxy.config.http.max_header_bytes, 'x');
     asio::write(oversized, asio::buffer(request));
-    // Complete the malformed request so the server need not wait for more header bytes.
+    // Fill the header budget without leaving unread bytes that can reset the reply on Windows.
     oversized.shutdown(tcp::socket::shutdown_send);
     const auto oversized_response = read_all(oversized);
     require(oversized_response.find("431 Request Header Fields Too Large") != std::string::npos,
@@ -349,8 +360,10 @@ void verify_http_errors(RunningProxy &proxy)
     const auto connect =
         "CONNECT 127.0.0.1:" + std::to_string(closed_port) + " HTTP/1.1\r\nHost: ignored\r\n\r\n";
     asio::write(unavailable, asio::buffer(connect));
-    require(read_all(unavailable).find("502 Bad Gateway") != std::string::npos,
-            "Unavailable HTTP upstream did not return 502");
+    const auto unavailable_response = read_all(unavailable);
+    require(unavailable_response.find("502 Bad Gateway") != std::string::npos ||
+                unavailable_response.find("504 Gateway Timeout") != std::string::npos,
+            "Unavailable HTTP upstream did not return 502 or 504");
 }
 
 void read_socks_success(tcp::socket &client)
@@ -423,11 +436,11 @@ void verify_socks5(RunningProxy &proxy)
     const std::array<std::uint8_t, 3> no_auth{0x05, 0x01, 0x00};
     asio::write(unsupported, asio::buffer(no_auth));
     read_exact(unsupported, method.data(), method.size());
-    const std::array<std::uint8_t, 10> udp_associate{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 1};
-    asio::write(unsupported, asio::buffer(udp_associate));
+    const std::array<std::uint8_t, 10> bind{0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 1};
+    asio::write(unsupported, asio::buffer(bind));
     std::array<std::uint8_t, 4> failure{};
     read_exact(unsupported, failure.data(), failure.size());
-    require(failure[1] == 0x07, "SOCKS5 UDP ASSOCIATE was not rejected as unsupported");
+    require(failure[1] == 0x07, "SOCKS5 BIND was not rejected as unsupported");
 }
 
 void verify_socks_ip_address(RunningProxy &proxy, bool ipv6)

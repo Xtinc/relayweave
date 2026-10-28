@@ -1,4 +1,5 @@
 #include "proxy_server.h"
+#include "socks5_udp.h"
 
 #include "message.h"
 #include "tls_channel.h"
@@ -409,6 +410,10 @@ class ProxySession
 
     void cancel() noexcept
     {
+        if (datagrams_)
+        {
+            datagrams_->cancel();
+        }
         resolver_.cancel();
         asio::error_code ignored;
         client_.close(ignored);
@@ -540,12 +545,13 @@ class ProxySession
                                   asio::cancel_after(config_.handshake_timeout, asio::use_awaitable));
     }
 
-    asio::awaitable<void> send_socks_reply(std::uint8_t reply)
+    asio::awaitable<void> send_socks_reply(std::uint8_t reply,
+                                          std::optional<tcp::endpoint> bound = std::nullopt)
     {
         std::vector<std::uint8_t> response{0x05, reply, 0x00};
         if (reply == 0x00)
         {
-            const auto endpoint = upstream_.local_endpoint();
+            const auto endpoint = bound ? *bound : upstream_.local_endpoint();
             if (endpoint.address().is_v6())
             {
                 response.push_back(0x04);
@@ -593,7 +599,7 @@ class ProxySession
         {
             co_return;
         }
-        if (request[1] != 0x01)
+        if (request[1] != 0x01 && request[1] != 0x03)
         {
             co_await send_socks_reply(0x07);
             co_return;
@@ -639,6 +645,25 @@ class ProxySession
         std::array<std::uint8_t, 2> port_bytes{};
         co_await read_socks(port_bytes);
         const auto port = static_cast<std::uint16_t>((static_cast<unsigned int>(port_bytes[0]) << 8) | port_bytes[1]);
+        if (request[1] == 0x03)
+        {
+            datagrams_.emplace(client_, config_);
+            const auto reply = co_await datagrams_->open(std::move(host), port);
+            if (reply != 0x00)
+            {
+                co_await send_socks_reply(reply);
+                co_return;
+            }
+            const auto bound = datagrams_->endpoint();
+            co_await send_socks_reply(0x00, tcp::endpoint(bound.address(), bound.port()));
+            PROXY_INFO_PRINT("Proxy [+] socks5 udp peer=%s relay=%s:%u", peer_.c_str(),
+                             bound.address().to_string().c_str(), static_cast<unsigned int>(bound.port()));
+            ScopeGuard log_closed([this] {
+                PROXY_INFO_PRINT("Proxy [x] socks5 udp peer=%s", peer_.c_str());
+            });
+            co_await datagrams_->run();
+            co_return;
+        }
         if (port == 0)
         {
             co_await send_socks_reply(0x01);
@@ -670,6 +695,7 @@ class ProxySession
     ProxyProtocol protocol_;
     const ProxyConfig &config_;
     std::string peer_;
+    std::optional<Socks5UdpAssociation> datagrams_;
 };
 
 ProxyConfig load_proxy_config(const std::filesystem::path &path)
@@ -680,7 +706,8 @@ ProxyConfig load_proxy_config(const std::filesystem::path &path)
     const auto &proxy = required_object(root, "proxy", "root");
     const auto &socks5 = required_object(root, "socks5", "root");
     const auto &http = required_object(root, "http", "root");
-    reject_unknown_fields(proxy, {"max_connections", "handshake_timeout_ms", "connect_timeout_ms"}, "proxy");
+    reject_unknown_fields(proxy, {"max_connections", "handshake_timeout_ms", "connect_timeout_ms",
+                                 "udp_max_targets", "udp_target_timeout_ms"}, "proxy");
     reject_unknown_fields(socks5, {"address", "port"}, "socks5");
     reject_unknown_fields(http, {"address", "port", "max_header_bytes"}, "http");
 
@@ -689,6 +716,9 @@ ProxyConfig load_proxy_config(const std::filesystem::path &path)
         optional_unsigned(proxy, "max_connections", result.max_connections, 1, max_connection_count, "proxy"));
     result.handshake_timeout = optional_duration(proxy, "handshake_timeout_ms", result.handshake_timeout, "proxy");
     result.connect_timeout = optional_duration(proxy, "connect_timeout_ms", result.connect_timeout, "proxy");
+    result.udp_max_targets = static_cast<std::size_t>(
+        optional_unsigned(proxy, "udp_max_targets", result.udp_max_targets, 1, 4096, "proxy"));
+    result.udp_target_timeout = optional_duration(proxy, "udp_target_timeout_ms", result.udp_target_timeout, "proxy");
     result.socks5.address = required_string(socks5, "address", "socks5");
     result.socks5.port = required_port(socks5, "port", "socks5");
     result.http.address = required_string(http, "address", "http");

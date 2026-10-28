@@ -24,6 +24,8 @@ struct ProxyConfig
     std::size_t max_connections = 512;
     std::chrono::steady_clock::duration handshake_timeout = std::chrono::seconds(10);
     std::chrono::steady_clock::duration connect_timeout = std::chrono::seconds(10);
+    std::size_t udp_max_targets = 256;
+    std::chrono::steady_clock::duration udp_target_timeout = std::chrono::seconds(60);
     ProxyListenerConfig socks5;
     HttpProxyListenerConfig http;
 };

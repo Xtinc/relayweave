@@ -34,6 +34,7 @@ Forwarder 拥有长期本地监听和业务容器，AgentSession 统一一次 TC
 TCP 共享发送队列按流标签交错插入，算法、接口与实现比较见 [FairQueue](docs/FairQueue.md)。
 部署见 [打包与安装](docs/RelayWeave打包与安装.md)、[证书制作与部署](docs/证书制作与部署.md)
 和 [管理面板部署说明](dashboard/README.md)。
+SOCKS5 TCP/UDP 能力、关联所有权与容量配置见 [SOCKS5 代理](docs/SOCKS5代理设计.md)。
 
 ## C++ / Asio 编码约束
 
