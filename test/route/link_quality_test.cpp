@@ -56,7 +56,7 @@ int main()
             quality.record(true, 20.0, at(second));
         }
         auto result = quality.assess(at(1799));
-        near(*result.quality.cost, 20.0, "Stable link cost is incorrect");
+        near(*result.quality.cost, 20.0, "Loss-free cost is incorrect");
         require(result.quality.usable && result.quality.confidence > 0.99, "Mature link is not usable/confident");
         require(quality.assess(at(1813)).quality.usable && !quality.assess(at(1814)).quality.usable,
                 "Completed-sample idle deadline is not exactly 15 seconds");
@@ -105,14 +105,17 @@ int main()
             near(*decay.assess(at(half_life)).scales[index].rtt_ms, expected,
                  "Configured half-life did not decay the evidence correctly");
         }
+        const auto previous_deviation = *fast.assess(at(1)).scales.back().jitter_ms;
         fast.record(false, 0.0, at(2));
         result = fast.assess(at(2));
-        near(*result.scales.back().jitter_ms, 20.0, "Jitter is incorrect");
+        near(*result.scales.back().jitter_ms, previous_deviation, "Failed probe changed RTT standard deviation");
         LinkQuality spread;
         spread.record(true, 10.0, at(0));
         spread.record(true, 30.0, at(0));
-        // Equal timestamps give mean 20, jitter 20 and deviation 10 at every scale.
-        near(*spread.assess(at(0)).quality.cost, 32.5, "Routing cost omitted RTT spread");
+        // Equal timestamps give mean 20 and standard deviation 10 at every scale.
+        near(*spread.assess(at(0)).scales.back().jitter_ms, 10.0, "Jitter must report RTT standard deviation");
+        // Independent reference: NIST moment formulas with mean 20, variance 100 and P99.7.
+        near(*spread.assess(at(0)).quality.cost, 65.50716111094681, "Lognormal P99.7 cost is incorrect");
         require(result.scales.back().loss_rate > 0.333 && result.scales.back().loss_rate < 0.334,
                 "Failed sample did not enter loss EMA");
         require(!fast.record(true, -1.0, at(3)), "Negative RTT was accepted");
@@ -127,18 +130,79 @@ int main()
         require(sparse.assess(at(1800)).quality.confidence < 0.03, "Sparse history claimed maturity");
 
         // Equal timestamps isolate loss from decay, freshness and confidence.
-        // A 20 ms link with 10% loss must lose to a stable 55 ms link.
+        // A 20 ms link with 10% loss has conditional first-loss cost 44.8,
+        // above a loss-free 44 ms link's cost of 44.
         LinkQuality lossy, reliable;
         for (int sample = 0; sample < 9; ++sample)
         {
             lossy.record(true, 20.0, at(0));
         }
         lossy.record(false, 0.0, at(0));
-        reliable.record(true, 55.0, at(0));
+        reliable.record(true, 44.0, at(0));
+        near(*lossy.assess(at(0)).quality.cost, 44.8, "Conditional three-retry loss estimate is incorrect");
         const auto lossy_cost = routing_cost(lossy.assess(at(0)).quality, std::chrono::milliseconds(0));
         const auto reliable_cost = routing_cost(reliable.assess(at(0)).quality, std::chrono::milliseconds(0));
         require(lossy_cost && reliable_cost, "Loss preference test requires usable links");
-        require(*lossy_cost > *reliable_cost, "Loss penalty still prefers a lossy low-latency link");
+        require(*lossy_cost > *reliable_cost, "Loss estimate did not affect route preference");
+
+        // Repeating the same distribution must not shrink its standard deviation.
+        LinkQuality repeated;
+        for (int sample = 0; sample < 1000; ++sample)
+        {
+            repeated.record(true, 10.0, at(0));
+            repeated.record(true, 30.0, at(0));
+        }
+        near(*repeated.assess(at(0)).scales.back().jitter_ms, 10.0,
+             "RTT standard deviation shrank with sample count");
+        repeated.record(false, 0.0, at(0));
+        require(*repeated.assess(at(0)).quality.cost > 2.0 * *spread.assess(at(0)).quality.cost,
+                "First loss did not at least double the lognormal baseline");
+
+        // Constant zero RTT is a supported degenerate limit, not log(0).
+        LinkQuality zero_delay;
+        zero_delay.record(true, 0.0, at(0));
+        near(*zero_delay.assess(at(0)).quality.cost, 0.0, "Zero RTT produced an invalid lognormal cost");
+
+        // A decaying old sample and valid zero RTTs must not overflow the CV calculation.
+        LinkQuality fading_tail;
+        fading_tail.record(true, 60000.0, at(0));
+        for (int sample = 1; sample <= 20; ++sample)
+        {
+            const auto now = at(sample * 1799); // Shorter than the full-history reset interval.
+            fading_tail.record(true, 0.0, now);
+            const auto fading = fading_tail.assess(now);
+            require(fading.quality.cost && std::isfinite(*fading.quality.cost),
+                    "Decaying RTT history produced a non-finite cost");
+            require(parse_quality(quality_json(fading.quality)).cost.has_value(),
+                    "Extreme RTT history broke the quality wire format");
+        }
+
+        // Convert milliseconds consistently: doubling all RTTs doubles the cost.
+        LinkQuality doubled;
+        doubled.record(true, 20.0, at(0));
+        doubled.record(true, 60.0, at(0));
+        near(*doubled.assess(at(0)).quality.cost, 2.0 * *spread.assess(at(0)).quality.cost,
+             "Lognormal cost depends on the RTT unit scale");
+
+        // Recent degradation must outweigh an established stable alternative.
+        LinkQuality spike;
+        for (int second = 0; second < 14400; ++second)
+        {
+            spike.record(true, 70.0, at(second));
+        }
+        spike.record(true, 700.0, at(14400));
+        require(*spike.assess(at(14400)).quality.cost > 450.0,
+                "Long-term history diluted a recent latency spike");
+
+        // Near-total loss still has a finite estimate and is excluded by availability gates.
+        LinkQuality severe_loss;
+        severe_loss.record(true, 20.0, at(0));
+        for (int sample = 0; sample < 99; ++sample)
+        {
+            severe_loss.record(false, 0.0, at(0));
+        }
+        near(*severe_loss.assess(at(0)).quality.cost, 158.008, "High-loss estimate is incorrect");
+        require(!severe_loss.assess(at(0)).quality.usable, "Near-total loss remained usable");
 
         LinkQuality down;
         down.record(false, 0.0, at(0));

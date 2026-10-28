@@ -2628,7 +2628,8 @@ FlowProtocol 仅在接收到有效 DATA 时累计 payload，入口、中间和�
 `clamp(1 - 总速率 × 8 / (bandwidth_mbps × 1000000), 0, 1)`，不统计帧头或重传。
 首次采样前 `available=1`，估计速率为零时为 1，超载为 0；快照中缺失/过期报告的值为 null。
 有向链路条目包含 `source`、`destination`、长期 `rtt_ms`、`jitter_ms`、`loss_rate`、
-`transmitted/received/completed`、`age_ms` 及质量摘要，例如：
+`transmitted/received/completed`、`age_ms` 及质量摘要。`jitter_ms` 为长期 RTT 标准差，
+不是相邻 RTT 差值的均值。质量摘要例如：
 
 ```json
 "quality": {"cost": 20.0, "confidence": 0.8, "usable": true}

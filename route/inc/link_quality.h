@@ -19,7 +19,7 @@ class LinkQuality
     {
         double sample_weight = 0.0;
         std::optional<double> rtt_ms;
-        std::optional<double> jitter_ms;
+        std::optional<double> jitter_ms; // Weighted RTT standard deviation.
         double loss_rate = 1.0;
     };
 
@@ -44,23 +44,18 @@ class LinkQuality
     [[nodiscard]] Assessment assess(Clock::time_point now) const noexcept;
 
   private:
-    static constexpr double LOSS_PENALTY = 400.0;
-
     struct Ema
     {
         double completed_weight = 0.0;
         double received_weight = 0.0;
-        double jitter_weight = 0.0;
         double rtt_sum = 0.0;
         double rtt_square_sum = 0.0;
-        double jitter_sum = 0.0;
     };
 
     std::array<Ema, 3> ema_;
     Clock::time_point first_sample_;
     std::optional<Clock::time_point> last_sample_;
     std::optional<Clock::time_point> last_success_;
-    std::optional<double> previous_rtt_;
     std::size_t completed_ = 0;
     std::size_t received_ = 0;
     std::size_t consecutive_failures_ = 0;

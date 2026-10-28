@@ -1,5 +1,4 @@
 #include "icmp.h"
-#include <cmath>
 #include <charconv>
 #include <exception>
 #include <iomanip>
@@ -55,10 +54,10 @@ void print_metrics(std::string_view target, const ICMP::Metrics &metrics)
     if (long_ema.rtt_ms && long_ema.jitter_ms)
     {
         std::cout << std::setprecision(3) << "rtt_ema_30min = " << *long_ema.rtt_ms
-                  << " ms, jitter_ema_30min = " << *long_ema.jitter_ms << " ms\n";
+                  << " ms, rtt_stddev_ema_30min = " << *long_ema.jitter_ms << " ms\n";
         if (metrics.assessment.quality.cost)
         {
-            std::cout << "quality_score = " << 100.0 * std::exp(-*metrics.assessment.quality.cost / 100.0)
+            std::cout << "quality_cost = " << *metrics.assessment.quality.cost
                       << ", confidence = " << metrics.assessment.quality.confidence << '\n';
         }
     }

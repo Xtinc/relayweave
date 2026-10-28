@@ -8,7 +8,10 @@
 namespace
 {
 constexpr double ln2 = 0.6931471805599453;
-constexpr std::array<double, 3> weights{0.15, 0.35, 0.50};
+// Relative weights normalize to 60%, 30%, 10% without a rounded fractional sum.
+constexpr std::array<double, 3> weights{6.0, 3.0, 1.0};
+// Inverse standard-normal CDF at 0.997, used by the NIST lognormal quantile formula.
+constexpr double normal_quantile_997 = 2.747781385444992;
 }
 
 nlohmann::json quality_json(const LinkQuality::Summary &quality)
@@ -83,12 +86,9 @@ bool LinkQuality::record(bool success, double rtt_ms, Clock::time_point now) noe
         if (last_sample_)
         {
             ema_ = {};
-            previous_rtt_.reset();
             consecutive_failures_ = 0;
         }
     }
-    const auto jitter = success && previous_rtt_ && elapsed < half_lives.front().count()
-                            ? std::optional(std::abs(rtt_ms - *previous_rtt_)) : std::nullopt;
     for (std::size_t index = 0; index < ema_.size(); ++index)
     {
         auto &ema = ema_[index];
@@ -97,21 +97,17 @@ bool LinkQuality::record(bool success, double rtt_ms, Clock::time_point now) noe
         ema.received_weight = decay * ema.received_weight + (success ? 1.0 : 0.0);
         ema.rtt_sum = decay * ema.rtt_sum + (success ? rtt_ms : 0.0);
         ema.rtt_square_sum = decay * ema.rtt_square_sum + (success ? rtt_ms * rtt_ms : 0.0);
-        ema.jitter_weight = decay * ema.jitter_weight + (jitter ? 1.0 : 0.0);
-        ema.jitter_sum = decay * ema.jitter_sum + jitter.value_or(0.0);
     }
     last_sample_ = now;
     ++completed_;
     if (!success)
     {
         ++consecutive_failures_;
-        previous_rtt_.reset();
         return true;
     }
     ++received_;
     consecutive_failures_ = 0;
     last_success_ = now;
-    previous_rtt_ = rtt_ms;
     return true;
 }
 
@@ -146,11 +142,24 @@ LinkQuality::Assessment LinkQuality::assess(Clock::time_point now) const noexcep
             continue;
         }
         const auto mean = ema.rtt_sum / ema.received_weight;
-        const auto jitter = ema.jitter_weight > 1e-9 ? ema.jitter_sum / ema.jitter_weight : 0.0;
         const auto deviation = std::sqrt(std::max(0.0, ema.rtt_square_sum / ema.received_weight - mean * mean));
         metrics.rtt_ms = mean;
-        metrics.jitter_ms = jitter;
-        const auto cost = mean + 0.5 * jitter + 0.25 * deviation - LOSS_PENALTY * std::log1p(-metrics.loss_rate);
+        metrics.jitter_ms = deviation;
+        const auto loss = metrics.loss_rate;
+        // Moment-match a two-parameter lognormal distribution to successful RTTs.
+        // A zero mean or variance is the degenerate constant-delay limit.
+        double baseline = mean;
+        if (mean > 0.0 && deviation > 0.0)
+        {
+            const auto variation = deviation / mean;
+            const auto squared_variation = variation * variation;
+            // If CV squared overflows, log(1 + CV^2) rounds to 2 * log(CV).
+            const auto log_variance = std::isfinite(squared_variation) ? std::log1p(squared_variation)
+                                                                     : 2.0 * std::log(variation);
+            baseline = mean * std::exp(normal_quantile_997 * std::sqrt(log_variance) - 0.5 * log_variance);
+        }
+        const auto recovery_factor = loss > 0.0 ? 2.0 + loss * (2.0 + 4.0 * loss) : 1.0;
+        const auto cost = baseline * recovery_factor;
         weighted_cost += weights[index] * cost;
         weight_sum += weights[index];
     }
