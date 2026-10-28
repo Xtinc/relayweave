@@ -47,14 +47,14 @@ std::size_t parse_count(std::string_view text)
 
 void print_metrics(std::string_view target, const ICMP::Metrics &metrics)
 {
-    const auto &long_ema = metrics.assessment.scales.back();
+    const auto &probe_metrics = metrics.assessment.metrics;
     std::cout << "\n--- " << target << " ping metrics ---\n"
               << metrics.transmitted << " packets transmitted, " << metrics.assessment.total_received << " received, "
-              << std::fixed << std::setprecision(1) << long_ema.loss_rate * 100.0 << "% packet loss\n";
-    if (long_ema.rtt_ms && long_ema.jitter_ms)
+              << std::fixed << std::setprecision(1) << probe_metrics.loss_rate * 100.0 << "% packet loss\n";
+    if (probe_metrics.rtt_ms && probe_metrics.jitter_ms)
     {
-        std::cout << std::setprecision(3) << "rtt_ema_30min = " << *long_ema.rtt_ms
-                  << " ms, rtt_stddev_ema_30min = " << *long_ema.jitter_ms << " ms\n";
+        std::cout << std::setprecision(3) << "rtt_ema_30s = " << *probe_metrics.rtt_ms
+                  << " ms, rtt_stddev_ema_30s = " << *probe_metrics.jitter_ms << " ms\n";
         if (metrics.assessment.quality.cost)
         {
             std::cout << "quality_cost = " << *metrics.assessment.quality.cost
@@ -68,7 +68,7 @@ asio::awaitable<void> start(std::string target, asio::io_context &io_context,
 {
     const auto destination = co_await resolve_target(target);
     std::cout << "PING " << target << " (" << destination.to_string() << ")" << std::endl;
-    icmp.emplace(io_context, std::chrono::seconds(1), std::chrono::milliseconds(800));
+    icmp.emplace(io_context, std::chrono::seconds(1), LinkQuality::scoring_timeout);
 
     icmp->run({destination});
     asio::steady_timer wait(io_context);

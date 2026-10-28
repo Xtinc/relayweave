@@ -123,7 +123,7 @@ asio::awaitable<bool> ProbeSet::refresh_targets()
             {
                 addresses.push_back(address);
             }
-            icmp_.emplace(io_, 1s, 800ms);
+            icmp_.emplace(io_, 1s, LinkQuality::scoring_timeout);
             bool started = false;
             try
             {

@@ -9,10 +9,6 @@ TEST_MEMBER(AgentRouting, candidate_paths)
 TEST_MEMBER(ProbeSet, resolved_)
 TEST_MEMBER(ProbeSet, icmp_)
 TEST_MEMBER(ICMP, sessions_)
-TEST_MEMBER(LinkQuality, ema_)
-TEST_MEMBER(LinkQuality, first_sample_)
-TEST_MEMBER(LinkQuality, last_sample_)
-TEST_MEMBER(LinkQuality, last_success_)
 
 namespace test_routing
 {
@@ -33,7 +29,10 @@ inline std::vector<RouteGraph::Path> candidates(Fixture &routing, const std::str
     auto &icmp = test_access::ProbeSet_icmp_(probes);
     auto &resolved = test_access::ProbeSet_resolved_(probes);
     auto &io = routing.io;
-    if (!icmp) icmp.emplace(io, std::chrono::seconds(1), std::chrono::milliseconds(800));
+    if (!icmp)
+    {
+        icmp.emplace(io, std::chrono::seconds(1), LinkQuality::scoring_timeout);
+    }
     auto &sessions = test_access::ICMP_sessions_(*icmp);
     sessions.clear();
     resolved.clear();
@@ -45,14 +44,10 @@ inline std::vector<RouteGraph::Path> candidates(Fixture &routing, const std::str
         resolved[destination] = {entry.node};
         auto &session = sessions.try_emplace(destination, io).first->second;
         auto &quality = session.state.quality;
-        test_access::LinkQuality_first_sample_(quality) = sampled - std::chrono::hours(1);
-        test_access::LinkQuality_last_sample_(quality) = sampled;
-        test_access::LinkQuality_last_success_(quality) = sampled;
-        for (auto &ema : test_access::LinkQuality_ema_(quality))
+        quality.record(true, entry.access_cost, sampled - LinkQuality::half_life);
+        for (int sample = 0; sample < 32; ++sample)
         {
-            ema.completed_weight = ema.received_weight = 10000.0;
-            ema.rtt_sum = 10000.0 * entry.access_cost;
-            ema.rtt_square_sum = 10000.0 * entry.access_cost * entry.access_cost;
+            quality.record(true, entry.access_cost, sampled);
         }
     }
     return test_access::AgentRouting_candidate_paths(routing, destination, now);
