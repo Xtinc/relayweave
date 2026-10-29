@@ -220,53 +220,6 @@ static void stream_admission_tests()
     }
 }
 
-static void sliced_buffer_admission_tests()
-{
-    // A small view still owns its full allocation until downstream completion.
-    for (const std::size_t size : {0, 1, 257})
-    {
-        LocalFixture fixture;
-        fixture.prepare(4);
-        const auto stream = std::get<std::shared_ptr<lnk::FlowStream>>(fixture.port(4));
-        const BytesBuf storage(FlowStream::maximum_chunk_size, 0x5a);
-        const auto memory_charge = lnk::Frame::charge_for_payload(storage.size());
-        const auto count = test_flow::window_bytes / memory_charge;
-        auto submit = [&] {
-            auto payload = stream->copy_payload(storage);
-            payload.slice(100, size);
-            auto result = asio::co_spawn(fixture.caller, stream->send(std::move(payload)), asio::use_future);
-            fixture.pump();
-            return result;
-        };
-        for (std::size_t index = 0; index < count; ++index)
-        {
-            auto sent = submit();
-            check(sent.wait_for(0s) == std::future_status::ready, "sliced buffer admission stalled early");
-            sent.get();
-        }
-        const auto held = count * memory_charge;
-        check(test_access::flow_buffered_bytes(*fixture.channel) == held,
-              "local memory budget ignored storage outside sliced views");
-        auto staged = submit();
-        check(staged.wait_for(0s) == std::future_status::ready, "sliced buffer handoff did not stage DATA");
-        staged.get();
-        auto pending = submit();
-        check(pending.wait_for(0s) != std::future_status::ready, "sliced buffers bypassed local memory backpressure");
-        check(fixture.receive(4) == BytesBuf(size, 0x5a), "sliced buffer payload changed");
-        check(test_access::flow_buffered_bytes(*fixture.channel) == held,
-              "dequeue released sliced buffer memory before completion");
-        fixture.complete(4);
-        check(pending.wait_for(0s) == std::future_status::ready, "sliced buffer completion did not resume sender");
-        pending.get();
-        for (std::size_t index = 0; index < count + 1; ++index)
-        {
-            check(fixture.receive(4) == BytesBuf(size, 0x5a), "resumed sliced buffer payload changed");
-            fixture.complete(4);
-        }
-        check(test_access::flow_buffered_bytes(*fixture.channel) == 0, "sliced buffers retained local memory charge");
-    }
-}
-
 static void flow_capacity_tests()
 {
     static_assert(lnk::max_flow_count == 1000);
@@ -1080,7 +1033,6 @@ static void multihop_tests()
         {
             check(test_access::flow_buffered_bytes(*node) == 0, "drained three-hop stream retained charge");
         }
-        // Exercise the public slicing API across real Links in both directions.
         // Each direction exceeds the initial wire window, including empty DATA.
         constexpr std::array<std::size_t, 3> sizes{0, 1, 257};
         constexpr std::size_t frames = 1026;
@@ -1094,43 +1046,42 @@ static void multihop_tests()
                 co_await test_flow::port(source, 7, 12, reverse));
             const auto receiver = std::get<std::shared_ptr<lnk::FlowStream>>(
                 co_await test_flow::port(sink, 7, 12, !reverse));
-            auto send_slices = [&]() -> asio::awaitable<void> {
+            auto send_chunks = [&]() -> asio::awaitable<void> {
                 for (std::size_t index = 0; index < frames; ++index)
                 {
-                    const BytesBuf storage(FlowStream::maximum_chunk_size, static_cast<std::uint8_t>(index));
-                    auto data = sender->copy_payload(storage);
-                    data.slice(123, sizes[index % sizes.size()]);
+                    const BytesBuf payload(sizes[index % sizes.size()], static_cast<std::uint8_t>(index));
+                    auto data = sender->copy_payload(payload);
                     co_await sender->send(std::move(data));
                 }
                 co_await sender->finish_send();
             };
-            auto sent_slices = asio::co_spawn(io, send_slices(), asio::use_future);
+            auto sent_chunks = asio::co_spawn(io, send_chunks(), asio::use_future);
             for (std::size_t index = 0; index < frames; ++index)
             {
                 auto data = co_await receiver->receive();
                 check(data && std::ranges::equal(data->bytes(),
                           BytesBuf(sizes[index % sizes.size()], static_cast<std::uint8_t>(index))),
-                      "three-hop sliced stream lost, reordered or changed DATA");
+                      "three-hop stream lost, reordered or changed DATA");
                 data.reset();
                 receiver->complete_receive();
             }
-            check(!(co_await receiver->receive()), "sliced stream FIN overtook or lost DATA");
-            check(sent_slices.wait_for(0s) == std::future_status::ready, "sliced stream sender did not drain");
-            sent_slices.get();
+            check(!(co_await receiver->receive()), "stream FIN overtook or lost DATA");
+            check(sent_chunks.wait_for(0s) == std::future_status::ready, "stream sender did not drain");
+            sent_chunks.get();
             for (const auto &node : nodes)
             {
                 const auto flow = test_access::FlowProtocol_flows_(*node).at(12);
                 const auto &direction = flow->stream->directions[std::size_t(reverse)];
                 if (reverse ? flow->previous : flow->next)
                 {
-                    check(direction.sent_bytes == wire_charge, "sender charged hidden slice storage to wire credit");
+                    check(direction.sent_bytes == wire_charge, "sender charged incorrect DATA wire credit");
                 }
                 if (reverse ? flow->next : flow->previous)
                 {
                     check(direction.received_bytes == wire_charge && direction.released_bytes == wire_charge,
-                          "receiver returned different credit for sliced DATA");
+                          "receiver returned different credit for DATA");
                 }
-                check(test_access::flow_buffered_bytes(*node) == 0, "sliced stream retained local memory charge");
+                check(test_access::flow_buffered_bytes(*node) == 0, "stream retained local memory charge");
             }
         }
     };
@@ -1163,7 +1114,6 @@ int main()
     try
     {
         stream_admission_tests();
-        sliced_buffer_admission_tests();
         flow_capacity_tests();
         flow_churn_tests();
         datagram_admission_tests();

@@ -139,11 +139,11 @@ RelayAgent::RelayAgent(asio::io_context &control_io, asio::io_context &transfer_
                        AgentConfig config)
     : control_executor_(control_io.get_executor()), transfer_executor_(transfer_io.get_executor()),
       config_(std::move(config)), routing_(control_io, config_.routing_max_nodes),
-      connections_(*this, control_executor_, ssl_context, config_),
+      connection_(*this, control_executor_, ssl_context, config_),
       forwarder_(std::make_unique<Forwarder>(*this, transfer_executor_, ssl_context, config_.server_name,
                                              config_.channel.handshake_timeout, config_.connect_timeout,
                                              config_.relay_open_timeout, config_.services, config_.forwards)),
-      control_(control_executor_, transfer_executor_, config_, connections_, routing_, *forwarder_)
+      control_(control_executor_, transfer_executor_, config_, connection_, routing_, *forwarder_)
 {
     if (&control_io == &transfer_io)
     {
@@ -162,7 +162,7 @@ void RelayAgent::start()
     }
     forwarder_->start();
     state_ = State::Running;
-    connections_.start();
+    connection_.start();
     control_.start();
 }
 
@@ -189,12 +189,12 @@ asio::awaitable<void> RelayAgent::stop_on_control_executor()
     PROXY_INFO_PRINT("Agent stopping");
     control_.stop();
     routing_.stop();
-    connections_.stop();
+    connection_.stop();
     asio::post(transfer_executor_, [this] { forwarder_->invalidate_relays("agent stopping"); });
 
     co_await control_.close();
     co_await routing_.close();
-    co_await connections_.close();
+    co_await connection_.close();
     co_await asio::co_spawn(transfer_executor_, forwarder_->async_stop(), asio::use_awaitable);
     state_ = State::Stopped;
     PROXY_INFO_PRINT("Agent stopped");

@@ -109,11 +109,6 @@ enum class CtrlCommand : std::uint32_t
     ServiceLocated,
     ServiceList,
     ServiceListed,
-
-    Node = 0x08000000u,
-    NodeLookup,
-    NodeLocated,
-    NodeError,
 };
 
 constexpr CtrlCommand ctrl_command_group(CtrlCommand command) noexcept

@@ -54,9 +54,8 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
     nodelink_mgr_ =
         std::make_unique<NodeLinkMgr>(control_executor_, cluster_data_executor_, config_.cluster, config_.tcp.address,
                                       config_.datagram.address, *cluster_mgr_, *topology_);
-    control_ =
-        std::make_unique<NodeControl>(registry_, *cluster_mgr_, *topology_, *metrics_, relay_sessions_,
-                                      config_.cluster.node_id, config_.control.advertise_address, config_.control.port);
+    control_ = std::make_unique<NodeControl>(registry_, *cluster_mgr_, *topology_, *metrics_, relay_sessions_,
+                                             config_.cluster.node_id, config_.control.advertise_address);
 }
 
 RelayNode::~RelayNode() = default;

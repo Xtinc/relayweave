@@ -18,7 +18,7 @@ TEST_MEMBER(RelayAgent, routing_)
 TEST_MEMBER(RelayAgent, transfer_executor_)
 TEST_MEMBER(RelayAgent, forwarder_)
 TEST_MEMBER(AgentControl, service_locations_)
-TEST_MEMBER(RelayAgent, connections_)
+TEST_MEMBER(RelayAgent, connection_)
 TEST_MEMBER(AgentRouting, path_cache_)
 TEST_MEMBER(RelayNode, config_)
 
@@ -34,9 +34,9 @@ struct RelayAgentTestAccess
     {
         return test_access::RelayAgent_routing_(agent);
     }
-    static NodeConnectionMgr &manager(RelayAgent &agent)
+    static NodeConnection &connection(RelayAgent &agent)
     {
-        return test_access::RelayAgent_connections_(agent);
+        return test_access::RelayAgent_connection_(agent);
     }
     static asio::awaitable<void> select_cached_path(RelayAgent &agent, ServiceKey service, std::uint64_t epoch,
                                                     std::vector<std::string> path)
@@ -76,14 +76,14 @@ struct RelayAgentTestAccess
     {
         const ServiceKey service{"auto-tcp", RelayProtocol::Tcp};
         co_await select_cached_path(agent, service, epoch, {"a", "b", "master"});
-        const auto primary = manager(agent).primary();
-        if (!primary || !primary->ready()) throw std::runtime_error("Primary is not ready");
+        const auto &primary = connection(agent);
+        if (!primary.ready()) throw std::runtime_error("Primary is not ready");
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         for (unsigned i = 0; i < 10; ++i)
         {
             const auto selected = co_await agent.select_relay(service, "master", deadline);
-            if (selected.server.node != "a" || selected.server.channel.lock() != primary->route().channel.lock() ||
-                selected.path != std::vector<std::string>{"a", "b", "master"} || manager(agent).primary() != primary)
+            if (selected.server.node != "a" || selected.server.channel.lock() != primary.route().channel.lock() ||
+                selected.path != std::vector<std::string>{"a", "b", "master"})
                 throw std::runtime_error("Routed selections did not retain the sole primary control");
         }
         bool timed_out = false;
@@ -628,19 +628,6 @@ void integration()
             {
                 channels.push_back(co_await connect_control(client_ssl, config));
             }
-            // The primary can be outside the path. node.lookup does not need a service.
-            channels[0]->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 1}, {"node_id", "a"}}));
-            auto location = co_await receive(channels[0], CtrlCommand::NodeLocated);
-            require(location.params->at("request_id") == 1 && location.params->at("node_id") == "a" &&
-                    location.params->at("address") == configs[1].control.address &&
-                    location.params->at("port") == configs[1].control.port, "Directed entry lookup returned wrong control endpoint");
-            channels[1]->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 2}, {"node_id", "a"}}));
-            location = co_await receive(channels[1], CtrlCommand::NodeLocated);
-            require(location.params->at("node_id") == "a", "Local entry lookup failed");
-            channels[2]->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 3}, {"node_id", "missing"}}));
-            location = co_await receive(channels[2], CtrlCommand::NodeError);
-            require(location.params->at("node_id") == "missing" && location.params->at("request_id") == 3,
-                    "Missing entry lookup lost request identity");
             for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
             {
                 channels[3]->send(CtrlMessage(CtrlCommand::ServiceRegister,
@@ -650,7 +637,7 @@ void integration()
             }
             channels[0]->send(CtrlMessage(CtrlCommand::ServiceLookup,
                 njson{{"request_id", 5}, {"service", "manual-tcp"}, {"protocol", "tcp"}}));
-            location = co_await receive(channels[0], CtrlCommand::ServiceLocated);
+            const auto location = co_await receive(channels[0], CtrlCommand::ServiceLocated);
             require(location.params->at("node_id") == "c", "Entry lookup changed service ownership");
             // Flow rejection happens before install(): the requester must still receive the original error.
             for (const auto ingress : {0U, 1U})

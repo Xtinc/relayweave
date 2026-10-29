@@ -22,7 +22,7 @@ TEST_MEMBER(RelayNode, registry_)
 TEST_MEMBER(RelayNode, relay_sessions_)
 TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(AgentControl, service_locations_)
-TEST_MEMBER(RelayAgent, connections_)
+TEST_MEMBER(RelayAgent, connection_)
 
 namespace
 {
@@ -207,8 +207,8 @@ asio::awaitable<void> verify_entries(RelayAgent &consumer, const std::vector<std
 
 asio::awaitable<void> verify_primary_reconnect(RelayAgent &consumer, std::vector<tcp::socket> &clients)
 {
-    const auto &connections = test_access::RelayAgent_connections_(consumer);
-    const auto original = connections.primary()->route().channel;
+    const auto &connection = test_access::RelayAgent_connection_(consumer);
+    const auto original = connection.route().channel;
     original.lock()->disconnect();
     for (auto &client : clients)
     {
@@ -220,7 +220,7 @@ asio::awaitable<void> verify_primary_reconnect(RelayAgent &consumer, std::vector
     }
     clients.clear();
     const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (!connections.primary()->ready() || !original.expired())
+    while (!connection.ready() || !original.expired())
     {
         require(std::chrono::steady_clock::now() < deadline, "Primary did not reconnect after disconnection");
         asio::steady_timer timer(co_await asio::this_coro::executor, 10ms);

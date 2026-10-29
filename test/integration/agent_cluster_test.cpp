@@ -266,8 +266,7 @@ asio::awaitable<void> verify_topology(asio::ssl::context &context, std::uint16_t
 }
 
 asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context &context,
-                                    asio::ssl::context &client_context, std::uint16_t unavailable_port,
-                                    std::uint16_t service_port)
+                                    asio::ssl::context &client_context, std::uint16_t service_port)
 {
     using namespace asio::experimental::awaitable_operators;
     auto upstream = co_await open_control(client_context, service_port);
@@ -278,8 +277,7 @@ asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context
     auto location = [&](std::uint64_t request, bool available) {
         channel->send(CtrlMessage{"service.located", njson{{"request_id", request},
             {"service", "service-b"}, {"protocol", "tcp"},
-            {"node_id", available ? "master" : "unavailable"}, {"address", "127.0.0.1"},
-            {"port", available ? service_port : unavailable_port}}});
+            {"node_id", available ? "master" : "unavailable"}, {"address", "127.0.0.1"}}});
     };
     auto receive_client = [&]() -> asio::awaitable<void> {
         for (;;)
@@ -331,8 +329,7 @@ asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context
     co_await channel->async_disconnect();
 }
 
-asio::awaitable<void> verify_discovery(asio::ssl::context &context, std::uint16_t entry_port,
-                                      std::uint16_t remote_port)
+asio::awaitable<void> verify_discovery(asio::ssl::context &context, std::uint16_t entry_port)
 {
     const auto executor = co_await asio::this_coro::executor;
     std::array<std::shared_ptr<TLSChannel>, 2> sessions;
@@ -359,7 +356,7 @@ asio::awaitable<void> verify_discovery(asio::ssl::context &context, std::uint16_
         require(params.at("node_id") == (index ? "slave" : "master"), "Incorrect location source");
         require(params.at("address") == (index ? "127.0.0.1" : "localhost"),
                 "Configured control advertise address was not returned");
-        require(params.at("port") == (index ? remote_port : entry_port), "Incorrect control port");
+        require(!params.contains("port"), "Service location retained an unused control port");
         require(!params.contains("source") && !params.contains("session_id") &&
                     !params.contains("requester_node"), "Internal routing fields leaked to client");
         co_await sessions[index]->async_disconnect();
@@ -505,7 +502,7 @@ int main()
         asio::co_spawn(control_io, verify_cluster_status(client_context, control_a, control_b, 2),
                        asio::use_future).get();
         asio::co_spawn(control_io, verify_topology(client_context, control_a, control_b), asio::use_future).get();
-        asio::co_spawn(control_io, verify_discovery(client_context, control_a, control_b),
+        asio::co_spawn(control_io, verify_discovery(client_context, control_a),
                        asio::use_future).get();
 
         auto wait_for_service = [&](std::uint16_t port, const std::string &scenario) {
@@ -577,10 +574,9 @@ int main()
 
         // An unavailable first Node must not suppress subsequent discovery.
         tcp::acceptor discovery_acceptor(control_io, {asio::ip::address_v4::loopback(), 0});
-        const auto unavailable = unused_port(control_io, used);
         const auto recovery_forward = unused_port(transfer_io, used);
         auto discovery_task = asio::co_spawn(control_io,
-            discovery_peer(discovery_acceptor, server_context, client_context, unavailable, control_a), asio::use_future);
+            discovery_peer(discovery_acceptor, server_context, client_context, control_a), asio::use_future);
         auto recovery_config = client_config(discovery_acceptor.local_endpoint().port());
         recovery_config.forwards.push_back(
             AgentForwardConfig{"service-b", "127.0.0.1", recovery_forward, RelayProtocol::Tcp});

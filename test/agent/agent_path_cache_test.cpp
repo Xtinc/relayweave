@@ -222,7 +222,6 @@ class ControlPeer
                     auto located = params;
                     located["node_id"] = "cache-node";
                     located["address"] = host;
-                    located["port"] = acceptor.local_endpoint().port();
                     current->send(CtrlMessage{CtrlCommand::ServiceLocated, std::move(located)});
                     ++lookups;
                     break;

@@ -117,9 +117,9 @@ static void validate_server_status(const njson &params, std::string_view locatio
 
 NodeControl::NodeControl(RegistryMgr &registry, ClusterMgr &cluster, const Topology &topology,
                          const NodeMetrics &metrics, const NodeSessionList &relays, std::string node_id,
-                         std::string advertise_address, std::uint16_t control_port)
+                         std::string advertise_address)
     : registry_(registry), cluster_(cluster), topology_(topology), metrics_(metrics), relay_sessions_(relays),
-      node_id_(std::move(node_id)), advertise_address_(std::move(advertise_address)), control_port_(control_port)
+      node_id_(std::move(node_id)), advertise_address_(std::move(advertise_address))
 {
 }
 
@@ -133,9 +133,6 @@ bool NodeControl::handle_client(SessionId id, const ControlSessionPtr &session, 
         break;
     case CtrlCommand::ServerIdentify:
         session->send(CtrlMessage{CtrlCommand::ServerIdentified, njson{{"node_id", node_id_}}});
-        break;
-    case CtrlCommand::NodeLookup:
-        locate_node(id, session, params);
         break;
     case CtrlCommand::ServiceLookup:
         locate_service(id, session, params);
@@ -166,13 +163,6 @@ void NodeControl::handle_cluster(CtrlCommand command, CtrlMessage message)
     const auto &params = *message.params;
     switch (command)
     {
-    case CtrlCommand::NodeLookup:
-        handle_node_lookup(params);
-        break;
-    case CtrlCommand::NodeLocated:
-    case CtrlCommand::NodeError:
-        handle_node_location(command, std::move(message));
-        break;
     case CtrlCommand::ServiceLookup:
         handle_cluster_lookup(params);
         break;
@@ -300,7 +290,6 @@ void NodeControl::handle_cluster_location(CtrlMessage message)
     config::message_service(params);
     config::message_protocol(params);
     config::required_string(params, "address", "service.located");
-    config::required_port(params, "port", "service.located");
     session->send(std::move(message));
 }
 
@@ -363,10 +352,10 @@ void NodeControl::handle_topology_query(const njson &params)
 
 void NodeControl::handle_topology_snapshot(CtrlMessage message)
 {
-    // if (message.params->at("source") != topology_.master_id())
-    // {
-    //     return;
-    // }
+    if (message.params->at("source") != topology_.master_id())
+    {
+        return;
+    }
     auto session = prepare_client_reply(message, "topology.snapshot");
     if (!session)
     {
@@ -391,8 +380,7 @@ std::optional<CtrlMessage> NodeControl::service_location(const njson &params)
                                                           {"service", service},
                                                           {"protocol", relay_protocol_name(protocol)},
                                                           {"node_id", node_id_},
-                                                          {"address", advertise_address_},
-                                                          {"port", control_port_}}};
+                                                          {"address", advertise_address_}}};
 }
 
 CtrlMessage NodeControl::server_status_message(std::uint64_t request_id)
@@ -433,55 +421,6 @@ void NodeControl::report_traffic(const ControlSessionPtr &session, const njson &
     const auto request_id = config::require_unsigned(params, "request_id");
     session->send(CtrlMessage{CtrlCommand::ServerTrafficReported,
                               njson{{"request_id", request_id}, {"services", registry_.traffic_report()}}});
-}
-
-void NodeControl::locate_node(SessionId id, const ControlSessionPtr &session, const njson &params)
-{
-    const auto request = config::require_unsigned(params, "request_id", true);
-    const auto node = config::required_string(params, "node_id", "node.lookup");
-    if (!topology_.members().contains(node))
-    {
-        session->send(CtrlMessage(CtrlCommand::NodeError,
-                                  njson{{"request_id", request}, {"node_id", node}, {"reason", "node unavailable"}}));
-        return;
-    }
-    if (node == node_id_)
-    {
-        session->send(CtrlMessage(CtrlCommand::NodeLocated, njson{{"request_id", request},
-                                                                  {"node_id", node},
-                                                                  {"address", advertise_address_},
-                                                                  {"port", control_port_}}));
-        return;
-    }
-    cluster_.send(node, CtrlMessage(CtrlCommand::NodeLookup,
-                                    njson{{"request_id", request}, {"node_id", node}, {"session_id", id}}));
-}
-
-void NodeControl::handle_node_lookup(const njson &params)
-{
-    const auto &source = params.at("source").get_ref<const std::string &>();
-    if (config::required_string(params, "node_id", "node.lookup") != node_id_ || !topology_.members().contains(source))
-    {
-        return;
-    }
-    CtrlMessage reply(CtrlCommand::NodeLocated, njson{{"address", advertise_address_}, {"port", control_port_}});
-    attach_cluster_reply_route(reply, params);
-    cluster_.send(source, std::move(reply));
-}
-
-void NodeControl::handle_node_location(CtrlCommand command, CtrlMessage message)
-{
-    if (auto session = prepare_client_reply(message, "node.located"))
-    {
-        const auto &params = *message.params;
-        config::require_unsigned(params, "request_id", true);
-        if (command == CtrlCommand::NodeLocated)
-        {
-            config::required_string(params, "address", "node.located");
-            config::required_port(params, "port", "node.located");
-        }
-        session->send(std::move(message));
-    }
 }
 
 NodeMetrics::NodeMetrics(asio::any_io_executor control, asio::any_io_executor tcp, asio::any_io_executor udp,

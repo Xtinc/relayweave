@@ -44,8 +44,7 @@ class PooledBuffer
     PooledBuffer() noexcept = default;
 
     PooledBuffer(std::shared_ptr<std::pmr::memory_resource> resource, std::size_t size)
-        : storage_(size ? static_cast<std::uint8_t *>(resource->allocate(size)) : nullptr, Deleter{size, resource}),
-          view_(storage_.get(), size)
+        : storage_(size ? static_cast<std::uint8_t *>(resource->allocate(size)) : nullptr, Deleter{size, resource})
     {
     }
 
@@ -58,60 +57,36 @@ class PooledBuffer
         }
     }
 
-    PooledBuffer(PooledBuffer &&other) noexcept
-        : storage_(std::move(other.storage_)), view_(std::exchange(other.view_, {}))
-    {
-    }
-
-    PooledBuffer &operator=(PooledBuffer &&other) noexcept
-    {
-        if (this != &other)
-        {
-            storage_ = std::move(other.storage_);
-            view_ = std::exchange(other.view_, {});
-        }
-        return *this;
-    }
+    PooledBuffer(PooledBuffer &&other) noexcept = default;
+    PooledBuffer &operator=(PooledBuffer &&other) noexcept = default;
 
     std::uint8_t *data() noexcept
     {
-        return view_.data();
+        return storage_.get();
     }
 
     const std::uint8_t *data() const noexcept
     {
-        return view_.data();
+        return storage_.get();
     }
 
     std::size_t size() const noexcept
-    {
-        return view_.size();
-    }
-
-    std::size_t allocation_size() const noexcept
     {
         return storage_ ? storage_.get_deleter().size : 0;
     }
 
     std::span<std::uint8_t> bytes() noexcept
     {
-        return view_;
+        return {data(), size()};
     }
 
     std::span<const std::uint8_t> bytes() const noexcept
     {
-        return view_;
-    }
-
-    void slice(std::size_t offset, std::size_t size) noexcept
-    {
-        assert(offset <= view_.size() && size <= view_.size() - offset);
-        view_ = view_.subspan(offset, size);
+        return {data(), size()};
     }
 
   private:
     std::unique_ptr<std::uint8_t, Deleter> storage_{nullptr, Deleter{}};
-    std::span<std::uint8_t> view_;
 };
 
 struct FlowWriteTag
@@ -146,11 +121,6 @@ struct Frame
     std::size_t charge() const noexcept
     {
         return charge_for_payload(payload.size());
-    }
-    // Local admission retains the whole allocation, including bytes outside a sliced view.
-    std::size_t memory_charge() const noexcept
-    {
-        return charge_for_payload(payload.allocation_size());
     }
 };
 static_assert(sizeof(Frame) <= Frame::buffer_overhead, "review frame management charge after changing Frame layout");

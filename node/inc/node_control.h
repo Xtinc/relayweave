@@ -104,19 +104,17 @@ class NodeControl
 
   public:
     /**
-     * @brief Borrow Node-owned dependencies and retain the local advertised control endpoint.
+     * @brief Borrow Node-owned dependencies and retain the advertised service Node address.
      * @param registry Node-owned session and service registry borrowed on control_io.
      * @param cluster Node-owned cluster control manager borrowed for message routing.
      * @param topology Node-owned topology and current membership state borrowed on control_io.
      * @param metrics Node-owned metrics provider borrowed for control-side snapshots.
      * @param relays Node-owned business container borrowed for read-only status reporting.
      * @param node_id Unique nonempty cluster Node identity.
-     * @param advertise_address Reachable Node address published for Agent control connections.
-     * @param control_port Port of the Node's public Agent control listener.
+     * @param advertise_address Reachable Node address published for Agent probes.
      */
     NodeControl(RegistryMgr &registry, ClusterMgr &cluster, const Topology &topology, const NodeMetrics &metrics,
-                const NodeSessionList &relays, std::string node_id, std::string advertise_address,
-                std::uint16_t control_port);
+                const NodeSessionList &relays, std::string node_id, std::string advertise_address);
     /**
      * @brief Handle a public client command; return false if the command belongs elsewhere.
      * @pre RelayNode has validated the params object; command-specific fields are checked here.
@@ -136,9 +134,6 @@ class NodeControl
     void handle_cluster(CtrlCommand command, CtrlMessage message);
 
   private:
-    void locate_node(SessionId id, const ControlSessionPtr &session, const njson &params);
-    void handle_node_lookup(const njson &params);
-    void handle_node_location(CtrlCommand command, CtrlMessage message);
     void broadcast_client_query(SessionId id, CtrlMessage message);
     void attach_cluster_reply_route(CtrlMessage &reply, const njson &query);
     ControlSessionPtr prepare_client_reply(CtrlMessage &reply, std::string_view location);
@@ -165,7 +160,6 @@ class NodeControl
     const NodeSessionList &relay_sessions_;
     std::string node_id_;
     std::string advertise_address_;
-    std::uint16_t control_port_;
 };
 
 #endif

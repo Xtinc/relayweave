@@ -420,14 +420,14 @@ void data_failures()
             auto udp_received = co_await port->receive();
             require(std::ranges::equal(udp_received.bytes(), valid_payload),
                     "malformed maximum-size UDP frame entered the flow");
-            require(udp_received.allocation_size() == valid_payload.size(),
+            require(udp_received.size() == valid_payload.size(),
                     "small UDP payload retained a maximum-size receive block");
             for (const auto length : {std::size_t{0}, std::size_t{64}, std::size_t{512}, LnkFrameHeader::maximum_payload})
             {
                 const BytesBuf expected(length, 0x7b);
                 co_await send_payload(expected);
                 auto received = co_await port->receive();
-                require(std::ranges::equal(received.bytes(), expected) && received.allocation_size() == length,
+                require(std::ranges::equal(received.bytes(), expected) && received.size() == length,
                         "UDP payload changed or was not allocated at its actual length");
                 require(std::ranges::equal(udp_received.bytes(), valid_payload),
                         "reusing the UDP receive array overwrote an earlier delivery");

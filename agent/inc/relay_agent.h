@@ -54,7 +54,7 @@ class RelayAgent
 {
   public:
     /**
-     * @brief Construct modules without starting control connections or local listeners.
+     * @brief Construct modules without starting the control connection or local listeners.
      * @param control_io Single-threaded control execution domain.
      * @param transfer_io Distinct single-threaded business execution domain.
      * @param ssl_context Borrowed client TLS context, valid through shutdown.
@@ -89,7 +89,6 @@ class RelayAgent
                                                  std::chrono::steady_clock::time_point deadline);
 
   private:
-    friend class NodeConnectionMgr;
     friend class NodeConnection;
     /** @brief Dispatch primary identification to the control component on control_io. */
     void connection_ready(const NodeConnection &connection);
@@ -112,7 +111,7 @@ class RelayAgent
     asio::io_context::executor_type transfer_executor_;
     AgentConfig config_;
     AgentRouting routing_;
-    NodeConnectionMgr connections_;
+    NodeConnection connection_;
     std::unique_ptr<Forwarder> forwarder_;
     AgentControl control_;
     State state_ = State::Created;

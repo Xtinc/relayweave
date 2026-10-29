@@ -88,27 +88,34 @@ int main(int argc, char *argv[])
                     worker.join();
                 }
             });
-            workers.emplace_back([&] { control_io.run(); });
             workers.emplace_back([&] {
-                set_current_thread_scheduler_policy();
+                set_current_thread_name("node-control");
+                control_io.run();
+            });
+            workers.emplace_back([&] {
+                set_current_thread_name("node-tcp");
                 transfer_tcp_io.run();
             });
             workers.emplace_back([&] {
-                set_current_thread_scheduler_policy();
+                set_current_thread_name("node-udp");
                 transfer_udp_io.run();
             });
-            workers.emplace_back([&] { cluster_data_io.run(); });
+            workers.emplace_back([&] {
+                set_current_thread_name("node-data");
+                cluster_data_io.run();
+            });
 
             try
             {
                 asio::post(control_io, asio::use_future([&] {
-                    node->start([&](std::string reason) {
-                        asio::post(signal_io, [&, reason = std::move(reason)] {
-                            failure = std::make_exception_ptr(std::runtime_error(reason));
-                            signals.cancel();
-                        });
-                    });
-                })).get();
+                               node->start([&](std::string reason) {
+                                   asio::post(signal_io, [&, reason = std::move(reason)] {
+                                       failure = std::make_exception_ptr(std::runtime_error(reason));
+                                       signals.cancel();
+                                   });
+                               });
+                           }))
+                    .get();
                 signal_io.run();
                 if (!failure)
                 {

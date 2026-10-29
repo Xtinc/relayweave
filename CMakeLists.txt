@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(relayweave VERSION 1.0.6 LANGUAGES CXX)
+project(relayweave VERSION 1.0.7 LANGUAGES CXX)
 
 if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2/include/asio.hpp"
     OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/CMakeLists.txt"
@@ -99,16 +99,16 @@ add_subdirectory(agent)
 add_subdirectory(proxy)
 add_subdirectory(dashboard)
 
-# include(CTest)
-# if(BUILD_TESTING)
-#     add_subdirectory(test)
-# endif()
+include(CTest)
+if(BUILD_TESTING)
+    add_subdirectory(test)
+endif()
 
-# option(BUILD_BENCHMARKS "Build manual performance benchmarks" OFF)
-# if(BUILD_BENCHMARKS)
-#     add_subdirectory(benchmark)
-# endif()
+option(BUILD_BENCHMARKS "Build manual performance benchmarks" OFF)
+if(BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
+endif()
 
-# if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-#     include(cmake/Packaging.cmake)
-# endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    include(cmake/Packaging.cmake)
+endif()

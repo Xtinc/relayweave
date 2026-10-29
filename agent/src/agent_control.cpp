@@ -6,10 +6,10 @@
 #include <unordered_set>
 
 AgentControl::AgentControl(asio::any_io_executor control_executor, asio::any_io_executor transfer_executor,
-                           const AgentConfig &config, NodeConnectionMgr &connections, AgentRouting &routing,
+                           const AgentConfig &config, NodeConnection &connection, AgentRouting &routing,
                            Forwarder &forwarder)
     : control_executor_(std::move(control_executor)), transfer_executor_(std::move(transfer_executor)), config_(config),
-      routing_(routing), forwarder_(forwarder), connections_(connections), discovery_timer_(control_executor_),
+      routing_(routing), forwarder_(forwarder), connection_(connection), discovery_timer_(control_executor_),
       discovery_done_(control_executor_)
 {
     for (const auto &forward : config_.forwards)
@@ -98,20 +98,20 @@ asio::awaitable<void> AgentControl::discovery_loop()
 
 void AgentControl::query_topology()
 {
-    const auto primary = connections_.primary();
+    const auto &primary = connection_;
     const auto now = AgentRouting::Clock::now();
-    if (primary && primary->ready() && !routing_.request_pending(now))
+    if (primary.ready() && !routing_.request_pending(now))
     {
         const auto request = allocate_request_id();
         routing_.begin_request(request, now);
-        primary->send(CtrlMessage{CtrlCommand::TopologyQuery, njson{{"request_id", request}}});
+        primary.send(CtrlMessage{CtrlCommand::TopologyQuery, njson{{"request_id", request}}});
     }
 }
 
 void AgentControl::update_probe_targets()
 {
-    const auto primary = connections_.primary();
-    std::map<std::string, std::string> targets{{primary ? primary->node_id() : std::string{}, config_.host}};
+    const auto &primary = connection_;
+    std::map<std::string, std::string> targets{{primary.node_id(), config_.host}};
     for (const auto &[service, location] : service_locations_)
     {
         if (!location.node.empty())
@@ -163,8 +163,8 @@ void AgentControl::connection_closed()
 
 void AgentControl::query_services(bool refresh)
 {
-    const auto primary = connections_.primary();
-    if (!primary || !primary->ready())
+    const auto &primary = connection_;
+    if (!primary.ready())
     {
         return;
     }
@@ -176,7 +176,7 @@ void AgentControl::query_services(bool refresh)
             continue;
         }
         location.request = allocate_request_id();
-        primary->send(
+        primary.send(
             CtrlMessage{CtrlCommand::ServiceLookup, njson{{"request_id", location.request},
                                                           {"service", service.service},
                                                           {"protocol", relay_protocol_name(service.protocol)}}});
@@ -194,11 +194,9 @@ void AgentControl::locate_service(const njson &params)
     }
     auto node = config::required_string(params, "node_id", "service.located");
     auto address = config::required_string(params, "address", "service.located");
-    const auto port = config::required_port(params, "port", "service.located");
     desired->second = ServiceLocation{0, node, std::move(address)};
-    PROXY_INFO_PRINT("Service located service=%s/%s -> %s@%s:%u", service.service.c_str(),
-                     relay_protocol_name(service.protocol).data(), node.c_str(), desired->second.address.c_str(),
-                     static_cast<unsigned int>(port));
+    PROXY_INFO_PRINT("Service located service=%s/%s -> %s@%s", service.service.c_str(),
+                     relay_protocol_name(service.protocol).data(), node.c_str(), desired->second.address.c_str());
     update_probe_targets();
     asio::post(transfer_executor_,
                [&forwarder = forwarder_, service = std::move(service), node = std::move(node)]() mutable {
@@ -346,13 +344,13 @@ asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, s
     {
         throw std::runtime_error("relay establishment timed out");
     }
-    const auto primary = connections_.primary();
-    if (!primary || !primary->ready())
+    const auto &primary = connection_;
+    if (!primary.ready())
     {
         throw std::runtime_error("primary control unavailable");
     }
     auto path = routing_.select_path(service, destination);
-    auto route = primary->route();
+    auto route = primary.route();
     route.node = path.size() > 1 ? path.front() : destination;
     co_return RelaySelection{std::move(route), std::move(path), routing_.epoch()};
 }

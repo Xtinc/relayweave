@@ -5,11 +5,8 @@
 #include <stdexcept>
 #include <type_traits>
 
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__linux__)
+#if defined(__linux__)
 #include <pthread.h>
-#include <sched.h>
 #endif
 
 using tcp = asio::ip::tcp;
@@ -18,34 +15,12 @@ using tls_stream = asio::ssl::stream<tcp::socket>;
 
 constexpr auto use_nothrow_awaitable = asio::as_tuple(asio::use_awaitable);
 
-void set_current_thread_scheduler_policy()
+void set_current_thread_name(const char *name)
 {
-#if defined(_WIN32)
-    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL))
-    {
-        PROXY_ERROR_PRINT("SetThreadPriority failed: error=%lu.", GetLastError());
-    }
-#elif defined(__linux__)
-    pthread_t thread = pthread_self();
-    struct sched_param param{};
-    const int max_priority = sched_get_priority_max(SCHED_RR);
-    const int min_priority = sched_get_priority_min(SCHED_RR);
-    if (max_priority < 0)
-    {
-        PROXY_ERROR_PRINT("sched_get_priority_max failed: error=%s.", std::strerror(errno));
-        return;
-    }
-    param.sched_priority = max_priority > min_priority ? max_priority - 1 : max_priority;
-    const auto error = pthread_setschedparam(thread, SCHED_RR, &param);
-    if (error != 0)
-    {
-        if (error == EPERM || error == EACCES)
-            PROXY_DEBUG_PRINT("Thread priority unchanged: SCHED_RR requires permission (%s)", std::strerror(error));
-        else
-            PROXY_ERROR_PRINT("Thread priority failed: SCHED_RR error=%s", std::strerror(error));
-        return;
-    }
-    pthread_setname_np(thread, "audio_thd");
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), name);
+#else
+    (void)name;
 #endif
 }
 
@@ -183,8 +158,8 @@ static void log_transfer_end(const asio::error_code &error, const char *protocol
         PROXY_DEBUG_PRINT("Transfer ended %s %s %s -> %s reason=%s", protocol, operation, socket_peer(from).c_str(),
                           socket_peer(to).c_str(), error.message().c_str());
     else
-        PROXY_ERROR_PRINT("Transfer failed %s %s %s -> %s reason=%s", protocol, operation,
-                          socket_peer(from).c_str(), socket_peer(to).c_str(), error.message().c_str());
+        PROXY_ERROR_PRINT("Transfer failed %s %s %s -> %s reason=%s", protocol, operation, socket_peer(from).c_str(),
+                          socket_peer(to).c_str(), error.message().c_str());
 }
 
 static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, TokenBucket *limiter,
@@ -257,15 +232,14 @@ asio::awaitable<std::size_t> read_tls_data(tls_stream &stream, std::span<std::ui
     co_return size;
 }
 
-asio::awaitable<void> write_tls_data(tls_stream &stream, std::span<const std::uint8_t> payload,
-                                    TrafficCounter *traffic)
+asio::awaitable<void> write_tls_data(tls_stream &stream, std::span<const std::uint8_t> payload, TrafficCounter *traffic)
 {
     while (!payload.empty())
     {
         const auto size = std::min(payload.size(), tls_data_maximum_payload);
-        const std::array<std::uint8_t, 4> header{
-            static_cast<std::uint8_t>(size >> 24), static_cast<std::uint8_t>(size >> 16),
-            static_cast<std::uint8_t>(size >> 8), static_cast<std::uint8_t>(size)};
+        const std::array<std::uint8_t, 4> header{static_cast<std::uint8_t>(size >> 24),
+                                                 static_cast<std::uint8_t>(size >> 16),
+                                                 static_cast<std::uint8_t>(size >> 8), static_cast<std::uint8_t>(size)};
         const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload.data(), size)};
         const auto [error, written] = co_await asio::async_write(stream, buffers, use_nothrow_awaitable);
         if (traffic && written > header.size())
@@ -339,7 +313,8 @@ static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limit
         }
         else
         {
-            const auto [error, written] = co_await asio::async_write(to, asio::buffer(buffer.data(), size), use_nothrow_awaitable);
+            const auto [error, written] =
+                co_await asio::async_write(to, asio::buffer(buffer.data(), size), use_nothrow_awaitable);
             if (traffic)
             {
                 traffic->add(written);
@@ -448,10 +423,10 @@ asio::awaitable<void> relay_udp_connected(udp::socket &local_socket, udp::socket
 asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming)
 {
     const auto executor = co_await asio::this_coro::executor;
-    const auto [order, outgoing_error, incoming_error] = co_await asio::experimental::make_parallel_group(
-        asio::co_spawn(executor, std::move(outgoing), asio::deferred),
-        asio::co_spawn(executor, std::move(incoming), asio::deferred)
-    ).async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
+    const auto [order, outgoing_error, incoming_error] =
+        co_await asio::experimental::make_parallel_group(asio::co_spawn(executor, std::move(outgoing), asio::deferred),
+                                                         asio::co_spawn(executor, std::move(incoming), asio::deferred))
+            .async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
     // operator&& retains only the outgoing exception if both fail; that can hide the original I/O error.
     for (const auto index : order)
     {

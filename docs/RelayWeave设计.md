@@ -163,11 +163,11 @@ flowchart TB
    - **托管组件**：`RegistryMgr`、`Topology`、`NodeControl`、`NodeMetrics`、`NodeLinkMgr`（控制事务状态机）、`ClusterMgr`、`NodeSession` 容器。
    - **职责范围**：处理来自 Agent 的控制长连接（端口 18443）；Master 节点的集群控制监听（端口 18447）；服务注册与发现；拓扑测量数据聚合与快照生成；Flow 路径安装（`FlowPrepare` / `FlowCommit`）事务驱动；业务会话协调（`ControlRouterSingle` / `ControlRouterMulti`）。
 2. **`transfer_tcp_io`（TCP/TLS 传输执行域）**：
-   - **驱动线程**：单线程运行，尝试设置专用系统调度优先级（`set_current_thread_scheduler_policy()`）。
+   - **驱动线程**：单线程运行，使用普通调度，Linux 线程名为 `node-tcp`。
    - **托管组件**：`TcpPipeline`、`TlsPipeline`。
    - **职责范围**：监听公网 TCP 业务端口（18444）与 TLS 业务端口（18446）；完成接入连接的 TLS 握手与证书校验；接收并验证首个 CBOR `relay.attach` 控制帧；负责 Agent 侧客户端 socket 与本地 `FlowStream` 端口之间全双工异步流式数据拷贝（`xfr_channel.h` 中的转发函数）。
 3. **`transfer_udp_io`（UDP 传输执行域）**：
-   - **驱动线程**：单线程运行，尝试设置专用系统调度优先级。
+   - **驱动线程**：单线程运行，使用普通调度，Linux 线程名为 `node-udp`。
    - **托管组件**：`DatagramMgr`。
    - **职责范围**：独占监听公网 UDP 业务单端口（18445）；基于 8 字节 `DatagramHeader` 执行数据报解复用；维护客户端远端反射地址（Endpoint Mapping）；与本地 `FlowDatagram` 端口执行异步报文收发。
 4. **`cluster_data_io`（专网数据链路执行域）**：
@@ -204,12 +204,14 @@ flowchart TD
 
 ### 2.2 RelayAgent 部件拓扑与双执行域
 
+`RelayAgent` 按值持有唯一 `NodeConnection`，不再通过连接管理器包装；连接对象在 start 时创建在途操作，在停止后等待任务与 TLS 通道排空。
+
 RelayAgent 采用精炼的双执行域架构，将轻量的控制管理与高吞吐的业务转发彻底解耦：
 
 ```mermaid
 flowchart TB
     subgraph ctl["control_io：一个线程"]
-        Connection["NodeConnectionMgr：主控长连接"]
+        Connection["NodeConnection：主控长连接"]
         Control["AgentControl：注册 / 发现 / 周期查询"]
         Routing["AgentRouting：探测 / 图计算 / 路径缓存"]
         Control <--> Connection
@@ -227,8 +229,10 @@ flowchart TB
 
 #### 双执行域职责
 
+Agent 和 Node 工作线程保留普通调度策略，仅通过 `set_current_thread_name()` 设置 Linux 线程名；Agent 使用 `agent-control` / `agent-transfer`，Node 使用 `node-control` / `node-tcp` / `node-udp` / `node-data`。
+
 1. **`control_io`（控制执行域）**：
-   - 托管 `NodeConnectionMgr`：维护与主控 RelayNode 的安全 mTLS 控制通道（端口 18443），执行重连与心跳。
+   - 托管 `NodeConnection`：维护与主控 RelayNode 的安全 mTLS 控制通道（端口 18443），执行重连与心跳。
    - 托管 `AgentControl`：负责服务注册（`ServiceRegister`）；发起服务查询（`ServiceLookup`）；获取集群拓扑快照并更新探测目标。
    - 托管 `AgentRouting`：维护链路质量度量，执行有节点数约束的最短路径计算并管理本地候选路径缓存。
 2. **`transfer_io`（传输执行域）**：
@@ -243,7 +247,7 @@ flowchart TB
 2. 协程内部切换至 `control_io`：
    - `AgentControl` 检查服务位置（`service_locations_`）与请求期限；服务位置由服务发现循环预先查询并更新。
    - 确定目的 Node 后，调用 `AgentRouting::select_path()` 在图模型中计算到达目标 Node 的最佳路径及逻辑入口节点。
-   - 从 `NodeConnectionMgr` 取得主控连接，将逻辑入口记录在回复路由中，由主控 Node 代转控制请求。
+   - 使用直接持有的 `NodeConnection`，将逻辑入口记录在回复路由中，由主控 Node 代转控制请求。
 3. 选路结果（包含路径列表、Epoch、逻辑入口与主控路由）打包返回给 `transfer_io`。
 4. `Forwarder` 在 `transfer_io` 上启动目标数据端口的连接建立，完成握手后开始桥接。
 
@@ -337,7 +341,8 @@ RelayWeave 采用分布式的服务发现架构，服务注册在节点本地集
 2. **服务发现流程 (`ServiceLookup`)**：
    - Consumer Agent 连接就绪后为配置的 forwards 查询服务；发现循环每 5 秒对未解析条目重试 `service.lookup` 并查询拓扑，得到映射后才供本地业务选择。
    - Node 优先检索本地 `RegistryMgr`；若本地未注册，则通过集群控制网向各节点查询，获取注册了该服务的宿主节点（Egress Node）。
-   - 查询成功后，Node 向 Agent 返回 `service.located` 报文，包含 `request_id`、`service`、`protocol`、`node_id`、`address` 与控制 `port`。
+   - 查询成功后，Node 向 Agent 返回 `service.located` 报文，包含 `request_id`、`service`、`protocol`、`node_id` 与 `address`；地址用于探测，不再携带未使用的控制端口。
+   - 集群返回的 `topology.snapshot` 仅在认证后的 `source` 等于当前 Master 时回送给 Agent；随后继续验证 requester、会话及快照结构。
    - Consumer Agent 将发现结果记录在 `service_locations_` 映射表中，并据此更新链路探测目标。
 
 ---
@@ -1066,21 +1071,20 @@ class PooledBuffer {
         }
     };
     std::unique_ptr<std::uint8_t, Deleter> storage_;
-    std::span<std::uint8_t> view_;
 };
 ```
 - **智能析构器携带池指针**：当 `PooledBuffer` 跨越执行域从 `transfer_tcp_io` 投递至 `cluster_data_io` 并在数据写出后析构时，其自带的 Deleter 将内存归还给其原始所属的 PMR 内存池，无需显式跨线程回调。
-- **切片视图（Slice）**：支持在原地无拷贝创建 `std::span` 子视图，用于解析或剥离二进制帧头。
+- **完整载荷所有权**：缓冲区持有完整分配，`size()` 同时表示载荷长度和请求分配长度；不保留切片视图。流控和本地预算统一调用 `Frame::charge()`，按载荷长度进行稳定逻辑计费，不等同于分配器实际 RSS。
 
 #### 5.6.3 数据热路径分配与拷贝分析
 
 在整个数据流转的热路径上：
-1. 客户端 Socket 读取数据直接写入从 PMR 池取出的 `PooledBuffer`；
+1. Agent 接入 Stream 目前先读入固定数组，再按实际读取长度复制到 `PooledBuffer`；NodeLink TCP 则根据帧体长度直接读入池缓冲；
 2. 构建 `Frame` 对象（占用栈帧或队列节点，不分配载荷堆空间）；
 3. 移交所有权至 `FlowStream` 并挂入 `FairQueue`；
 4. 物理 TCP Socket 集中调用 `async_write` 发送；
 5. 发送完成后归还信用并触发 `PooledBuffer` 析构还池。
-整个过程在各中继跳之间通过移动语义传递缓冲区，避免了二次深拷贝。
+各中继跳之间通过移动语义传递缓冲区；接入 Stream 的额外复制仍由后续优化处理。
 
 
 ## 6. 安全体系与证书信任模型
@@ -1364,11 +1368,11 @@ RelayNode 内部的活体协程由进程常驻任务、控制连接、NodeLink�
 
 | 对象/数据结构名称 | 对象尺寸 (sizeof) | 内存归属与生命周期 | 计费与分配口径 |
 |---|---|---|---|
-| **`Frame`** | **96 字节** | 栈/发送队列节点 | 静态断言约束 `sizeof(Frame) <= 128`。流控逻辑计费为 128 字节加上载荷向上取整至 2 的幂次。 |
+| **`Frame`** | **80 字节** | 栈/发送队列节点 | 静态断言约束 `sizeof(Frame) <= 128`。流控逻辑计费为 128 字节加上载荷向上取整至 2 的幂次。 |
 | **`NodeSession`** | **288 字节** | `control_io` | 会话存活期间由 `NodeSessionList` 智能指针持有，会话结束即刻释放。按值持有控制器。 |
 | **`FlowState`** | **~480 字节** | `cluster_data_io` | 包含流状态、双向流控计数器、等待队列。由 `FlowProtocol::flows_` 持有。 |
 | **`NodeLink`** | **832 字节** | `cluster_data_io` | 包含物理 Socket、FairQueue 发送队列、信用合并表等。每对节点按 transport 复用一条，常驻内存。 |
-| **`PooledBuffer`** | **32 字节** | 跨域移动持有 | 栈对象 32 字节（包含 `unique_ptr` + `Deleter` + `span` 视图）。底层内存块来自 PMR 池。 |
+| **`PooledBuffer`** | **32 字节** | 跨域移动持有 | 栈对象 32 字节（包含 `unique_ptr` 及携带分配长度和共享资源的 `Deleter`）。底层内存块来自 PMR 池。 |
 | **`FairQueue`** | **88 字节** | `NodeLink` 成员 | 内部维护 `std::list` 头结点与成员 `unordered_set`（复用桶容量）。 |
 
 在实际生产部署中，进程物理 RSS 内存主要由双方向发送/接收缓冲、队列积压、协程帧、TLS 状态、PMR 预热保留容量以及 Socket 内核缓冲区构成。
@@ -1825,9 +1829,8 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
     "request_id": 52,
     "service": "prod-ssh",
     "protocol": "tcp",
-    "node": "node-3",
-    "address": "203.0.113.12",
-    "port": 18443
+    "node_id": "node-3",
+    "address": "203.0.113.12"
   }
 }
 ```
@@ -1857,6 +1860,6 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 | **`agent/inc/relay_agent.h`**<br>`agent/src/relay_agent.cpp` | `RelayAgent` | 组合根 (协调双执行域) | Agent 进程组合根。管理 control_io 与 transfer_io。 |
 | **`agent/inc/agent_control.h`**<br>`agent/src/agent_control.cpp` | `AgentControl` | `control_io` | Agent 服务注册、服务发现与拓扑轮询驱动。 |
 | **`agent/inc/agent_routing.h`**<br>`agent/src/agent_routing.cpp` | `AgentRouting` | `control_io` | Agent 路径计算器与最优候选路径缓存。 |
-| **`agent/inc/node_connection.h`**<br>`agent/src/node_connection.cpp` | `NodeConnectionMgr` | `control_io` | 到 RelayNode 的长连接管理池。 |
+| **`agent/inc/node_connection.h`**<br>`agent/src/node_connection.cpp` | `NodeConnection` | `control_io` | 直接拥有唯一主控连接、重连与停止排空。 |
 | **`agent/inc/forwarder.h`**<br>`agent/src/forwarder.cpp` | `Forwarder` | `transfer_io` | 本地端口监听器（TCP/UDP）与 `AgentSession` 管理中心。 |
 | **`agent/inc/agent_session.h`**<br>`agent/src/agent_session.cpp` | `AgentSession` | `transfer_io` | 客户端业务连接会话，执行本地 Socket 与远端 Node 数据端口桥接。 |

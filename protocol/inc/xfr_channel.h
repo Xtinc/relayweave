@@ -9,7 +9,11 @@
 #include <span>
 #include <string_view>
 
-void set_current_thread_scheduler_policy();
+/**
+ * @brief Name the calling worker on Linux without changing its scheduling policy.
+ * @param name Null-terminated thread name of at most 15 bytes; ignored on other platforms.
+ */
+void set_current_thread_name(const char *name);
 
 template <class Socket> std::string socket_peer(const Socket &socket)
 {
@@ -70,9 +74,9 @@ inline constexpr std::string_view tls_data_framing = "length32-fin-v1";
 inline constexpr std::size_t tls_data_maximum_payload = LnkFrameHeader::maximum_payload;
 
 asio::awaitable<std::size_t> read_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
-                                          std::span<std::uint8_t> buffer);
+                                           std::span<std::uint8_t> buffer);
 asio::awaitable<void> write_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
-                                    std::span<const std::uint8_t> payload, TrafficCounter *traffic = nullptr);
+                                     std::span<const std::uint8_t> payload, TrafficCounter *traffic = nullptr);
 asio::awaitable<void> finish_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream);
 
 asio::awaitable<void> relay_tls(asio::ip::tcp::socket &left, asio::ssl::stream<asio::ip::tcp::socket> &right);

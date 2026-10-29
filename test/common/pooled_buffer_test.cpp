@@ -132,32 +132,30 @@ void ownership()
         require_buffer(resource->allocations == 0, "empty control frame allocated storage");
         PooledBuffer packet(resource, 128);
         auto storage = packet.data();
-        packet.data()[40] = 17;
-        packet.data()[63] = 255;
-        packet.slice(40, 24);
+        packet.data()[0] = 17;
+        packet.data()[127] = 255;
         PooledBuffer moved(std::move(packet));
         PooledBuffer assigned(resource, 16);
         assigned = std::move(moved);
         require_buffer(!packet.data() && !moved.data(), "move retained a second buffer owner");
-        require_buffer(packet.bytes().empty() && packet.allocation_size() == 0 && moved.bytes().empty() &&
-                           moved.allocation_size() == 0,
-                       "moved buffer retained a payload view or allocation charge");
-        require_buffer(assigned.data() == storage + 40 && assigned.size() == 24 && assigned.allocation_size() == 128 &&
+        require_buffer(packet.bytes().empty() && moved.bytes().empty(),
+                       "moved buffer retained a payload or allocation charge");
+        require_buffer(assigned.data() == storage && assigned.size() == 128 &&
                            assigned.bytes().front() == 17 && assigned.bytes().back() == 255,
-                       "move copied or corrupted the payload view");
+                       "move copied or corrupted the payload");
         require_buffer(resource->allocations == 2 && resource->live.size() == 1,
                        "move assignment allocated or retained the previous block");
         auto &same = assigned;
         assigned = std::move(same);
-        require_buffer(assigned.data() == storage + 40 && assigned.size() == 24 && assigned.allocation_size() == 128,
-                       "self move lost the payload view or storage ownership");
+        require_buffer(assigned.data() == storage && assigned.size() == 128,
+                       "self move lost the payload or storage ownership");
         const std::array<std::uint8_t, 3> external{0, 42, 255};
         PooledBuffer copied(resource, external);
         require_buffer(std::equal(copied.bytes().begin(), copied.bytes().end(), external.begin()),
                        "public payload import changed bytes");
     }
     require_buffer(resource->valid_deallocations && resource->live.empty(),
-                   "offset payload was not returned with its original address, size and alignment");
+                   "payload was not returned with its original address, size and alignment");
 }
 
 void channel_transfer()
@@ -167,8 +165,7 @@ void channel_transfer()
         asio::io_context io(1);
         asio::experimental::channel<void(asio::error_code, PooledBuffer)> queue(io, 1);
         PooledBuffer first(resource, 4136);
-        first.data()[40] = 42;
-        first.slice(40, 1);
+        first.data()[0] = 42;
         const auto storage = first.data();
         require_buffer(queue.try_send(asio::error_code{}, std::move(first)), "pooled buffer was not admitted");
         PooledBuffer rejected(resource, 8);
@@ -178,7 +175,7 @@ void channel_transfer()
         auto pending = asio::co_spawn(io, queue.async_receive(asio::use_awaitable), asio::use_future);
         io.run();
         auto packet = pending.get();
-        require_buffer(packet.data() == storage && packet.size() == 1 && packet.bytes().front() == 42 &&
+        require_buffer(packet.data() == storage && packet.size() == 4136 && packet.bytes().front() == 42 &&
                            resource->allocations == 2,
                        "channel or coroutine transfer copied or reallocated payload storage");
     }
@@ -231,14 +228,6 @@ void logical_charge()
     {
         require_buffer(lnk::Frame::charge_for_payload(size) == charge, "wire credit charge changed");
     }
-    lnk::Frame frame{};
-    frame.payload = PooledBuffer(std::make_shared<std::pmr::synchronized_pool_resource>(), 4137);
-    frame.payload.slice(100, 1);
-    require_buffer(frame.charge() == 384, "wire credit included storage outside the payload view");
-    require_buffer(frame.memory_charge() == 8320, "local memory charge ignored sliced-away storage");
-    frame.payload.slice(1, 0);
-    require_buffer(frame.charge() == 128, "empty sliced DATA charged hidden storage to the peer");
-    require_buffer(frame.memory_charge() == 8320, "empty view stopped accounting for its allocation");
 }
 
 void shared_resource_lifetime()
@@ -252,7 +241,6 @@ void shared_resource_lifetime()
         const allocation_count::Scope counting;
         payload = PooledBuffer(pool, 1024);
         payload.bytes().front() = 42;
-        payload.slice(0, 1);
     }
     require_buffer(!weak.expired(), "business delivery released its allocator too early");
     std::thread writer([payload = std::move(payload)]() mutable {
@@ -273,7 +261,7 @@ int main()
         pool_reuse();
         logical_charge();
         shared_resource_lifetime();
-        std::cout << "[PASS] exclusive ownership, offset views and asynchronous channel transfers\n";
+        std::cout << "[PASS] exclusive ownership, exact payload storage and asynchronous channel transfers\n";
     }
     catch (const std::exception &error)
     {

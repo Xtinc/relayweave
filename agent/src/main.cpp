@@ -76,9 +76,12 @@ int main(int argc, char *argv[])
                 worker.join();
             }
         });
-        workers.emplace_back([&] { control_io.run(); });
         workers.emplace_back([&] {
-            set_current_thread_scheduler_policy();
+            set_current_thread_name("agent-control");
+            control_io.run();
+        });
+        workers.emplace_back([&] {
+            set_current_thread_name("agent-transfer");
             transfer_io.run();
         });
 

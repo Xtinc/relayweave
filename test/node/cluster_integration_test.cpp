@@ -387,20 +387,21 @@ asio::awaitable<CtrlMessage> peer_query(const std::shared_ptr<TLSChannel> &peer,
     for (;;)
     {
         auto message = co_await peer->async_receive(3s);
-        if (message.type() == CtrlCommand::NodeLookup && message.params->at("request_id") == request)
+        if (message.type() == CtrlCommand::ServiceLookup && message.params->at("request_id") == request)
         {
             co_return message;
         }
     }
 }
 
-CtrlMessage located_reply(const CtrlMessage &query, std::uint16_t port)
+CtrlMessage located_reply(const CtrlMessage &query)
 {
     const auto &params = *query.params;
-    return CtrlMessage(CtrlCommand::NodeLocated,
+    return CtrlMessage(CtrlCommand::ServiceLocated,
         njson{{"target", params.at("source")}, {"requester_node", params.at("source")},
               {"session_id", params.at("session_id")}, {"request_id", params.at("request_id")},
-              {"source", "forged"}, {"node_id", "forged"}, {"address", "127.0.0.1"}, {"port", port}});
+              {"source", "forged"}, {"node_id", "forged"}, {"address", "127.0.0.1"},
+              {"service", params.at("service")}, {"protocol", params.at("protocol")}});
 }
 
 asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &peer,
@@ -412,21 +413,19 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
     local->send(CtrlMessage(CtrlCommand::ServiceRegister,
                            njson{{"request_id", 100U}, {"service", "public-query"}, {"protocol", "tcp"}}));
     co_await client_reply(local, CtrlCommand::ServiceOk);
+    njson snapshot;
     for (const auto &client : {local, remote})
     {
         client->send(CtrlMessage(CtrlCommand::ServiceLookup,
                                 njson{{"request_id", 101U}, {"service", "public-query"}, {"protocol", "tcp"}}));
         const auto service = co_await client_reply(client, CtrlCommand::ServiceLocated);
-        require(service.params->at("node_id") == "slave" && service.params->at("port") == slave_port,
+        require(service.params->at("node_id") == "slave" && service.params->at("address") == "127.0.0.1" &&
+                    !service.params->contains("port"),
                 "Local/remote service discovery changed its owner or endpoint");
-        client->send(CtrlMessage(CtrlCommand::NodeLookup,
-                                njson{{"request_id", 102U}, {"node_id", "slave"}}));
-        const auto node = co_await client_reply(client, CtrlCommand::NodeLocated);
-        require(node.params->at("node_id") == "slave" && node.params->at("port") == slave_port,
-                "Local/remote node discovery changed its endpoint");
         client->send(CtrlMessage(CtrlCommand::TopologyQuery, njson{{"request_id", 103U}}));
         const auto topology = co_await client_reply(client, CtrlCommand::TopologySnapshot);
         require(topology.params->at("nodes").size() >= 2, "Topology query lost cluster members");
+        snapshot = *topology.params;
         client->send(CtrlMessage(CtrlCommand::ServerCluster, njson{{"request_id", 104U}}));
         std::set<std::string> reported;
         for (unsigned i = 0; i < 2; ++i)
@@ -450,18 +449,27 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
     require(traffic.params->at("services").size() == 1, "Traffic query lost the registered service");
 
     // The observer holds a real lookup so replies can exercise routing without timing races.
-    remote->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 201U}, {"node_id", "observer"}}));
+    remote->send(CtrlMessage(CtrlCommand::ServiceLookup,
+                             njson{{"request_id", 201U}, {"service", "observer-service"}, {"protocol", "tcp"}}));
     const auto query = co_await peer_query(peer, 201U);
-    auto wrong = located_reply(query, master_port);
+    auto forged_snapshot = snapshot;
+    forged_snapshot["target"] = query.params->at("source");
+    forged_snapshot["requester_node"] = query.params->at("source");
+    forged_snapshot["session_id"] = query.params->at("session_id");
+    forged_snapshot["request_id"] = query.params->at("request_id");
+    forged_snapshot["source"] = "test-master";
+    peer->send(CtrlMessage(CtrlCommand::TopologySnapshot, std::move(forged_snapshot)));
+    auto wrong = located_reply(query);
     (*wrong.params)["requester_node"] = "another-node";
     (*wrong.params)["address"] = "wrong.invalid";
     peer->send(std::move(wrong));
-    peer->send(located_reply(query, master_port));
-    const auto correct = co_await client_reply(remote, CtrlCommand::NodeLocated);
+    peer->send(located_reply(query));
+    const auto correct = co_await client_reply(remote, CtrlCommand::ServiceLocated);
     require(correct.params->at("node_id") == "observer" && correct.params->at("address") == "127.0.0.1",
             "Reply accepted a wrong requester or trusted a forged source/node ID");
 
-    remote->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 202U}, {"node_id", "observer"}}));
+    remote->send(CtrlMessage(CtrlCommand::ServiceLookup,
+                             njson{{"request_id", 202U}, {"service", "observer-service"}, {"protocol", "tcp"}}));
     const auto late = co_await peer_query(peer, 202U);
     co_await remote->async_disconnect();
     const auto old_session = late.params->at("session_id").get<std::uint64_t>();
@@ -473,12 +481,13 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
         co_await wait.async_wait(asio::use_awaitable);
     }
     auto replacement = co_await connect(client_context, master_port);
-    replacement->send(CtrlMessage(CtrlCommand::NodeLookup, njson{{"request_id", 203U}, {"node_id", "observer"}}));
+    replacement->send(CtrlMessage(CtrlCommand::ServiceLookup,
+                             njson{{"request_id", 203U}, {"service", "observer-service"}, {"protocol", "tcp"}}));
     const auto fresh = co_await peer_query(peer, 203U);
     require(fresh.params->at("session_id") != old_session, "Replacement connection reused a retired session ID");
-    peer->send(located_reply(late, master_port));
-    peer->send(located_reply(fresh, master_port));
-    const auto current = co_await client_reply(replacement, CtrlCommand::NodeLocated);
+    peer->send(located_reply(late));
+    peer->send(located_reply(fresh));
+    const auto current = co_await client_reply(replacement, CtrlCommand::ServiceLocated);
     require(current.params->at("request_id") == 203U, "Late reply reached the replacement client");
     co_await local->async_disconnect();
     co_await replacement->async_disconnect();

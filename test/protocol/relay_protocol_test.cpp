@@ -85,8 +85,7 @@ void test_control_commands()
              CommandCase{CtrlCommand::ServerIdentified, "server.identified", CtrlCommand::Server, CtrlCommand::Server},
              CommandCase{CtrlCommand::ServerStatusQuery, "server.status.query", CtrlCommand::Server, CtrlCommand::Server},
              CommandCase{CtrlCommand::ServerTrafficReported, "server.traffic.reported", CtrlCommand::Server, CtrlCommand::Server},
-             CommandCase{CtrlCommand::ServiceListed, "service.listed", CtrlCommand::Service, CtrlCommand::Service},
-             CommandCase{CtrlCommand::NodeLocated, "node.located", CtrlCommand::Node, CtrlCommand::Node}})
+             CommandCase{CtrlCommand::ServiceListed, "service.listed", CtrlCommand::Service, CtrlCommand::Service}})
     {
         const auto message = unpack_message(WireMessage::pack(CtrlMessage{command}));
         require(message.command == name && message.type() == command, "Control command wire mapping is inconsistent");
