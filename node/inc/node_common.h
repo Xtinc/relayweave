@@ -9,6 +9,9 @@
 #include <memory>
 #include <mutex>
 #include <unordered_set>
+#include <utility>
+
+class FlowProtocol;
 
 /**
  * @brief Identify an Agent reply address, locally or through its primary Node, on control_io.
@@ -20,7 +23,9 @@ struct AgentPeer
      * @brief Borrow a local Agent control session without extending its lifetime.
      * @param session Original Agent control session, stored weakly.
      */
-    AgentPeer(const ControlSessionPtr &session) : local(session) {}
+    AgentPeer(const ControlSessionPtr &session) : local(session)
+    {
+    }
     /**
      * @brief Describe the original Agent session carried by an authenticated cluster message.
      * @param node Authenticated primary Node identity.
@@ -28,7 +33,9 @@ struct AgentPeer
      * @param accessor Original Agent peer address for accounting and status.
      */
     AgentPeer(std::string node, std::uint64_t session_id, std::string accessor)
-        : node(std::move(node)), session_id(session_id), accessor(std::move(accessor)) {}
+        : node(std::move(node)), session_id(session_id), accessor(std::move(accessor))
+    {
+    }
 
     /**
      * @brief Compare reply identities independently of business request IDs and UUIDs.
@@ -47,7 +54,10 @@ struct AgentPeer
      * @brief Inspect the locally known reply address.
      * @return True for a live local session or a remote address awaiting cluster lifetime notifications.
      */
-    explicit operator bool() const noexcept { return !node.empty() || !local.expired(); }
+    explicit operator bool() const noexcept
+    {
+        return !node.empty() || !local.expired();
+    }
     /**
      * @brief Read the original Agent address for traffic accounting and status reports.
      * @return Borrowed peer address, or empty after a local session expires.
@@ -170,38 +180,24 @@ class ServiceTraffic
 using SRVTrafficPtr = std::shared_ptr<ServiceTraffic>;
 
 /**
- * @brief Hold common Agent-to-Flow state for stream and datagram remote endpoints.
- * @details All access requires the owning transfer executor. The manager removes lookup
- * entries before waking tasks that still retain the endpoint during closure.
+ * @brief Hold attachment, traffic and lifetime state shared by local and remote relay pairs.
+ * @details All access requires the owning transfer executor. Managers retain concrete resource-owning pairs
+ * and remove their lookup entries before close(); awaiting tasks retain the pair until they drain.
  */
-struct RelayEndpoint
+struct RelayPair
 {
     /**
-     * @brief Initialize the Agent role and its attachment event on the transfer executor.
-     * @param executor Executor that owns the object's timers, I/O resources, and mutable state.
-     * @param role Local Agent role: RelayAttach::Producer or RelayAttach::Consumer.
+     * @brief Initialize the attachment event on the owning transfer executor.
+     * @param executor Single-threaded transfer executor owning the pair.
      */
-    RelayEndpoint(asio::any_io_executor executor, int role) : role(role), attached(executor)
+    explicit RelayPair(asio::any_io_executor executor) : attached(executor)
     {
     }
-    /**
-     * @brief Bind traffic limits and service accounting; throw if the endpoint has closed.
-     * @param limits Per-direction byte rates and burst sizes applied at this endpoint.
-     * @param traffic Shared accounting record for the locally hosted service, or empty when no local record
-     * exists.
-     * @param accessor Consumer peer label used to count active service accessors.
-     * @throws std::runtime_error If the endpoint has already closed.
-     */
-    void bind(const TrafficLimitConfig &limits, SRVTrafficPtr traffic, std::string accessor);
-    /**
-     * @brief Attribute payload bytes to service RX or TX using the local Agent role.
-     * @param from_agent True for Agent-to-Flow traffic; false for Flow-to-Agent traffic.
-     * @param size Number of successfully transferred user payload bytes.
-     */
-    void count(bool from_agent, std::size_t size);
+    /** @brief Destroy through a common pair pointer after all borrowing tasks have drained. */
+    virtual ~RelayPair() = default;
+    /** @brief Close concrete resources and wake waiters after the manager removes its lookup entry. */
+    virtual void close();
 
-    std::uint64_t ticket = 0;
-    int role;
     AsyncEvent attached;
     bool closed = false;
     bool active = false;
@@ -209,6 +205,99 @@ struct RelayEndpoint
     TokenBucket tx_limiter;
     SRVTrafficPtr traffic;
     std::string accessor;
+
+  protected:
+    /** @brief Bind limits and accounting after preparation validates readiness on the transfer executor. */
+    void bind_traffic(const TrafficLimitConfig &limits, SRVTrafficPtr traffic, std::string accessor);
+};
+
+/** @brief Share two-role credentials and local service accounting without owning transport resources. */
+struct LocalRelayPair : RelayPair
+{
+    /**
+     * @brief Generate distinct nonzero tickets and initialize the attachment event.
+     * @param executor Single-threaded transfer executor owning the pair.
+     */
+    explicit LocalRelayPair(asio::any_io_executor executor);
+    /**
+     * @brief Await both attachments, then bind accounting and activate on the transfer executor.
+     * @param limits Per-direction byte rates and burst sizes.
+     * @param traffic Nonempty local service accounting record.
+     * @param accessor Consumer peer label used for accounting.
+     * @return Completes after activation; attachment closure or cancellation throws.
+     * @details The caller must retain this pair until the coroutine exits.
+     */
+    asio::awaitable<void> prepare(const TrafficLimitConfig &limits, SRVTrafficPtr traffic, std::string accessor);
+    /** @brief Wake attachment waiters and remove an active pair's accessor after lookup removal. */
+    void close() override;
+
+    std::uint64_t producer_ticket;
+    std::uint64_t consumer_ticket;
+};
+
+/**
+ * @brief Share one Agent's credentials, activation and directional accounting on its transfer executor.
+ * @details Concrete pairs own their Flow port; the common preparation has no concrete Flow type dependency.
+ */
+struct RemoteRelayPair : RelayPair
+{
+    /**
+     * @brief Generate the attachment ticket and retain the local Agent role.
+     * @param executor Single-threaded transfer executor owning the endpoint.
+     * @param role Local Agent role: RelayAttach::Producer or RelayAttach::Consumer.
+     */
+    RemoteRelayPair(asio::any_io_executor executor, int role);
+    /**
+     * @brief Await attachment, bind the concrete Flow, and install accounting on the transfer executor.
+     * @param channel Protocol service owning the committed Flow, borrowed through preparation.
+     * @param epoch Cluster authorization epoch of the Flow.
+     * @param flow_id Nonzero committed Flow ID.
+     * @param transfer Executor owning this pair and the returned Flow port.
+     * @param limits Per-direction byte rates and burst sizes, borrowed through preparation.
+     * @param traffic Optional local service accounting record.
+     * @param accessor Consumer peer label used for accounting.
+     * @return Completes after binding; attachment, binding and cancellation failures propagate directly.
+     * @details The caller retains this pair until completion. A Flow returned after closure is closed too.
+     */
+    asio::awaitable<void> prepare(FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
+                                  asio::any_io_executor transfer, const TrafficLimitConfig &limits,
+                                  SRVTrafficPtr traffic, std::string accessor);
+    /**
+     * @brief Enable an attached, bound endpoint before relay.ready on its transfer executor.
+     * @param ready True if the authenticated Agent transport and its Flow port are both present.
+     */
+    void activate(bool ready);
+    /**
+     * @brief Count an optional service accessor for the scope of the forwarding task.
+     * @return Guard removing the accessor before the retained endpoint leaves the task scope.
+     */
+    auto track_accessor()
+    {
+        if (traffic)
+        {
+            traffic->add_accessor(accessor);
+        }
+        return ScopeGuard([this] {
+            if (traffic)
+            {
+                traffic->remove_accessor(accessor);
+            }
+        });
+    }
+    /**
+     * @brief Attribute bytes to service RX or TX using the local Agent role.
+     * @param from_agent True for Agent-to-Flow traffic, false for Flow-to-Agent traffic.
+     * @param size Successfully transferred user payload bytes.
+     */
+    void count(bool from_agent, std::size_t size);
+
+    int role;
+    std::uint64_t ticket;
+
+  protected:
+    /** @brief Bind and retain the concrete Flow port; called only by prepare() on the transfer executor. */
+    virtual asio::awaitable<void> bind_flow(FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
+                                            asio::any_io_executor transfer) = 0;
 };
 
 /**

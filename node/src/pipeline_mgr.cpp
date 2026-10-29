@@ -2,17 +2,14 @@
 #include "flow_protocol.h"
 #include "frame_io.h"
 #include "xfr_channel.h"
+#include <exception>
 
-namespace
-{
-auto remaining_timeout(std::chrono::steady_clock::time_point deadline)
+static auto remaining_timeout(std::chrono::steady_clock::time_point deadline)
 {
     const auto remaining = deadline - std::chrono::steady_clock::now();
     if (remaining <= std::chrono::steady_clock::duration::zero())
         throw asio::system_error(asio::error::timed_out, "relay transfer connection setup timed out");
     return remaining;
-}
-
 }
 
 TcpTransport::TcpTransport(asio::ssl::context &) noexcept
@@ -161,39 +158,17 @@ template <typename Transport> AttachPair StreamPipeline<Transport>::install_loca
     const auto uuid = id_allocator_->allocate();
     ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
     auto pair = std::make_shared<LocalPair>(executor_);
-    do
-        pair->consumer_ticket = generate_random_id();
-    while (pair->consumer_ticket == pair->producer_ticket);
     local_pairs_.emplace(uuid, pair);
     rollback.dismiss();
     return {{uuid, pair->producer_ticket, data_port_}, {uuid, pair->consumer_ticket, data_port_}};
 }
 
-template <typename Transport> asio::awaitable<bool> StreamPipeline<Transport>::wait_local_pair(std::uint64_t uuid)
-{
-    auto pair = local_pairs_.at(uuid);
-    co_return co_await pair->attached.wait() && !pair->closed;
-}
-
 template <typename Transport>
-void StreamPipeline<Transport>::bind_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor)
+asio::awaitable<void> StreamPipeline<Transport>::prepare_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic,
+                                                                    std::string accessor)
 {
     auto pair = local_pairs_.at(uuid);
-    if (!pair->producer_stream || !pair->consumer_stream || pair->traffic || !traffic)
-        throw std::runtime_error("local pair cannot bind service");
-    pair->traffic = std::move(traffic);
-    pair->accessor = std::move(accessor);
-    pair->rx_limiter = TokenBucket(config_.rx_bytes_per_second, config_.rx_burst_bytes);
-    pair->tx_limiter = TokenBucket(config_.tx_bytes_per_second, config_.tx_burst_bytes);
-}
-
-template <typename Transport> void StreamPipeline<Transport>::activate_local_pair(std::uint64_t uuid)
-{
-    auto pair = local_pairs_.at(uuid);
-    if (!pair->traffic || pair->active)
-        throw std::runtime_error("local pair unavailable");
-    pair->active = true;
-    pair->traffic->add_accessor(pair->accessor);
+    co_await pair->prepare(config_, std::move(traffic), std::move(accessor));
 }
 
 template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::run_local_pair(std::uint64_t uuid)
@@ -212,15 +187,7 @@ template <typename Transport> void StreamPipeline<Transport>::close_local_pair(s
         return;
     auto pair = it->second;
     local_pairs_.erase(it);
-    pair->closed = true;
-    asio::error_code ignored;
-    if (pair->producer_stream)
-        pair->producer_stream->lowest_layer().close(ignored);
-    if (pair->consumer_stream)
-        pair->consumer_stream->lowest_layer().close(ignored);
-    pair->attached.notify_all();
-    if (pair->active)
-        pair->traffic->remove_accessor(pair->accessor);
+    pair->close();
     id_allocator_->release(uuid);
 }
 
@@ -237,44 +204,23 @@ template <typename Transport> AttachInfo StreamPipeline<Transport>::install_remo
     const auto uuid = id_allocator_->allocate();
     ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
     auto endpoint = std::make_shared<RemotePair>(executor_, role);
-    endpoint->ticket = generate_random_id();
     remote_pairs_.emplace(uuid, endpoint);
     rollback.dismiss();
     return {uuid, endpoint->ticket, data_port_};
 }
 
-template <typename Transport> asio::awaitable<bool> StreamPipeline<Transport>::wait_remote_pair(std::uint64_t uuid)
+template <typename Transport>
+asio::awaitable<void> StreamPipeline<Transport>::prepare_remote_pair(std::uint64_t uuid, FlowProtocol &channel,
+                                                                     std::uint64_t epoch, std::uint64_t flow_id,
+                                                                     SRVTrafficPtr traffic, std::string accessor)
 {
     const auto it = remote_pairs_.find(uuid);
     if (it == remote_pairs_.end())
     {
-        co_return false;
+        throw std::runtime_error("relay endpoint closed before attach");
     }
     auto endpoint = it->second;
-    co_return co_await endpoint->attached.wait() && !endpoint->closed;
-}
-
-template <typename Transport>
-asio::awaitable<void> StreamPipeline<Transport>::bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch,
-                                                 std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor)
-{
-    const auto endpoint = remote_pairs_.at(uuid);
-    if (endpoint->closed || endpoint->flow)
-    {
-        throw std::runtime_error("relay endpoint cannot bind flow");
-    }
-    auto port = co_await asio::co_spawn(channel.executor(),
-        [protocol = channel.shared_from_this(), epoch, flow_id, reverse = endpoint->role == RelayAttach::Producer,
-         transfer = executor_]() -> asio::awaitable<std::shared_ptr<lnk::FlowStream>> {
-            co_return protocol->bind_stream_flow(epoch, flow_id, reverse, transfer);
-        }, asio::use_awaitable);
-    if (endpoint->closed)
-    {
-        port->close("endpoint closed during binding");
-        throw std::runtime_error("relay endpoint closed during binding");
-    }
-    endpoint->bind(config_, std::move(traffic), std::move(accessor));
-    endpoint->flow = std::move(port);
+    co_await endpoint->prepare(channel, epoch, flow_id, executor_, config_, std::move(traffic), std::move(accessor));
 }
 
 template <typename Transport>
@@ -342,8 +288,8 @@ asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_p
         }
         else
         {
-            const auto written =
-                co_await asio::async_write(*endpoint->stream, asio::buffer(data->data(), data->size()), asio::use_awaitable);
+            const auto written = co_await asio::async_write(*endpoint->stream, asio::buffer(data->data(), data->size()),
+                                                            asio::use_awaitable);
             endpoint->count(false, written);
         }
         data.reset();
@@ -354,11 +300,7 @@ asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_p
 template <typename Transport> void StreamPipeline<Transport>::activate_remote_pair(std::uint64_t uuid)
 {
     auto endpoint = remote_pairs_.at(uuid);
-    if (!endpoint->stream || !endpoint->flow || endpoint->active)
-    {
-        throw std::runtime_error("relay bridge unavailable");
-    }
-    endpoint->active = true;
+    endpoint->activate(endpoint->stream.has_value() && endpoint->flow);
 }
 
 template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::run_remote_pair(std::uint64_t uuid)
@@ -368,16 +310,7 @@ template <typename Transport> asio::awaitable<void> StreamPipeline<Transport>::r
     {
         throw std::runtime_error("relay bridge unavailable");
     }
-    if (endpoint->traffic)
-    {
-        endpoint->traffic->add_accessor(endpoint->accessor);
-    }
-    ScopeGuard accessor([endpoint] {
-        if (endpoint->traffic)
-        {
-            endpoint->traffic->remove_accessor(endpoint->accessor);
-        }
-    });
+    const auto accessor = endpoint->track_accessor();
     std::exception_ptr failure;
     try
     {
@@ -414,17 +347,7 @@ template <typename Transport> void StreamPipeline<Transport>::close_remote_pair(
     }
     auto endpoint = it->second;
     remote_pairs_.erase(it);
-    endpoint->closed = true;
-    if (endpoint->flow)
-    {
-        endpoint->flow->close("relay endpoint closed");
-    }
-    if (endpoint->stream)
-    {
-        asio::error_code ignored;
-        endpoint->stream->lowest_layer().close(ignored);
-    }
-    endpoint->attached.notify_all();
+    endpoint->close();
     id_allocator_->release(uuid);
 }
 

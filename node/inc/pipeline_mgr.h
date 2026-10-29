@@ -1,11 +1,12 @@
 #ifndef RELAYWEAVE_STREAM_PIPELINE_H
 #define RELAYWEAVE_STREAM_PIPELINE_H
 
-#include "node_common.h"
 #include "flow_protocol.h"
+#include "node_common.h"
 #include "tls_channel.h"
 #include "xfr_channel.h"
 #include <atomic>
+#include <stdexcept>
 
 /** @brief Prepare plain TCP sockets and provide bidirectional service copying on transfer_tcp_io. */
 struct TcpTransport
@@ -37,7 +38,7 @@ struct TcpTransport
      * @param traffic Service counters updated only after successful payload writes.
      */
     static asio::awaitable<void> relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
-                                      TokenBucket &tx_limiter, ServiceTraffic &traffic);
+                                       TokenBucket &tx_limiter, ServiceTraffic &traffic);
 };
 
 /** @brief Borrow the server TLS context for Agent handshakes and framed stream copying. */
@@ -60,8 +61,7 @@ struct TlsTransport
      * handshake before it.
      * @return An owned stream ready for RelayAttach parsing.
      */
-    asio::awaitable<Stream> prepare(asio::ip::tcp::socket socket,
-                                    std::chrono::steady_clock::time_point deadline) const;
+    asio::awaitable<Stream> prepare(asio::ip::tcp::socket socket, std::chrono::steady_clock::time_point deadline) const;
     /**
      * @brief Copy framed TLS data with service limits, accounting, and independent FIN directions.
      * @param producer Attached Producer data stream; borrowed until both copy directions finish.
@@ -71,7 +71,7 @@ struct TlsTransport
      * @param traffic Service counters updated only after successful payload writes.
      */
     static asio::awaitable<void> relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
-                                      TokenBucket &tx_limiter, ServiceTraffic &traffic);
+                                       TokenBucket &tx_limiter, ServiceTraffic &traffic);
 
   private:
     asio::ssl::context &context_;
@@ -85,41 +85,73 @@ struct TlsTransport
  * tasks before close; setup tasks retain the pipeline until timeout or attachment completes.
  * Closing removes lookup entries before waking tasks that still retain a pair.
  */
-template <typename Transport>
-class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transport>>
+template <typename Transport> class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transport>>
 {
     using tcp = asio::ip::tcp;
     using Stream = typename Transport::Stream;
 
     /** @brief Own one attached Agent stream and its bound multi-node Flow endpoint. */
-    struct RemotePair : RelayEndpoint
+    struct RemotePair : RemoteRelayPair
     {
-        using RelayEndpoint::RelayEndpoint;
+        using RemoteRelayPair::RemoteRelayPair;
+        /** @copydoc RelayPair::close */
+        void close() override
+        {
+            if (flow)
+            {
+                flow->close("relay endpoint closed");
+            }
+            if (stream)
+            {
+                asio::error_code ignored;
+                stream->lowest_layer().close(ignored);
+            }
+            RemoteRelayPair::close();
+        }
+
         std::shared_ptr<lnk::FlowStream> flow;
         std::optional<Stream> stream;
+
+      private:
+        /** @brief Bind and retain a FlowStream on the owning transfer executor. */
+        asio::awaitable<void> bind_flow(FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
+                                        asio::any_io_executor transfer) override
+        {
+            if (flow)
+            {
+                throw std::runtime_error("relay endpoint cannot bind flow");
+            }
+            flow = co_await asio::co_spawn(
+                channel.executor(),
+                [protocol = channel.shared_from_this(), epoch, flow_id, reverse = role == RelayAttach::Producer,
+                 transfer]() -> asio::awaitable<std::shared_ptr<lnk::FlowStream>> {
+                    co_return protocol->bind_stream_flow(epoch, flow_id, reverse, transfer);
+                },
+                asio::use_awaitable);
+        }
     };
 
     /** @brief Own both Agent streams, attachment credentials, and single-node service accounting. */
-    struct LocalPair
+    struct LocalPair : LocalRelayPair
     {
-        /**
-         * @brief Initialize the shared attachment event on the transfer executor.
-         * @param executor Executor that owns the object's timers, I/O resources, and mutable state.
-         */
-        explicit LocalPair(asio::any_io_executor executor) : attached(executor)
+        using LocalRelayPair::LocalRelayPair;
+        /** @copydoc LocalRelayPair::close */
+        void close() override
         {
+            asio::error_code ignored;
+            if (producer_stream)
+            {
+                producer_stream->lowest_layer().close(ignored);
+            }
+            if (consumer_stream)
+            {
+                consumer_stream->lowest_layer().close(ignored);
+            }
+            LocalRelayPair::close();
         }
-        AsyncEvent attached;
-        std::uint64_t producer_ticket = generate_random_id();
-        std::uint64_t consumer_ticket = 0;
+
         std::optional<Stream> producer_stream;
         std::optional<Stream> consumer_stream;
-        TokenBucket rx_limiter;
-        TokenBucket tx_limiter;
-        SRVTrafficPtr traffic;
-        std::string accessor;
-        bool active = false;
-        bool closed = false;
     };
 
   public:
@@ -152,24 +184,18 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
      */
     AttachInfo install_remote_pair(int role);
     /**
-     * @brief Await Agent attachment; return false if closure wakes the waiter before attachment.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @return True after the Agent attaches; false if the endpoint is missing or closes before attachment.
+     * @brief Await Agent attachment and bind its Flow in one transfer-executor operation.
+     * @param uuid Node-local relay ID returned by install_remote_pair().
+     * @param channel Protocol service owning the committed Flow, borrowed through preparation.
+     * @param epoch Cluster authorization epoch of the Flow.
+     * @param flow_id Nonzero committed Flow ID.
+     * @param traffic Optional local service accounting record.
+     * @param accessor Consumer peer label used for accounting.
+     * @return Completes after attachment and Flow binding; failures and cancellation propagate as exceptions.
+     * @details Runs on transfer_tcp_io and retains the endpoint through attachment and Flow binding.
      */
-    asio::awaitable<bool> wait_remote_pair(std::uint64_t uuid);
-    /**
-     * @brief Bind service accounting and a committed Flow, crossing to the protocol executor once.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @param channel Protocol service owning the committed Flow; must outlive endpoint binding.
-     * @param epoch Cluster membership epoch that authorizes this Flow.
-     * @param flow_id Nonzero ID of the committed Flow within the supplied epoch.
-     * @param traffic Optional local service accounting record; remote-service ingress may omit it.
-     * @param accessor Consumer peer label used to count active service accessors.
-     * @pre Called on transfer_tcp_io for an installed, open, unbound endpoint and a committed Flow.
-     * @throws std::runtime_error If the endpoint cannot bind or closes during the cross-executor operation.
-     */
-    asio::awaitable<void> bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
-                       SRVTrafficPtr traffic, std::string accessor);
+    asio::awaitable<void> prepare_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch,
+                                              std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor);
     /**
      * @brief Require an attached, bound remote endpoint and enable forwarding before relay.ready.
      * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
@@ -197,25 +223,14 @@ class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transp
      */
     AttachPair install_local_pair();
     /**
-     * @brief Await both Agent roles; return false when closure wakes the waiter.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @return True after both roles attach; false if the pair closes or the attachment event is cancelled.
+     * @brief Await both Agent attachments, bind service accounting, and activate on the transfer executor.
+     * @param uuid Node-local relay ID returned by install_local_pair().
+     * @param traffic Nonempty local service accounting record.
+     * @param accessor Consumer peer label used for accounting.
+     * @return Completes after activation; throws if attachment closes or its wait is cancelled.
+     * @details Runs on transfer_tcp_io and retains the pair through attachment and preparation.
      */
-    asio::awaitable<bool> wait_local_pair(std::uint64_t uuid);
-    /**
-     * @brief Bind a fully attached local pair to service accounting and configured traffic limits.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @param traffic Shared service accounting record retained while the relay transfers data.
-     * @param accessor Consumer peer label used to count active service accessors.
-     * @pre Both Agent streams are attached and traffic is nonempty.
-     * @throws std::runtime_error If the pair cannot bind to the service.
-     */
-    void bind_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor);
-    /**
-     * @brief Enable a bound local pair before notifying both Agent roles that the relay is ready.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     */
-    void activate_local_pair(std::uint64_t uuid);
+    asio::awaitable<void> prepare_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor);
     /**
      * @brief Await local transfer lifetime; the controller must drain this task before closing the pair.
      * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.

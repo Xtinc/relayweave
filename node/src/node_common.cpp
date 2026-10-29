@@ -93,19 +93,87 @@ std::uint64_t ServiceTraffic::rounded_ema(double value) noexcept
     return value <= 0.0 ? 0 : static_cast<std::uint64_t>(value + 0.5);
 }
 
-void RelayEndpoint::bind(const TrafficLimitConfig &limits, SRVTrafficPtr service_traffic, std::string client)
+void RelayPair::bind_traffic(const TrafficLimitConfig &limits, SRVTrafficPtr service_traffic, std::string client)
 {
-    if (closed)
-    {
-        throw std::runtime_error("relay endpoint is closed");
-    }
     rx_limiter = TokenBucket(limits.rx_bytes_per_second, limits.rx_burst_bytes);
     tx_limiter = TokenBucket(limits.tx_bytes_per_second, limits.tx_burst_bytes);
     traffic = std::move(service_traffic);
     accessor = std::move(client);
 }
 
-void RelayEndpoint::count(bool from_agent, std::size_t size)
+void RelayPair::close()
+{
+    closed = true;
+    attached.notify_all();
+}
+
+LocalRelayPair::LocalRelayPair(asio::any_io_executor executor)
+    : RelayPair(executor), producer_ticket(generate_random_id())
+{
+    do
+    {
+        consumer_ticket = generate_random_id();
+    } while (consumer_ticket == producer_ticket);
+}
+
+asio::awaitable<void> LocalRelayPair::prepare(const TrafficLimitConfig &limits, SRVTrafficPtr service_traffic,
+                                              std::string client)
+{
+    if (!co_await attached.wait() || closed)
+    {
+        throw std::runtime_error("relay setup timed out");
+    }
+    if (traffic || !service_traffic)
+    {
+        throw std::runtime_error("local pair cannot bind service");
+    }
+    bind_traffic(limits, std::move(service_traffic), std::move(client));
+    active = true;
+    traffic->add_accessor(accessor);
+}
+
+void LocalRelayPair::close()
+{
+    RelayPair::close();
+    if (active)
+    {
+        traffic->remove_accessor(accessor);
+        active = false;
+    }
+}
+
+RemoteRelayPair::RemoteRelayPair(asio::any_io_executor executor, int agent_role)
+    : RelayPair(executor), role(agent_role), ticket(generate_random_id())
+{
+}
+
+asio::awaitable<void> RemoteRelayPair::prepare(FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
+                                               asio::any_io_executor transfer, const TrafficLimitConfig &limits,
+                                               SRVTrafficPtr service_traffic, std::string client)
+{
+    if (!co_await attached.wait() || closed)
+    {
+        throw std::runtime_error("relay endpoint closed before attach");
+    }
+    co_await bind_flow(channel, epoch, flow_id, transfer);
+    if (closed)
+    {
+        close();
+        throw std::runtime_error("relay endpoint closed during binding");
+    }
+    bind_traffic(limits, std::move(service_traffic), std::move(client));
+}
+
+void RemoteRelayPair::activate(bool ready)
+{
+    if (!ready || active)
+    {
+        throw std::runtime_error("relay bridge unavailable");
+    }
+    active = true;
+}
+
+void RemoteRelayPair::count(bool from_agent, std::size_t size)
 {
     if (traffic)
     {

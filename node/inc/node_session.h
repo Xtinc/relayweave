@@ -1,10 +1,10 @@
 #ifndef RELAYWEAVE_NODE_SESSION_H
 #define RELAYWEAVE_NODE_SESSION_H
 
-#include "control_router_single.h"
 #include "control_router_multi.h"
-#include "pipeline_mgr.h"
+#include "control_router_single.h"
 #include "datagram_mgr.h"
+#include "pipeline_mgr.h"
 #include <memory>
 #include <variant>
 #include <vector>
@@ -41,8 +41,8 @@ class NodeSession
      * @param traffic Local service accounting record; ingress instances may omit it when the service is
      * remote.
      */
-    NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer,
-                njson params, SRVTrafficPtr traffic);
+    NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer, njson params,
+                SRVTrafficPtr traffic);
     /** @brief Run the controller through setup, transfer, and cancellation-safe resource cleanup. */
     asio::awaitable<void> run();
     /**
@@ -107,12 +107,11 @@ class NodeSession
     using Attachment = std::variant<std::monostate, AttachInfo, AttachPair>;
     /** @brief Install a local pair or remote endpoint on its transfer executor from control_io. */
     asio::awaitable<void> install(int role = RelayAttach::Consumer);
-    /** @brief Await attachment on the transfer executor with the controller's absolute deadline. */
-    asio::awaitable<bool> wait_attach(std::chrono::steady_clock::time_point deadline);
-    /** @brief Bind and activate a Single local pair in one task on its transfer executor from control_io. */
-    asio::awaitable<void> bind_and_activate(std::string accessor);
-    /** @brief Copy binding metadata across executors and bind a committed Multi Flow endpoint. */
-    asio::awaitable<void> bind(std::string accessor, std::uint64_t epoch, std::uint64_t flow_id);
+    /** @brief Await Single attachment, bind, and activate in one transfer-executor task within the deadline. */
+    asio::awaitable<void> prepare_local(std::chrono::steady_clock::time_point deadline, std::string accessor);
+    /** @brief Await Multi attachment and bind in one transfer-executor task; failures propagate directly. */
+    asio::awaitable<void> prepare_remote(std::chrono::steady_clock::time_point deadline,
+                                        std::string accessor, std::uint64_t epoch, std::uint64_t flow_id);
     /** @brief Activate the Multi endpoint on its transfer executor after peer coordination. */
     asio::awaitable<void> activate();
     /** @brief Await the manager-owned transfer operation on its transfer executor. */

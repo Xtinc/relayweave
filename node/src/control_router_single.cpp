@@ -4,8 +4,8 @@
 
 using Clock = std::chrono::steady_clock;
 
-ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const AgentPeer &consumer,
-                                         const AgentPeer &producer, njson params)
+ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const AgentPeer &consumer, const AgentPeer &producer,
+                                         njson params)
     : relay_(relay), consumer_(consumer), producer_(producer), params_(std::move(params))
 {
     const auto protocol = config::message_protocol(params_);
@@ -108,8 +108,8 @@ void ControlRouterSingle::notify_agents() const
             values["protocol"] = params_.at("protocol");
             if (!producer)
                 values["request_id"] = params_.at("request_id");
-            relay_.send_agent(session,
-                CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
+            relay_.send_agent(
+                session, CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
         }
     }
 }
@@ -149,8 +149,8 @@ void ControlRouterSingle::close_agents() const
     }
     if (consumer)
     {
-        relay_.node_.send_relay(consumer,
-            CtrlMessage(ready_ ? CtrlCommand::RelayClosed : CtrlCommand::RelayError, std::move(values)));
+        relay_.node_.send_relay(
+            consumer, CtrlMessage(ready_ ? CtrlCommand::RelayClosed : CtrlCommand::RelayError, std::move(values)));
     }
 }
 
@@ -168,18 +168,12 @@ asio::awaitable<void> ControlRouterSingle::run()
             throw asio::system_error(asio::error::operation_aborted);
         }
         notify_agents();
-        if (!co_await relay_.wait_attach(deadline_))
+        const auto &consumer = consumer_;
+        if (!consumer)
         {
-            throw std::runtime_error("relay setup timed out");
+            throw asio::system_error(asio::error::operation_aborted);
         }
-        {
-            const auto &consumer = consumer_;
-            if (!consumer)
-            {
-                throw asio::system_error(asio::error::operation_aborted);
-            }
-            co_await relay_.bind_and_activate(std::string(consumer.peer()));
-        }
+        co_await relay_.prepare_local(deadline_, std::string(consumer.peer()));
         if (stop_requested_ || Clock::now() >= deadline_)
         {
             throw asio::system_error(asio::error::operation_aborted);

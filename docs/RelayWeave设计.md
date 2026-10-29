@@ -200,6 +200,30 @@ flowchart TD
   - 跨域信令触发：使用 `asio::post(target_executor, ...)` 或 `asio::dispatch`。
   - 跨域流式数据传递：使用 Asio 实验性并发通道 `asio::experimental::concurrent_channel`，其内部实现保证了不同执行域之间线程安全的数据推送与非阻塞等待。
 
+#### 配对状态与跨域准备
+
+配对对象使用普通继承，共享基类均不依赖具体 Flow 类型：
+
+```mermaid
+classDiagram
+    RelayPair <|-- LocalRelayPair
+    RelayPair <|-- RemoteRelayPair
+    LocalRelayPair <|-- StreamLocalPair
+    LocalRelayPair <|-- DatagramLocalPair
+    RemoteRelayPair <|-- StreamRemotePair
+    RemoteRelayPair <|-- DatagramRemotePair
+```
+
+图中的 Stream/Datagram 类型分别是两个管理器内部的 `LocalPair` / `RemotePair`，沿用 RelayPair 系列命名。`RelayPair` 统一接入事件、closed/active、限速和计数绑定，提供虚析构与 `close()`；`LocalRelayPair` 实现完整的双端接入等待、准备、激活及访问者回收；`RemoteRelayPair` 实现单端接入等待、驱动 Flow 绑定、绑定后关闭检查、计数绑定、激活与方向计数。具体派生类持有 socket、UDP session/source 和各自的 Flow 端口，覆盖 `close()`，远端类型另覆盖受保护的 `bind_flow()`。公共准备流程不依赖具体 Flow 类型，也不使用模板或统一 Flow 适配接口。
+
+管理器负责容量、ID、容器及 UDP session/bindings。准备入口查表后持有局部 `shared_ptr`，直接 `co_await pair->prepare(...)`，共同生命周期只在配对类中实现。NodeSession 仍通过原有 `co_spawn` 投递到传输域，多跳 Flow 绑定仍只跨一次协议域。为共享这些流程，建立期间增加嵌套协程帧：单跳增加配对 prepare，多跳增加配对 prepare 与具体 bind_flow；没有额外的独立协程链或跨域通知，逐包转发也不经过虚函数分派。
+
+关闭时管理器先移除查找关联及 UDP bindings，再调用具体配对对象的 `close()`，最后释放 ID。具体类关闭 Flow/socket 或唤醒 UDP 结束事件，公共类负责关闭标记、接入唤醒与本地访问者回收。绑定期间关闭时，管理器协程仍持有对象；晚返回的 Flow 先交给具体配对对象持有，公共 prepare 检查 closed 后再次通过虚 close 回收它并抛出异常。因此具体 close 即使已标记 closed 也会关闭新交付的资源，本地访问者则通过清除已有 active 状态保证只回收一次。
+
+多跳激活仍在 peer 同步后、`relay.ready` 前完成，防止 UDP 提前转发。准备过程沿用控制器的绝对建立期限，取消与关闭继续由原有任务链排空。准备接口返回 `awaitable<void>`，接入、Flow 绑定的失败与取消均通过 `use_awaitable` 自然传播，不把异常作为返回值。Node 将接入、绑定与 peer 就绪协调统一记为 `prepare` 阶段，就绪前收到 Agent 拒绝或业务取消时也使用该阶段；`relay.error`、peer close 的诊断字段不再区分原 attach/bridge。原错误原因与 Flow 关闭、控制断线等独立阶段保留。
+
+每个管理器的 local/remote 配对接口合计从 12 个减为 9 个。按一次正常生命周期中 NodeSession 发往传输域的调用计数，单跳由 5 次减为 4 次（install、prepare、bridge、close），多跳每个端点由 6 次减为 5 次（额外保留 activate）；多跳绑定 Flow 所需的一次传输域到协议域调用保持不变。
+
 ---
 
 ### 2.2 RelayAgent 部件拓扑与双执行域
@@ -1199,10 +1223,10 @@ sequenceDiagram
 2. **数据接入与配对（接入屏障）**：
    - 双端 Agent 异步建立到 Node 数据端口（18444）的 TCP 连接。
    - 双端在 Socket 建立后的第一个包发送长度前缀 + CBOR 编码的 `relay.attach`，附带各自的角色（`Consumer=2` / `Producer=1`）、`uuid` 与 `ticket`。
-   - `transfer_tcp_io` 执行域在内存中等待两端齐备。两端凭证均匹配成功后，解绑临时监听关联，进入配对状态。
+   - `prepare_local` 在传输执行域内等待两端凭证匹配，随后连续绑定流量计数与限速并激活配对，一次返回控制域。
 3. **数据桥接与半关闭（传输阶段）**：
-   - 触发 `relay_tcp()` / `relay_tls()`，启动双向协程流式复制循环。
    - 控制面回送 `relay.ready`，通知客户端开始发送业务数据。
+   - 随后调用 `relay_tcp()` / `relay_tls()`，启动双向协程流式复制循环。
    - **双向半关闭（FIN/EOF）**：当客户端关闭写端（发送 FIN）时，Node 端读取到 EOF，向服务端对向 Socket 发送 `shutdown(SHUT_WR)`。服务端仍可继续反向发送剩余响应数据，直至服务端也发送 EOF。双向均关闭后，Node 清理该会话资源。TLS 接入通过 `length32-fin-v1` 的零长度业务帧传递业务 FIN。
 
 ---

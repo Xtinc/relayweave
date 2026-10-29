@@ -1,8 +1,8 @@
 #ifndef PROXY_DATAGRAM_MANAGER_HEADER
 #define PROXY_DATAGRAM_MANAGER_HEADER
 
-#include "node_common.h"
 #include "flow_protocol.h"
+#include "node_common.h"
 #include "xfr_channel.h"
 
 /**
@@ -23,15 +23,17 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
     };
 
     /** @brief Own both Agent UDP identities, authenticated sources, limits, and lifetime events. */
-    struct LocalPair
+    struct LocalPair : LocalRelayPair
     {
         /**
          * @brief Initialize attachment and lifetime events on the UDP transfer executor.
          * @param executor Executor that owns the object's timers, I/O resources, and mutable state.
          */
-        explicit LocalPair(asio::any_io_executor executor) : attached(executor), finished(executor)
+        explicit LocalPair(asio::any_io_executor executor) : LocalRelayPair(executor), finished(executor)
         {
         }
+        /** @copydoc LocalRelayPair::close */
+        void close() override;
         /**
          * @brief Borrow the authenticated source endpoint for a selected Agent role.
          * @param side Producer or Consumer role whose source binding or directional limit is selected.
@@ -52,38 +54,30 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
          */
         bool allow(Side side, std::size_t payload_size);
 
-        AsyncEvent attached;
         AsyncEvent finished;
         std::uint64_t producer_session_id = 0;
         std::uint64_t consumer_session_id = 0;
         DatagramHeader::Buffer producer_session_header;
         DatagramHeader::Buffer consumer_session_header;
-        std::uint64_t producer_ticket = generate_random_id();
-        std::uint64_t consumer_ticket = 0;
         std::optional<udp::endpoint> producer_endpoint;
         std::optional<udp::endpoint> consumer_endpoint;
-        TokenBucket rx_limiter;
-        TokenBucket tx_limiter;
-        SRVTrafficPtr traffic;
-        std::string accessor;
-        bool active = false;
-        bool closed = false;
     };
 
     /** @brief Own a bound Flow datagram endpoint and one authenticated Agent UDP source. */
-    struct RemotePair : RelayEndpoint
+    struct RemotePair : RemoteRelayPair
     {
+        using RemoteRelayPair::RemoteRelayPair;
+        /** @copydoc RelayPair::close */
+        void close() override;
+
         std::shared_ptr<lnk::FlowDatagram> flow;
-        /**
-         * @brief Initialize common endpoint state for the selected Agent role.
-         * @param executor Executor that owns the object's timers, I/O resources, and mutable state.
-         * @param role Local Agent role: RelayAttach::Producer or RelayAttach::Consumer.
-         */
-        RemotePair(asio::any_io_executor executor, int role) : RelayEndpoint(executor, role)
-        {
-        }
         std::uint64_t session_id = 0;
         std::optional<udp::endpoint> source;
+
+      private:
+        /** @brief Bind and retain a FlowDatagram on the owning transfer executor. */
+        asio::awaitable<void> bind_flow(FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
+                                        asio::any_io_executor transfer) override;
     };
 
     /** @brief Map a UDP session ID to a relay resource and its Agent role. */
@@ -124,24 +118,18 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
      */
     AttachInfo install_remote_pair(int role);
     /**
-     * @brief Await Agent attachment; return false if closure wakes the waiter before attachment.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @return True after the Agent attaches; false if the endpoint is missing or closes before attachment.
+     * @brief Await Agent attachment and bind its Flow in one transfer-executor operation.
+     * @param uuid Node-local relay ID returned by install_remote_pair().
+     * @param channel Protocol service owning the committed Flow, borrowed through preparation.
+     * @param epoch Cluster authorization epoch of the Flow.
+     * @param flow_id Nonzero committed Flow ID.
+     * @param traffic Optional local service accounting record.
+     * @param accessor Consumer peer label used for accounting.
+     * @return Completes after attachment and Flow binding; failures and cancellation propagate as exceptions.
+     * @details Runs on transfer_udp_io and retains the endpoint through attachment and Flow binding.
      */
-    asio::awaitable<bool> wait_remote_pair(std::uint64_t uuid);
-    /**
-     * @brief Bind service accounting and a committed Flow, crossing to the protocol executor once.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @param channel Protocol service owning the committed Flow; must outlive endpoint binding.
-     * @param epoch Cluster membership epoch that authorizes this Flow.
-     * @param flow_id Nonzero ID of the committed Flow within the supplied epoch.
-     * @param traffic Optional local service accounting record; remote-service ingress may omit it.
-     * @param accessor Consumer peer label used to count active service accessors.
-     * @pre Called on transfer_udp_io for an installed, open, unbound endpoint and a committed Flow.
-     * @throws std::runtime_error If the endpoint cannot bind or closes during the cross-executor operation.
-     */
-    asio::awaitable<void> bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
-                       SRVTrafficPtr traffic, std::string accessor);
+    asio::awaitable<void> prepare_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch,
+                                              std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor);
     /**
      * @brief Require an attached, bound remote endpoint and enable forwarding before relay.ready.
      * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
@@ -169,25 +157,14 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
      */
     AttachPair install_local_pair();
     /**
-     * @brief Await both Agent roles; return false when closure wakes the waiter.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @return True after both roles attach; false if the pair closes or the attachment event is cancelled.
+     * @brief Await both Agent attachments, bind service accounting, and activate on the transfer executor.
+     * @param uuid Node-local relay ID returned by install_local_pair().
+     * @param traffic Nonempty local service accounting record.
+     * @param accessor Consumer peer label used for accounting.
+     * @return Completes after activation; throws if attachment closes or its wait is cancelled.
+     * @details Runs on transfer_udp_io and retains the pair through attachment and preparation.
      */
-    asio::awaitable<bool> wait_local_pair(std::uint64_t uuid);
-    /**
-     * @brief Bind a fully attached local pair to service accounting and configured traffic limits.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     * @param traffic Shared service accounting record retained while the relay transfers data.
-     * @param accessor Consumer peer label used to count active service accessors.
-     * @pre Both authenticated UDP sources are attached and traffic is nonempty.
-     * @throws std::runtime_error If the pair cannot bind to the service.
-     */
-    void bind_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor);
-    /**
-     * @brief Enable a bound local pair before notifying both Agent roles that the relay is ready.
-     * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
-     */
-    void activate_local_pair(std::uint64_t uuid);
+    asio::awaitable<void> prepare_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor);
     /**
      * @brief Await local transfer lifetime; the controller must drain this task before closing the pair.
      * @param uuid Node-local nonzero relay ID returned by the corresponding install operation.
@@ -208,7 +185,6 @@ class DatagramMgr : public std::enable_shared_from_this<DatagramMgr>
   private:
     asio::awaitable<void> receive_datagram();
     std::optional<RoutedDatagram> route_datagram(std::span<std::uint8_t> datagram, const udp::endpoint &source);
-    asio::awaitable<void> write_remote_pair(std::shared_ptr<RemotePair> endpoint);
     std::uint64_t allocate_session_id() const;
 
     asio::any_io_executor executor_;

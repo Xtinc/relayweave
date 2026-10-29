@@ -359,7 +359,7 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
     {
         const auto error = co_await receive(consumer, CtrlCommand::RelayError);
         require(error.params->at("request_id") == request &&
-                (error.params->at("stage") == "attach" || error.params->at("stage") == "bridge") &&
+                error.params->at("stage") == "prepare" &&
                 error.params->at("reason") == "relay establishment timed out",
                 "Wrong ticket passed the readiness barrier: " + error.params->dump());
         co_await receive(producer, CtrlCommand::RelayClosed);
@@ -804,7 +804,7 @@ void integration()
                 co_await receive(channels[1], CtrlCommand::RelayOpened);
                 co_await receive(channels[3], CtrlCommand::RelayOffer);
                 const auto expired = co_await receive(channels[1], CtrlCommand::RelayError);
-                require(expired.params->at("request_id") == request && expired.params->at("stage") == "attach" &&
+                require(expired.params->at("request_id") == request && expired.params->at("stage") == "prepare" &&
                         expired.params->at("reason") == "relay establishment timed out" &&
                         std::chrono::steady_clock::now() - started >= 2s,
                         "Node did not expire its local establishment timeout or propagate peer closure");
@@ -1004,7 +1004,7 @@ void integration()
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             auto pending_target = co_await target.async_accept(asio::cancel_after(1s, asio::use_awaitable));
             const auto producer_expired = co_await receive(channels[1], CtrlCommand::RelayError);
-            require(producer_expired.params->at("request_id") == 31 && producer_expired.params->at("stage") == "attach" &&
+            require(producer_expired.params->at("request_id") == 31 && producer_expired.params->at("stage") == "prepare" &&
                     producer_expired.params->at("reason").get<std::string>().find("timed out") != std::string::npos &&
                     std::chrono::steady_clock::now() - producer_started >= 1s,
                     "Producer Agent did not enforce its own establishment timeout");
@@ -1181,7 +1181,7 @@ void integration()
             co_await receive(channels[1], CtrlCommand::RelayOpened);
             const auto rejected = co_await receive(channels[1], CtrlCommand::RelayError);
             const auto refused_reason = asio::error_code(asio::error::connection_refused).message();
-            require(rejected.params->at("stage") == "attach" &&
+            require(rejected.params->at("stage") == "prepare" &&
                     rejected.params->at("reason").get<std::string>().find(refused_reason) != std::string::npos,
                     "Producer target failure did not preserve the original error");
             channels[1]->send(CtrlMessage(CtrlCommand::RelayOpen,

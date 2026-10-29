@@ -3,6 +3,37 @@
 #include "frame_io.h"
 #include <algorithm>
 
+void DatagramMgr::LocalPair::close()
+{
+    LocalRelayPair::close();
+    finished.notify_all();
+}
+
+asio::awaitable<void> DatagramMgr::RemotePair::bind_flow(FlowProtocol &channel, std::uint64_t epoch,
+                                                         std::uint64_t flow_id, asio::any_io_executor transfer)
+{
+    if (flow)
+    {
+        throw std::runtime_error("relay endpoint cannot bind flow");
+    }
+    flow = co_await asio::co_spawn(
+        channel.executor(),
+        [protocol = channel.shared_from_this(), epoch, flow_id, reverse = role == RelayAttach::Producer,
+         transfer]() -> asio::awaitable<std::shared_ptr<lnk::FlowDatagram>> {
+            co_return protocol->bind_datagram_flow(epoch, flow_id, reverse, transfer);
+        },
+        asio::use_awaitable);
+}
+
+void DatagramMgr::RemotePair::close()
+{
+    if (flow)
+    {
+        flow->close("relay endpoint closed");
+    }
+    RemoteRelayPair::close();
+}
+
 std::optional<DatagramMgr::udp::endpoint> &DatagramMgr::LocalPair::endpoint(Side side)
 {
     return side == Side::Producer ? producer_endpoint : consumer_endpoint;
@@ -63,7 +94,6 @@ AttachInfo DatagramMgr::install_remote_pair(int role)
     ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
     const auto session = allocate_session_id();
     auto endpoint = std::make_shared<RemotePair>(executor_, role);
-    endpoint->ticket = generate_random_id();
     endpoint->session_id = session;
     remote_pairs_.emplace(uuid, endpoint);
     bindings_.emplace(session, Binding{uuid, role == RelayAttach::Producer ? Side::Producer : Side::Consumer});
@@ -71,43 +101,27 @@ AttachInfo DatagramMgr::install_remote_pair(int role)
     return {uuid, endpoint->ticket, listen_endpoint_.port(), session};
 }
 
-asio::awaitable<bool> DatagramMgr::wait_remote_pair(std::uint64_t uuid)
+asio::awaitable<void> DatagramMgr::prepare_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch,
+                                                       std::uint64_t flow_id, SRVTrafficPtr traffic,
+                                                       std::string accessor)
 {
     const auto it = remote_pairs_.find(uuid);
     if (it == remote_pairs_.end())
     {
-        co_return false;
+        throw std::runtime_error("relay endpoint closed before attach");
     }
     auto endpoint = it->second;
-    co_return co_await endpoint->attached.wait() && !endpoint->closed;
+    co_await endpoint->prepare(channel, epoch, flow_id, executor_, config_, std::move(traffic), std::move(accessor));
 }
 
-asio::awaitable<void> DatagramMgr::bind_remote_pair(std::uint64_t uuid, FlowProtocol &channel, std::uint64_t epoch,
-                                                    std::uint64_t flow_id, SRVTrafficPtr traffic, std::string accessor)
+asio::awaitable<void> DatagramMgr::run_remote_pair(std::uint64_t uuid)
 {
-    const auto endpoint = remote_pairs_.at(uuid);
-    if (endpoint->closed || endpoint->flow)
+    auto endpoint = remote_pairs_.at(uuid);
+    if (!endpoint->active)
     {
-        throw std::runtime_error("relay endpoint cannot bind flow");
+        throw std::runtime_error("relay bridge unavailable");
     }
-    auto port = co_await asio::co_spawn(
-        channel.executor(),
-        [protocol = channel.shared_from_this(), epoch, flow_id, reverse = endpoint->role == RelayAttach::Producer,
-         transfer = executor_]() -> asio::awaitable<std::shared_ptr<lnk::FlowDatagram>> {
-            co_return protocol->bind_datagram_flow(epoch, flow_id, reverse, transfer);
-        },
-        asio::use_awaitable);
-    if (endpoint->closed)
-    {
-        port->close("endpoint closed during binding");
-        throw std::runtime_error("relay endpoint closed during binding");
-    }
-    endpoint->bind(config_, std::move(traffic), std::move(accessor));
-    endpoint->flow = std::move(port);
-}
-
-asio::awaitable<void> DatagramMgr::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
-{
+    const auto accessor = endpoint->track_accessor();
     const auto header = DatagramHeader::encode(endpoint->session_id);
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
     for (;;)
@@ -130,31 +144,7 @@ asio::awaitable<void> DatagramMgr::write_remote_pair(std::shared_ptr<RemotePair>
 void DatagramMgr::activate_remote_pair(std::uint64_t uuid)
 {
     auto endpoint = remote_pairs_.at(uuid);
-    if (!endpoint->source || !endpoint->flow || endpoint->active)
-    {
-        throw std::runtime_error("relay bridge unavailable");
-    }
-    endpoint->active = true;
-}
-
-asio::awaitable<void> DatagramMgr::run_remote_pair(std::uint64_t uuid)
-{
-    auto endpoint = remote_pairs_.at(uuid);
-    if (!endpoint->active)
-    {
-        throw std::runtime_error("relay bridge unavailable");
-    }
-    if (endpoint->traffic)
-    {
-        endpoint->traffic->add_accessor(endpoint->accessor);
-    }
-    ScopeGuard accessor([endpoint] {
-        if (endpoint->traffic)
-        {
-            endpoint->traffic->remove_accessor(endpoint->accessor);
-        }
-    });
-    co_await write_remote_pair(endpoint);
+    endpoint->activate(endpoint->source.has_value() && endpoint->flow);
 }
 
 void DatagramMgr::close_remote_pair(std::uint64_t uuid)
@@ -166,13 +156,8 @@ void DatagramMgr::close_remote_pair(std::uint64_t uuid)
     }
     auto endpoint = it->second;
     remote_pairs_.erase(it);
-    endpoint->closed = true;
-    if (endpoint->flow)
-    {
-        endpoint->flow->close("relay endpoint closed");
-    }
     bindings_.erase(endpoint->session_id);
-    endpoint->attached.notify_all();
+    endpoint->close();
     id_allocator_->release(uuid);
 }
 
@@ -183,9 +168,6 @@ AttachPair DatagramMgr::install_local_pair()
     const auto uuid = id_allocator_->allocate();
     ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
     auto pair = std::make_shared<LocalPair>(executor_);
-    do
-        pair->consumer_ticket = generate_random_id();
-    while (pair->consumer_ticket == pair->producer_ticket);
     pair->producer_session_id = allocate_session_id();
     bindings_.emplace(pair->producer_session_id, Binding{uuid, Side::Producer});
     ScopeGuard binding_rollback([this, pair] { bindings_.erase(pair->producer_session_id); });
@@ -200,31 +182,10 @@ AttachPair DatagramMgr::install_local_pair()
             {uuid, pair->consumer_ticket, listen_endpoint_.port(), pair->consumer_session_id}};
 }
 
-asio::awaitable<bool> DatagramMgr::wait_local_pair(std::uint64_t uuid)
-{
-    const auto pair = local_pairs_.at(uuid);
-    const bool notified = co_await pair->attached.wait();
-    co_return notified && !pair->closed;
-}
-
-void DatagramMgr::bind_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor)
+asio::awaitable<void> DatagramMgr::prepare_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic, std::string accessor)
 {
     auto pair = local_pairs_.at(uuid);
-    if (!pair->producer_endpoint || !pair->consumer_endpoint || pair->traffic || !traffic)
-        throw std::runtime_error("local pair cannot bind service");
-    pair->traffic = std::move(traffic);
-    pair->accessor = std::move(accessor);
-    pair->rx_limiter = TokenBucket(config_.rx_bytes_per_second, config_.rx_burst_bytes);
-    pair->tx_limiter = TokenBucket(config_.tx_bytes_per_second, config_.tx_burst_bytes);
-}
-
-void DatagramMgr::activate_local_pair(std::uint64_t uuid)
-{
-    auto pair = local_pairs_.at(uuid);
-    if (!pair->traffic || pair->active)
-        throw std::runtime_error("local pair unavailable");
-    pair->active = true;
-    pair->traffic->add_accessor(pair->accessor);
+    co_await pair->prepare(config_, std::move(traffic), std::move(accessor));
 }
 
 asio::awaitable<void> DatagramMgr::run_local_pair(std::uint64_t uuid)
@@ -243,13 +204,9 @@ void DatagramMgr::close_local_pair(std::uint64_t uuid)
         return;
     auto pair = it->second;
     local_pairs_.erase(it);
-    pair->closed = true;
     bindings_.erase(pair->producer_session_id);
     bindings_.erase(pair->consumer_session_id);
-    pair->attached.notify_all();
-    pair->finished.notify_all();
-    if (pair->active)
-        pair->traffic->remove_accessor(pair->accessor);
+    pair->close();
     id_allocator_->release(uuid);
 }
 
