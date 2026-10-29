@@ -107,5 +107,5 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 新增测试应验证可观察的业务结果、边界或真实故障，优先使用协议对端和公开接口。
 必要的状态构造或检查放在 `support/` 或测试翻译单元中；不为测试增加业务友元、开关或诊断接口。
 
-公平队列的手动 Release 容器对比见 [FairQueue](../docs/FairQueue.md)。`fair_queue_compare` 与
+公平队列的手动 Release 容器对比见 [FairQueue 设计](../docs/RelayWeave设计.md#55-近似公平队列调度算法-fairqueue)。`fair_queue_compare` 与
 `fair_queue_memory` 分离计时和分配计数，不加入 CTest 或既有五个通道 benchmark。
