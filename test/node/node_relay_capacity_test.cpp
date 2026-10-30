@@ -41,9 +41,10 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
 
     const njson params{{"request_id", 7U}, {"service", "events"}, {"protocol", "tcp"},
                        {"epoch", 17U}, {"path", {"test-master", "peer"}}};
-    NodeSession ingress(node, consumer, params, true);
+    const RelayRequest request{"events", RelayProtocol::Tcp, 7, {"test-master", "peer"}, 17};
+    NodeSession ingress(node, consumer, request, true);
     NodeSession single(node, consumer, producer,
-                       njson{{"request_id", 7U}, {"service", "events"}, {"protocol", "tcp"}},
+                       RelayRequest{"events", RelayProtocol::Tcp, 7},
                        std::make_shared<ServiceTraffic>());
     unsigned ingress_cancelled = 0;
     unsigned single_cancelled = 0;
@@ -98,7 +99,7 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
 
     for (const bool force : {false, true})
     {
-        NodeSession invalidated(node, consumer, params, true);
+        NodeSession invalidated(node, consumer, request, true);
         unsigned cancelled = 0;
         invalidated.cancellation_slot().assign([&](asio::cancellation_type) { ++cancelled; });
         invalidated.invalidate(force ? 17 : 18, force ? "cluster control failed" : "");
@@ -106,9 +107,9 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
         require_capacity(cancelled == 1, "Epoch or cluster failure did not cancel exactly once");
     }
 
-    auto peer_params = params;
-    peer_params["flow_id"] = 39U;
-    peer_params["source"] = "peer";
+    auto peer_params = request;
+    peer_params.flow_id = 39;
+    peer_params.peer = "peer";
     NodeSession egress(node, producer, peer_params, false);
     unsigned egress_cancelled = 0;
     egress.cancellation_slot().assign([&](asio::cancellation_type) { ++egress_cancelled; });
@@ -160,7 +161,7 @@ int main()
         auto unrelated = std::make_shared<TLSChannel>(asio::ip::tcp::socket(control), ssl, TLSChannelRole::S);
         auto make_relay = [&](RelayProtocol protocol) {
             return std::make_shared<NodeSession>(*node, session, session,
-                njson{{"request_id", 1}, {"service", "capacity"}, {"protocol", relay_protocol_name(protocol)}},
+                RelayRequest{"capacity", protocol, 1},
                 std::make_shared<ServiceTraffic>());
         };
         auto poll_control = [&] { control.restart(); control.poll(); };
@@ -231,8 +232,7 @@ int main()
         auto make_multi = [&](bool ingress) {
             return std::make_shared<NodeSession>(
                 *node, session,
-                njson{{"request_id", 7U}, {"service", "capacity"}, {"protocol", "udp"},
-                       {"epoch", 17U}, {"flow_id", 39U}, {"source", "peer"}, {"path", {"test-master", "peer"}}},
+                RelayRequest{"capacity", RelayProtocol::Udp, 7, {"test-master", "peer"}, 17, 39, "peer"},
                 ingress);
         };
         auto reject_multi = [&](bool ingress) {

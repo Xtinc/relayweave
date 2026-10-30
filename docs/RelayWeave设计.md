@@ -200,6 +200,8 @@ flowchart TD
   - 跨域信令触发：使用 `asio::post(target_executor, ...)` 或 `asio::dispatch`。
   - 跨域流式数据传递：使用 Asio 实验性并发通道 `asio::experimental::concurrent_channel`，其内部实现保证了不同执行域之间线程安全的数据推送与非阻塞等待。
 
+Node 通过普通 `RelayRequest` 将已解析的业务构造参数传入 NodeSession 和控制器。两个 Router 只保留业务推进、匹配和状态报告所需的字段，协议由 NodeSession 已选定的数据管理器确定，epoch/Flow/peer 使用各自已有成员。JSON 只在输入、输出边界出现，不作为内部请求镜像。
+
 #### 配对状态与跨域准备
 
 配对对象使用普通继承，共享基类均不依赖具体 Flow 类型：
@@ -276,6 +278,8 @@ Agent 和 Node 工作线程保留普通调度策略，仅通过 `set_current_thr
 4. `Forwarder` 在 `transfer_io` 上启动目标数据端口的连接建立，完成握手后开始桥接。
 
 ---
+
+AgentSession 用 `optional<RelayEndpoint>` 表示尚未获得或已获得的接入端点。地址、端口、uuid、ticket、UDP session 与可选 Flow ID 在消息入口完整校验后安装；TLS framing 在入口检查，不保存重复字符串。Forwarder 直接访问这些字段完成原有消息分派和去重；已有 ServiceKey 和 RelaySelection 继续拥有服务协议、选路及 epoch，不将整份 Node 报文留在会话中。
 
 ### 2.3 核心辅助与状态管理组件
 
@@ -474,14 +478,17 @@ sequenceDiagram
     Note over M: committed = 0x07，完成事务
 ```
 
+NodeLinkMgr 在 control_io 用普通 `LinkParams`、`FlowParams` 保存已解析的授权参数；Master 请求另持有确认位图、结果和期限，本地 Flow 端点另持有 committed 状态。路径、地址和 transport 在输入边界解析，成员变化校验及事务推进直接访问类型字段，不保存 JSON 镜像。跨域仍使用现有 `LinkSpec`、`FlowSpec`。Prepare 是内存预留，不包含持久化。
+
 1. **第一阶段：准备（`FlowPrepare`）**：
    - Master 协调非零 64 位 `flow_id`（远程入口请求时由入口生成），向路径中所有节点下发 `flow.prepare`，携带完整的 `path`、`addresses`、`links`、`request_id` 与 `ttl_ms`，各节点据此派生上一跳与下一跳信息。
    - 各节点在本地 `FlowProtocol` 中创建处于 `Prepared` 状态的 `FlowState`，初始化队列与流控计数，提交时发布初始信用。
    - 节点完成后回复 `flow.prepared`。Master 使用单字节位图 `prepared |= (1 << node_index)` 记录应答。当所有位全部置 1 时，第一阶段完成。
+
 2. **第二阶段：提交（`FlowCommit`）**：
-   - Master 向路径上的各节点发送 `flow.commit` 报文。
+   - Master 向路径上的各节点发送 `flow.commit` 报文，只携带 `master`、`epoch`、`flow_id`、`request_id`；认证 `source` 由集群层填入。节点按本地预留参数核对身份，不再接收或比较整条路径。
    - 各节点在数据执行域上将 `FlowState` 的状态切换为 `Active`，激活物理 NodeLink 与 Flow 之间的数据分发路由。
-   - 各节点回复 `flow.committed`。Master 再次通过位图 `committed` 校验所有节点均已激活，随后向发起请求的 Ingress 节点返回成功结果。
+   - Prepared、Committed、Closed、Error 回复只携带同一事务身份和相应 stage/reason。Master 按已保存的路径核对认证来源及阶段，再通过位图 `committed` 校验所有节点均已激活，随后向发起请求的 Ingress 节点返回成功结果。
 
 #### 3.4.3 事务超时、回滚与主动释放机制
 
@@ -1779,29 +1786,39 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 
 #### A.2.3 Flow 路径安装事务消息 (Master <-> Node)
 
+事务身份由 `master`、`epoch`、`flow_id`、`request_id` 组成；集群层以认证连接填入 `source`。只有 Prepare 携带完整路径。Master 保留路径和确认位图，本地端点保留已验证的授权参数；后续阶段检查身份、来源和当前阶段。
+
 ##### 1. `flow.prepare` (Master -> Path Nodes)
 ```json
 {
   "command": "flow.prepare",
   "params": {
+    "source": "master-0",
+    "master": "master-0",
     "epoch": 42,
     "flow_id": 5001,
+    "request_id": 9001,
+    "path": ["node-1", "node-2", "node-3"],
+    "addresses": ["203.0.113.1", "203.0.113.2", "203.0.113.3"],
+    "links": [1001, 1002],
     "transport": "tcp",
-    "previous": 0,
-    "next": 2,
-    "previous_peer": "",
-    "next_peer": "node-2"
+    "ttl_ms": 10000
   }
 }
 ```
+
+`previous`、`next` 和相邻 peer 在本地根据路径派生，属于数据域 FlowSpec，不是 Prepare wire 字段。重复 Prepare 仍比较完整授权参数；期限不属于路径身份。此阶段只预留内存资源，不持久化。
 
 ##### 2. `flow.commit` (Master -> Path Nodes)
 ```json
 {
   "command": "flow.commit",
   "params": {
+    "source": "master-0",
+    "master": "master-0",
     "epoch": 42,
-    "flow_id": 5001
+    "flow_id": 5001,
+    "request_id": 9001
   }
 }
 ```
@@ -1811,12 +1828,29 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 {
   "command": "flow.close",
   "params": {
+    "source": "master-0",
+    "master": "master-0",
     "epoch": 42,
     "flow_id": 5001,
-    "reason": "normal finished"
+    "request_id": 9001,
+    "stage": "close",
+    "reason": "closed by caller"
   }
 }
 ```
+
+##### 4. 确认与错误回复 (Path Nodes -> Master)
+
+| 命令 | 身份字段 | 诊断字段 |
+|---|---|---|
+| `flow.prepared` | master、epoch、flow_id、request_id；source 为认证节点 | stage、reason |
+| `flow.committed` | 同上 | stage、reason |
+| `flow.closed` | 同上 | 数据端关闭事件含 stage/reason；未知事务 Close 的确认不含诊断字段 |
+| `flow.error` | 同上 | stage、reason，保留原始错误原因 |
+
+Commit、Close 和以上回复均不携带 path、addresses、links、transport、ttl_ms 或 committed。committed 仅为本地授权状态。已知事务核对身份后执行，未知 Commit 忽略；来自当前 Master、身份完整的未知 Close 直接确认，不创建端点或历史缓存。Master 只接受路径成员在对应阶段的确认，关闭期间和释放后的迟到确认不能推进建立。
+
+此格式要求 Master 与所有 Slave 同步升级；不提供旧完整载荷协议的兼容分支或版本协商。Agent/dashboard 报文和 Link 事务格式不随本次改变。
 
 ---
 

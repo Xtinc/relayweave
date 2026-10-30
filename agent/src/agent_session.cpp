@@ -5,6 +5,25 @@
 
 using Clock = std::chrono::steady_clock;
 
+AgentSession::RelayEndpoint AgentSession::RelayEndpoint::from_params(const njson &p, RelayProtocol protocol)
+{
+    RelayEndpoint endpoint;
+    endpoint.address = config::required_string(p, "data_address", "relay endpoint");
+    endpoint.port = config::message_data_port(p);
+    endpoint.uuid = config::require_unsigned(p, "uuid", true);
+    endpoint.ticket = config::require_unsigned(p, "ticket", true);
+    endpoint.flow_id = config::optional_unsigned(p, "flow_id", true);
+    if (protocol == RelayProtocol::Udp)
+    {
+        endpoint.session_id = config::require_unsigned(p, "session_id", true);
+    }
+    else if (protocol == RelayProtocol::Tls && p.value("tls_framing", std::string{}) != tls_data_framing)
+    {
+        throw std::invalid_argument("Unsupported TLS data framing");
+    }
+    return endpoint;
+}
+
 AgentSession::AgentSession(Forwarder &owner, std::uint64_t request, ServiceKey service, std::string destination,
                            Clock::time_point deadline)
     : owner(owner), request(request), service(std::move(service)), destination(std::move(destination)),
@@ -34,7 +53,7 @@ void AgentSession::fail(std::string cause)
         return;
     }
 
-    const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
+    const auto uuid = endpoint ? endpoint->uuid : 0;
     PROXY_ERROR_PRINT("Relay failed %s %s service=%s request_id=%llu uuid=%llu reason=%s",
                       relay_protocol_name(service.protocol).data(), producer() ? "producer" : "consumer",
                       service.service.c_str(), static_cast<unsigned long long>(request),
@@ -83,8 +102,7 @@ void AgentSession::handle(const CtrlMessage &message)
         return;
     }
 
-    if (!endpoint.empty() && p.contains("flow_id") &&
-        (!endpoint.contains("flow_id") || p.at("flow_id") != endpoint.at("flow_id")))
+    if (endpoint.has_value() && p.contains("flow_id") && (!endpoint->flow_id || p.at("flow_id") != *endpoint->flow_id))
     {
         return;
     }
@@ -97,9 +115,9 @@ void AgentSession::handle(const CtrlMessage &message)
         return;
     }
 
-    if (command == CtrlCommand::RelayOpened && endpoint.empty())
+    if (command == CtrlCommand::RelayOpened && !endpoint)
     {
-        endpoint = p;
+        endpoint = RelayEndpoint::from_params(p, service.protocol);
         changed.cancel();
     }
     else if (command == CtrlCommand::RelayReady && !ready)
@@ -107,7 +125,7 @@ void AgentSession::handle(const CtrlMessage &message)
         ready = true;
         PROXY_INFO_PRINT("Relay [+] %s %s service=%s uuid=%llu", relay_protocol_name(service.protocol).data(),
                          producer() ? "producer" : "consumer", service.service.c_str(),
-                         static_cast<unsigned long long>(config::require_unsigned(endpoint, "uuid", true)));
+                         static_cast<unsigned long long>(endpoint->uuid));
         owner.relay_ready(*this);
         changed.cancel();
     }
@@ -228,7 +246,7 @@ asio::awaitable<void> AgentSession::run()
         fail(stage + ": " + cause);
     }
 
-    const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
+    const auto uuid = endpoint ? endpoint->uuid : 0;
     if (!reason.empty() && !node_closed && (submitted || producer()))
     {
         njson values{{"request_id", request}, {"reason", reason}};
@@ -260,17 +278,13 @@ asio::awaitable<void> AgentSession::attach()
         throw asio::system_error(asio::error::operation_aborted);
     }
 
-    const auto host = config::required_string(endpoint, "data_address", "relay endpoint");
-    const auto port = config::message_data_port(endpoint);
-    const auto uuid = config::require_unsigned(endpoint, "uuid", true);
-    const auto ticket = config::require_unsigned(endpoint, "ticket", true);
+    const auto &host = endpoint->address;
+    const auto port = endpoint->port;
+    const auto uuid = endpoint->uuid;
+    const auto ticket = endpoint->ticket;
     auto attachment = RelayAttach::to_msg({producer() ? RelayAttach::Producer : RelayAttach::Consumer, uuid, ticket});
     if (service.protocol == RelayProtocol::Tls)
     {
-        if (endpoint.value("tls_framing", std::string{}) != tls_data_framing)
-        {
-            throw std::invalid_argument("Unsupported TLS data framing");
-        }
         (*attachment.params)["tls_framing"] = std::string(tls_data_framing);
     }
     const auto frame = WireMessage::pack(std::move(attachment));
@@ -290,9 +304,9 @@ asio::awaitable<void> AgentSession::attach()
     if (service.protocol == RelayProtocol::Udp)
     {
         auto &sockets = std::get<DatagramData>(data);
-        sockets.session_header = DatagramHeader::encode(config::require_unsigned(endpoint, "session_id", true));
+        sockets.session_header = DatagramHeader::encode(endpoint->session_id);
         sockets.maximum_payload =
-            endpoint.contains("flow_id") ? LnkFrameHeader::maximum_payload : DatagramHeader::maximum_user_payload;
+            endpoint->flow_id.has_value() ? LnkFrameHeader::maximum_payload : DatagramHeader::maximum_user_payload;
         if (target)
         {
             auto endpoints = co_await sockets.resolver.async_resolve(

@@ -49,6 +49,34 @@ static bool valid_flow_path(const std::vector<std::string> &path)
     return true;
 }
 
+njson NodeLinkMgr::LinkParams::to_params(std::string_view node) const
+{
+    njson p{{"id", id}, {"epoch", epoch}, {"master", master}, {"left", left}, {"right", right},
+            {"transport", relay_protocol_name(transport)}, {"token", token}, {"left_address", left_address},
+            {"right_address", right_address}, {"tcp_port", tcp_port}, {"udp_port", udp_port}};
+    if (!node.empty())
+    {
+        p["peer"] = node == left ? right : left;
+        p["peer_address"] = node == left ? right_address : left_address;
+    }
+    return p;
+}
+
+njson NodeLinkMgr::FlowParams::identity_params() const
+{
+    return {{"epoch", epoch}, {"master", master}, {"flow_id", id}, {"request_id", request_id}};
+}
+
+njson NodeLinkMgr::FlowParams::to_params() const
+{
+    auto p = identity_params();
+    p["path"] = path;
+    p["addresses"] = addresses;
+    p["links"] = links;
+    p["transport"] = relay_protocol_name(transport);
+    return p;
+}
+
 NodeLinkMgr::NodeLinkMgr(asio::any_io_executor control, asio::any_io_executor data, ClusterConfig config,
                          std::string tcp_address, std::string udp_address, ClusterMgr &cluster, Topology &topology)
     : control_(control), config_(std::move(config)), cluster_(cluster), topology_(topology),
@@ -125,11 +153,11 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
             case CtrlCommand::LinkClosed: {
                 const auto id = event.id;
                 const auto endpoint = link_endpoints_.find(id);
-                if (endpoint == link_endpoints_.end() || endpoint->second.at("epoch") != event.epoch)
+                if (endpoint == link_endpoints_.end() || endpoint->second.epoch != event.epoch)
                 {
                     continue;
                 }
-                auto params = endpoint->second;
+                auto params = endpoint->second.to_params(config_.node_id);
                 params["stage"] = std::move(event.stage);
                 params["reason"] = std::move(event.reason);
                 params.erase("token");
@@ -146,21 +174,21 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
             case CtrlCommand::FlowClosed: {
                 const auto id = event.id;
                 const auto endpoint = flow_endpoints_.find(id);
-                if (endpoint == flow_endpoints_.end() || endpoint->second.at("epoch") != event.epoch)
+                if (endpoint == flow_endpoints_.end() || endpoint->second.params.epoch != event.epoch)
                 {
                     continue;
                 }
-                auto params = endpoint->second;
-                params["stage"] = std::move(event.stage);
-                params["reason"] = std::move(event.reason);
                 if (type == CtrlCommand::FlowCommitted)
                 {
-                    endpoint->second["committed"] = true;
+                    endpoint->second.committed = true;
                 }
                 if (type == CtrlCommand::FlowError || type == CtrlCommand::FlowClosed)
                 {
-                    flow_closed(id, params.value("reason", "flow closed"));
+                    flow_closed(id, event.reason);
                 }
+                auto params = endpoint->second.params.identity_params();
+                params["stage"] = std::move(event.stage);
+                params["reason"] = std::move(event.reason);
                 cluster_.send(std::string(topology_.master_id()), CtrlMessage(type, std::move(params)));
                 if (type == CtrlCommand::FlowError || type == CtrlCommand::FlowClosed)
                 {
@@ -218,15 +246,9 @@ asio::awaitable<bool> NodeLinkMgr::stop()
     co_return stop_ok_;
 }
 
-NodeLinkMgr::LinkRequest::LinkRequest(asio::any_io_executor executor, njson values)
+NodeLinkMgr::LinkRequest::LinkRequest(asio::any_io_executor executor, LinkParams values)
     : params(std::move(values)), timeout(executor), completed_event(executor)
 {
-}
-
-NodeLinkMgr::LinkKey NodeLinkMgr::link_key(const njson &p)
-{
-    return {p.at("left").get<std::string>(), p.at("right").get<std::string>(),
-            parse_relay_protocol(p.at("transport").get_ref<const std::string &>())};
 }
 
 asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::string right, RelayProtocol transport)
@@ -255,7 +277,6 @@ asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::stri
         std::swap(left, right);
     }
 
-    njson params{{"left", left}, {"right", right}, {"transport", relay_protocol_name(transport)}};
     const LinkKey pair{left, right, transport};
     std::shared_ptr<LinkRequest> request;
     if (auto found = link_requests_.find(pair); found != link_requests_.end())
@@ -268,16 +289,19 @@ asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::stri
         {
             co_return LinkResult{0, "ensure", "node link capacity exceeded"};
         }
-        auto id = generate_random_id();
-        params["id"] = id;
-        params["epoch"] = topology_.epoch();
-        params["master"] = std::string(topology_.master_id());
-        params["token"] = std::to_string(generate_random_id()) + ":" + std::to_string(generate_random_id());
-        params["left_address"] = members.at(left);
-        params["right_address"] = members.at(right);
-        params["tcp_port"] = config_.tcp_port;
-        params["udp_port"] = config_.udp_port;
-        request = std::make_shared<LinkRequest>(control_, params);
+        LinkParams params;
+        params.id = generate_random_id();
+        params.epoch = topology_.epoch();
+        params.master = topology_.master_id();
+        params.left = left;
+        params.right = right;
+        params.transport = transport;
+        params.token = std::to_string(generate_random_id()) + ":" + std::to_string(generate_random_id());
+        params.left_address = members.at(left);
+        params.right_address = members.at(right);
+        params.tcp_port = config_.tcp_port;
+        params.udp_port = config_.udp_port;
+        request = std::make_shared<LinkRequest>(control_, std::move(params));
         link_requests_.emplace(pair, request);
         request->timeout.expires_after(10s);
         request->timeout.async_wait([this, request](asio::error_code error) {
@@ -288,10 +312,7 @@ asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::stri
         });
         for (auto &node : {left, right})
         {
-            auto prepare = params;
-            const auto &peer = node == left ? right : left;
-            prepare["peer"] = peer;
-            prepare["peer_address"] = members.at(peer);
+            auto prepare = request->params.to_params(node);
             if (cluster_.send(node, CtrlMessage(CtrlCommand::LinkPrepare, std::move(prepare))) !=
                 ClusterMgr::SendResult::Submitted)
             {
@@ -315,9 +336,10 @@ asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::stri
 
 bool NodeLinkMgr::send_both(const LinkRequest &request, CtrlCommand command)
 {
-    return cluster_.send(request.params.at("left"), CtrlMessage(command, request.params)) ==
+    auto params = request.params.to_params();
+    return cluster_.send(request.params.left, CtrlMessage(command, params)) ==
                ClusterMgr::SendResult::Submitted &&
-           cluster_.send(request.params.at("right"), CtrlMessage(command, request.params)) ==
+           cluster_.send(request.params.right, CtrlMessage(command, std::move(params))) ==
                ClusterMgr::SendResult::Submitted;
 }
 
@@ -328,12 +350,12 @@ void NodeLinkMgr::finish_link(std::shared_ptr<LinkRequest> request, std::string 
         return;
     }
     request->completed = true;
-    request->result = {request->params.at("id").get<std::uint64_t>(), std::move(stage), std::move(reason)};
+    request->result = {request->params.id, std::move(stage), std::move(reason)};
     request->timeout.cancel();
     if (!request->result)
     {
         send_both(*request, CtrlCommand::LinkClose);
-        auto found = link_requests_.find(link_key(request->params));
+        auto found = link_requests_.find({request->params.left, request->params.right, request->params.transport});
         if (found != link_requests_.end() && found->second == request)
         {
             link_requests_.erase(found);
@@ -366,9 +388,9 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
                 {
                     return;
                 }
-                const auto left = p.at("left").get<std::string>();
-                const auto right = p.at("right").get<std::string>();
-                const auto peer = p.at("peer").get<std::string>();
+                auto left = p.at("left").get<std::string>();
+                auto right = p.at("right").get<std::string>();
+                auto peer = p.at("peer").get<std::string>();
                 if (!(left < right) || (config_.node_id != left && config_.node_id != right) ||
                     peer != (config_.node_id == left ? right : left) || !topology_.members().contains(peer) ||
                     p.at("peer_address") != topology_.members().at(peer))
@@ -376,7 +398,8 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
                     return;
                 }
                 const auto transport = parse_relay_protocol(p.at("transport").get<std::string>());
-                if (transport == RelayProtocol::Tls || p.at("token").get<std::string>().empty())
+                auto token = p.at("token").get<std::string>();
+                if (transport == RelayProtocol::Tls || token.empty())
                 {
                     return;
                 }
@@ -392,14 +415,15 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
                 {
                     throw std::runtime_error("node link capacity exceeded");
                 }
-                link_endpoints_[id] = p;
-                asio::post(protocol_->executor(),
-                           [data = protocol_,
-                            spec = lnk::LinkSpec{id, epoch, transport, peer, p.at("peer_address").get<std::string>(),
-                                                 p.at("token").get<std::string>(), config_.tcp_port, config_.udp_port,
-                                                 config_.node_id == left}]() mutable {
-                               data->links().prepare(std::move(spec));
-                           });
+                lnk::LinkSpec spec{id, epoch, transport, std::move(peer), p.at("peer_address").get<std::string>(),
+                                   token, config_.tcp_port, config_.udp_port, config_.node_id == left};
+                link_endpoints_.emplace(id,
+                    LinkParams{id, epoch, std::string(topology_.master_id()), std::move(left), std::move(right),
+                               transport, std::move(token), p.at("left_address").get<std::string>(),
+                               p.at("right_address").get<std::string>(), config_.tcp_port, config_.udp_port});
+                asio::post(protocol_->executor(), [data = protocol_, spec = std::move(spec)]() mutable {
+                    data->links().prepare(std::move(spec));
+                });
             }
             else
             {
@@ -413,8 +437,8 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
                     return;
                 }
                 const auto &authorized = found->second;
-                if (p.at("token") != authorized.at("token") || p.at("left") != authorized.at("left") ||
-                    p.at("right") != authorized.at("right") || p.at("transport") != authorized.at("transport"))
+                if (p.at("token") != authorized.token || p.at("left") != authorized.left ||
+                    p.at("right") != authorized.right || p.at("transport") != relay_protocol_name(authorized.transport))
                 {
                     return;
                 }
@@ -435,14 +459,15 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
             return;
         }
 
-        auto found = link_requests_.find(link_key(p));
+        auto found = link_requests_.find({p.at("left").get<std::string>(), p.at("right").get<std::string>(),
+                                         parse_relay_protocol(p.at("transport").get<std::string>())});
         if (found == link_requests_.end())
         {
             return;
         }
 
         auto request = found->second;
-        if (request->params.at("id") != id ||
+        if (request->params.id != id ||
             (source != p.at("left").get<std::string>() && source != p.at("right").get<std::string>()))
         {
             return;
@@ -503,12 +528,11 @@ void NodeLinkMgr::members_changed()
     {
         return;
     }
-    const auto valid_link = [this](const njson &p) {
-        return p.at("epoch") == topology_.epoch() && p.at("master").get<std::string>() == topology_.master_id() &&
-               topology_.members().contains(p.at("left").get<std::string>()) &&
-               topology_.members().contains(p.at("right").get<std::string>()) &&
-               p.at("left_address") == topology_.members().at(p.at("left").get<std::string>()) &&
-               p.at("right_address") == topology_.members().at(p.at("right").get<std::string>());
+    const auto valid_link = [this](const LinkParams &p) {
+        return p.epoch == topology_.epoch() && p.master == topology_.master_id() &&
+               topology_.members().contains(p.left) && topology_.members().contains(p.right) &&
+               p.left_address == topology_.members().at(p.left) &&
+               p.right_address == topology_.members().at(p.right);
     };
     for (auto it = link_endpoints_.begin(); it != link_endpoints_.end();)
     {
@@ -540,7 +564,7 @@ void NodeLinkMgr::members_changed()
     }
     for (auto it = flow_endpoints_.begin(); it != flow_endpoints_.end();)
     {
-        if (valid_flow(it->second))
+        if (valid_flow(it->second.params))
         {
             ++it;
             continue;
@@ -552,22 +576,22 @@ void NodeLinkMgr::members_changed()
     }
 }
 
-NodeLinkMgr::FlowRequest::FlowRequest(asio::any_io_executor executor, njson values)
+NodeLinkMgr::FlowRequest::FlowRequest(asio::any_io_executor executor, FlowParams values)
     : params(std::move(values)), timeout(executor), completed_event(executor), released_event(executor)
 {
-    result.epoch = params.at("epoch").get<std::uint64_t>();
-    result.id = params.at("flow_id").get<std::uint64_t>();
+    result.epoch = params.epoch;
+    result.id = params.id;
     result.stage = "links";
 }
 
-bool NodeLinkMgr::valid_flow(const njson &p) const
+bool NodeLinkMgr::valid_flow(const FlowParams &p) const
 {
-    if (p.at("epoch") != topology_.epoch() || p.at("master").get<std::string>() != topology_.master_id())
+    if (p.epoch != topology_.epoch() || p.master != topology_.master_id())
     {
         return false;
     }
-    const auto nodes = p.at("path").get<std::vector<std::string>>();
-    const auto addresses = p.at("addresses").get<std::vector<std::string>>();
+    const auto &nodes = p.path;
+    const auto &addresses = p.addresses;
     if (!valid_flow_path(nodes) || addresses.size() != nodes.size())
     {
         return false;
@@ -642,15 +666,16 @@ std::shared_ptr<NodeLinkMgr::FlowRequest> NodeLinkMgr::create_flow(std::vector<s
     {
         throw std::runtime_error("flow identity already exists");
     }
-    njson p{{"epoch", topology_.epoch()},
-            {"master", std::string(topology_.master_id())},
-            {"flow_id", id},
-            {"request_id", generate_random_id()},
-            {"path", path},
-            {"addresses", addresses},
-            {"transport", relay_protocol_name(transport)},
-            {"links", std::vector<std::uint64_t>(path.size() - 1)}};
-    auto r = std::make_shared<FlowRequest>(control_, std::move(p));
+    FlowParams params;
+    params.epoch = topology_.epoch();
+    params.master = topology_.master_id();
+    params.id = id;
+    params.request_id = generate_random_id();
+    params.links.resize(path.size() - 1);
+    params.path = std::move(path);
+    params.addresses = std::move(addresses);
+    params.transport = transport;
+    auto r = std::make_shared<FlowRequest>(control_, std::move(params));
     flow_requests_.emplace(id, r);
     arm_flow_timeout(r);
     return r;
@@ -658,8 +683,8 @@ std::shared_ptr<NodeLinkMgr::FlowRequest> NodeLinkMgr::create_flow(std::vector<s
 
 asio::awaitable<FlowResult> NodeLinkMgr::establish_flow(std::shared_ptr<FlowRequest> r)
 {
-    const auto path = r->params.at("path").get<std::vector<std::string>>();
-    const auto transport = parse_relay_protocol(r->params.at("transport").get<std::string>());
+    const auto &path = r->params.path;
+    const auto transport = r->params.transport;
     /** @brief Own one adjacent-Link establishment result for the control-side parallel path setup. */
     struct Edge
     {
@@ -689,7 +714,7 @@ asio::awaitable<FlowResult> NodeLinkMgr::establish_flow(std::shared_ptr<FlowRequ
             }
             if (!r->completed)
             {
-                r->params["links"][edge.index] = edge.result.id;
+                r->params.links[edge.index] = edge.result.id;
             }
         }
     }
@@ -730,7 +755,7 @@ asio::awaitable<FlowResult> NodeLinkMgr::establish_flow(std::shared_ptr<FlowRequ
 
 bool NodeLinkMgr::send_all(const FlowRequest &r, CtrlCommand command)
 {
-    auto p = r.params;
+    auto p = command == CtrlCommand::FlowPrepare ? r.params.to_params() : r.params.identity_params();
     if (command == CtrlCommand::FlowPrepare)
     {
         p["ttl_ms"] = std::uint64_t(std::clamp<std::int64_t>(
@@ -742,9 +767,9 @@ bool NodeLinkMgr::send_all(const FlowRequest &r, CtrlCommand command)
         p["stage"] = r.result.stage;
         p["reason"] = r.result.reason;
     }
-    for (const auto &node : p.at("path"))
+    for (const auto &node : r.params.path)
     {
-        if (cluster_.send(node.get<std::string>(), CtrlMessage(command, p)) != ClusterMgr::SendResult::Submitted)
+        if (cluster_.send(node, CtrlMessage(command, p)) != ClusterMgr::SendResult::Submitted)
         {
             return false;
         }
@@ -816,45 +841,45 @@ void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
             {
                 return;
             }
-            const auto reject = [&](std::string reason) {
-                auto error = p;
-                error["stage"] = "prepare";
-                error["reason"] = std::move(reason);
-                cluster_.send(source, CtrlMessage(CtrlCommand::FlowError, std::move(error)));
-            };
             if (type == CtrlCommand::FlowPrepare)
             {
-                const auto path = p.at("path").get<std::vector<std::string>>();
-                const auto edge_ids = p.at("links").get<std::vector<std::uint64_t>>();
+                FlowParams params{epoch, std::string(topology_.master_id()), id,
+                                  config::require_unsigned(p, "request_id", true),
+                                  p.at("path").get<std::vector<std::string>>(),
+                                  p.at("addresses").get<std::vector<std::string>>(),
+                                  p.at("links").get<std::vector<std::uint64_t>>(),
+                                  parse_relay_protocol(p.at("transport").get<std::string>())};
+                const auto reject = [&](std::string reason) {
+                    auto error = params.identity_params();
+                    error["stage"] = "prepare";
+                    error["reason"] = std::move(reason);
+                    cluster_.send(source, CtrlMessage(CtrlCommand::FlowError, std::move(error)));
+                };
+                const auto &path = params.path;
+                const auto &edge_ids = params.links;
                 const auto ttl = config::require_unsigned(p, "ttl_ms", true);
-                config::require_unsigned(p, "request_id", true);
-                if (!valid_flow(p) || std::ranges::find(path, config_.node_id) == path.end() || ttl > 10000 ||
+                if (!valid_flow(params) || std::ranges::find(path, config_.node_id) == path.end() || ttl > 10000 ||
                     edge_ids.size() + 1 != path.size() || std::ranges::find(edge_ids, 0) != edge_ids.end() ||
-                    parse_relay_protocol(p.at("transport").get<std::string>()) == RelayProtocol::Tls)
+                    params.transport == RelayProtocol::Tls)
                 {
                     reject("invalid flow path or identity");
                     return;
                 }
                 if (auto it = flow_endpoints_.find(id); it != flow_endpoints_.end())
                 {
-                    if (it->second.at("request_id") != p.at("request_id") || it->second.at("path") != p.at("path") ||
-                        it->second.at("links") != p.at("links") || it->second.at("transport") != p.at("transport"))
+                    if (it->second.params != params)
                     {
                         reject("conflicting flow prepare");
                         return;
                     }
                 }
-                else
+                else if (flow_endpoints_.size() >= lnk::max_flow_count)
                 {
-                    if (flow_endpoints_.size() >= lnk::max_flow_count)
-                    {
-                        reject("flow endpoint capacity exceeded");
-                        return;
-                    }
-                    flow_endpoints_.emplace(id, p);
+                    reject("flow endpoint capacity exceeded");
+                    return;
                 }
                 const auto index = std::size_t(std::ranges::find(path, config_.node_id) - path.begin());
-                lnk::FlowSpec spec{id, epoch, parse_relay_protocol(p.at("transport").get<std::string>())};
+                lnk::FlowSpec spec{id, epoch, params.transport};
                 spec.prepare_timeout = std::chrono::milliseconds(ttl);
                 if (index)
                 {
@@ -866,6 +891,7 @@ void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
                     spec.next = edge_ids[index];
                     spec.next_peer = path[index + 1];
                 }
+                flow_endpoints_.try_emplace(id, FlowEndpoint{std::move(params)});
                 asio::post(protocol_->executor(), [data = protocol_, spec = std::move(spec)]() mutable {
                     try
                     {
@@ -879,21 +905,23 @@ void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
             }
             else
             {
+                const auto request_id = config::require_unsigned(p, "request_id", true);
                 auto it = flow_endpoints_.find(id);
                 if (it == flow_endpoints_.end())
                 {
                     if (type == CtrlCommand::FlowClose)
                     {
-                        cluster_.send(source, CtrlMessage(CtrlCommand::FlowClosed, p));
+                        cluster_.send(source,
+                                      CtrlMessage(CtrlCommand::FlowClosed,
+                                                  njson{{"master", std::string(topology_.master_id())},
+                                                        {"epoch", epoch}, {"flow_id", id}, {"request_id", request_id}}));
                     }
                     return;
                 }
-                for (const auto *field : {"request_id", "path", "links", "transport", "addresses"})
+                const auto &authorized = it->second.params;
+                if (authorized.epoch != epoch || authorized.request_id != request_id)
                 {
-                    if (p.at(field) != it->second.at(field))
-                    {
-                        return;
-                    }
+                    return;
                 }
                 asio::post(protocol_->executor(), [this, id, type, reason = p.value("reason", "")] {
                     if (type == CtrlCommand::FlowCommit)
@@ -919,12 +947,12 @@ void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
             return;
         }
         auto r = it != flow_requests_.end() ? it->second : closing->second;
-        if (p.at("request_id") != r->params.at("request_id") || p.at("path") != r->params.at("path") ||
-            p.at("links") != r->params.at("links") || p.at("transport") != r->params.at("transport"))
+        if (r->params.epoch != epoch ||
+            config::require_unsigned(p, "request_id", true) != r->params.request_id)
         {
             return;
         }
-        const auto path = r->params.at("path").get<std::vector<std::string>>();
+        const auto &path = r->params.path;
         const auto node = std::ranges::find(path, source);
         if (node == path.end())
         {
@@ -1027,7 +1055,7 @@ asio::awaitable<std::string> NodeLinkMgr::wait_flow_closed(std::uint64_t epoch, 
     if (!topology_.is_master())
     {
         const auto endpoint = flow_endpoints_.find(id);
-        if (endpoint == flow_endpoints_.end() || endpoint->second.at("epoch") != epoch)
+        if (endpoint == flow_endpoints_.end() || endpoint->second.params.epoch != epoch)
         {
             co_return "flow closed";
         }

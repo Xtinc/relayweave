@@ -5,10 +5,11 @@
 using Clock = std::chrono::steady_clock;
 
 ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const AgentPeer &consumer, const AgentPeer &producer,
-                                         njson params)
-    : relay_(relay), consumer_(consumer), producer_(producer), params_(std::move(params))
+                                         RelayRequest params)
+    : relay_(relay), consumer_(consumer), producer_(producer), service_(std::move(params.service)),
+      request_id_(params.request_id)
 {
-    const auto protocol = config::message_protocol(params_);
+    const auto protocol = params.protocol;
     const auto &config = relay.node_.config_;
     const auto timeout = protocol == RelayProtocol::Udp   ? config.datagram.setup_timeout
                          : protocol == RelayProtocol::Tls ? config.tls.setup_timeout
@@ -30,8 +31,8 @@ std::optional<njson> ControlRouterSingle::status_report() const
         return std::nullopt;
     }
     return njson{{"mode", "single"},
-                 {"service", params_.at("service")},
-                 {"protocol", params_.at("protocol")},
+                 {"service", service_},
+                 {"protocol", relay_protocol_name(relay_.protocol())},
                  {"uuid", relay_.uuid()},
                  {"consumer_peer", std::string(consumer.peer())},
                  {"producer_peer", std::string(producer.peer())}};
@@ -44,7 +45,7 @@ bool ControlRouterSingle::matches(const AgentPeer &session, const njson &params)
     const auto uuid = config::optional_unsigned(params, "uuid", true);
     const auto request = config::optional_unsigned(params, "request_id");
     return (uuid && relay_.uuid() == *uuid) ||
-           (request && consumer_ == session && params_.at("request_id") == *request);
+           (request && consumer_ == session && request_id_ == *request);
 }
 
 bool ControlRouterSingle::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
@@ -104,10 +105,10 @@ void ControlRouterSingle::notify_agents() const
         if (const auto &session = producer ? producer_ : consumer_; session)
         {
             auto values = (producer ? pair.producer : pair.consumer).to_params(relay_.protocol());
-            values["service"] = params_.at("service");
-            values["protocol"] = params_.at("protocol");
+            values["service"] = service_;
+            values["protocol"] = relay_protocol_name(relay_.protocol());
             if (!producer)
-                values["request_id"] = params_.at("request_id");
+                values["request_id"] = request_id_;
             relay_.send_agent(
                 session, CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
         }
@@ -116,7 +117,7 @@ void ControlRouterSingle::notify_agents() const
 
 void ControlRouterSingle::ready_agents() const
 {
-    const njson values{{"uuid", relay_.uuid()}, {"protocol", params_.at("protocol")}};
+    const njson values{{"uuid", relay_.uuid()}, {"protocol", relay_protocol_name(relay_.protocol())}};
     const auto &consumer = consumer_;
     if (consumer)
     {
@@ -135,9 +136,9 @@ void ControlRouterSingle::close_agents() const
     {
         return;
     }
-    njson values{{"request_id", params_.at("request_id")},
-                 {"service", params_.at("service")},
-                 {"protocol", params_.at("protocol")},
+    njson values{{"request_id", request_id_},
+                 {"service", service_},
+                 {"protocol", relay_protocol_name(relay_.protocol())},
                  {"reason", reason_}};
     const auto id = relay_.uuid();
     if (id)
@@ -180,8 +181,8 @@ asio::awaitable<void> ControlRouterSingle::run()
         }
         ready_agents();
         ready_ = true;
-        PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", params_.at("protocol").get<std::string>().c_str(),
-                         params_.at("service").get<std::string>().c_str(),
+        PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", relay_protocol_name(relay_.protocol()).data(),
+                         service_.c_str(),
                          static_cast<unsigned long long>(relay_.uuid()));
         co_await relay_.bridge();
         if (reason_.empty())
@@ -201,8 +202,8 @@ asio::awaitable<void> ControlRouterSingle::run()
     if (ready_)
     {
         PROXY_INFO_PRINT("Relay [x] %s service=%s uuid=%llu reason=%s",
-                         params_.at("protocol").get<std::string>().c_str(),
-                         params_.at("service").get<std::string>().c_str(),
+                         relay_protocol_name(relay_.protocol()).data(),
+                         service_.c_str(),
                          static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     }
     co_await relay_.close();

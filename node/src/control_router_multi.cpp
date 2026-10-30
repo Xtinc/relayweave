@@ -5,25 +5,25 @@
 
 using Clock = std::chrono::steady_clock;
 
-ControlRouterMulti::ControlRouterMulti(NodeSession &relay, const AgentPeer &session, njson params, bool ingress)
-    : relay_(relay), session_(session), params_(std::move(params)), changed_(relay.node_.control_executor_),
-      ingress_(ingress)
+ControlRouterMulti::ControlRouterMulti(NodeSession &relay, const AgentPeer &session, RelayRequest params, bool ingress)
+    : relay_(relay), session_(session), service_(std::move(params.service)), request_id_(params.request_id),
+      path_(std::move(params.path)), accessor_(std::move(params.accessor)), epoch_(params.epoch),
+      changed_(relay.node_.control_executor_), ingress_(ingress)
 {
-    const auto protocol = config::message_protocol(params_);
+    const auto protocol = params.protocol;
     const auto &config = relay.node_.config_;
     const auto timeout = protocol == RelayProtocol::Udp   ? config.datagram.setup_timeout
                          : protocol == RelayProtocol::Tls ? config.tls.setup_timeout
                                                           : config.tcp.setup_timeout;
     deadline_ = Clock::now() + timeout;
-    epoch_ = params_.at("epoch").get<std::uint64_t>();
     if (ingress_)
     {
-        peer_ = params_.at("path").back().get<std::string>();
+        peer_ = path_.back();
     }
     else
     {
-        flow_id_ = params_.at("flow_id").get<std::uint64_t>();
-        peer_ = params_.at("source").get<std::string>();
+        flow_id_ = params.flow_id;
+        peer_ = std::move(params.peer);
         progress_ = Progress::PeerOpened;
     }
 }
@@ -49,14 +49,14 @@ std::optional<njson> ControlRouterMulti::status_report() const
     }
     njson report{{"mode", "multi"},
                  {"role", ingress_ ? "ingress" : "egress"},
-                 {"service", params_.at("service")},
-                 {"protocol", params_.at("protocol")},
+                 {"service", service_},
+                 {"protocol", relay_protocol_name(relay_.protocol())},
                  {"epoch", epoch_},
                  {"flow_id", flow_id_},
                  {"agent_peer", std::string(session.peer())}};
     if (ingress_)
     {
-        report["path"] = params_.at("path");
+        report["path"] = path_;
     }
     return report;
 }
@@ -66,13 +66,13 @@ void ControlRouterMulti::notify_agent() const
     if (const auto &session = session_; session)
     {
         auto values = std::get<AttachInfo>(relay_.endpoint_).to_params(relay_.protocol());
-        values["service"] = params_.at("service");
-        values["protocol"] = params_.at("protocol");
+        values["service"] = service_;
+        values["protocol"] = relay_protocol_name(relay_.protocol());
         values["epoch"] = epoch_;
         values["flow_id"] = flow_id_;
         if (ingress_)
         {
-            values["request_id"] = params_.at("request_id");
+            values["request_id"] = request_id_;
         }
         relay_.send_agent(
             session, CtrlMessage(ingress_ ? CtrlCommand::RelayOpened : CtrlCommand::RelayOffer, std::move(values)));
@@ -84,12 +84,14 @@ void ControlRouterMulti::ready_agent()
     progress_ = Progress::Ready;
     if (const auto &session = session_; session)
     {
-        njson values{
-            {"uuid", relay_.uuid()}, {"protocol", params_.at("protocol")}, {"epoch", epoch_}, {"flow_id", flow_id_}};
+        njson values{{"uuid", relay_.uuid()},
+                     {"protocol", relay_protocol_name(relay_.protocol())},
+                     {"epoch", epoch_},
+                     {"flow_id", flow_id_}};
         relay_.send_agent(session, CtrlMessage(CtrlCommand::RelayReady, std::move(values)));
     }
-    PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", params_.at("protocol").get<std::string>().c_str(),
-                     params_.at("service").get<std::string>().c_str(), static_cast<unsigned long long>(relay_.uuid()));
+    PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", relay_protocol_name(relay_.protocol()).data(),
+                     service_.c_str(), static_cast<unsigned long long>(relay_.uuid()));
 }
 
 void ControlRouterMulti::close_agent() const
@@ -98,8 +100,8 @@ void ControlRouterMulti::close_agent() const
     {
         const auto *endpoint = std::get_if<AttachInfo>(&relay_.endpoint_);
         auto values = endpoint ? endpoint->to_params(relay_.protocol()) : njson::object();
-        values["service"] = params_.at("service");
-        values["protocol"] = params_.at("protocol");
+        values["service"] = service_;
+        values["protocol"] = relay_protocol_name(relay_.protocol());
         values["epoch"] = epoch_;
         values["stage"] = stage_;
         values["reason"] = reason_;
@@ -109,8 +111,8 @@ void ControlRouterMulti::close_agent() const
         }
         if (ingress_)
         {
-            values["request_id"] = params_.at("request_id");
-            values["path"] = params_.at("path");
+            values["request_id"] = request_id_;
+            values["path"] = path_;
         }
         relay_.node_.send_relay(
             session,
@@ -144,7 +146,7 @@ bool ControlRouterMulti::matches(const AgentPeer &session, const njson &params) 
     const auto request = config::optional_unsigned(params, "request_id");
     const auto uuid = config::optional_unsigned(params, "uuid");
     const auto id = relay_.uuid();
-    return (ingress_ && request && params_.at("request_id") == *request) || (uuid && id && id == *uuid);
+    return (ingress_ && request && request_id_ == *request) || (uuid && id && id == *uuid);
 }
 
 bool ControlRouterMulti::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
@@ -162,12 +164,10 @@ bool ControlRouterMulti::handle(CtrlCommand command, const AgentPeer &session, c
 
     if (opening)
     {
-        for (const auto *field : {"path", "epoch", "service", "protocol"})
+        if (params.at("path") != path_ || params.at("epoch") != epoch_ || params.at("service") != service_ ||
+            params.at("protocol") != relay_protocol_name(relay_.protocol()))
         {
-            if (params_.at(field) != params.at(field))
-            {
-                throw std::invalid_argument("relay request conflicts with existing request");
-            }
+            throw std::invalid_argument("relay request conflicts with existing request");
         }
         if (progress_ >= Progress::AgentNotified)
         {
@@ -264,9 +264,8 @@ asio::awaitable<void> ControlRouterMulti::run()
             const auto submitted_epoch = epoch_;
             const auto flow = co_await asio::co_spawn(
                 node.control_executor_,
-                node.nodelink_mgr_->open_flow(params_.at("path").get<std::vector<std::string>>(),
-                                              relay_.protocol() == RelayProtocol::Udp ? RelayProtocol::Udp
-                                                                                      : RelayProtocol::Tcp),
+                node.nodelink_mgr_->open_flow(path_, relay_.protocol() == RelayProtocol::Udp ? RelayProtocol::Udp
+                                                                                             : RelayProtocol::Tcp),
                 asio::cancel_at(deadline_, asio::use_awaitable));
             if (!flow)
             {
@@ -282,8 +281,8 @@ asio::awaitable<void> ControlRouterMulti::run()
             }
             const auto &session = session_;
             progress_ = Progress::PeerOpened;
-            send_peer(CtrlCommand::RelayPeerOpen, njson{{"service", params_.at("service")},
-                                                        {"protocol", params_.at("protocol")},
+            send_peer(CtrlCommand::RelayPeerOpen, njson{{"service", service_},
+                                                        {"protocol", relay_protocol_name(relay_.protocol())},
                                                         {"accessor", std::string(session.peer())}});
         }
         const auto [order, transfer_error, flow_error] =
@@ -305,8 +304,8 @@ asio::awaitable<void> ControlRouterMulti::run()
             if (!stop_requested_)
             {
                 PROXY_ERROR_PRINT("Relay failed %s service=%s stage=%s reason=%s",
-                                  params_.at("protocol").get<std::string>().c_str(),
-                                  params_.at("service").get<std::string>().c_str(), stage_.c_str(), reason_.c_str());
+                                  relay_protocol_name(relay_.protocol()).data(), service_.c_str(), stage_.c_str(),
+                                  reason_.c_str());
             }
         }
     }
@@ -315,10 +314,8 @@ asio::awaitable<void> ControlRouterMulti::run()
     stop_requested_ = true;
     if (progress_ == Progress::Ready)
     {
-        PROXY_INFO_PRINT("Relay [x] %s service=%s uuid=%llu reason=%s",
-                         params_.at("protocol").get<std::string>().c_str(),
-                         params_.at("service").get<std::string>().c_str(),
-                         static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
+        PROXY_INFO_PRINT("Relay [x] %s service=%s uuid=%llu reason=%s", relay_protocol_name(relay_.protocol()).data(),
+                         service_.c_str(), static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     }
     close_agent();
     if (progress_ >= Progress::PeerOpened && !from_peer_)
@@ -350,7 +347,7 @@ asio::awaitable<void> ControlRouterMulti::establish_and_transfer()
     progress_ = Progress::AgentNotified;
     notify_agent();
     stage_ = "prepare";
-    co_await relay_.prepare_remote(deadline_, params_.value("accessor", std::string{}), epoch_, flow_id_);
+    co_await relay_.prepare_remote(deadline_, accessor_, epoch_, flow_id_);
     if (stop_requested_)
     {
         throw asio::system_error(asio::error::operation_aborted);

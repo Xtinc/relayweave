@@ -62,10 +62,10 @@ inline asio::awaitable<void> close_link(std::shared_ptr<RelayNode> node, std::ui
     auto &manager = links(node);
     for (const auto &[_, request] : test_access::NodeLinkMgr_link_requests_(manager))
     {
-        if (request->params.at("id") == id)
+        if (request->params.id == id)
         {
-            auto params = request->params;
-            params["source"] = params.at("left");
+            auto params = request->params.to_params();
+            params["source"] = request->params.left;
             manager.handle(CtrlCommand::LinkClosed, CtrlMessage(CtrlCommand::LinkClosed, std::move(params)));
             break;
         }

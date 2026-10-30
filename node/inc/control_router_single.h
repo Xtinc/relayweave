@@ -20,8 +20,7 @@ class ControlRouterSingle
      * @param producer Producer Agent control session; borrowed until the relay task drains.
      * @param params Single-node relay request containing service, protocol, and the Consumer request ID.
      */
-    ControlRouterSingle(NodeSession &relay, const AgentPeer &consumer, const AgentPeer &producer,
-                        njson params);
+    ControlRouterSingle(NodeSession &relay, const AgentPeer &consumer, const AgentPeer &producer, RelayRequest params);
     /** @brief Attach both roles, bind and activate data, notify ready, then drain and close. */
     asio::awaitable<void> run();
     /**
@@ -64,7 +63,8 @@ class ControlRouterSingle
     NodeSession &relay_;
     AgentPeer consumer_;
     AgentPeer producer_;
-    njson params_;
+    std::string service_;
+    std::uint64_t request_id_;
     std::chrono::steady_clock::time_point deadline_;
     std::string reason_;
     bool ready_ = false;

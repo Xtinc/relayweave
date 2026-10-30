@@ -30,7 +30,8 @@ class NodeSession
      * @param traffic Local service accounting record; ingress instances may omit it when the service is
      * remote.
      */
-    NodeSession(RelayNode &node, const AgentPeer &session, njson params, bool ingress, SRVTrafficPtr traffic = {});
+    NodeSession(RelayNode &node, const AgentPeer &session, RelayRequest params, bool ingress,
+                SRVTrafficPtr traffic = {});
     /**
      * @brief Construct a single-node instance borrowing both Agent control sessions.
      * @param node Owning Node, which must outlive this business instance.
@@ -41,7 +42,7 @@ class NodeSession
      * @param traffic Local service accounting record; ingress instances may omit it when the service is
      * remote.
      */
-    NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer, njson params,
+    NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer, RelayRequest params,
                 SRVTrafficPtr traffic);
     /** @brief Run the controller through setup, transfer, and cancellation-safe resource cleanup. */
     asio::awaitable<void> run();
@@ -110,8 +111,8 @@ class NodeSession
     /** @brief Await Single attachment, bind, and activate in one transfer-executor task within the deadline. */
     asio::awaitable<void> prepare_local(std::chrono::steady_clock::time_point deadline, std::string accessor);
     /** @brief Await Multi attachment and bind in one transfer-executor task; failures propagate directly. */
-    asio::awaitable<void> prepare_remote(std::chrono::steady_clock::time_point deadline,
-                                        std::string accessor, std::uint64_t epoch, std::uint64_t flow_id);
+    asio::awaitable<void> prepare_remote(std::chrono::steady_clock::time_point deadline, std::string accessor,
+                                         std::uint64_t epoch, std::uint64_t flow_id);
     /** @brief Activate the Multi endpoint on its transfer executor after peer coordination. */
     asio::awaitable<void> activate();
     /** @brief Await the manager-owned transfer operation on its transfer executor. */

@@ -348,8 +348,8 @@ void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
         if (relay->producer())
         {
             send_control(relay->selection.server,
-                         CtrlMessage(CtrlCommand::RelayReject, njson{{"uuid", relay->endpoint.at("uuid")},
-                                                                     {"reason", "relay capacity reached"}}));
+                         CtrlMessage(CtrlCommand::RelayReject,
+                                     njson{{"uuid", relay->endpoint->uuid}, {"reason", "relay capacity reached"}}));
         }
         return;
     }
@@ -402,7 +402,7 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
         }
         for (const auto &[request, active] : relays_)
         {
-            if (active->producer() && active->selection.server.node == route.node && active->endpoint.at("uuid") == *uuid)
+            if (active->producer() && active->selection.server.node == route.node && active->endpoint->uuid == *uuid)
             {
                 return;
             }
@@ -412,7 +412,7 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
         relay->target = target->second;
         relay->selection.server = std::move(route);
         relay->selection.epoch = config::optional_unsigned(p, "epoch", true).value_or(0);
-        relay->endpoint = p;
+        relay->endpoint = AgentSession::RelayEndpoint::from_params(p, protocol);
         start_relay(std::move(relay));
         return;
     }
@@ -426,8 +426,8 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
         }
         const bool by_request = (command == CtrlCommand::RelayOpened || command == CtrlCommand::RelayError) &&
                                 request && *request == id && !relay->producer();
-        const bool by_uuid = command != CtrlCommand::RelayOpened && uuid && !relay->endpoint.empty() &&
-                             relay->endpoint.at("uuid") == *uuid;
+        const bool by_uuid = command != CtrlCommand::RelayOpened && uuid && relay->endpoint.has_value() &&
+                             relay->endpoint->uuid == *uuid;
         if (by_request || by_uuid)
         {
             // A single-node relay may have both roles in this Agent and share one UUID.

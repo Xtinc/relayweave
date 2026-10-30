@@ -1,5 +1,18 @@
 #include "node_fixture.h"
 TEST_MEMBER(NodeMetrics, bandwidth_at_)
+TEST_MEMBER(RelayNode, topology_)
+TEST_MEMBER(NodeLinkMgr, create_flow)
+TEST_MEMBER(NodeLinkMgr, send_all)
+TEST_MEMBER(NodeLinkMgr, finish_flow)
+TEST_MEMBER(NodeLinkMgr, flow_requests_)
+TEST_MEMBER(NodeLinkMgr, closing_flows_)
+TEST_MEMBER(NodeLinkMgr, flow_endpoints_)
+TEST_MEMBER(NodeLinkMgr, running_)
+TEST_MEMBER(NodeLinkMgr, receive_events)
+TEST_MEMBER(ClusterMgr, running_)
+TEST_MEMBER(ClusterMgr, outbound_channel_)
+TEST_MEMBER(FlowProtocol, emit)
+TEST_MEMBER(FlowProtocol, events_)
 #include <asio/experimental/awaitable_operators.hpp>
 #include <future>
 #include <iostream>
@@ -27,6 +40,218 @@ std::uint16_t flow_udp_port(asio::io_context &io)
     asio::ip::udp::socket socket(io, {asio::ip::address_v4::loopback(), 0});
     return socket.local_endpoint().port();
 }
+/** @brief Exercise transaction identity and real control serialization without opening data sockets. */
+static void verify_flow_transactions()
+{
+    asio::io_context control(1);
+    asio::io_context transfer(1);
+    asio::io_context udp(1);
+    asio::io_context data(1);
+    asio::ssl::context ssl(asio::ssl::context::tls_server);
+    auto config = make_test_node_config();
+    config.control.address = config.tcp.address = config.tls.address = config.datagram.address = "127.0.0.1";
+    auto node = std::make_shared<RelayNode>(control, transfer, udp, data, ssl, config);
+    auto &manager = test_node::links(node);
+    auto &cluster = test_node::cluster(node);
+    auto &topology = *test_access::RelayNode_topology_(*node);
+    std::vector<std::string> names{config.cluster.node_id};
+    njson members = njson::array({{{"node_id", names.front()}, {"address", "127.0.0.1"}}});
+    for (int i = 1; i < 8; ++i)
+    {
+        names.push_back("node-" + std::to_string(i));
+        members.push_back({{"node_id", names.back()}, {"address", "127.0.0." + std::to_string(i + 1)}});
+    }
+    topology.update_members({{"source", names.front()}, {"master", names.front()},
+                             {"epoch", 0x2122232425262728ULL}, {"version", 1U}, {"members", members}});
+    test_access::ClusterMgr_running_(cluster) = true;
+    test_access::NodeLinkMgr_running_(manager) = true;
+    auto receiver = asio::co_spawn(control, test_access::NodeLinkMgr_receive_events(manager), asio::use_future);
+    const auto poll = [&] { control.restart(); control.poll(); };
+    const auto take = [&] {
+        std::vector<CtrlMessage> messages;
+        while (test_access::ClusterMgr_outbound_channel_(cluster).try_receive(
+            [&](asio::error_code error, CtrlMessage message) {
+                require_flow(!error, "control capture failed");
+                messages.push_back(std::move(message));
+            }))
+        {
+        }
+        return messages;
+    };
+    const auto compact = [&](const CtrlMessage &message) {
+        const auto &p = *message.params;
+        for (const auto &[key, value] : p.items())
+        {
+            require_flow(key == "master" || key == "epoch" || key == "flow_id" || key == "request_id" ||
+                             key == "stage" || key == "reason" || key == "target",
+                         "Flow phase retained redundant path or endpoint fields");
+        }
+        for (const auto *field : {"master", "epoch", "flow_id", "request_id"})
+        {
+            require_flow(p.contains(field), "compact Flow message lost transaction identity");
+        }
+    };
+    poll();
+    for (const std::size_t count : {2U, 3U, 8U})
+    {
+        const std::vector<std::string> path(names.begin(), names.begin() + count);
+        auto request = test_access::NodeLinkMgr_create_flow(manager, path, RelayProtocol::Tcp,
+                                                            0x0102030405060708ULL + count);
+        request->params.request_id = 0x1112131415161718ULL;
+        for (std::size_t i = 0; i < request->params.links.size(); ++i)
+        {
+            request->params.links[i] = 0x3132333435363738ULL + i;
+        }
+        request->result.stage = "prepare";
+        auto full = request->params.to_params();
+        full["ttl_ms"] = 10000U;
+        full["source"] = names.front();
+        const auto measure = [&](const CtrlMessage &message) {
+            auto after = *message.params;
+            after.erase("target");
+            after["source"] = names.front();
+            auto before = after;
+            if (message.type() != CtrlCommand::FlowPrepare)
+            {
+                for (const auto *field : {"path", "addresses", "links", "transport"})
+                {
+                    before[field] = full.at(field);
+                }
+                if (message.type() != CtrlCommand::FlowCommit && message.type() != CtrlCommand::FlowClose)
+                {
+                    before["ttl_ms"] = full.at("ttl_ms");
+                }
+                if (message.type() == CtrlCommand::FlowClosed)
+                {
+                    before["committed"] = true;
+                }
+            }
+            const auto old_size = WireMessage::pack(CtrlMessage(message.type(), std::move(before))).size() -
+                                  WireMessage::header_length;
+            const auto new_size = WireMessage::pack(CtrlMessage(message.type(), std::move(after))).size() -
+                                  WireMessage::header_length;
+            require_flow(message.type() == CtrlCommand::FlowPrepare ? new_size == old_size : new_size < old_size,
+                         "Flow payload size did not match phase simplification");
+            std::cout << "[WIRE] nodes=" << count << " command=" << message.command
+                      << " old=" << old_size << " new=" << new_size << '\n';
+        };
+        const auto acknowledge = [&](CtrlCommand command, std::string source) {
+            auto p = request->params.identity_params();
+            p["source"] = std::move(source);
+            manager.handle(command, CtrlMessage(command, std::move(p)));
+        };
+        require_flow(test_access::NodeLinkMgr_send_all(manager, *request, CtrlCommand::FlowPrepare),
+                     "Prepare submission failed");
+        auto messages = take();
+        require_flow(messages.size() == count && messages.front().params->at("path") == path,
+                     "Prepare lost its full path or recipients");
+        measure(messages.front());
+        for (const auto *field : {"master", "epoch", "flow_id", "request_id", "source"})
+        {
+            auto wrong = request->params.identity_params();
+            wrong["source"] = names.front();
+            wrong[field] = std::string_view(field) == "source" || std::string_view(field) == "master"
+                               ? njson("outsider") : njson(std::uint64_t{1});
+            manager.handle(CtrlCommand::FlowPrepared, CtrlMessage(CtrlCommand::FlowPrepared, std::move(wrong)));
+            require_flow(request->prepared == 0, "wrong identity or source advanced Prepare");
+        }
+        acknowledge(CtrlCommand::FlowCommitted, names.front());
+        require_flow(request->committed == 0, "Commit confirmation advanced before Prepare");
+        manager.handle(CtrlCommand::FlowPrepare, CtrlMessage(CtrlCommand::FlowPrepare, full));
+        auto duplicate = full;
+        duplicate["ttl_ms"] = 5000U;
+        manager.handle(CtrlCommand::FlowPrepare, CtrlMessage(CtrlCommand::FlowPrepare, duplicate));
+        require_flow(test_access::NodeLinkMgr_flow_endpoints_(manager).size() == 1,
+                     "duplicate Prepare allocated a second endpoint");
+        duplicate["request_id"] = 2U;
+        manager.handle(CtrlCommand::FlowPrepare, CtrlMessage(CtrlCommand::FlowPrepare, duplicate));
+        messages = take();
+        require_flow(messages.size() == 1 && messages.front().type() == CtrlCommand::FlowError &&
+                         messages.front().params->at("reason") == "conflicting flow prepare",
+                     "conflicting Prepare replaced authorization or lost its original error");
+        compact(messages.front());
+        measure(messages.front());
+        const auto notification = [&](lnk::EventKind kind, std::string stage) {
+            test_access::FlowProtocol_emit(manager.protocol(),
+                lnk::ProtocolEvent{kind, request->params.epoch, request->params.id, std::move(stage), ""});
+            poll();
+            auto replies = take();
+            require_flow(replies.size() == 1, "data notification did not produce one acknowledgement");
+            compact(replies.front());
+            measure(replies.front());
+        };
+        notification(lnk::EventKind::FlowPrepared, "prepare");
+        acknowledge(CtrlCommand::FlowPrepared, names.front());
+        acknowledge(CtrlCommand::FlowPrepared, names.front());
+        require_flow(request->prepared == 1, "duplicate acknowledgement advanced another node");
+        for (std::size_t i = 1; i < count; ++i)
+        {
+            acknowledge(CtrlCommand::FlowPrepared, path[i]);
+        }
+        messages = take();
+        require_flow(messages.size() == count && messages.front().type() == CtrlCommand::FlowCommit,
+                     "complete Prepare did not submit Commit to the path");
+        for (const auto &message : messages)
+        {
+            compact(message);
+        }
+        measure(messages.front());
+        acknowledge(CtrlCommand::FlowPrepared, names.front());
+        require_flow(take().empty(), "late Prepare acknowledgement repeated Commit");
+        notification(lnk::EventKind::FlowCommitted, "commit");
+        for (const auto &source : path)
+        {
+            acknowledge(CtrlCommand::FlowCommitted, source);
+        }
+        require_flow(request->completed && bool(request->result), "compact Commit did not finish establishment");
+        test_access::NodeLinkMgr_finish_flow(manager, request, "close", "closed by caller");
+        messages = take();
+        require_flow(messages.size() == count && messages.front().type() == CtrlCommand::FlowClose,
+                     "Close did not cover the original path");
+        for (const auto &message : messages)
+        {
+            compact(message);
+        }
+        measure(messages.front());
+        acknowledge(CtrlCommand::FlowClosed, "outsider");
+        auto wrong = request->params.identity_params();
+        wrong["request_id"] = 2U;
+        wrong["source"] = names.front();
+        manager.handle(CtrlCommand::FlowClosed, CtrlMessage(CtrlCommand::FlowClosed, wrong));
+        require_flow(request->closed == 0 && !request->released, "wrong Close acknowledgement released the path");
+        notification(lnk::EventKind::FlowClosed, "close");
+        for (const auto &source : path)
+        {
+            acknowledge(CtrlCommand::FlowClosed, source);
+        }
+        require_flow(request->released && test_access::NodeLinkMgr_closing_flows_(manager).empty(),
+                     "compact Closed did not release coordination state");
+        auto identity = request->params.identity_params();
+        identity["source"] = names.front();
+        manager.handle(CtrlCommand::FlowCommit, CtrlMessage(CtrlCommand::FlowCommit, identity));
+        require_flow(take().empty(), "unknown Commit produced a reply");
+        manager.handle(CtrlCommand::FlowClose, CtrlMessage(CtrlCommand::FlowClose, identity));
+        messages = take();
+        require_flow(messages.size() == 1 && messages.front().type() == CtrlCommand::FlowClosed &&
+                         test_access::NodeLinkMgr_flow_endpoints_(manager).empty(),
+                     "unknown Close failed to acknowledge or created endpoint state");
+        compact(messages.front());
+        identity.erase("request_id");
+        manager.handle(CtrlCommand::FlowClose, CtrlMessage(CtrlCommand::FlowClose, identity));
+        require_flow(take().empty(), "Close without transaction identity was acknowledged");
+        acknowledge(CtrlCommand::FlowPrepared, names.front());
+        acknowledge(CtrlCommand::FlowCommitted, names.front());
+        require_flow(test_access::NodeLinkMgr_flow_requests_(manager).empty() && take().empty(),
+                     "late acknowledgement revived a released transaction");
+    }
+    test_access::NodeLinkMgr_running_(manager) = false;
+    data.poll();
+    test_access::FlowProtocol_events_(manager.protocol()).close();
+    poll();
+    receiver.get();
+    test_access::ClusterMgr_running_(cluster) = false;
+}
+
 void flow_integration()
 {
     asio::io_context control(1);
@@ -107,6 +332,18 @@ void flow_integration()
                 co_await delay_flow(20ms);
             }
             require_flow(bool(warm), "flow did not become Ready");
+            auto identity = test_access::NodeLinkMgr_flow_requests_(test_node::links(nodes[0])).at(warm.id)->params.identity_params();
+            identity["source"] = "master";
+            for (const auto *field : {"source", "epoch", "request_id"})
+            {
+                auto wrong = identity;
+                wrong[field] = std::string_view(field) == "source" ? njson("c") : njson(std::uint64_t{1});
+                test_node::links(nodes[1]).handle(CtrlCommand::FlowClose, CtrlMessage(CtrlCommand::FlowClose, wrong));
+            }
+            require_flow(co_await test_node::send_data(nodes[1], warm.epoch, warm.id, false, {61}),
+                         "wrong compact Close cancelled a healthy Flow");
+            require_flow(co_await test_node::receive_flow(nodes[3], warm.epoch, warm.id) == BytesBuf{61},
+                         "wrong compact Close changed forwarding authorization");
             co_await test_node::close_flow(nodes[0], warm.epoch, warm.id);
             // Open and cancel can arrive in the same receive batch; late establishment cannot resurrect the Flow.
             const auto cancelled_id = generate_random_id();
@@ -444,6 +681,7 @@ int main()
 {
     try
     {
+        verify_flow_transactions();
         flow_integration();
         std::cout << "[PASS] NodeLinkMgr flows and TCP/UDP hop forwarding\n";
     }

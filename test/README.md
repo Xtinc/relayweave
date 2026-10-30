@@ -92,6 +92,7 @@ build/test/tools/test_tls_channel_peer client localhost 18443
   分配计数仅在该测试可执行文件中拦截全局分配；实际分配失败通过测试侧资源验证，不向生产池增加故障接口。UDP 拥塞通过拒绝准入和健康 Flow 继续收发验证。
 - 端点交付（`lnk_flow_receive`）：保持调用方执行器及载荷地址；socket 写完成通知后才归还信用；关闭、取消唤醒挂起交接并排空任务，迟到通知不复活 Flow，业务缓冲可晚于协议销毁。
   单向 FIN 保留反向传输；FIN 后对向错误保留真实原因，接收失败取消信用等待中的发送者。
+- Flow 控制事务（`node_flows`）：2/3/8 节点确认位图、精简后的生产报文及实际 CBOR 大小；重复/冲突 Prepare、错误来源与事务身份、错误阶段、未知 Commit/Close、迟到确认和关闭释放。真实转发同时验证错误的精简 Close 不会关闭健康 Flow；测试使用既有成员访问夹具，不增加生产接口或测试开关。
 - 共享 Link（`lnk_channel_flows`、`node_links`）：并发响应、FIN/RESET、准备期限、Flow 隔离、物理 writer 失败取消 reader 并清理依赖 Flow。
   跨流交错后按被测 Flow 的接收计数等待积压到达；Link 关闭检查本队列排空、相邻队列关联帧删除，以及健康 Flow 的帧和信用保留。
 - 公平队列（`fair_queue`）：三种候选与生产版本的独立模型对拍、穷举/随机轨迹、有限状态进展、只可移动数据、哈希冲突及 Frame 所有权；`lnk_flow_control` 的 wire 场景验证真实写出交错和关闭隔离。

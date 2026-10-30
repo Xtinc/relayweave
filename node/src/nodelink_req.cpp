@@ -91,18 +91,18 @@ void NodeLinkMgr::handle_flow_request(CtrlCommand command, CtrlMessage message)
         {
             const auto it = flow_requests_.find(id);
             if (it != flow_requests_.end() && it->second->result.epoch == epoch &&
-                it->second->params.at("path").front() == source)
+                it->second->params.path.front() == source)
             {
                 finish_flow(it->second, "close", "closed by caller");
             }
             return;
         }
-        const auto path = p.at("path").get<std::vector<std::string>>();
+        auto path = p.at("path").get<std::vector<std::string>>();
         if (epoch != topology_.epoch() || path.empty() || path.front() != source)
         {
             throw std::runtime_error("invalid flow requester or epoch");
         }
-        auto request = create_flow(path, parse_relay_protocol(p.at("transport").get<std::string>()), id);
+        auto request = create_flow(std::move(path), parse_relay_protocol(p.at("transport").get<std::string>()), id);
         ++flow_tasks_;
         try
         {
@@ -147,10 +147,10 @@ bool NodeLinkMgr::egress_ready(std::uint64_t epoch, std::uint64_t id, const std:
     {
         return false;
     }
-    const auto &p = it->second;
-    const auto &path = p.at("path");
-    return p.at("epoch") == epoch && p.value("committed", false) && path.back() == config_.node_id &&
-           path.front() == ingress && p.at("transport") == std::string(relay_protocol_name(transport));
+    const auto &endpoint = it->second;
+    const auto &p = endpoint.params;
+    return p.epoch == epoch && endpoint.committed && p.path.back() == config_.node_id &&
+           p.path.front() == ingress && p.transport == transport;
 }
 
 void NodeLinkMgr::flow_closed(std::uint64_t id, std::string reason)

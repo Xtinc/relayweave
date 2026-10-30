@@ -43,6 +43,19 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
         std::size_t maximum_payload = DatagramHeader::maximum_user_payload;
     };
 
+    /** @brief Retain the parsed Node attachment on transfer_io; Flow identity is absent for single-node relays. */
+    struct RelayEndpoint
+    {
+        /** @brief Parse and validate an attachment before installing it in a session. */
+        static RelayEndpoint from_params(const njson &params, RelayProtocol protocol);
+        std::uint64_t uuid = 0;
+        std::uint64_t ticket = 0;
+        std::string address;
+        std::uint16_t port = 0;
+        std::uint64_t session_id = 0;
+        std::optional<std::uint64_t> flow_id;
+    };
+
     bool producer() const
     {
         return target.has_value();
@@ -59,7 +72,7 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
     std::string destination;
     std::chrono::steady_clock::time_point deadline;
     RelaySelection selection;
-    njson endpoint;
+    std::optional<RelayEndpoint> endpoint;
     std::optional<std::size_t> forward;
     std::optional<AgentServiceConfig> target;
     using Data = std::variant<StreamData, DatagramData>;

@@ -117,8 +117,7 @@ class NodeLinkMgr
      * @param transport NodeLink transport: TCP or UDP; TLS uses TCP on inter-Node links.
      * @return True only for a committed local egress matching all supplied authorization fields.
      */
-    bool egress_ready(std::uint64_t epoch, std::uint64_t id, const std::string &ingress,
-                      RelayProtocol transport) const;
+    bool egress_ready(std::uint64_t epoch, std::uint64_t id, const std::string &ingress, RelayProtocol transport) const;
     /**
      * @brief Await Flow invalidation and return its close reason.
      * @param epoch Cluster membership epoch that authorizes this Flow.
@@ -145,12 +144,52 @@ class NodeLinkMgr
 
   private:
     using Clock = std::chrono::steady_clock;
+    /** @brief Retain shared Link authorization on control_io; peer fields are derived per endpoint. */
+    struct LinkParams
+    {
+        /** @brief Encode Link parameters, deriving peer fields when addressing an endpoint. */
+        njson to_params(std::string_view node = {}) const;
+        std::uint64_t id = 0;
+        std::uint64_t epoch = 0;
+        std::string master;
+        std::string left;
+        std::string right;
+        RelayProtocol transport = RelayProtocol::Tcp;
+        std::string token;
+        std::string left_address;
+        std::string right_address;
+        std::uint16_t tcp_port = 0;
+        std::uint16_t udp_port = 0;
+    };
+    /** @brief Retain validated path parameters without a JSON runtime mirror. */
+    struct FlowParams
+    {
+        /** @brief Encode complete Prepare parameters; its deadline is supplied by the transaction. */
+        njson to_params() const;
+        /** @brief Encode the identity shared by later phases and acknowledgements. */
+        njson identity_params() const;
+        bool operator==(const FlowParams &) const = default;
+        std::uint64_t epoch = 0;
+        std::string master;
+        std::uint64_t id = 0;
+        std::uint64_t request_id = 0;
+        std::vector<std::string> path;
+        std::vector<std::string> addresses;
+        std::vector<std::uint64_t> links;
+        RelayProtocol transport = RelayProtocol::Tcp;
+    };
+    /** @brief Own local Flow authorization and its data-domain commit acknowledgement on control_io. */
+    struct FlowEndpoint
+    {
+        FlowParams params;
+        bool committed = false;
+    };
     /** @brief Retain Link parameters and acknowledgements; bit 0 is left and bit 1 is right. */
     struct LinkRequest
     {
         /** @brief Retain validated Link parameters and construct deadline and completion state on control_io. */
-        LinkRequest(asio::any_io_executor executor, njson params);
-        njson params;
+        LinkRequest(asio::any_io_executor executor, LinkParams params);
+        LinkParams params;
         LinkResult result;
         asio::steady_timer timeout;
         AsyncEvent completed_event;
@@ -161,13 +200,12 @@ class NodeLinkMgr
     bool send_both(const LinkRequest &request, CtrlCommand command);
     void finish_link(std::shared_ptr<LinkRequest> request, std::string stage, std::string reason);
     using LinkKey = std::tuple<std::string, std::string, RelayProtocol>;
-    static LinkKey link_key(const njson &params);
     /** @brief Retain a master path transaction; acknowledgement bit i denotes path node i. */
     struct FlowRequest
     {
         /** @brief Retain path parameters and construct setup and release waiters on control_io. */
-        FlowRequest(asio::any_io_executor executor, njson params);
-        njson params;
+        FlowRequest(asio::any_io_executor executor, FlowParams params);
+        FlowParams params;
         FlowResult result;
         asio::steady_timer timeout;
         AsyncEvent completed_event;
@@ -183,7 +221,9 @@ class NodeLinkMgr
     struct RemoteFlow
     {
         /** @brief Initialize the remote result event on control_io. */
-        explicit RemoteFlow(asio::any_io_executor executor) : completed(executor) {}
+        explicit RemoteFlow(asio::any_io_executor executor) : completed(executor)
+        {
+        }
         FlowResult result;
         AsyncEvent completed;
     };
@@ -191,7 +231,9 @@ class NodeLinkMgr
     struct FlowWatch
     {
         /** @brief Initialize the one-shot closure event on control_io. */
-        explicit FlowWatch(asio::any_io_executor executor) : closed(executor) {}
+        explicit FlowWatch(asio::any_io_executor executor) : closed(executor)
+        {
+        }
         std::string reason;
         AsyncEvent closed;
     };
@@ -209,7 +251,7 @@ class NodeLinkMgr
     bool send_all(const FlowRequest &request, CtrlCommand command);
     void finish_flow(std::shared_ptr<FlowRequest> request, std::string stage, std::string reason);
     void released(std::shared_ptr<FlowRequest> request, std::string error = {});
-    bool valid_flow(const njson &params) const;
+    bool valid_flow(const FlowParams &params) const;
     void handle_link(CtrlCommand command, CtrlMessage message);
     void handle_flow(CtrlCommand command, CtrlMessage message);
     /** @brief Receive data-domain events on control_io; notification loss terminates the data service. */
@@ -222,9 +264,9 @@ class NodeLinkMgr
     Topology &topology_;
     std::shared_ptr<FlowProtocol> protocol_;
     std::map<LinkKey, std::shared_ptr<LinkRequest>> link_requests_;
-    std::map<std::uint64_t, njson> link_endpoints_;
+    std::map<std::uint64_t, LinkParams> link_endpoints_;
     std::map<std::uint64_t, std::shared_ptr<FlowRequest>> flow_requests_;
-    std::map<std::uint64_t, njson> flow_endpoints_;
+    std::map<std::uint64_t, FlowEndpoint> flow_endpoints_;
     std::map<std::uint64_t, std::shared_ptr<FlowRequest>> closing_flows_;
     std::map<std::uint64_t, std::shared_ptr<RemoteFlow>> remote_flows_;
     std::map<std::uint64_t, std::shared_ptr<FlowWatch>> flow_watches_;

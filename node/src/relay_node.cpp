@@ -440,14 +440,14 @@ void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, cons
     const bool multi = params.contains("path");
     try
     {
-        njson values{{"request_id", request}, {"service", service}, {"protocol", relay_protocol_name(protocol)}};
+        RelayRequest values{service, protocol, request};
         if (multi)
         {
-            values["path"] = params.at("path");
-            values["epoch"] = config::require_unsigned(params, "epoch", true);
-            const auto path = values.at("path").get<std::vector<std::string>>();
+            values.path = params.at("path").get<std::vector<std::string>>();
+            values.epoch = config::require_unsigned(params, "epoch", true);
+            const auto &path = values.path;
             if (!request || path.size() < 2 || path.front() != config_.cluster.node_id ||
-                values.at("epoch") != topology_->epoch())
+                values.epoch != topology_->epoch())
             {
                 throw std::invalid_argument("invalid path or stale epoch");
             }
@@ -511,12 +511,19 @@ void RelayNode::handle_relay_peer(CtrlCommand command, const CtrlMessage &messag
         {
             throw std::runtime_error("flow unavailable or wrong endpoint");
         }
-        const auto service = registry_.find_service(config::message_service(params));
+        const auto service_name = config::message_service(params);
+        const auto service = registry_.find_service(service_name);
         if (!service || service->protocol != protocol)
         {
             throw std::runtime_error(!service ? "service unavailable" : "service protocol mismatch");
         }
-        start_relay(std::make_shared<NodeSession>(*this, service->session, params, false, service->traffic));
+        RelayRequest request{service_name, protocol};
+        request.epoch = epoch;
+        request.flow_id = id;
+        request.peer = source;
+        request.accessor = config::optional_string(params, "accessor", "");
+        start_relay(
+            std::make_shared<NodeSession>(*this, service->session, std::move(request), false, service->traffic));
     }
     catch (const std::exception &error)
     {

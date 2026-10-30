@@ -22,7 +22,7 @@ class ControlRouterMulti
      * ID.
      * @param ingress True for the first Node on the selected path; false for the last Node.
      */
-    ControlRouterMulti(NodeSession &relay, const AgentPeer &session, njson params, bool ingress);
+    ControlRouterMulti(NodeSession &relay, const AgentPeer &session, RelayRequest params, bool ingress);
     /** @brief Establish and transfer alongside a Flow watcher, then drain and release resources. */
     asio::awaitable<void> run();
     /**
@@ -87,7 +87,10 @@ class ControlRouterMulti
     void send_peer(CtrlCommand command, njson params) const;
     NodeSession &relay_;
     AgentPeer session_;
-    njson params_;
+    std::string service_;
+    std::uint64_t request_id_;
+    std::vector<std::string> path_;
+    std::string accessor_;
     std::uint64_t epoch_ = 0;
     std::uint64_t flow_id_ = 0;
     std::string peer_;

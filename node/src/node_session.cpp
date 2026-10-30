@@ -1,19 +1,20 @@
 #include "node_session.h"
 #include "relay_node.h"
 
-NodeSession::NodeSession(RelayNode &node, const AgentPeer &session, njson params, bool ingress, SRVTrafficPtr traffic)
-    : node_(node), control_(std::in_place_type<ControlRouterMulti>, *this, session, params, ingress),
+NodeSession::NodeSession(RelayNode &node, const AgentPeer &session, RelayRequest params, bool ingress,
+                        SRVTrafficPtr traffic)
+    : node_(node), control_(std::in_place_type<ControlRouterMulti>, *this, session, std::move(params), ingress),
       traffic_(std::move(traffic))
 {
-    select_data(config::message_protocol(params));
+    select_data(params.protocol);
 }
 
-NodeSession::NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer, njson params,
+NodeSession::NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer, RelayRequest params,
                          SRVTrafficPtr traffic)
-    : node_(node), control_(std::in_place_type<ControlRouterSingle>, *this, consumer, producer, params),
+    : node_(node), control_(std::in_place_type<ControlRouterSingle>, *this, consumer, producer, std::move(params)),
       traffic_(std::move(traffic))
 {
-    select_data(config::message_protocol(params));
+    select_data(params.protocol);
 }
 
 void NodeSession::select_data(RelayProtocol protocol)

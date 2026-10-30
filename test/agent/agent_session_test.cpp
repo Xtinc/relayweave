@@ -26,8 +26,9 @@ struct AgentSessionTestAccess
         auto session = std::make_shared<AgentSession>(owner, 7, ServiceKey{"drain-test", RelayProtocol::Tcp},
                                                      std::string{}, std::chrono::steady_clock::now() + std::chrono::seconds(2));
         test_access::AgentSession_target(*session) = AgentServiceConfig{"drain-test", "127.0.0.1", target_port};
-        test_access::AgentSession_endpoint(*session) = njson{{"data_address", "127.0.0.1"}, {"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
-                                 {"flow_id", std::uint64_t{3}}, {"data_port", entry_port}};
+        test_access::AgentSession_handle(*session, CtrlMessage(CtrlCommand::RelayOpened,
+            njson{{"data_address", "127.0.0.1"}, {"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
+                  {"flow_id", std::uint64_t{3}}, {"data_port", entry_port}}));
         return session;
     }
 
@@ -52,7 +53,7 @@ struct AgentSessionTestAccess
                     auto session = std::make_shared<AgentSession>(
                         owner, 7, ServiceKey{"close-test", protocol}, std::string{},
                         std::chrono::steady_clock::now() + std::chrono::seconds(2));
-                    test_access::AgentSession_endpoint(*session) = njson{{"uuid", std::uint64_t{1}}};
+                    test_access::AgentSession_endpoint(*session).emplace().uuid = 1;
                     test_access::AgentSession_ready(*session) = true;
                     if (protocol == RelayProtocol::Udp)
                     {
@@ -105,14 +106,23 @@ struct AgentSessionTestAccess
         }
     }
 
-    static asio::awaitable<void> expired_endpoint(Forwarder &owner)
+    static void validate_endpoint(Forwarder &owner)
     {
-        auto session = producer(owner, 1, 0);
-        test_access::AgentSession_deadline(*session) = std::chrono::steady_clock::now();
-        co_await session->run();
-        if (test_access::AgentSession_reason(*session).find("data_port is outside the valid range") == std::string::npos)
+        auto session = std::make_shared<AgentSession>(owner, 7, ServiceKey{"endpoint-test", RelayProtocol::Tcp},
+                                                     std::string{}, std::chrono::steady_clock::now());
+        bool rejected = false;
+        try
         {
-            throw std::runtime_error("Expired establishment deadline hid the original attachment failure");
+            test_access::AgentSession_handle(*session, CtrlMessage(CtrlCommand::RelayOpened,
+                njson{{"data_address", "127.0.0.1"}, {"uuid", 1U}, {"ticket", 2U}, {"data_port", 0U}}));
+        }
+        catch (const std::invalid_argument &error)
+        {
+            rejected = std::string_view(error.what()) == "data_port is outside the valid range";
+        }
+        if (!rejected || test_access::AgentSession_endpoint(*session))
+        {
+            throw std::runtime_error("Invalid attachment changed endpoint state or hid its original error");
         }
     }
 
@@ -231,7 +241,7 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
     if (end == End::Normal)
     {
         AgentSessionTestAccess::validate_close_messages(*owner);
-        co_await AgentSessionTestAccess::expired_endpoint(*owner);
+        AgentSessionTestAccess::validate_endpoint(*owner);
     }
     tcp::acceptor target(transfer, {asio::ip::address_v4::loopback(), 0});
     tcp::acceptor entry(transfer, {asio::ip::address_v4::loopback(), 0});

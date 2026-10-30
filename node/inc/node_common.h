@@ -10,6 +10,7 @@
 #include <mutex>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 class FlowProtocol;
 
@@ -75,6 +76,19 @@ struct AgentPeer
     std::weak_ptr<ControlSession> local;
     std::string node;
     std::uint64_t session_id = 0;
+    std::string accessor;
+};
+
+/** @brief Carry parsed relay construction parameters on control_io; not retained alongside controller state. */
+struct RelayRequest
+{
+    std::string service;
+    RelayProtocol protocol = RelayProtocol::Tcp;
+    std::uint64_t request_id = 0;
+    std::vector<std::string> path;
+    std::uint64_t epoch = 0;
+    std::uint64_t flow_id = 0;
+    std::string peer;
     std::string accessor;
 };
 
