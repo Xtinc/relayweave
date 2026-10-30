@@ -372,7 +372,7 @@ class Benchmark
             const std::uint64_t id = index;
             std::memcpy(pattern.data() + 8, &id, sizeof(id));
             const auto began = Clock::now();
-            co_await pair.source->send(pair.source->copy_payload(pattern));
+            co_await pair.source->send(lnk::PooledBuffer(pair.source->pool, pattern));
             const auto now = Clock::now();
             pair.sent += options_.chunk;
             ++sequence;

@@ -981,16 +981,16 @@ void integration()
                 }
                 else
                 {
-                    std::array<std::uint8_t, 3> data;
+                    BytesBuf data(3);
                     if (tls)
                     {
-                        require(co_await read_tls_data(*tls, data) == data.size(), "TLS return DATA length changed");
+                        require(co_await read_tls_data(*tls, data) == 3, "TLS return DATA length changed");
                     }
                     else
                     {
                         co_await asio::async_read(socket, asio::buffer(data), asio::cancel_after(1s, asio::use_awaitable));
                     }
-                    require(data == std::array<std::uint8_t, 3>{1, 2, 3}, "Real Agent business return payload changed");
+                    require(data == BytesBuf{1, 2, 3}, "Real Agent business return payload changed");
                 }
                 channels[1]->send(CtrlMessage(CtrlCommand::RelayCancel, njson{{"request_id", 30}}));
                 co_await receive(channels[1], CtrlCommand::RelayClosed);

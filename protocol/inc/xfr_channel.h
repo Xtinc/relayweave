@@ -4,10 +4,16 @@
 #include "asio.hpp"
 #include "asio/ssl.hpp"
 #include "message.h"
+#include <array>
 #include <atomic>
+#include <memory>
+#include <memory_resource>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <utility>
 
 /**
  * @brief Name the calling worker on Linux without changing its scheduling policy.
@@ -73,8 +79,46 @@ asio::awaitable<void> relay_tcp(asio::ip::tcp::socket &left, asio::ip::tcp::sock
 inline constexpr std::string_view tls_data_framing = "length32-fin-v1";
 inline constexpr std::size_t tls_data_maximum_payload = LnkFrameHeader::maximum_payload;
 
-asio::awaitable<std::size_t> read_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
-                                           std::span<std::uint8_t> buffer);
+/**
+ * @brief Validate and read one TLS business frame directly into its destination buffer.
+ * @tparam Buffer BytesBuf for reusable storage or lnk::PooledBuffer for an owned Flow payload.
+ * @param stream TLS stream borrowed until the frame is read on its executor.
+ * @param buffer Destination storage; BytesBuf retains its high-water size, PooledBuffer owns this frame.
+ * @param pool Shared allocator required for PooledBuffer; unused for BytesBuf.
+ * @return Payload length in bytes, or zero for business FIN; malformed or incomplete frames throw.
+ */
+template <typename Buffer>
+asio::awaitable<std::size_t> read_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream, Buffer &buffer,
+                                         std::shared_ptr<std::pmr::memory_resource> pool = {})
+{
+    std::array<std::uint8_t, 4> header{};
+    co_await asio::async_read(stream, asio::buffer(header), asio::use_awaitable);
+    std::uint32_t size = 0;
+    for (const auto byte : header)
+    {
+        size = (size << 8) | byte;
+    }
+    if (size > tls_data_maximum_payload)
+    {
+        throw std::invalid_argument("Invalid TLS DATA length");
+    }
+    if constexpr (std::is_same_v<Buffer, BytesBuf>)
+    {
+        if (size > buffer.size())
+        {
+            buffer = Buffer(size);
+        }
+    }
+    else
+    {
+        buffer = Buffer(std::move(pool), size);
+    }
+    if (size != 0)
+    {
+        co_await asio::async_read(stream, asio::buffer(buffer.data(), size), asio::use_awaitable);
+    }
+    co_return size;
+}
 asio::awaitable<void> write_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
                                      std::span<const std::uint8_t> payload, TrafficCounter *traffic = nullptr);
 asio::awaitable<void> finish_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream);

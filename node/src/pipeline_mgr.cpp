@@ -226,32 +226,34 @@ asio::awaitable<void> StreamPipeline<Transport>::prepare_remote_pair(std::uint64
 template <typename Transport>
 asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
-    std::array<std::uint8_t, lnk::FlowStream::maximum_chunk_size> buffer;
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
     for (;;)
     {
-        std::size_t size;
+        lnk::PooledBuffer data;
         if constexpr (std::is_same_v<Transport, TlsTransport>)
         {
-            size = co_await read_tls_data(*endpoint->stream, buffer);
+            co_await read_tls_data(*endpoint->stream, data, endpoint->flow->pool);
         }
         else
         {
-            const auto [error, received] =
-                co_await endpoint->stream->async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
+            data = lnk::PooledBuffer(endpoint->flow->pool, 32 * 1024);
+            const auto [error, received] = co_await endpoint->stream->async_read_some(
+                asio::buffer(data.data(), data.size()), use_nothrow_awaitable);
             if (error && error != asio::error::eof)
             {
                 throw asio::system_error(error);
             }
-            size = received;
+            data.truncate(received);
         }
+        const auto size = data.size();
         if (size == 0)
         {
+            data = {};
             co_await endpoint->flow->finish_send();
             co_return;
         }
         co_await limiter.consume(size);
-        co_await endpoint->flow->send(endpoint->flow->copy_payload({buffer.data(), size}));
+        co_await endpoint->flow->send(std::move(data));
         endpoint->count(true, size);
     }
 }

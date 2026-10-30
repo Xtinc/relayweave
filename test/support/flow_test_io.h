@@ -122,7 +122,7 @@ inline asio::awaitable<bool> send_data(std::shared_ptr<FlowProtocol> channel, st
     {
         co_await asio::co_spawn((*stream)->executor(),
             [stream = *stream, payload = std::move(payload)]() -> asio::awaitable<void> {
-                co_await stream->send(stream->copy_payload(payload));
+                co_await stream->send(lnk::PooledBuffer(stream->pool, payload));
             }, asio::use_awaitable);
         co_return true;
     }

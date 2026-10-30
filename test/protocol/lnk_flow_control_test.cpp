@@ -77,7 +77,7 @@ struct LocalFixture
     std::future<void> submit(std::uint64_t id, BytesBuf payload, asio::cancellation_slot slot = {}, bool run = true)
     {
         const auto stream = std::get<std::shared_ptr<lnk::FlowStream>>(port(id));
-        auto result = asio::co_spawn(caller, stream->send(stream->copy_payload(payload)),
+        auto result = asio::co_spawn(caller, stream->send(lnk::PooledBuffer(stream->pool, payload)),
                                     asio::bind_cancellation_slot(slot, asio::use_future));
         if (run)
         {
@@ -1050,7 +1050,9 @@ static void multihop_tests()
                 for (std::size_t index = 0; index < frames; ++index)
                 {
                     const BytesBuf payload(sizes[index % sizes.size()], static_cast<std::uint8_t>(index));
-                    auto data = sender->copy_payload(payload);
+                    lnk::PooledBuffer data(sender->pool, 32768);
+                    std::ranges::copy(payload, data.data());
+                    data.truncate(payload.size());
                     co_await sender->send(std::move(data));
                 }
                 co_await sender->finish_send();

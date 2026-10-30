@@ -21,23 +21,10 @@ constexpr auto retired_flow_ttl = std::chrono::seconds(10);
 // Endpoint I/O runs on the transfer executor.
 lnk::FlowStream::FlowStream(asio::any_io_executor transfer, asio::any_io_executor data,
                             std::weak_ptr<FlowProtocol> channel, std::uint64_t flow_id, bool direction,
-                            std::shared_ptr<std::pmr::synchronized_pool_resource> pool)
-    : id_(flow_id), reverse_(direction), send_queue_(transfer, 0), receive_queue_(transfer, 1),
-      receive_completed_(transfer, 1), send_space_(data, 1), protocol_(std::move(channel)), pool_(std::move(pool))
+                            std::shared_ptr<std::pmr::synchronized_pool_resource> payload_pool)
+    : pool(std::move(payload_pool)), id_(flow_id), reverse_(direction), send_queue_(transfer, 0),
+      receive_queue_(transfer, 1), receive_completed_(transfer, 1), send_space_(data, 1), protocol_(std::move(channel))
 {
-}
-
-lnk::PooledBuffer lnk::FlowStream::copy_payload(std::span<const std::uint8_t> data)
-{
-    if (closed_)
-    {
-        throw std::runtime_error(reason_);
-    }
-    if (data.size() > maximum_chunk_size)
-    {
-        throw std::invalid_argument("invalid stream chunk size");
-    }
-    return PooledBuffer(pool_, data);
 }
 
 asio::awaitable<void> lnk::FlowStream::send(PooledBuffer payload)
@@ -634,7 +621,7 @@ void FlowProtocol::receive(const NodeLink &link, Frame f)
 
 void FlowProtocol::written(Frame frame)
 {
-    const auto memory_bytes = frame.charge();
+    const auto memory_bytes = frame.memory_charge();
     const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
     frame.payload = {};
     if (frame.owner && frame.owner->transport == RelayProtocol::Tcp)
@@ -722,7 +709,7 @@ bool FlowProtocol::Stream::route(const std::shared_ptr<FlowState> &s, Frame &f)
         // RESET bypasses DATA credit and closes the Flow in the caller.
         return !output || protocol_.links_.enqueue(*protocol_.links_.connections_.at(output), std::move(f));
     }
-    const auto used = f.charge();
+    const auto used = f.memory_charge();
     auto &direction = s->stream->directions[std::size_t(reverse)];
     if (output)
     {
@@ -750,7 +737,7 @@ bool FlowProtocol::Stream::try_send(const std::shared_ptr<FlowState> &flow, bool
 {
     assert(flow->phase == FlowState::Phase::Active && flow->transport == RelayProtocol::Tcp);
     auto &direction = flow->stream->directions[std::size_t(reverse)];
-    if (data && Frame::charge_for_payload(data->size()) >
+    if (data && Frame::charge_for_payload(data->capacity()) >
                     flow_window_bytes - std::min(direction.buffered_bytes, flow_window_bytes))
     {
         return false;
@@ -1044,7 +1031,7 @@ asio::awaitable<void> FlowProtocol::Stream::receive_loop(const std::shared_ptr<F
         {
             co_return;
         }
-        const auto memory_bytes = frame.charge();
+        const auto memory_bytes = frame.memory_charge();
         const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
         const auto reverse = frame.header.reverse;
         const auto kind = frame.header.kind;

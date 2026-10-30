@@ -46,7 +46,8 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
 {
   public:
     static constexpr std::size_t maximum_chunk_size = LnkFrameHeader::maximum_payload;
-    PooledBuffer copy_payload(std::span<const std::uint8_t> data);
+    /** @brief Retain the shared, thread-safe allocator used by payloads across executors. */
+    const std::shared_ptr<std::pmr::memory_resource> pool;
     asio::awaitable<void> send(PooledBuffer data);
     asio::awaitable<void> finish_send();
     asio::awaitable<std::optional<PooledBuffer>> receive();
@@ -63,7 +64,7 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
     // An engaged value is DATA (including empty DATA); nullopt is an ordered FIN.
     using Queue = asio::experimental::concurrent_channel<void(asio::error_code, std::optional<PooledBuffer>)>;
     FlowStream(asio::any_io_executor transfer, asio::any_io_executor data, std::weak_ptr<FlowProtocol> protocol,
-               std::uint64_t id, bool reverse, std::shared_ptr<std::pmr::synchronized_pool_resource> pool);
+               std::uint64_t id, bool reverse, std::shared_ptr<std::pmr::synchronized_pool_resource> payload_pool);
     const std::uint64_t id_;
     const bool reverse_;
     Queue send_queue_;
@@ -76,7 +77,6 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
     bool send_finished_ = false;
     std::string reason_;
     std::weak_ptr<FlowProtocol> protocol_;
-    const std::shared_ptr<std::pmr::synchronized_pool_resource> pool_;
 };
 
 // Datagram endpoints never wait for queue capacity and never acknowledge delivery.

@@ -212,26 +212,6 @@ asio::awaitable<void> relay_tcp(tcp::socket &left, tcp::socket &right, TokenBuck
                            transfer_tcp(right, left, right_to_left_limiter, right_to_left_traffic));
 }
 
-asio::awaitable<std::size_t> read_tls_data(tls_stream &stream, std::span<std::uint8_t> buffer)
-{
-    std::array<std::uint8_t, 4> header{};
-    co_await asio::async_read(stream, asio::buffer(header), asio::use_awaitable);
-    std::uint32_t size = 0;
-    for (const auto byte : header)
-    {
-        size = (size << 8) | byte;
-    }
-    if (size > tls_data_maximum_payload || size > buffer.size())
-    {
-        throw std::invalid_argument("Invalid TLS DATA length");
-    }
-    if (size != 0)
-    {
-        co_await asio::async_read(stream, asio::buffer(buffer.data(), size), asio::use_awaitable);
-    }
-    co_return size;
-}
-
 asio::awaitable<void> write_tls_data(tls_stream &stream, std::span<const std::uint8_t> payload, TrafficCounter *traffic)
 {
     while (!payload.empty())
@@ -260,11 +240,15 @@ asio::awaitable<void> finish_tls_data(tls_stream &stream)
     co_await asio::async_write(stream, asio::buffer(fin), asio::use_awaitable);
 }
 
-// Business FIN is independent of TLS shutdown, including on TLS 1.2 connections.
+/** @brief Copy framed TLS business data with independent FIN and bounded, reusable receive storage. */
 template <typename From, typename To>
 static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limiter, TrafficCounter *traffic)
 {
-    std::array<std::uint8_t, tls_data_maximum_payload> buffer{};
+    BytesBuf buffer;
+    if constexpr (!std::is_same_v<From, tls_stream>)
+    {
+        buffer.resize(32 * 1024);
+    }
     for (;;)
     {
         std::size_t size;
