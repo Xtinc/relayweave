@@ -313,21 +313,18 @@ int main()
         }
         {
             Fixture f;
-            lnk::PooledBuffer payload(f.port->pool, 32768);
-            std::ranges::copy(std::array<std::uint8_t, 3>{8, 9, 10}, payload.data());
-            payload.truncate(3);
+            lnk::PooledBuffer payload(f.port->pool, std::array<std::uint8_t, 3>{8, 9, 10});
             const auto storage = payload.data();
             auto sent = asio::co_spawn(f.caller, f.port->send(std::move(payload)), asio::use_future);
             f.pump();
             sent.get();
-            check(test_access::flow_buffered_bytes(*f.channel) == 32768 + lnk::Frame::buffer_overhead,
-                  "short read hid its retained allocation from the local budget");
+            check(test_access::flow_buffered_bytes(*f.channel) == 384,
+                  "small payload charged an incorrect local budget");
             auto received = f.receive();
             f.pump();
             auto delivery = received.get();
             check(delivery && delivery->data() == storage, "stream endpoint copied its pooled payload");
-            check(delivery->size() == 3 && delivery->capacity() == 32768,
-                  "stream endpoint changed the valid length or retained allocation");
+            check(delivery->size() == 3, "stream endpoint changed the payload length");
             auto stopped = asio::co_spawn(f.data, f.channel->stop(), asio::use_future);
             f.pump();
             stopped.get();

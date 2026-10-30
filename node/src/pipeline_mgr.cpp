@@ -227,6 +227,7 @@ template <typename Transport>
 asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
 {
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
+    BytesBuf read_buffer(std::is_same_v<Transport, TcpTransport> ? 32 * 1024 : 0);
     for (;;)
     {
         lnk::PooledBuffer data;
@@ -236,19 +237,17 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
         }
         else
         {
-            data = lnk::PooledBuffer(endpoint->flow->pool, 32 * 1024);
-            const auto [error, received] = co_await endpoint->stream->async_read_some(
-                asio::buffer(data.data(), data.size()), use_nothrow_awaitable);
+            const auto [error, received] =
+                co_await endpoint->stream->async_read_some(asio::buffer(read_buffer), use_nothrow_awaitable);
             if (error && error != asio::error::eof)
             {
                 throw asio::system_error(error);
             }
-            data.truncate(received);
+            data = lnk::PooledBuffer(endpoint->flow->pool, std::span(read_buffer).first(received));
         }
         const auto size = data.size();
         if (size == 0)
         {
-            data = {};
             co_await endpoint->flow->finish_send();
             co_return;
         }

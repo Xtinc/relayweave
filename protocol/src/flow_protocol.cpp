@@ -621,7 +621,7 @@ void FlowProtocol::receive(const NodeLink &link, Frame f)
 
 void FlowProtocol::written(Frame frame)
 {
-    const auto memory_bytes = frame.memory_charge();
+    const auto memory_bytes = frame.charge();
     const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
     frame.payload = {};
     if (frame.owner && frame.owner->transport == RelayProtocol::Tcp)
@@ -709,7 +709,7 @@ bool FlowProtocol::Stream::route(const std::shared_ptr<FlowState> &s, Frame &f)
         // RESET bypasses DATA credit and closes the Flow in the caller.
         return !output || protocol_.links_.enqueue(*protocol_.links_.connections_.at(output), std::move(f));
     }
-    const auto used = f.memory_charge();
+    const auto used = f.charge();
     auto &direction = s->stream->directions[std::size_t(reverse)];
     if (output)
     {
@@ -737,7 +737,7 @@ bool FlowProtocol::Stream::try_send(const std::shared_ptr<FlowState> &flow, bool
 {
     assert(flow->phase == FlowState::Phase::Active && flow->transport == RelayProtocol::Tcp);
     auto &direction = flow->stream->directions[std::size_t(reverse)];
-    if (data && Frame::charge_for_payload(data->capacity()) >
+    if (data && Frame::charge_for_payload(data->size()) >
                     flow_window_bytes - std::min(direction.buffered_bytes, flow_window_bytes))
     {
         return false;
@@ -1031,7 +1031,7 @@ asio::awaitable<void> FlowProtocol::Stream::receive_loop(const std::shared_ptr<F
         {
             co_return;
         }
-        const auto memory_bytes = frame.memory_charge();
+        const auto memory_bytes = frame.charge();
         const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
         const auto reverse = frame.header.reverse;
         const auto kind = frame.header.kind;

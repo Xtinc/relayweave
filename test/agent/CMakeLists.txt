@@ -1,4 +1,4 @@
-foreach(name IN ITEMS agent_lifecycle agent_session forwarder)
+foreach(name IN ITEMS agent_lifecycle agent_session forwarder forwarder_messages)
     relayweave_test(${name} ${name}_test.cpp
         LIBRARIES relayweave_agent_lib LABELS agent integration)
 endforeach()

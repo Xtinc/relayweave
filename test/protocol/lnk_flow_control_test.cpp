@@ -1050,10 +1050,7 @@ static void multihop_tests()
                 for (std::size_t index = 0; index < frames; ++index)
                 {
                     const BytesBuf payload(sizes[index % sizes.size()], static_cast<std::uint8_t>(index));
-                    lnk::PooledBuffer data(sender->pool, 32768);
-                    std::ranges::copy(payload, data.data());
-                    data.truncate(payload.size());
-                    co_await sender->send(std::move(data));
+                    co_await sender->send(lnk::PooledBuffer(sender->pool, payload));
                 }
                 co_await sender->finish_send();
             };

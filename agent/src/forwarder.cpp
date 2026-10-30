@@ -377,61 +377,88 @@ void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
 
 void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
 {
-    const auto &p = config::message_params(message);
+    if (!message.params || !message.params->is_object())
+    {
+        PROXY_ERROR_PRINT("Relay message rejected command=%s: parameters must be an object", message.command.c_str());
+        return;
+    }
+    const auto &p = *message.params;
     const auto command = message.type();
-    const auto protocol = config::message_protocol(p);
-    const auto uuid = config::optional_unsigned(p, "uuid", true);
+    const auto identity = p.find("uuid");
+    const auto uuid = identity != p.end() && identity->is_number_unsigned() ? identity->get<std::uint64_t>() : 0;
     if (state_ != State::Running)
     {
         if (uuid)
         {
-            send_control(route, CtrlMessage(CtrlCommand::RelayCancel, njson{{"uuid", *uuid}}));
+            send_control(route, CtrlMessage(CtrlCommand::RelayCancel, njson{{"uuid", uuid}}));
         }
         return;
     }
 
     if (command == CtrlCommand::RelayOffer)
     {
-        const auto service = config::message_service(p);
-        const auto target = services_.find(service);
-        if (!uuid || target == services_.end() || target->second.protocol != protocol)
+        try
         {
-            send_control(route, CtrlMessage(CtrlCommand::RelayReject,
-                                            njson{{"uuid", uuid.value_or(0)}, {"reason", "service unavailable"}}));
-            return;
-        }
-        for (const auto &[request, active] : relays_)
-        {
-            if (active->producer() && active->selection.server.node == route.node && active->endpoint->uuid == *uuid)
+            const auto protocol = config::message_protocol(p);
+            const auto service = config::message_service(p);
+            const auto target = services_.find(service);
+            if (!uuid || target == services_.end() || target->second.protocol != protocol)
             {
+                send_control(route, CtrlMessage(CtrlCommand::RelayReject,
+                                                njson{{"uuid", uuid}, {"reason", "service unavailable"}}));
                 return;
             }
+            for (const auto &[request, active] : relays_)
+            {
+                if (active->producer() && active->selection.server.node == route.node && active->endpoint->uuid == uuid)
+                {
+                    return;
+                }
+            }
+            auto relay = std::make_shared<AgentSession>(*this, allocate_request_id(), ServiceKey{service, protocol},
+                                                        std::string{}, Clock::now() + relay_open_timeout_);
+            relay->target = target->second;
+            relay->selection.server = route;
+            relay->selection.epoch = config::optional_unsigned(p, "epoch", true).value_or(0);
+            relay->endpoint = AgentSession::RelayEndpoint::from_params(p, protocol);
+            start_relay(std::move(relay));
         }
-        auto relay = std::make_shared<AgentSession>(*this, allocate_request_id(), ServiceKey{service, protocol},
-                                                    std::string{}, Clock::now() + relay_open_timeout_);
-        relay->target = target->second;
-        relay->selection.server = std::move(route);
-        relay->selection.epoch = config::optional_unsigned(p, "epoch", true).value_or(0);
-        relay->endpoint = AgentSession::RelayEndpoint::from_params(p, protocol);
-        start_relay(std::move(relay));
+        catch (const std::exception &error)
+        {
+            send_control(route, CtrlMessage(CtrlCommand::RelayReject,
+                                            njson{{"uuid", uuid},
+                                                  {"reason", "invalid relay.offer: " + std::string(error.what())}}));
+        }
         return;
     }
 
-    const auto request = config::optional_unsigned(p, "request_id");
+    const auto request = p.find("request_id");
     for (const auto &[id, relay] : relays_)
     {
-        if (relay->selection.server.node != route.node || relay->service.protocol != protocol)
+        if (relay->selection.server.node != route.node)
         {
             continue;
         }
         const bool by_request = (command == CtrlCommand::RelayOpened || command == CtrlCommand::RelayError) &&
-                                request && *request == id && !relay->producer();
-        const bool by_uuid = command != CtrlCommand::RelayOpened && uuid && relay->endpoint.has_value() &&
-                             relay->endpoint->uuid == *uuid;
+                                request != p.end() && request->is_number_unsigned() &&
+                                *request == id && !relay->producer();
+        const bool by_uuid =
+            command != CtrlCommand::RelayOpened && uuid && relay->endpoint.has_value() && relay->endpoint->uuid == uuid;
         if (by_request || by_uuid)
         {
             // A single-node relay may have both roles in this Agent and share one UUID.
-            relay->handle(message);
+            try
+            {
+                if (config::message_protocol(p) != relay->service.protocol)
+                {
+                    continue;
+                }
+                relay->handle(message);
+            }
+            catch (const std::exception &error)
+            {
+                relay->fail("invalid " + message.command + ": " + error.what());
+            }
             if (command == CtrlCommand::RelayOpened)
             {
                 return;
@@ -441,7 +468,7 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
 
     if (command == CtrlCommand::RelayOpened && uuid)
     {
-        send_control(route, CtrlMessage(CtrlCommand::RelayCancel, njson{{"uuid", *uuid}}));
+        send_control(route, CtrlMessage(CtrlCommand::RelayCancel, njson{{"uuid", uuid}}));
     }
 }
 

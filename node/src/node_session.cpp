@@ -2,40 +2,40 @@
 #include "relay_node.h"
 
 NodeSession::NodeSession(RelayNode &node, const AgentPeer &session, RelayRequest params, bool ingress,
-                        SRVTrafficPtr traffic)
-    : node_(node), control_(std::in_place_type<ControlRouterMulti>, *this, session, std::move(params), ingress),
+                         SRVTrafficPtr traffic)
+    : node_(node), data_manager_(select_data(params.protocol)),
+      control_(std::in_place_type<ControlRouterMulti>, *this, session, std::move(params), ingress),
       traffic_(std::move(traffic))
 {
-    select_data(params.protocol);
 }
 
 NodeSession::NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer, RelayRequest params,
                          SRVTrafficPtr traffic)
-    : node_(node), control_(std::in_place_type<ControlRouterSingle>, *this, consumer, producer, std::move(params)),
+    : node_(node), data_manager_(select_data(params.protocol)),
+      control_(std::in_place_type<ControlRouterSingle>, *this, consumer, producer, std::move(params)),
       traffic_(std::move(traffic))
 {
-    select_data(params.protocol);
 }
 
-void NodeSession::select_data(RelayProtocol protocol)
+NodeSession::DataManager NodeSession::select_data(RelayProtocol protocol) const
 {
     if (protocol == RelayProtocol::Udp)
     {
-        data_ = node_.datagram_mgr_.get();
+        return node_.datagram_mgr_.get();
     }
     else if (protocol == RelayProtocol::Tls)
     {
-        data_ = node_.tls_pipeline_.get();
+        return node_.tls_pipeline_.get();
     }
     else
     {
-        data_ = node_.tcp_pipeline_.get();
+        return node_.tcp_pipeline_.get();
     }
 }
 
 asio::any_io_executor NodeSession::data_executor() const
 {
-    return std::holds_alternative<DatagramMgr *>(data_) ? node_.transfer_udp_executor_ : node_.transfer_tcp_executor_;
+    return std::holds_alternative<DatagramMgr *>(data_manager_) ? node_.transfer_udp_executor_ : node_.transfer_tcp_executor_;
 }
 
 asio::awaitable<void> NodeSession::run()
@@ -79,11 +79,11 @@ bool NodeSession::handle_peer(CtrlCommand command, const CtrlMessage &message)
 
 RelayProtocol NodeSession::protocol() const noexcept
 {
-    if (std::holds_alternative<DatagramMgr *>(data_))
+    if (std::holds_alternative<DatagramMgr *>(data_manager_))
     {
         return RelayProtocol::Udp;
     }
-    return std::holds_alternative<TlsPipeline *>(data_) ? RelayProtocol::Tls : RelayProtocol::Tcp;
+    return std::holds_alternative<TlsPipeline *>(data_manager_) ? RelayProtocol::Tls : RelayProtocol::Tcp;
 }
 
 bool NodeSession::is_multi() const noexcept
@@ -113,7 +113,7 @@ asio::awaitable<void> NodeSession::install(int role)
 {
     endpoint_ = co_await asio::co_spawn(
         data_executor(),
-        [data = data_, role, single = !is_multi()]() -> asio::awaitable<Attachment> {
+        [data = data_manager_, role, single = !is_multi()]() -> asio::awaitable<Attachment> {
             co_return std::visit(
                 [&](auto *manager) -> Attachment {
                     if (single)
@@ -134,7 +134,7 @@ asio::awaitable<void> NodeSession::prepare_local(std::chrono::steady_clock::time
             return asio::co_spawn(data_executor(), manager->prepare_local_pair(uuid(), traffic_, std::move(accessor)),
                                   asio::cancel_at(deadline, asio::use_awaitable));
         },
-        data_);
+        data_manager_);
 }
 
 asio::awaitable<void> NodeSession::prepare_remote(std::chrono::steady_clock::time_point deadline, std::string accessor,
@@ -147,14 +147,14 @@ asio::awaitable<void> NodeSession::prepare_remote(std::chrono::steady_clock::tim
                                                                traffic_, std::move(accessor)),
                                   asio::cancel_at(deadline, asio::use_awaitable));
         },
-        data_);
+        data_manager_);
 }
 
 asio::awaitable<void> NodeSession::activate()
 {
     return asio::co_spawn(
         data_executor(),
-        [data = data_, id = uuid()]() -> asio::awaitable<void> {
+        [data = data_manager_, id = uuid()]() -> asio::awaitable<void> {
             std::visit([&](auto *manager) { manager->activate_remote_pair(id); }, data);
             co_return;
         },
@@ -168,7 +168,7 @@ asio::awaitable<void> NodeSession::bridge()
             auto task = is_multi() ? manager->run_remote_pair(uuid()) : manager->run_local_pair(uuid());
             return asio::co_spawn(data_executor(), std::move(task), asio::use_awaitable);
         },
-        data_);
+        data_manager_);
 }
 
 asio::awaitable<void> NodeSession::close()
@@ -180,7 +180,7 @@ asio::awaitable<void> NodeSession::close()
     }
     co_await asio::co_spawn(
         data_executor(),
-        [data = data_, id, single = !is_multi()]() -> asio::awaitable<void> {
+        [data = data_manager_, id, single = !is_multi()]() -> asio::awaitable<void> {
             std::visit(
                 [&](auto *manager) {
                     if (single)

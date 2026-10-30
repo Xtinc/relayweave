@@ -123,9 +123,10 @@ class NodeSession
     void send_agent(const AgentPeer &route, CtrlMessage message) const;
     std::uint64_t uuid() const;
     RelayNode &node_;
+    using DataManager = std::variant<TcpPipeline *, TlsPipeline *, DatagramMgr *>;
+    DataManager data_manager_;
     std::variant<ControlRouterSingle, ControlRouterMulti> control_;
-    std::variant<TcpPipeline *, TlsPipeline *, DatagramMgr *> data_;
-    void select_data(RelayProtocol protocol);
+    DataManager select_data(RelayProtocol protocol) const;
     asio::any_io_executor data_executor() const;
     asio::cancellation_signal cancellation_;
     Attachment endpoint_;

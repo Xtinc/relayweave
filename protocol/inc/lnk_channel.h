@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <array>
 #include <bit>
-#include <cassert>
 #include <chrono>
 #include <cstring>
 #include <deque>
@@ -25,7 +24,7 @@ struct FlowState;
 
 /**
  * @brief Own uninitialised, movable bytes and retain their allocator across executors.
- * @details The valid length may shrink; the full allocation stays owned until destruction.
+ * @details Own the complete allocation until it is moved or destroyed.
  */
 class PooledBuffer
 {
@@ -45,8 +44,7 @@ class PooledBuffer
     PooledBuffer() noexcept = default;
 
     PooledBuffer(std::shared_ptr<std::pmr::memory_resource> resource, std::size_t size)
-        : storage_(size ? static_cast<std::uint8_t *>(resource->allocate(size)) : nullptr, Deleter{size, resource}),
-          size_(size)
+        : storage_(size ? static_cast<std::uint8_t *>(resource->allocate(size)) : nullptr, Deleter{size, resource})
     {
     }
 
@@ -74,24 +72,7 @@ class PooledBuffer
 
     std::size_t size() const noexcept
     {
-        return storage_ ? size_ : 0;
-    }
-
-    /** @brief Return the requested allocation size, including bytes outside the valid payload.
-     * @return Owned allocation length in bytes, or zero for an empty or moved-from buffer.
-     */
-    std::size_t capacity() const noexcept
-    {
         return storage_ ? storage_.get_deleter().size : 0;
-    }
-
-    /** @brief Reduce the valid payload length without reallocating or releasing storage.
-     * @param size New valid length in bytes, no greater than size().
-     */
-    void truncate(std::size_t size) noexcept
-    {
-        assert(size <= this->size());
-        size_ = size;
     }
 
     std::span<std::uint8_t> bytes() noexcept
@@ -106,7 +87,6 @@ class PooledBuffer
 
   private:
     std::unique_ptr<std::uint8_t, Deleter> storage_{nullptr, Deleter{}};
-    std::size_t size_ = 0;
 };
 
 struct FlowWriteTag
@@ -133,7 +113,7 @@ struct Frame
     // Shared Link writes can outlive map removal. Keep the exact Flow identity for completion.
     // Flow-owned queues leave this empty to avoid a self-reference.
     std::shared_ptr<FlowState> owner;
-    // Stable wire-credit units, independent of the allocator's actual block sizes.
+    // Logical charge for local budgets and wire credit, independent of allocator block sizes.
     static std::size_t charge_for_payload(std::size_t size) noexcept
     {
         return buffer_overhead + (size ? std::bit_ceil(std::max(size, std::size_t{256})) : 0);
@@ -141,13 +121,6 @@ struct Frame
     std::size_t charge() const noexcept
     {
         return charge_for_payload(payload.size());
-    }
-    /** @brief Charge the complete retained allocation against the local buffer budget.
-     * @return Allocation rounded by the same rule as wire credit, plus frame overhead.
-     */
-    std::size_t memory_charge() const noexcept
-    {
-        return charge_for_payload(payload.capacity());
     }
 };
 static_assert(sizeof(Frame) <= Frame::buffer_overhead, "review frame management charge after changing Frame layout");
