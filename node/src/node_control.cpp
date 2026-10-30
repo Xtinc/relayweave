@@ -331,7 +331,11 @@ void NodeControl::report_topology(SessionId id, const ControlSessionPtr &session
         }
         return;
     }
-    broadcast_client_query(id, CtrlMessage{CtrlCommand::TopologyQuery, njson{{"request_id", request_id}}});
+    if (const auto master = topology_.master_id(); !master.empty())
+    {
+        cluster_.send(std::string(master),
+                      CtrlMessage{CtrlCommand::TopologyQuery, njson{{"request_id", request_id}, {"session_id", id}}});
+    }
 }
 
 void NodeControl::handle_topology_query(const njson &params)

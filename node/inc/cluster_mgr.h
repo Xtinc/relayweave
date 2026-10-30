@@ -80,7 +80,8 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
      */
     SendResult send(std::string target, CtrlMessage message);
     /**
-     * @brief Queue delivery to all joined participants, including the local master, on control_io.
+     * @brief Queue a broadcast to joined participants on control_io.
+     * @details Broadcasts omit their authenticated source. Publishers apply any required local work themselves.
      * @param message Control message to dispatch; ownership of its parameters may be transferred.
      * @return Local submission result, with the same meaning as send().
      */

@@ -347,7 +347,9 @@ flowchart TB
 
 Master 的 `ClusterRoom` 作为集群内部的控制交换矩阵，提供两类消息投递模式：
 - **定向交付（Unicast）**：源节点在消息参数中指定 `target`。Master 查表，移除 `target` 并按连接身份写入 `source`，将消息投递至目标节点的专用控制连接，用于首末节点握手（`RelayPeerOpen` / `RelayPeerReady`）。
-- **全网广播（Broadcast）**：通过 `target: "all"` 发布集群成员更新（`topology.members`）、分发查询与会话解绑（`relay.detach`）。Master 将消息投递给所有已加入参与者，包括本机 Master；拓扑快照通过 `topology.query` 请求获取。
+- **全网广播（Broadcast）**：通过 `target: "all"` 分发服务/状态查询、会话解绑和成员通知。Master 一律向已加入的其他参与者投递，排除认证 source，不按业务命令分类。发布方自行完成需要的本地处理。
+- **成员发布**：`publish_members()` 先通过定向交付将成员表应用到本机 Master，再广播给其他节点。每个节点仍只应用一次；通用路由层不为 `topology.members` 设置特殊回送规则。
+- **拓扑查询**：Master 本地直接生成快照；Slave 仅向 `topology_.master_id()` 单播 `topology.query`，Master 按原 session/request 路由返回快照。尚未获知 Master 时不提交无目标查询，发现端沿用原有查询周期。该路径不增加缓存、目录或后台任务。
 
 ---
 

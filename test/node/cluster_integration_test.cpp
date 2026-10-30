@@ -139,12 +139,9 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
             peer->send(std::move(message));
         };
         broadcast(a, CtrlMessage{"notice", njson{{"request_id", 1}}});
-        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("notice") == 1; });
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("notice") == 1; });
-        require(a_inbox.messages.back().first == "a" && b_inbox.messages.back().first == "a",
-                "Broadcast lost the authenticated source");
-        require(!a_inbox.messages.back().second.params->contains("target") &&
-                    !b_inbox.messages.back().second.params->contains("target"),
+        require(b_inbox.messages.back().first == "a", "Broadcast lost the authenticated source");
+        require(!b_inbox.messages.back().second.params->contains("target"),
                 "Cluster target leaked into a broadcast delivery");
 
         a->send(CtrlMessage{"direct", njson{{"target", "b"}, {"request_id", 2}}});
@@ -158,16 +155,31 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("direct.barrier") == 1; });
         require(a_inbox.count("direct") == 0 && b_inbox.count("direct") == 1,
                 "Directed message reached a non-target peer");
+        require(a_inbox.count("notice") == 0, "Generic broadcast was echoed back to its source");
 
         broadcast(b, CtrlMessage{"reported", njson{{"request_id", 1}, {"value", 42}}});
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("reported") == 1; });
-        co_await receive_until(b, b_inbox, [&] { return b_inbox.count("reported") == 1; });
         require(a_inbox.messages.back().first == "b" &&
                     a_inbox.messages.back().second.params->at("request_id") == 1,
                 "Protocol response lost source or request_id");
+        for (const auto command : {CtrlCommand::ServiceLookup, CtrlCommand::ServerStatusQuery, CtrlCommand::RelayDetach})
+        {
+            const auto name = ctrl_command_name(command);
+            broadcast(a, CtrlMessage(command, njson{{"request_id", 41U}, {"session_id", 1U},
+                {"agent_session_id", 1U}, {"service", "missing-service"}, {"protocol", "tcp"}}));
+            co_await receive_until(b, b_inbox, [&] { return b_inbox.count(name) == 1; });
+            const auto barriers = a_inbox.count("origin.barrier");
+            master->send("a", CtrlMessage{"origin.barrier"});
+            co_await receive_until(a, a_inbox, [&] { return a_inbox.count("origin.barrier") > barriers; });
+            std::cout << "[MESSAGES] command=" << name << " source_deliveries=" << a_inbox.count(name)
+                      << " other_peer_deliveries=" << b_inbox.count(name) << '\n';
+            require(a_inbox.count(name) == 0, "Broadcast was echoed back to its source");
+            require(b_inbox.messages.back().first == "a", "Filtered broadcast lost its authenticated source");
+        }
         require(master->broadcast(CtrlMessage{"master.notice"}) == ClusterMgr::SendResult::Submitted, "Master rejected a broadcast submission");
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("master.notice") == 1; });
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("master.notice") == 1; });
+        require(b_inbox.count("reported") == 0, "Response broadcast was echoed back to its source");
         require(master->send({}, CtrlMessage{"invalid.target"}) == ClusterMgr::SendResult::InvalidMessage, "Empty target was accepted");
         require(master->broadcast(CtrlMessage{"invalid.params", njson::array()}) == ClusterMgr::SendResult::InvalidMessage, "Invalid parameters were accepted");
         require(master->broadcast(CtrlMessage{"cluster.invalid"}) == ClusterMgr::SendResult::InvalidMessage, "Reserved command was accepted");
@@ -198,7 +210,9 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         large->send(budget_message("all", legal_size));
         co_await receive_budget(a, a_inbox);
         co_await receive_budget(b, b_inbox);
-        co_await receive_budget(large, large_inbox);
+        master->send(longest_id, CtrlMessage{"budget.origin.barrier"});
+        co_await receive_until(large, large_inbox, [&] { return large_inbox.count("budget.origin.barrier") == 1; });
+        require(large_inbox.count("budget.notice") == 0, "Large broadcast was echoed back to its source");
 
         // Fits the incoming wire limit, but the largest authenticated source would push it over.
         large->send(budget_message("b", WireMessage::max_message_length - 128));
@@ -273,6 +287,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         raw->send(CtrlMessage{"identity", njson{{"target", "all"}, {"source", "forged"}}});
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("identity") == 1; });
         require(a_inbox.messages.back().first == "raw", "Peer forged the broadcast source");
+        master->send("raw", CtrlMessage{"identity.barrier"});
         auto raw_delivery = co_await raw->async_receive();
         while (raw_delivery.command == "topology.members")
         {
@@ -281,9 +296,9 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
                     "Cluster membership announcement is invalid");
             raw_delivery = co_await raw->async_receive();
         }
-        require(raw_delivery.command == "identity" && raw_delivery.params->at("source") == "raw",
-                "Raw peer did not receive its own broadcast");
-        require(!raw_delivery.params->contains("target"), "Raw broadcast leaked its target");
+        require(raw_delivery.command == "identity.barrier" && raw_delivery.params->at("source") == "master",
+                "Raw peer received its own broadcast or lost the ordering barrier");
+        require(!raw_delivery.params->contains("target"), "Raw unicast leaked its target");
         raw->send(CtrlMessage{"cluster.invalid"});
         bool invalid_closed = false;
         try
@@ -426,6 +441,22 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
         const auto topology = co_await client_reply(client, CtrlCommand::TopologySnapshot);
         require(topology.params->at("nodes").size() >= 2, "Topology query lost cluster members");
         snapshot = *topology.params;
+        test_node::cluster(master).send("observer", CtrlMessage{"topology.barrier"});
+        std::size_t unrelated_queries = 0;
+        for (;;)
+        {
+            const auto observed = co_await peer->async_receive(3s);
+            if (observed.command == "topology.barrier")
+            {
+                break;
+            }
+            if (observed.type() == CtrlCommand::TopologyQuery)
+            {
+                ++unrelated_queries;
+            }
+        }
+        std::cout << "[MESSAGES] topology unrelated_peer_queries=" << unrelated_queries << '\n';
+        require(unrelated_queries == 0, "Topology query reached a non-master Node");
         client->send(CtrlMessage(CtrlCommand::ServerCluster, njson{{"request_id", 104U}}));
         std::set<std::string> reported;
         for (unsigned i = 0; i < 2; ++i)
