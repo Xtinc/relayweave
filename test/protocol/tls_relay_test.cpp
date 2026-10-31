@@ -87,8 +87,16 @@ asio::awaitable<void> receive_data(TLS &stream, const BytesBuf &expected)
 {
     BytesBuf buffer(tls_data_maximum_payload);
     std::size_t offset = 0;
-    while (const auto size = co_await read_tls_data(stream, buffer))
+    for (;;)
     {
+        std::array<std::uint8_t, 4> header{};
+        co_await asio::async_read(stream, asio::buffer(header), asio::use_awaitable);
+        const auto size = decode_tls_data_size(header);
+        if (size == 0)
+        {
+            break;
+        }
+        co_await asio::async_read(stream, asio::buffer(buffer.data(), size), asio::use_awaitable);
         require(size <= expected.size() - offset &&
                 std::equal(buffer.begin(), buffer.begin() + size, expected.begin() + offset), "TLS DATA changed");
         offset += size;
@@ -98,15 +106,21 @@ asio::awaitable<void> receive_data(TLS &stream, const BytesBuf &expected)
 
 asio::awaitable<void> tls_business(TLS &requester, TLS &responder)
 {
-    const BytesBuf request(tls_data_maximum_payload + 11, 0x5a);
-    const BytesBuf reply(2 * tls_data_maximum_payload + 17, 0xa5);
-    co_await write_tls_data(requester, request);
-    co_await finish_tls_data(requester);
-    co_await receive_data(responder, request);
+    const BytesBuf request(tls_data_maximum_payload - 11, 0x5a);
+    const BytesBuf reply(tls_data_maximum_payload, 0xa5);
     // The service deliberately waits for business FIN before producing its reply.
-    co_await write_tls_data(responder, reply);
-    co_await finish_tls_data(responder);
-    co_await receive_data(requester, reply);
+    for (bool responding : {false, true})
+    {
+        auto &sender = responding ? responder : requester;
+        auto &receiver = responding ? requester : responder;
+        const auto &payload = responding ? reply : request;
+        const auto header = encode_tls_data_size(payload.size());
+        const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload)};
+        co_await asio::async_write(sender, buffers, asio::use_awaitable);
+        const std::array<std::uint8_t, 4> fin{};
+        co_await asio::async_write(sender, asio::buffer(fin), asio::use_awaitable);
+        co_await receive_data(receiver, payload);
+    }
 }
 
 asio::awaitable<void> single_tls(Fixture &f, bool reverse)
@@ -116,9 +130,9 @@ asio::awaitable<void> single_tls(Fixture &f, bool reverse)
     TrafficCounter incoming;
     co_await await_transfers(relay_tls(f.left_server, f.right_server, nullptr, nullptr, &outgoing, &incoming),
         tls_business(reverse ? f.right_client : f.left_client, reverse ? f.left_client : f.right_client));
-    require(outgoing.total() == (reverse ? 2 * tls_data_maximum_payload + 17 : tls_data_maximum_payload + 11),
+    require(outgoing.total() == (reverse ? tls_data_maximum_payload : tls_data_maximum_payload - 11),
             "TLS outgoing traffic includes framing or lost bytes");
-    require(incoming.total() == (reverse ? tls_data_maximum_payload + 11 : 2 * tls_data_maximum_payload + 17),
+    require(incoming.total() == (reverse ? tls_data_maximum_payload - 11 : tls_data_maximum_payload),
             "TLS incoming traffic includes framing or lost bytes");
 }
 
@@ -134,25 +148,26 @@ asio::awaitable<void> receive_tcp(tcp::socket &socket, const BytesBuf &expected)
 
 asio::awaitable<void> access_business(Fixture &f, bool reverse)
 {
-    const BytesBuf request(tls_data_maximum_payload + 11, 0x5a);
-    const BytesBuf reply(2 * tls_data_maximum_payload + 17, 0xa5);
-    if (reverse)
+    const BytesBuf request(tls_data_maximum_payload - 11, 0x5a);
+    const BytesBuf reply(tls_data_maximum_payload, 0xa5);
+    for (bool responding : {false, true})
     {
-        co_await write_tls_data(f.left_client, request);
-        co_await finish_tls_data(f.left_client);
-        co_await receive_tcp(f.app, request);
-        co_await asio::async_write(f.app, asio::buffer(reply), asio::use_awaitable);
-        f.app.shutdown(tcp::socket::shutdown_send);
-        co_await receive_data(f.left_client, reply);
-    }
-    else
-    {
-        co_await asio::async_write(f.app, asio::buffer(request), asio::use_awaitable);
-        f.app.shutdown(tcp::socket::shutdown_send);
-        co_await receive_data(f.left_client, request);
-        co_await write_tls_data(f.left_client, reply);
-        co_await finish_tls_data(f.left_client);
-        co_await receive_tcp(f.app, reply);
+        const auto &payload = responding ? reply : request;
+        if (reverse != responding)
+        {
+            const auto header = encode_tls_data_size(payload.size());
+            const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload)};
+            co_await asio::async_write(f.left_client, buffers, asio::use_awaitable);
+            const std::array<std::uint8_t, 4> fin{};
+            co_await asio::async_write(f.left_client, asio::buffer(fin), asio::use_awaitable);
+            co_await receive_tcp(f.app, payload);
+        }
+        else
+        {
+            co_await asio::async_write(f.app, asio::buffer(payload), asio::use_awaitable);
+            f.app.shutdown(tcp::socket::shutdown_send);
+            co_await receive_data(f.left_client, payload);
+        }
     }
 }
 
@@ -195,7 +210,10 @@ asio::awaitable<void> invalid_length(Fixture &f)
 
 asio::awaitable<void> break_during_limit(Fixture &f, bool reverse)
 {
-    co_await write_tls_data(reverse ? f.right_client : f.left_client, BytesBuf(60, 0x5a));
+    const BytesBuf payload(60, 0x5a);
+    const auto header = encode_tls_data_size(payload.size());
+    const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload)};
+    co_await asio::async_write(reverse ? f.right_client : f.left_client, buffers, asio::use_awaitable);
     asio::steady_timer timer(f.io, 20ms);
     co_await timer.async_wait(asio::use_awaitable);
     auto &peer = reverse ? f.left_client : f.right_client;

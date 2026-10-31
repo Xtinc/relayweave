@@ -2,6 +2,7 @@
 #include "flow_protocol.h"
 #include "frame_io.h"
 #include "xfr_channel.h"
+#include <array>
 #include <exception>
 
 static auto remaining_timeout(std::chrono::steady_clock::time_point deadline)
@@ -233,7 +234,14 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
         lnk::PooledBuffer data;
         if constexpr (std::is_same_v<Transport, TlsTransport>)
         {
-            co_await read_tls_data(*endpoint->stream, data, endpoint->flow->pool);
+            std::array<std::uint8_t, 4> header{};
+            co_await asio::async_read(*endpoint->stream, asio::buffer(header), asio::use_awaitable);
+            const auto size = decode_tls_data_size(header);
+            data = lnk::PooledBuffer(endpoint->flow->pool, size);
+            if (size != 0)
+            {
+                co_await asio::async_read(*endpoint->stream, asio::buffer(data.data(), size), asio::use_awaitable);
+            }
         }
         else
         {
@@ -251,7 +259,10 @@ asio::awaitable<void> StreamPipeline<Transport>::read_remote_pair(std::shared_pt
             co_await endpoint->flow->finish_send();
             co_return;
         }
-        co_await limiter.consume(size);
+        if (const auto deadline = limiter.reserve(size))
+        {
+            co_await limiter.wait_until(*deadline);
+        }
         co_await endpoint->flow->send(std::move(data));
         endpoint->count(true, size);
     }
@@ -268,7 +279,8 @@ asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_p
         {
             if constexpr (std::is_same_v<Transport, TlsTransport>)
             {
-                co_await finish_tls_data(*endpoint->stream);
+                const std::array<std::uint8_t, 4> fin{};
+                co_await asio::async_write(*endpoint->stream, asio::buffer(fin), asio::use_awaitable);
             }
             else
             {
@@ -281,18 +293,25 @@ asio::awaitable<void> StreamPipeline<Transport>::write_remote_pair(std::shared_p
             }
             co_return;
         }
-        co_await limiter.consume(data->size());
+        if (const auto deadline = limiter.reserve(data->size()))
+        {
+            co_await limiter.wait_until(*deadline);
+        }
         if constexpr (std::is_same_v<Transport, TlsTransport>)
         {
-            co_await write_tls_data(*endpoint->stream, data->bytes());
-            endpoint->count(false, data->size());
+            if (data->size() != 0)
+            {
+                const auto header = encode_tls_data_size(data->size());
+                const std::array<asio::const_buffer, 2> buffers{asio::buffer(header),
+                                                             asio::buffer(data->data(), data->size())};
+                co_await asio::async_write(*endpoint->stream, buffers, asio::use_awaitable);
+            }
         }
         else
         {
-            const auto written = co_await asio::async_write(*endpoint->stream, asio::buffer(data->data(), data->size()),
-                                                            asio::use_awaitable);
-            endpoint->count(false, written);
+            co_await asio::async_write(*endpoint->stream, asio::buffer(data->data(), data->size()), asio::use_awaitable);
         }
+        endpoint->count(false, data->size());
         data.reset();
         endpoint->flow->complete_receive();
     }

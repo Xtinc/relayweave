@@ -665,7 +665,6 @@ std::shared_ptr<lnk::FlowDatagram> FlowProtocol::bind_datagram_flow(std::uint64_
 }
 
 // TCP protocol: credit, ordered DATA/FIN/RESET, and one joined endpoint task.
-
 std::shared_ptr<lnk::FlowStream> FlowProtocol::Stream::bind(const std::shared_ptr<FlowState> &flow, bool reverse,
                                                             asio::any_io_executor transfer)
 {

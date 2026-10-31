@@ -416,12 +416,15 @@ class Benchmark
                 const auto requested = rate(Clock::now());
                 if (previous_rate != requested)
                 {
-                    // Only replace a test sink's bucket after its prior consume has completed.
+                    // Only replace a test sink's bucket after its prior wait has completed.
                     // Production has no live rate-change API; this models downstream speed changes.
                     limiter = TokenBucket(static_cast<std::uint64_t>(requested) * 125000 / options_.flows, 0);
                     previous_rate = requested;
                 }
-                co_await limiter.consume(payload->size());
+                if (const auto deadline = limiter.reserve(payload->size()))
+                {
+                    co_await limiter.wait_until(*deadline);
+                }
             }
             const auto bytes = payload->size();
             payload.reset();

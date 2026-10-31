@@ -466,21 +466,37 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
                 payload[i] = static_cast<std::uint8_t>(i);
             }
             const auto started = std::chrono::steady_clock::now();
-            co_await write_tls_data(left, payload);
-            co_await finish_tls_data(left);
+            const auto payload_header = encode_tls_data_size(payload.size());
+            const std::array<asio::const_buffer, 2> payload_buffers{asio::buffer(payload_header), asio::buffer(payload)};
+            co_await asio::async_write(left, payload_buffers, asio::use_awaitable);
+            const std::array<std::uint8_t, 4> fin{};
+            co_await asio::async_write(left, asio::buffer(fin), asio::use_awaitable);
             BytesBuf received(tls_data_maximum_payload);
-            const auto size = co_await read_tls_data(right, received);
-            require(size == payload.size() && std::equal(payload.begin(), payload.end(), received.begin()),
-                    "TLS DATA changed before FIN");
+            std::array<std::uint8_t, 4> header{};
+            co_await asio::async_read(right, asio::buffer(header), asio::use_awaitable);
+            const auto size = decode_tls_data_size(header);
+            require(size == payload.size(), "TLS DATA length changed before FIN");
+            co_await asio::async_read(right, asio::buffer(received.data(), size), asio::use_awaitable);
+            require(std::equal(payload.begin(), payload.end(), received.begin()), "TLS DATA changed before FIN");
             require(std::chrono::steady_clock::now() - started >= 400ms,
                     "TLS endpoint did not enforce its configured stream rate limit");
-            require(co_await read_tls_data(right, received) == 0, "TLS business FIN was lost");
+            co_await asio::async_read(right, asio::buffer(header), asio::use_awaitable);
+            require(decode_tls_data_size(header) == 0, "TLS business FIN was lost");
             const BytesBuf reply(expected.begin(), expected.end());
-            co_await write_tls_data(right, reply);
-            co_await finish_tls_data(right);
+            const auto reply_header = encode_tls_data_size(reply.size());
+            const std::array<asio::const_buffer, 2> reply_buffers{asio::buffer(reply_header), asio::buffer(reply)};
+            co_await asio::async_write(right, reply_buffers, asio::use_awaitable);
+            co_await asio::async_write(right, asio::buffer(fin), asio::use_awaitable);
             std::size_t total = 0;
-            while (const auto count = co_await read_tls_data(left, received))
+            for (;;)
             {
+                co_await asio::async_read(left, asio::buffer(header), asio::use_awaitable);
+                const auto count = decode_tls_data_size(header);
+                if (count == 0)
+                {
+                    break;
+                }
+                co_await asio::async_read(left, asio::buffer(received.data(), count), asio::use_awaitable);
                 require(total + count <= reply.size() &&
                         std::equal(received.begin(), received.begin() + count, reply.begin() + total),
                         "TLS reverse DATA changed after FIN");
@@ -984,7 +1000,10 @@ void integration()
                     BytesBuf data(3);
                     if (tls)
                     {
-                        require(co_await read_tls_data(*tls, data) == 3, "TLS return DATA length changed");
+                        std::array<std::uint8_t, 4> header{};
+                        co_await asio::async_read(*tls, asio::buffer(header), asio::use_awaitable);
+                        require(decode_tls_data_size(header) == data.size(), "TLS return DATA length changed");
+                        co_await asio::async_read(*tls, asio::buffer(data), asio::use_awaitable);
                     }
                     else
                     {
