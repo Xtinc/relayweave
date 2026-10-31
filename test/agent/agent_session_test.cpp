@@ -234,9 +234,11 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
                                asio::ssl::context &ssl, End end)
 {
     auto agent = std::make_shared<RelayAgent>(control, transfer, ssl, AgentConfig{});
-    auto owner = std::make_unique<Forwarder>(*agent, transfer.get_executor(), ssl, std::nullopt,
-                                            1s, 1s, 2s, std::vector<AgentServiceConfig>{},
-                                            std::vector<AgentForwardConfig>{});
+    AgentConfig config;
+    config.channel.handshake_timeout = 1s;
+    config.connect_timeout = 1s;
+    config.relay_open_timeout = 2s;
+    auto owner = std::make_unique<Forwarder>(*agent, transfer.get_executor(), ssl, config);
     owner->start();
     if (end == End::Normal)
     {

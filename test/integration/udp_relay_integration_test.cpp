@@ -1,6 +1,8 @@
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
+#include "forwarder.h"
+#include "member_access.h"
 #include "relay_node.h"
 
 #include <algorithm>
@@ -12,6 +14,13 @@
 #include <openssl/ssl.h>
 #include <stdexcept>
 #include <thread>
+
+TEST_MEMBER(AgentControl, service_locations_)
+TEST_MEMBER(RelayAgent, control_)
+TEST_MEMBER(RelayAgent, forwarder_)
+TEST_MEMBER(Forwarder, relays_)
+TEST_MEMBER(RelayNode, relay_sessions_)
+TEST_MEMBER(RelayNode, registry_)
 
 namespace
 {
@@ -91,7 +100,7 @@ AgentConfig client_config(std::uint16_t control_port)
     config.connect_timeout = 1s;
     config.reconnect_initial_delay = 50ms;
     config.reconnect_max_delay = 200ms;
-    // All protocols use the Agent establishment budget; running UDP has no expiry.
+    // Establishment and UDP business idle have independent deadlines.
     config.relay_open_timeout = 1s;
     config.channel = channel_config();
     return config;
@@ -118,30 +127,46 @@ asio::awaitable<void> udp_echo(udp::socket &socket)
     }
 }
 
+void wait_service(asio::io_context &control, asio::io_context &transfer, RelayAgent &agent, std::string name)
+{
+    for (int attempt = 0; attempt < 800; ++attempt)
+    {
+        const bool available = asio::co_spawn(control, [&agent, name]() -> asio::awaitable<bool> {
+            const auto &locations = test_access::AgentControl_service_locations_(test_access::RelayAgent_control_(agent));
+            const auto location = locations.find(ServiceKey{name, RelayProtocol::Udp});
+            co_return location != locations.end() && !location->second.node.empty();
+        }, asio::use_future).get();
+        if (available)
+        {
+            // Drain the service availability post before sending a one-shot first packet.
+            asio::co_spawn(transfer, []() -> asio::awaitable<void> { co_return; }, asio::use_future).get();
+            return;
+        }
+        std::this_thread::sleep_for(10ms);
+    }
+    throw std::runtime_error("UDP service was not discovered");
+}
+
 void expect_round_trip(udp::socket &socket, const BytesBuf &payload)
 {
-    for (int attempt = 0; attempt < 40; ++attempt)
+    // Exactly one send: retries would hide a missing first-packet cache.
+    socket.send(asio::buffer(payload));
+    for (int poll = 0; poll < 200; ++poll)
     {
-        socket.send(asio::buffer(payload));
-        for (int poll = 0; poll < 15; ++poll)
+        std::array<std::uint8_t, 65535> received{};
+        asio::error_code error;
+        const auto size = socket.receive(asio::buffer(received), 0, error);
+        if (!error)
         {
-            std::array<std::uint8_t, 65535> received{};
-            asio::error_code error;
-            const auto size = socket.receive(asio::buffer(received), 0, error);
-            if (!error)
-            {
-                require(size == payload.size() && std::equal(payload.begin(), payload.end(), received.begin()),
-                        "UDP relay payload mismatch");
-                return;
-            }
-            if (error != asio::error::would_block && error != asio::error::try_again)
-            {
-                throw asio::system_error(error, "UDP relay receive failed");
-            }
-            std::this_thread::sleep_for(10ms);
+            require(size == payload.size() && std::equal(payload.begin(), payload.end(), received.begin()),
+                    "UDP relay payload mismatch");
+            return;
         }
+        if (error != asio::error::would_block && error != asio::error::try_again)
+            throw asio::system_error(error, "UDP relay receive failed");
+        std::this_thread::sleep_for(10ms);
     }
-    throw std::runtime_error("UDP relay did not become ready");
+    throw std::runtime_error("One-shot UDP request did not receive a reply");
 }
 
 void expect_drop(udp::socket &socket, const BytesBuf &payload)
@@ -232,6 +257,7 @@ int main()
         std::thread server_transfer_udp_thread([&server_transfer_udp_io]() { server_transfer_udp_io.run(); });
 
         auto consumer_settings = client_config(control_port);
+        consumer_settings.udp_idle_timeout = 500ms;
         consumer_settings.forwards.push_back(
             AgentForwardConfig{"udp-echo", "127.0.0.1", forward_port, RelayProtocol::Udp});
         consumer_settings.forwards.push_back(
@@ -267,6 +293,8 @@ int main()
         self_probe.connect(udp::endpoint(asio::ip::address_v4::loopback(), self_forward_port));
         self_probe.non_blocking(true);
 
+        wait_service(consumer_control_io, consumer_transfer_io, *consumer, "udp-echo");
+        wait_service(consumer_control_io, consumer_transfer_io, *consumer, "udp-self");
         const BytesBuf maximum_payload(DatagramHeader::maximum_user_payload, 0x5a);
         expect_round_trip(probe, maximum_payload);
         expect_round_trip(self_probe, maximum_payload);
@@ -277,6 +305,44 @@ int main()
         const BytesBuf payload{'u', 'd', 'p', '-', 'r', 'e', 'l', 'a', 'y'};
         expect_round_trip(probe, payload);
         expect_round_trip(second_probe, payload);
+
+        udp::socket same_ip(probe_io, udp::endpoint(asio::ip::address_v4::loopback(), 0));
+        udp::socket other_ip(probe_io, udp::endpoint(asio::ip::make_address("127.0.0.2"), 0));
+        for (auto *client : {&same_ip, &other_ip})
+        {
+            client->connect(probe.remote_endpoint());
+            client->non_blocking(true);
+            expect_round_trip(*client, BytesBuf{});
+        }
+        // Keep all three clients live and interleave them after the last sender changed.
+        expect_round_trip(probe, payload);
+        expect_round_trip(same_ip, BytesBuf{1, 3, 5});
+        expect_round_trip(other_ip, BytesBuf{2, 4, 6});
+        expect_round_trip(probe, payload);
+
+        // Idle cancellation must release the real Node pair and both Agent roles, including self-service.
+        bool drained = false;
+        for (int attempt = 0; attempt < 200; ++attempt)
+        {
+            std::this_thread::sleep_for(10ms);
+            const auto node_empty = asio::co_spawn(server_control_io, [&]() -> asio::awaitable<bool> {
+                co_return test_access::RelayNode_relay_sessions_(*server).empty();
+            }, asio::use_future).get();
+            const auto consumer_empty = asio::co_spawn(consumer_transfer_io, [&]() -> asio::awaitable<bool> {
+                co_return test_access::Forwarder_relays_(*test_access::RelayAgent_forwarder_(*consumer)).empty();
+            }, asio::use_future).get();
+            const auto producer_empty = asio::co_spawn(producer_transfer_io, [&]() -> asio::awaitable<bool> {
+                co_return test_access::Forwarder_relays_(*test_access::RelayAgent_forwarder_(*producer)).empty();
+            }, asio::use_future).get();
+            if (node_empty && consumer_empty && producer_empty)
+            {
+                drained = true;
+                break;
+            }
+        }
+        require(drained, "UDP idle did not release both Agents and the Node pair");
+        expect_round_trip(probe, payload);
+        expect_round_trip(self_probe, payload);
 
         const auto original_probe_port = probe.local_endpoint().port();
         probe.close();
@@ -311,6 +377,19 @@ int main()
         replacement->start();
         std::thread replacement_control_thread([&replacement_control_io]() { replacement_control_io.run(); });
         std::thread replacement_transfer_thread([&replacement_transfer_io]() { replacement_transfer_io.run(); });
+        // A cached service location is not a registration acknowledgement from the replacement Producer.
+        bool registered = false;
+        for (int attempt = 0; attempt < 200; ++attempt)
+        {
+            registered = asio::co_spawn(server_control_io, [&]() -> asio::awaitable<bool> {
+                co_return test_access::RelayNode_registry_(*server).find_service("udp-echo").has_value();
+            }, asio::use_future).get();
+            if (registered)
+                break;
+            std::this_thread::sleep_for(10ms);
+        }
+        require(registered, "Replacement UDP Producer did not register");
+        wait_service(consumer_control_io, consumer_transfer_io, *consumer, "udp-echo");
         expect_round_trip(probe, payload);
         expect_round_trip(second_probe, payload);
 
@@ -330,7 +409,7 @@ int main()
         server_transfer_udp_thread.join();
         echo_thread.join();
 
-        std::cout << "[PASS] Native UDP proactive setup, forwarding, and TLS lifecycle\n";
+        std::cout << "[PASS] Native UDP one-shot setup, multiple client endpoints, forwarding and control lifecycle\n";
         return 0;
     }
     catch (const std::exception &exception)

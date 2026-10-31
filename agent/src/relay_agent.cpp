@@ -114,8 +114,9 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
     const auto relay = root.find("relay");
     if (relay != root.end())
     {
-        reject_unknown_fields(*relay, {"open_timeout_ms"}, "relay");
+        reject_unknown_fields(*relay, {"open_timeout_ms", "udp_idle_timeout_ms"}, "relay");
         result.relay_open_timeout = optional_duration(*relay, "open_timeout_ms", result.relay_open_timeout, "relay");
+        result.udp_idle_timeout = optional_duration(*relay, "udp_idle_timeout_ms", result.udp_idle_timeout, "relay");
     }
 
     const auto reconnect = root.find("reconnect");
@@ -140,9 +141,7 @@ RelayAgent::RelayAgent(asio::io_context &control_io, asio::io_context &transfer_
     : control_executor_(control_io.get_executor()), transfer_executor_(transfer_io.get_executor()),
       config_(std::move(config)), routing_(control_io, config_.routing_max_nodes),
       connection_(*this, control_executor_, ssl_context, config_),
-      forwarder_(std::make_unique<Forwarder>(*this, transfer_executor_, ssl_context, config_.server_name,
-                                             config_.channel.handshake_timeout, config_.connect_timeout,
-                                             config_.relay_open_timeout, config_.services, config_.forwards)),
+      forwarder_(std::make_unique<Forwarder>(*this, transfer_executor_, ssl_context, config_)),
       control_(control_executor_, transfer_executor_, config_, connection_, routing_, *forwarder_)
 {
     if (&control_io == &transfer_io)

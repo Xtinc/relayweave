@@ -263,7 +263,7 @@ Agent 和 Node 工作线程保留普通调度策略，仅通过 `set_current_thr
    - 托管 `AgentRouting`：维护链路质量度量，执行有节点数约束的最短路径计算并管理本地候选路径缓存。
 2. **`transfer_io`（传输执行域）**：
    - 托管 `Forwarder`：管理配置文件声明的所有本地监听器（`forwards`）。
-   - 托管 `AgentSession`：每个进入的客户端连接实例化一个 `AgentSession`，驱动流式数据传输与生命周期管理。
+   - 托管 `AgentSession`：每个进入的流式客户端连接或 UDP 客户端关联实例化一个 `AgentSession`，驱动数据传输与生命周期管理。
 
 #### 跨域协作：`select_relay` 异步调用链
 
@@ -280,6 +280,14 @@ Agent 和 Node 工作线程保留普通调度策略，仅通过 `set_current_thr
 ---
 
 AgentSession 用 `optional<RelayEndpoint>` 表示尚未获得或已获得的接入端点。地址、端口、uuid、ticket、UDP session 与可选 Flow ID 在消息入口完整校验后安装；TLS framing 在入口检查，不保存重复字符串。Forwarder 直接访问这些字段完成原有消息分派和去重；已有 ServiceKey 和 RelaySelection 继续拥有服务协议、选路及 epoch，不将整份 Node 报文留在会话中。
+
+UDP 本地 forward 按 `(forward_id, 客户端 IP, 客户端端口)` 查找独立关联。每个监听器只保存 endpoint → request ID 索引，`relays_` 持有会话；客户端 endpoint 固定保存在该会话的 DatagramData 中。不同客户端复用现有协议分别建立 Node session / Flow，Producer 为每个会话创建独立目标 socket；回包不会再根据最后一次本地发送者选择地址。
+
+首包到来且服务可用、共享容量与建立并发允许时，先保存一份实际长度的 `optional<BytesBuf>` 首包并同步安装索引，再异步开始选路和 attach。建立过程中后续报文直接丢弃，不覆盖首包或延长绝对建立期限；零长度首包也会被保存。attach 返回并收到 ready 后按最终路径的载荷上限检查首包，超长则丢弃，否则发送；缓存保持到异步发送完成，随后清空并开放正常本地转发。原始报文不拼接、不拆分、不自动重放，未准入客户端没有额外等待表。没有预建会话池、自动重建或逐客户端重试定时器；新报文可在旧关联排空后重新触发建立。
+
+Consumer UDP 会话的建立中、运行中和关闭中状态均占用 Agent 原有 1000 个共享会话额度，每会话至多保存一份首包（最大 65499 字节），释放任务时清空首包与 endpoint 索引。新客户端准入时从现有会话容器统计尚未 ready 的 Consumer UDP 会话，同一 Agent 所有 UDP forward 共用建立并发上限，代码固定为 100 个，不提供配置项。ready 会话、TCP/TLS 和 Producer 不占用该建立额度；失败会话排空移除后释放额度。达到上限时直接丢弃新客户端报文，不排队。没有时间窗口、速率限制或独立计数器；此并发上限不代替集群总消息预算。
+
+一个由 Forwarder 持有并排空的 idle 任务扫描已完成首包处理的 Consumer UDP 会话，检查周期为 idle timeout 与 1 秒的较小值。合法出站业务报文成功发送、通过长度/session 校验的入站业务报文更新活动时间，空包也算活动；建立期间丢弃、超长或无效报文不续期。默认空闲 60 秒后通过现有 cancel 链路释放两端会话、目标 socket、Node 配对和 Flow。服务下线、服务所在 Node 改变或控制断开时取消原关联；重复的同位置通知不重建会话。关联索引在任务排空后按 endpoint 和 request ID 同时匹配删除，迟到通知不会复活已关闭会话，也不把用过的会话换绑给其他客户端。直接接入 Node 的其他 UDP 客户端仍不具备 Node 通用 idle 回收。
 
 ### 2.3 核心辅助与状态管理组件
 
@@ -1547,7 +1555,8 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
     "max_delay_ms": 10000
   },
   "relay": {
-    "open_timeout_ms": 10000
+    "open_timeout_ms": 10000,
+    "udp_idle_timeout_ms": 60000
   },
   "routing": {
     "max_nodes": 4
@@ -1591,6 +1600,7 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 | 配置段落 / 字段 | 类型 | 说明 |
 |---|---|---|
 | **`server.host` / `port`** | 字符串/整数 | 初次启动连接的主控 RelayNode 控制端口（默认 18443）。 |
+| **`relay.udp_idle_timeout_ms`** | 正整数，默认 60000 | Consumer UDP 关联双向业务空闲期限；回收通过既有取消链路释放 Node/Producer 资源。 |
 | **`routing.max_nodes`** | 整数 (默认 4) | 运行 Dijkstra 算法时计算的最长中继跳数上限。 |
 | **`services`** | 数组 (Producer 配置) | 声明本机对外提供的真实后端服务。Agent 启动后自动向 Node 发起 `ServiceRegister`。 |
 | **`forwards`** | 数组 (Consumer 配置) | 声明本机需要监听的本地转发端口。当本地客户端连接进入时，触发选路与中继桥接。 |

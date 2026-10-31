@@ -54,7 +54,7 @@ struct RelayAgentTestAccess
                     co_await timer.async_wait(asio::use_awaitable);
                     continue;
                 }
-                // Clear a UDP relay that may have opened before topology/cache availability.
+                // Invalidate prior selections before installing the requested test path.
                 co_await asio::co_spawn(test_access::RelayAgent_transfer_executor_(agent),
                     [forwarder = test_access::RelayAgent_forwarder_(agent).get(), service]() -> asio::awaitable<void> {
                         forwarder->clear_service(service);
@@ -1090,45 +1090,44 @@ void integration()
                     const std::array<std::uint8_t, 4> bytes{7, 6, 5, 4};
                     std::array<std::uint8_t, 32> data;
                     udp::endpoint sender;
-                    bool delivered = false;
-                    for (unsigned attempt = 0; attempt < 40; ++attempt)
-                    {
-                        co_await app.async_send(asio::buffer(bytes), asio::use_awaitable);
-                        const auto [error, size] = co_await udp_target.async_receive_from(asio::buffer(data), sender,
-                            asio::cancel_after(100ms, use_nothrow_awaitable));
-                        if (!error)
-                        {
-                            require(size == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
-                                    "Consumer Agent UDP payload changed");
-                            delivered = true;
-                            break;
-                        }
-                    }
-                    require(delivered, "Consumer Agent UDP path did not become ready");
+                    co_await app.async_send(asio::buffer(bytes), asio::use_awaitable);
+                    const auto first_size = co_await udp_target.async_receive_from(asio::buffer(data), sender,
+                        asio::cancel_after(3s, asio::use_awaitable));
+                    require(first_size == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
+                            "Consumer Agent lost or changed its one-shot first UDP packet");
+                    const auto original_sender = sender;
                     co_await udp_target.async_send_to(asio::buffer(bytes), sender, asio::use_awaitable);
                     const auto n = co_await app.async_receive(asio::buffer(data), asio::cancel_after(1s, asio::use_awaitable));
                     require(n == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
                             "Consumer Agent UDP reverse path failed");
-                    // Both relay branches must enforce the listener's original source-address binding.
+                    // Different IPs and different ports get independent target sockets and fixed return routes.
                     udp::socket stranger(client, {asio::ip::make_address("127.0.0.2"), 0});
                     stranger.connect(app.remote_endpoint());
                     co_await stranger.async_send(asio::buffer(bytes), asio::use_awaitable);
-                    const auto [source_error, source_size] = co_await udp_target.async_receive_from(
-                        asio::buffer(data), sender, asio::cancel_after(150ms, use_nothrow_awaitable));
-                    require(source_error == asio::error::operation_aborted && source_size == 0,
-                            "Consumer Agent forwarded a datagram from a different local source address");
+                    const auto source_size = co_await udp_target.async_receive_from(asio::buffer(data), sender,
+                        asio::cancel_after(3s, asio::use_awaitable));
+                    require(source_size == bytes.size() && sender != original_sender,
+                            "Different-IP UDP client did not obtain an independent target socket");
+                    const auto stranger_sender = sender;
                     udp::socket replacement(client, udp::v4());
                     replacement.connect(app.remote_endpoint());
                     co_await replacement.async_send(asio::buffer(bytes), asio::use_awaitable);
                     const auto forwarded = co_await udp_target.async_receive_from(asio::buffer(data), sender,
-                        asio::cancel_after(1s, asio::use_awaitable));
-                    require(forwarded == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
-                            "Consumer Agent rejected the original source address with a new port");
+                        asio::cancel_after(3s, asio::use_awaitable));
+                    require(forwarded == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()) &&
+                                sender != original_sender && sender != stranger_sender,
+                            "Same-IP UDP clients shared a target socket");
+                    // Reply to earlier requests after the newest endpoint has sent its packet.
+                    co_await udp_target.async_send_to(asio::buffer(bytes), original_sender, asio::use_awaitable);
+                    co_await udp_target.async_send_to(asio::buffer(bytes), stranger_sender, asio::use_awaitable);
                     co_await udp_target.async_send_to(asio::buffer(bytes), sender, asio::use_awaitable);
-                    const auto returned = co_await replacement.async_receive(asio::buffer(data),
-                        asio::cancel_after(1s, asio::use_awaitable));
-                    require(returned == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
-                            "Consumer Agent did not update the local return endpoint");
+                    for (auto *receiver : {&app, &stranger, &replacement})
+                    {
+                        const auto returned = co_await receiver->async_receive(asio::buffer(data),
+                            asio::cancel_after(1s, asio::use_awaitable));
+                        require(returned == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
+                                "Delayed UDP reply crossed client associations");
+                    }
 
                     const BytesBuf maximum(LnkFrameHeader::maximum_payload, 0xa5);
                     BytesBuf large_data(maximum.size() + 1);

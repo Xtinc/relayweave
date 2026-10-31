@@ -68,7 +68,7 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 - Agent 停止（`agent_lifecycle`）：所有者线程顺序调用阻塞 stop，等待控制侧与业务侧排空；完成后重复调用直接返回；排空失败保持 Stopping、保留元数据，解决失败后可再次调用完成排空，最终释放 Agent。
 - Agent 进程（`agent_process`）：真实可执行文件处理 SIGTERM/SIGINT 后阻塞停止并释放监听；启动失败时仍排空、join worker 并返回原异常。
 - Agent 会话（`agent_session`）：正常关闭保留本地双向排空，数据完成后无需等待额外控制关闭；错误原因、终结通知字段及原建立期限保持正确。
-- Agent 集群控制（`agent_cluster_control`）：十入口单主控并发，Producer/Node 晚上线及 UDP 主动建立；主控断开关闭旧业务、重连重新建立；Single 接入等待、缺失端超时、按请求号取消和远端释放；Multi 同类场景由 `relay_paths` 覆盖。
+- Agent 集群控制（`agent_cluster_control`）：十入口单主控并发，Producer/Node 晚上线及 UDP 单次首包按需建立；主控断开关闭旧业务、重连重新建立；Single 接入等待、缺失端超时、按请求号取消和远端释放；Multi 同类场景由 `relay_paths` 覆盖。
 
 
 - 公共控制（`cluster_integration`）：本地/远端发现、状态与拓扑查询、认证来源与路由字段清理、非 Master 拓扑响应拒绝、错误 requester 和关闭会话的迟到响应；重启后重复验证。 拓扑请求只到 Master，所有广播统一排除来源；真实对端通过有序屏障检查普通通知、响应及大报文不回送，成员发布则显式应用到本机 Master 后广播其他节点。发送结果区分停止、未连接和非法消息；Master 出站队列溢出关闭控制连接并丢弃待发消息。
@@ -79,6 +79,7 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 - 进程（`node_process`，Unix/Python）：真实 SIGTERM、未完成 TCP/TLS setup、启动失败退出码与端口重绑，验证线程 join 收尾。
 
 - TCP 复制：两侧读/写失败和限速等待中的对向失败必须排空；正常 EOF 保留反向回传，校验原始异常和实际流量。
+- Agent UDP（`forwarder`、`udp_relay_integration`、`relay_paths`）：单次首包与空首包缓存、建立期间后续包丢弃；同 IP 不同端口、不同 IP、多个监听器与多跳的独立会话及延迟回包；建立并发上限、建立超时、双向 idle、服务变更和停止排空。
 - UDP 复制：零长度、4097 字节及最大合法载荷双向保持原样；短头、错误 session、超限包丢弃后仍能处理后续包；两侧 I/O 失败都能排空。
 - Flow 流控（`lnk_flow_control`）：按本地 TCP 准入、数量上限、UDP 丢包、信用批次、真实 wire 和三跳恢复归类。
   空、1 字节及 257 字节 DATA 按实际长度分配，在三跳双向连续发送超过初始窗口，验证信用扣还、本地占额释放、DATA/FIN 顺序与排空。

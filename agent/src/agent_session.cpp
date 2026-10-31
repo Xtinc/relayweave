@@ -126,7 +126,6 @@ void AgentSession::handle(const CtrlMessage &message)
         PROXY_INFO_PRINT("Relay [+] %s %s service=%s uuid=%llu", relay_protocol_name(service.protocol).data(),
                          producer() ? "producer" : "consumer", service.service.c_str(),
                          static_cast<unsigned long long>(endpoint->uuid));
-        owner.relay_ready(*this);
         changed.cancel();
     }
     else if (command == CtrlCommand::RelayError || command == CtrlCommand::RelayClosed)
@@ -218,7 +217,7 @@ asio::awaitable<void> AgentSession::run()
             }
             else
             {
-                co_await owner.receive_datagrams(*this);
+                co_await owner.relay_datagrams(*this);
             }
 
             cancel("UDP forwarding ended");

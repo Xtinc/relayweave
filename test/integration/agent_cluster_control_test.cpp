@@ -1,6 +1,7 @@
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
+#include "forwarder.h"
 #include "relay_node.h"
 #include "node_session.h"
 #include "xfr_channel.h"
@@ -23,6 +24,7 @@ TEST_MEMBER(RelayNode, relay_sessions_)
 TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(RelayAgent, connection_)
+TEST_MEMBER(RelayAgent, forwarder_)
 
 namespace
 {
@@ -304,21 +306,21 @@ asio::awaitable<void> verify_unavailable(RelayAgent &consumer, const std::vector
     require(locations.at({"late-udp", RelayProtocol::Udp}).node.empty(), "Offline UDP service became available");
 }
 
-asio::awaitable<void> verify_late_udp(const std::shared_ptr<RelayNode> &node, std::uint16_t forward_port)
+asio::awaitable<void> verify_late_udp(RelayAgent &agent, std::uint16_t forward_port)
 {
     const auto executor = co_await asio::this_coro::executor;
     const auto deadline = std::chrono::steady_clock::now() + 8s;
     for (;;)
     {
-        const auto &sessions = test_access::RelayNode_relay_sessions_(*node);
-        if (std::ranges::any_of(sessions, [](const auto &session) {
-                const auto report = session->status_report();
-                return report && report->at("service") == "late-udp";
-            }))
+        const auto &locations = test_access::AgentControl_service_locations_(test_access::RelayAgent_control_(agent));
+        const auto location = locations.find({"late-udp", RelayProtocol::Udp});
+        if (location != locations.end() && !location->second.node.empty())
         {
+            co_await asio::co_spawn(test_access::RelayAgent_forwarder_(agent)->executor(),
+                []() -> asio::awaitable<void> { co_return; }, asio::use_awaitable);
             break;
         }
-        require(std::chrono::steady_clock::now() < deadline, "Late UDP producer did not establish proactively");
+        require(std::chrono::steady_clock::now() < deadline, "Late UDP producer was not discovered");
         asio::steady_timer timer(executor, 20ms);
         co_await timer.async_wait(asio::use_awaitable);
     }
@@ -508,16 +510,16 @@ int main()
             nodes.back()->start();
         });
         asio::co_spawn(control_io, verify_entries(*agents.back(), nodes, forwards, clients), asio::use_future).get();
-        asio::co_spawn(control_io, verify_late_udp(nodes[9], udp_forward), asio::use_future).get();
+        asio::co_spawn(control_io, verify_late_udp(*agents.back(), udp_forward), asio::use_future).get();
         asio::co_spawn(control_io, verify_primary_reconnect(*agents.back(), clients), asio::use_future).get();
         asio::co_spawn(control_io, verify_entries(*agents.back(), nodes, forwards, clients), asio::use_future).get();
-        asio::co_spawn(control_io, verify_late_udp(nodes[9], udp_forward), asio::use_future).get();
+        asio::co_spawn(control_io, verify_late_udp(*agents.back(), udp_forward), asio::use_future).get();
         agents.back()->stop();
         asio::co_spawn(control_io, wait_empty(nodes), asio::use_future).get();
         asio::co_spawn(control_io, verify_detach(client_context, primary_port, nodes), asio::use_future).get();
         asio::co_spawn(control_io, verify_attach_wait(client_context, primary_port, entry_ports[0], nodes),
                        asio::use_future).get();
-        std::cout << "[PASS] Late producer/Node recovery, proactive UDP, delayed attach, timeout and cancellation\n";
+        std::cout << "[PASS] Late producer/Node recovery, one-shot UDP setup, delayed attach, timeout and cancellation\n";
         std::cout << "[PASS] Ten entrances share one Agent control; disconnection closes old business and reconnect establishes new business\n";
         return 0;
     }

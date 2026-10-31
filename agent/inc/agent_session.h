@@ -41,6 +41,9 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
         std::optional<asio::ip::udp::socket> target;
         DatagramHeader::Buffer session_header{};
         std::size_t maximum_payload = DatagramHeader::maximum_user_payload;
+        asio::ip::udp::endpoint local_peer;
+        std::optional<BytesBuf> first_packet;
+        std::chrono::steady_clock::time_point last_activity;
     };
 
     /** @brief Retain the parsed Node attachment on transfer_io; Flow identity is absent for single-node relays. */

@@ -21,7 +21,7 @@ NodeLinkMgr 直接持有 protocol/FlowProtocol；协议服务持有 lnk_channel 
 protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBOR。
 控制通知使用有界协程收发接口，数据域直接逐跳分派，不通过模块回调注册。
 Flow 提交后不做周期续租；控制连接断开、epoch/路径成员失效、NodeLink 断开或显式关闭时清理。
-超时仅用于建立阶段和关闭确认，NodeLink 与集群控制连接使用各自的心跳检测失联。
+路径超时用于建立阶段和关闭确认，UDP 客户端关联另有业务空闲回收；NodeLink 与集群控制连接使用各自的心跳检测失联。
 NodeSession 按所选路径直接持有 ControlRouterSingle 或 ControlRouterMulti，两者都在 control_io 协调业务；多跳首尾通过集群单播通信。
 RelayNode 直接持有唯一 RegistryMgr 和 NodeSession 容器，负责全局业务创建、查找分派和停止排空；控制器只推进自己的实例。
 NodeControl 借用注册表、拓扑和业务元数据，统一处理公共注册、查询与集群响应回送；NodeMetrics 拥有队列探针、流量采样和运行指标。
@@ -32,7 +32,8 @@ Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 
 RelayAgent 直接持有 AgentControl、NodeConnection、AgentRouting 和 Forwarder，配置保留在 relay_agent.h/.cpp。
 AgentControl 借用同级模块，负责发现与入口等待；NodeConnection 直接拥有主控连接及重连和排空状态，AgentRouting 拥有目的 Node 路径缓存。
 Agent 服务发现只保存目的 Node 位置，选路后的逻辑入口控制信令继续由唯一主控连接代转，不提供主控离线定位。
-Forwarder 拥有长期本地监听和业务容器，AgentSession 统一一次 TCP/TLS/UDP 接入与复制；UDP 服务离线时只保留本地 forward。
+Forwarder 拥有长期本地监听和业务容器，AgentSession 统一一次 TCP/TLS/UDP 接入与复制；UDP 按监听器与完整客户端源端点按需建立独立会话，建立期间只缓存首包并丢弃后续包；服务离线时只保留本地 forward。
+UDP Consumer 按双向业务空闲超时回收关联（默认 60 秒），所有监听器共用 UDP 建立并发上限（代码固定为 100 个）；受限的新客户端报文直接丢弃。
 单跳和多跳 TCP/TLS 均保留双向半关闭，UDP 单节点用户载荷上限为 65499 字节、多节点为 65467 字节；服务限速和统计保留在端点，
 共享通道、路径事务、数据热路径和生命周期统一见 [RelayWeave 设计](docs/RelayWeave设计.md)。
 多节点 TCP/TLS 使用逐跳双向信用窗口，拥塞时等待；UDP 满队列丢包而不关闭健康 Flow。

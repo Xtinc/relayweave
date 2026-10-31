@@ -14,38 +14,40 @@ Forwarder::StreamForward::StreamForward(asio::any_io_executor executor, AgentFor
 }
 
 Forwarder::DatagramForward::DatagramForward(asio::any_io_executor executor, AgentForwardConfig config)
-    : listener_socket(executor), retry_timer(std::move(executor)), config(std::move(config))
+    : listener_socket(std::move(executor)), config(std::move(config))
 {
 }
 
 Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ssl::context &ssl_context,
-                     std::optional<std::string> server_name, std::chrono::steady_clock::duration handshake_timeout,
-                     std::chrono::steady_clock::duration connect_timeout,
-                     std::chrono::steady_clock::duration relay_open_timeout, std::vector<AgentServiceConfig> services,
-                     std::vector<AgentForwardConfig> forwards)
+                     const AgentConfig &config)
     : agent_(agent), transfer_work_(asio::make_work_guard(std::move(executor))),
-      session_options_{ssl_context, std::move(server_name), handshake_timeout, connect_timeout},
-      relay_open_timeout_(relay_open_timeout), stopped_event_(transfer_work_.get_executor())
+      session_options_{ssl_context, config.server_name, config.channel.handshake_timeout, config.connect_timeout},
+      relay_open_timeout_(config.relay_open_timeout), udp_idle_timeout_(config.udp_idle_timeout),
+      udp_idle_timer_(transfer_work_.get_executor()),
+      stopped_event_(transfer_work_.get_executor())
 {
-    for (auto &service : services)
+    if (config.udp_idle_timeout <= Clock::duration::zero())
     {
-        auto name = service.name;
-        services_.emplace(std::move(name), std::move(service));
+        throw std::invalid_argument("UDP idle timeout must be positive");
+    }
+    for (const auto &service : config.services)
+    {
+        services_.emplace(service.name, service);
     }
 
-    const auto datagram_count = std::count_if(
-        forwards.begin(), forwards.end(), [](const auto &forward) { return forward.protocol == RelayProtocol::Udp; });
-    stream_forwards_.reserve(forwards.size() - datagram_count);
+    const auto datagram_count = std::count_if(config.forwards.begin(), config.forwards.end(),
+        [](const auto &forward) { return forward.protocol == RelayProtocol::Udp; });
+    stream_forwards_.reserve(config.forwards.size() - datagram_count);
     datagram_forwards_.reserve(datagram_count);
-    for (auto &forward : forwards)
+    for (const auto &forward : config.forwards)
     {
         if (forward.protocol != RelayProtocol::Udp)
         {
-            stream_forwards_.emplace_back(transfer_work_.get_executor(), std::move(forward));
+            stream_forwards_.emplace_back(transfer_work_.get_executor(), forward);
         }
         else
         {
-            datagram_forwards_.emplace_back(transfer_work_.get_executor(), std::move(forward));
+            datagram_forwards_.emplace_back(transfer_work_.get_executor(), forward);
         }
     }
 }
@@ -85,23 +87,20 @@ void Forwarder::start()
                          static_cast<unsigned int>(forward.config.listen_port), forward.config.service.c_str());
         spawn_task(receive_local_datagrams(id), "Local UDP receive loop");
     }
+    if (!datagram_forwards_.empty())
+    {
+        spawn_task(expire_datagrams(), "UDP idle expiry");
+    }
 }
 
 void Forwarder::set_service(ServiceKey service, std::string node)
 {
-    service_nodes_.insert_or_assign(service, std::move(node));
-    if (service.protocol != RelayProtocol::Udp)
+    const auto existing = service_nodes_.find(service);
+    if (existing != service_nodes_.end() && existing->second != node && service.protocol == RelayProtocol::Udp)
     {
-        return;
+        clear_service(service, "service location changed");
     }
-
-    for (DatagramForwardId id = 0; id < datagram_forwards_.size(); ++id)
-    {
-        if (datagram_forwards_[id].config.service == service.service)
-        {
-            open_datagram_forward(id);
-        }
-    }
+    service_nodes_.insert_or_assign(std::move(service), std::move(node));
 }
 
 void Forwarder::clear_service(const ServiceKey &service, std::string reason)
@@ -115,18 +114,6 @@ void Forwarder::clear_service(const ServiceKey &service, std::string reason)
             relay->cancel(reason);
         }
     }
-
-    if (service.protocol == RelayProtocol::Udp)
-    {
-        for (auto &forward : datagram_forwards_)
-        {
-            if (forward.config.service == service.service)
-            {
-                // Preserve the wakeup even if the owned retry has not started waiting yet.
-                forward.retry_timer.expires_at(Clock::now());
-            }
-        }
-    }
 }
 
 void Forwarder::control_disconnected()
@@ -135,10 +122,6 @@ void Forwarder::control_disconnected()
     for (const auto &[request, relay] : relays_)
     {
         relay->cancel("primary control disconnected");
-    }
-    for (auto &forward : datagram_forwards_)
-    {
-        forward.retry_timer.expires_at(Clock::now());
     }
 }
 
@@ -167,6 +150,7 @@ void Forwarder::invalidate_relays(std::string reason)
 asio::awaitable<void> Forwarder::async_stop()
 {
     state_ = State::Stopping;
+    udp_idle_timer_.cancel();
     for (auto &forward : stream_forwards_)
     {
         asio::error_code ignored;
@@ -176,7 +160,6 @@ asio::awaitable<void> Forwarder::async_stop()
     {
         asio::error_code ignored;
         forward.listener_socket.close(ignored);
-        forward.retry_timer.expires_at(Clock::now());
     }
     for (const auto &[request, relay] : relays_)
     {
@@ -248,103 +231,96 @@ asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forwa
             continue;
         }
 
-        if (size > DatagramHeader::maximum_user_payload ||
-            (forward.local_peer && forward.local_peer->address() != source.address()))
+        if (size > DatagramHeader::maximum_user_payload)
         {
             continue;
         }
 
-        forward.local_peer = source;
-        auto relay = forward.relay;
-        if (!relay || !relay->ready || !relay->reason.empty())
+        const auto client = forward.clients.find(source);
+        if (client == forward.clients.end())
         {
+            const ServiceKey service{forward.config.service, RelayProtocol::Udp};
+            const auto destination = service_nodes_.find(service);
+            if (destination == service_nodes_.end() || relays_.size() >= relay_capacity)
+            {
+                continue;
+            }
+            const auto opening = std::count_if(relays_.begin(), relays_.end(), [](const auto &entry) {
+                return entry.second->forward && !entry.second->ready;
+            });
+            if (static_cast<std::size_t>(opening) >= udp_opening_capacity)
+            {
+                continue;
+            }
+            try
+            {
+                auto relay = std::make_shared<AgentSession>(*this, allocate_request_id(), service, destination->second,
+                                                            Clock::now() + relay_open_timeout_);
+                relay->forward = forward_id;
+                auto &sockets = std::get<AgentSession::DatagramData>(relay->data);
+                sockets.local_peer = source;
+                sockets.first_packet.emplace(payload.begin(), payload.begin() + size);
+                start_relay(std::move(relay));
+            }
+            catch (const std::exception &error)
+            {
+                PROXY_ERROR_PRINT("UDP association failed service=%s reason=%s", forward.config.service.c_str(),
+                                  error.what());
+            }
             continue;
         }
 
+        auto relay = relays_.at(client->second);
         auto &sockets = std::get<AgentSession::DatagramData>(relay->data);
-        if (size > sockets.maximum_payload)
+        if (!relay->reason.empty() || !relay->ready || sockets.first_packet || size > sockets.maximum_payload)
         {
             continue;
         }
+        try
+        {
+            co_await send_datagram(*relay, std::span(payload.data(), size));
+        }
+        catch (const std::exception &error)
+        {
+            relay->fail("send relay datagram: " + std::string(error.what()));
+        }
+    }
+}
 
-        const std::array buffers{asio::buffer(sockets.session_header), asio::buffer(payload.data(), size)};
-        const auto [send_error, sent] = co_await sockets.transfer.async_send(buffers, use_nothrow_awaitable);
+asio::awaitable<void> Forwarder::expire_datagrams()
+{
+    const auto interval = std::min(udp_idle_timeout_, Clock::duration(std::chrono::seconds(1)));
+    while (state_ == State::Running)
+    {
+        udp_idle_timer_.expires_after(interval);
+        const auto [error] = co_await udp_idle_timer_.async_wait(use_nothrow_awaitable);
         if (state_ != State::Running)
         {
             co_return;
         }
-        if (send_error || sent != sockets.session_header.size() + size)
+        if (error)
         {
-            relay->fail("send relay datagram: " + (send_error ? send_error.message() : "truncated datagram"));
+            throw asio::system_error(error);
+        }
+        const auto now = Clock::now();
+        for (const auto &[request, relay] : relays_)
+        {
+            if (relay->forward && relay->ready && relay->reason.empty())
+            {
+                const auto &sockets = std::get<AgentSession::DatagramData>(relay->data);
+                if (!sockets.first_packet && now - sockets.last_activity >= udp_idle_timeout_)
+                {
+                    relay->cancel("UDP idle timeout");
+                }
+            }
         }
     }
-}
-
-void Forwarder::open_datagram_forward(DatagramForwardId forward_id)
-{
-    auto &forward = datagram_forwards_[forward_id];
-    if (state_ != State::Running || forward.relay || forward.retry_scheduled)
-    {
-        return;
-    }
-
-    const ServiceKey service{forward.config.service, RelayProtocol::Udp};
-    const auto destination = service_nodes_.find(service);
-    if (destination == service_nodes_.end())
-    {
-        return;
-    }
-
-    auto relay = std::make_shared<AgentSession>(*this, allocate_request_id(), service, destination->second,
-                                                Clock::now() + relay_open_timeout_);
-    relay->forward = forward_id;
-    start_relay(std::move(relay));
-}
-
-void Forwarder::schedule_datagram_retry(DatagramForwardId forward_id)
-{
-    auto &forward = datagram_forwards_[forward_id];
-    if (state_ != State::Running || !service_nodes_.contains(ServiceKey{forward.config.service, RelayProtocol::Udp}))
-    {
-        return;
-    }
-
-    forward.retry_scheduled = true;
-    forward.retry_timer.expires_after(forward.retry_delay);
-    forward.retry_delay = std::min(forward.retry_delay * 2, Clock::duration(std::chrono::seconds(10)));
-    try
-    {
-        spawn_task(retry_datagram_forward(forward_id), "UDP forward retry");
-    }
-    catch (...)
-    {
-        forward.retry_scheduled = false;
-        throw;
-    }
-}
-
-asio::awaitable<void> Forwarder::retry_datagram_forward(DatagramForwardId forward_id)
-{
-    auto &forward = datagram_forwards_[forward_id];
-    const auto [error] = co_await forward.retry_timer.async_wait(use_nothrow_awaitable);
-    forward.retry_scheduled = false;
-    if (error && error != asio::error::operation_aborted)
-    {
-        throw std::runtime_error("udp service=" + forward.config.service + " retry: " + error.message());
-    }
-
-    open_datagram_forward(forward_id);
 }
 
 void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
 {
-    if (relays_.size() >= 1000)
+    if (relays_.size() >= relay_capacity)
     {
-        if (relay->forward)
-        {
-            schedule_datagram_retry(*relay->forward);
-        }
-
         if (relay->producer())
         {
             send_control(relay->selection.server,
@@ -355,22 +331,18 @@ void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
     }
 
     relays_.emplace(relay->request, relay);
-    if (relay->forward)
-    {
-        datagram_forwards_[*relay->forward].relay = relay;
-    }
-
     try
     {
+        if (relay->forward)
+        {
+            const auto &peer = std::get<AgentSession::DatagramData>(relay->data).local_peer;
+            datagram_forwards_[*relay->forward].clients.emplace(peer, relay->request);
+        }
         spawn_task(relay->run(), "Agent session");
     }
     catch (...)
     {
-        relays_.erase(relay->request);
-        if (relay->forward)
-        {
-            datagram_forwards_[*relay->forward].relay.reset();
-        }
+        relay_finished(*relay);
         throw;
     }
 }
@@ -536,28 +508,45 @@ asio::awaitable<RelaySelection> Forwarder::select_relay(ServiceKey service, std:
     return agent_.select_relay(std::move(service), std::move(destination), deadline);
 }
 
-void Forwarder::relay_ready(const AgentSession &relay)
+void Forwarder::relay_finished(AgentSession &relay)
 {
     if (relay.forward)
     {
-        datagram_forwards_[*relay.forward].retry_delay = std::chrono::milliseconds(500);
+        auto &clients = datagram_forwards_[*relay.forward].clients;
+        auto &sockets = std::get<AgentSession::DatagramData>(relay.data);
+        sockets.first_packet.reset();
+        const auto client = clients.find(sockets.local_peer);
+        if (client != clients.end() && client->second == relay.request)
+        {
+            clients.erase(client);
+        }
     }
-}
-
-void Forwarder::relay_finished(const AgentSession &relay)
-{
     relays_.erase(relay.request);
-    if (relay.forward)
-    {
-        auto &listener = datagram_forwards_[*relay.forward];
-        listener.relay.reset();
-        schedule_datagram_retry(*relay.forward);
-    }
 }
 
-asio::awaitable<void> Forwarder::receive_datagrams(AgentSession &relay)
+asio::awaitable<void> Forwarder::send_datagram(AgentSession &relay, std::span<const std::uint8_t> payload)
 {
     auto &sockets = std::get<AgentSession::DatagramData>(relay.data);
+    const std::array<asio::const_buffer, 2> buffers{asio::buffer(sockets.session_header),
+                                                  asio::buffer(payload.data(), payload.size())};
+    const auto sent = co_await sockets.transfer.async_send(buffers, asio::use_awaitable);
+    if (sent != sockets.session_header.size() + payload.size())
+    {
+        throw std::runtime_error("truncated relay datagram");
+    }
+    sockets.last_activity = Clock::now();
+}
+
+asio::awaitable<void> Forwarder::relay_datagrams(AgentSession &relay)
+{
+    auto &sockets = std::get<AgentSession::DatagramData>(relay.data);
+    sockets.last_activity = Clock::now();
+    if (sockets.first_packet->size() <= sockets.maximum_payload)
+    {
+        co_await send_datagram(relay, *sockets.first_packet);
+    }
+    sockets.first_packet.reset();
+
     auto &listener = datagram_forwards_[*relay.forward];
     const auto &header = sockets.session_header;
     std::array<std::uint8_t, DatagramHeader::maximum_wire_payload + 1> buffer;
@@ -577,11 +566,12 @@ asio::awaitable<void> Forwarder::receive_datagrams(AgentSession &relay)
             throw asio::system_error(error);
         }
         if (size < header.size() || size > header.size() + sockets.maximum_payload ||
-            !std::equal(header.begin(), header.end(), buffer.begin()) || !listener.local_peer)
+            !std::equal(header.begin(), header.end(), buffer.begin()))
         {
             continue;
         }
-        const auto peer = *listener.local_peer;
+        sockets.last_activity = Clock::now();
+        const auto peer = sockets.local_peer;
         const auto payload_size = size - header.size();
         const auto sent = co_await listener.listener_socket.async_send_to(
             asio::buffer(buffer.data() + header.size(), payload_size), peer, asio::use_awaitable);

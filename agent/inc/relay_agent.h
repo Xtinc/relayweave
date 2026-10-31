@@ -33,6 +33,7 @@ struct AgentConfig
     std::chrono::steady_clock::duration reconnect_initial_delay = std::chrono::milliseconds(500);
     std::chrono::steady_clock::duration reconnect_max_delay = std::chrono::seconds(10);
     std::chrono::steady_clock::duration relay_open_timeout = std::chrono::seconds(10);
+    std::chrono::steady_clock::duration udp_idle_timeout = std::chrono::seconds(60);
     std::vector<AgentServiceConfig> services;
     std::vector<AgentForwardConfig> forwards;
     TLSChannelConfig channel;
