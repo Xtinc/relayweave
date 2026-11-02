@@ -10,6 +10,7 @@ using namespace std::chrono_literals;
 using tcp = asio::ip::tcp;
 
 TEST_MEMBER(RelayNode, registry_)
+TEST_MEMBER(RelayNode, topology_)
 
 namespace
 {
@@ -128,10 +129,17 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
     {
         a = co_await connect(context, port);
         b = co_await connect(context, port);
+        const auto &master_topology = *test_access::RelayNode_topology_(*master_owner);
+        require(master_topology.epoch() != 0 && master_topology.members().size() == 1 &&
+                    master_topology.members().contains("master"),
+                "Single-node master did not apply its own membership");
         a->send(CtrlMessage{"cluster.join", njson{{"node_id", "a"}}});
         b->send(CtrlMessage{"cluster.join", njson{{"node_id", "b"}}});
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("cluster.joined") == 1; });
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("cluster.joined") == 1; });
+        require(master_topology.members().size() == 3 && master_topology.members().contains("a") &&
+                    master_topology.members().contains("b"),
+                "Master did not apply joined members locally");
 
         const auto broadcast = [&](const std::shared_ptr<TLSChannel> &peer, CtrlMessage message) {
             if (!message.params) message.params = njson::object();
@@ -150,10 +158,14 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
                     b_inbox.messages.back().second.params->at("request_id") == 2 &&
                     !b_inbox.messages.back().second.params->contains("target"),
                 "Directed message lost its source or leaked its target");
+        a->send(CtrlMessage{"direct.self", njson{{"target", "a"}}});
+        co_await receive_until(a, a_inbox, [&] { return a_inbox.count("direct.self") == 1; });
+        require(a_inbox.messages.back().first == "a", "Self-unicast lost its authenticated source");
         master->broadcast(CtrlMessage{"direct.barrier"});
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("direct.barrier") == 1; });
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("direct.barrier") == 1; });
-        require(a_inbox.count("direct") == 0 && b_inbox.count("direct") == 1,
+        require(a_inbox.count("direct") == 0 && b_inbox.count("direct") == 1 &&
+                    b_inbox.count("direct.self") == 0,
                 "Directed message reached a non-target peer");
         require(a_inbox.count("notice") == 0, "Generic broadcast was echoed back to its source");
 
@@ -284,18 +296,24 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         auto raw = co_await connect(context, port);
         raw->send(CtrlMessage{"cluster.join", njson{{"node_id", "raw"}}});
         require((co_await raw->async_receive()).command == "cluster.joined", "Raw peer did not join");
-        raw->send(CtrlMessage{"identity", njson{{"target", "all"}, {"source", "forged"}}});
+        raw->send(CtrlMessage{"identity", njson{{"target", "all"}, {"source", "a"}}});
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("identity") == 1; });
         require(a_inbox.messages.back().first == "raw", "Peer forged the broadcast source");
         master->send("raw", CtrlMessage{"identity.barrier"});
         auto raw_delivery = co_await raw->async_receive();
+        std::uint64_t joined_version = 0;
         while (raw_delivery.command == "topology.members")
         {
             const auto &members = config::message_params(raw_delivery);
-            require(members.at("master") == "master" && members.at("members").is_array(),
+            joined_version = members.at("version").get<std::uint64_t>();
+            require(members.at("source") == "master" && members.at("master") == "master" &&
+                        members.at("epoch") == master_topology.epoch() && members.at("members").size() == 4 &&
+                        !members.contains("target"),
                     "Cluster membership announcement is invalid");
             raw_delivery = co_await raw->async_receive();
         }
+        require(joined_version != 0 && master_topology.members().contains("raw"),
+                "Member join did not reach both the master and the joining peer");
         require(raw_delivery.command == "identity.barrier" && raw_delivery.params->at("source") == "master",
                 "Raw peer received its own broadcast or lost the ordering barrier");
         require(!raw_delivery.params->contains("target"), "Raw unicast leaked its target");
@@ -311,6 +329,13 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         }
         require(invalid_closed, "Invalid cluster command did not close the session");
         co_await raw->async_disconnect();
+        co_await receive_until(a, a_inbox, [&] {
+            const auto &message = a_inbox.messages.back().second;
+            return message.type() == CtrlCommand::TopologyMembers && message.params->at("version") > joined_version;
+        });
+        require(!master_topology.members().contains("raw") && master_topology.members().size() == 3 &&
+                    a_inbox.messages.back().second.params->at("members").size() == 3,
+                "Member leave did not reach both the master and remaining peers");
 
         // Overflow must drop pending messages and close joined and handshaking peers.
         tcp::socket stalled(io);
@@ -520,6 +545,22 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
     peer->send(located_reply(fresh));
     const auto current = co_await client_reply(replacement, CtrlCommand::ServiceLocated);
     require(current.params->at("request_id") == 203U, "Late reply reached the replacement client");
+
+    replacement->send(CtrlMessage(CtrlCommand::ServiceRegister,
+                                 njson{{"request_id", 204U}, {"service", "master-only-query"}, {"protocol", "tcp"}}));
+    co_await client_reply(replacement, CtrlCommand::ServiceOk);
+    njson lookup{{"request_id", 205U}, {"service", "master-only-query"}, {"protocol", "tcp"},
+                 {"session_id", fresh.params->at("session_id")}};
+    require(test_node::cluster(master).broadcast(CtrlMessage(CtrlCommand::ServiceLookup, lookup)) ==
+                ClusterMgr::SendResult::Submitted,
+            "Master rejected a local broadcast");
+    lookup["request_id"] = 206U;
+    require(test_node::cluster(master).send("test-master", CtrlMessage(CtrlCommand::ServiceLookup, std::move(lookup))) ==
+                ClusterMgr::SendResult::Submitted,
+            "Master rejected a self-unicast");
+    const auto self = co_await client_reply(replacement, CtrlCommand::ServiceLocated);
+    require(self.params->at("request_id") == 206U && self.params->at("node_id") == "test-master",
+            "Master echoed its own broadcast or failed to deliver a self-unicast");
     co_await local->async_disconnect();
     co_await replacement->async_disconnect();
 }

@@ -296,10 +296,6 @@ void NodeControl::handle_cluster_location(CtrlMessage message)
 void NodeControl::handle_cluster_status_query(const njson &params)
 {
     const auto &requester = params.at("source").get_ref<const std::string &>();
-    if (requester == node_id_)
-    {
-        return;
-    }
     static_cast<void>(config::require_unsigned(params, "session_id", true));
     const auto request_id = config::require_unsigned(params, "request_id", true);
     auto report = server_status_message(request_id);

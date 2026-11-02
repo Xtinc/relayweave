@@ -346,7 +346,7 @@ flowchart TB
    - Slave 建立 TLS 连接后，向 Master 发送 `cluster.join` 控制消息，携带本机的 `node_id` 与发布地址 `address`。
    - Master 接收到请求后，检查 `node_id` 非空、长度不超过 256 字节、非保留名 `all` 且在集群内唯一；连接身份由 mTLS 证书链验证。
    - 校验通过后，Master 登记该节点，并向该 Slave 回复 `cluster.joined` 报文。
-   - 随后，Master 递增成员版本 `version`，向所有已加入节点广播 `topology.members`，携带 Epoch、version、Master 标识与完整成员列表。
+   - 随后，Master 递增成员版本 `version`，先在本机应用 `topology.members`，再广播给其他已加入节点，携带 Epoch、version、Master 标识与完整成员列表。
 2. **Epoch 纪元防呆机制**：
    - Master 启动时生成非零随机 Epoch，该进程生命周期内保持不变；节点重新接入更新成员 version。
    - 所有中继路径 Flow 的创建与交互均携带创建时的 Epoch；一旦节点收到属于旧 Epoch 的控制报文，立即判定为过期分区消息并拒绝执行。
@@ -354,10 +354,12 @@ flowchart TB
 #### 3.1.3 集群消息定向路由与广播
 
 Master 的 `ClusterRoom` 作为集群内部的控制交换矩阵，提供两类消息投递模式：
-- **定向交付（Unicast）**：源节点在消息参数中指定 `target`。Master 查表，移除 `target` 并按连接身份写入 `source`，将消息投递至目标节点的专用控制连接，用于首末节点握手（`RelayPeerOpen` / `RelayPeerReady`）。
+- **定向交付（Unicast）**：源节点在消息参数中指定 `target`。Master 查表，移除 `target` 并按连接身份写入 `source`，将消息投递至目标节点的专用控制连接，用于首末节点握手（`RelayPeerOpen` / `RelayPeerReady`）等。目标可为发送者自身，包括 Master 本机。
 - **全网广播（Broadcast）**：通过 `target: "all"` 分发服务/状态查询、会话解绑和成员通知。Master 一律向已加入的其他参与者投递，排除认证 source，不按业务命令分类。发布方自行完成需要的本地处理。
 - **成员发布**：`publish_members()` 先通过定向交付将成员表应用到本机 Master，再广播给其他节点。每个节点仍只应用一次；通用路由层不为 `topology.members` 设置特殊回送规则。
 - **拓扑查询**：Master 本地直接生成快照；Slave 仅向 `topology_.master_id()` 单播 `topology.query`，Master 按原 session/request 路由返回快照。尚未获知 Master 时不提交无目标查询，发现端沿用原有查询周期。该路径不增加缓存、目录或后台任务。
+
+广播不承担来源节点的本地处理：服务查询先查本地注册表，集群状态查询先回复本机状态，控制断开先清理本地会话。回送只会重复这些工作；成员发布复用定向交付完成本地应用后即可使用相同广播规则。Slave 发起的每次广播因此少一次跨节点回送，Master 发起的广播少一次本地派发。成员变化时多一次本机定向路由，跨节点消息数量不变；无需增加业务命令特例、回送开关或状态。
 
 ---
 

@@ -82,7 +82,7 @@ class ClusterRoom
         return participants_.size();
     }
 
-    /** @brief Validate routing, stamp the authenticated source, and deliver unicast or broadcast. */
+    /** @brief Route unicast by target and broadcast to joined members other than the authenticated source. */
     void deliver(std::string_view source, CtrlMessage message)
     {
         if (message.command.starts_with("cluster."))
@@ -118,7 +118,7 @@ class ClusterRoom
 
         for (const auto &participant : participants_)
         {
-            if (!participant->node_id().empty())
+            if (!participant->node_id().empty() && participant->node_id() != source)
             {
                 participant->deliver(message);
             }
@@ -162,7 +162,9 @@ class ClusterRoom
                                                                 {"version", version_},
                                                                 {"master", master_id_},
                                                                 {"members", std::move(members)},
-                                                                {"target", cluster_broadcast_target}}};
+                                                                {"target", master_id_}}};
+        deliver(master_id_, message);
+        (*message.params)["target"] = cluster_broadcast_target;
         deliver(master_id_, std::move(message));
     }
 
