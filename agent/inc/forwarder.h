@@ -12,7 +12,7 @@ class AgentSession;
 
 /**
  * @brief Own local forwards, business sessions, UDP associations, and idle expiry on transfer_io.
- * @details Borrows RelayAgent and the TLS context through shutdown. Owns all listeners and session
+ * @details Borrows RelayAgent through shutdown and owns its business RPK context. Owns all listeners and session
  * associations; AgentSession uses lifecycle notifications instead of modifying these containers.
  * async_stop() drains listeners, idle expiry, and business tasks before releasing the transfer work guard.
  */
@@ -23,7 +23,7 @@ class Forwarder
      * @brief Construct listeners and session settings without starting I/O.
      * @param agent Borrowed composition root used for cross-domain entrance selection.
      * @param executor Single-threaded transfer executor owning all forward and session state.
-     * @param ssl_context Borrowed TLS context, valid until business tasks drain.
+     * @param ssl_context Existing control identity; its certificate and key are retained by the business context.
      * @param config Settings and listener descriptions copied during construction.
      */
     Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ssl::context &ssl_context,
@@ -32,9 +32,9 @@ class Forwarder
     struct SessionOptions
     {
         asio::ssl::context &ssl_context;
-        std::optional<std::string> server_name;
         std::chrono::steady_clock::duration handshake_timeout;
         std::chrono::steady_clock::duration connect_timeout;
+        std::chrono::steady_clock::duration disconnect_timeout;
     };
     /** @brief Read the business execution domain. @return Executor owning every session socket. */
     asio::any_io_executor executor() const
@@ -104,6 +104,7 @@ class Forwarder
      * @brief Match a business message or create its producer session on transfer_io.
      * @param route Primary control source and logical business Node.
      * @param message Owned message, matched by source, protocol, request and/or UUID.
+     * @pre AgentControl has validated that message parameters are an object before posting to transfer_io.
      */
     void relay_message(ServerRoute route, CtrlMessage message);
     /**
@@ -155,6 +156,7 @@ class Forwarder
     static constexpr std::size_t udp_opening_capacity = 100;
     RelayAgent &agent_;
     asio::executor_work_guard<asio::any_io_executor> transfer_work_;
+    asio::ssl::context business_context_{asio::ssl::context::tls};
     SessionOptions session_options_;
     std::chrono::steady_clock::duration relay_open_timeout_;
     std::chrono::steady_clock::duration udp_idle_timeout_;

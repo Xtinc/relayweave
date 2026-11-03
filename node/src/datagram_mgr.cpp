@@ -117,10 +117,6 @@ asio::awaitable<void> DatagramMgr::prepare_remote_pair(std::uint64_t uuid, FlowP
 asio::awaitable<void> DatagramMgr::run_remote_pair(std::uint64_t uuid)
 {
     auto endpoint = remote_pairs_.at(uuid);
-    if (!endpoint->active)
-    {
-        throw std::runtime_error("relay bridge unavailable");
-    }
     const auto accessor = endpoint->track_accessor();
     const auto header = DatagramHeader::encode(endpoint->session_id);
     auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
@@ -164,7 +160,9 @@ void DatagramMgr::close_remote_pair(std::uint64_t uuid)
 AttachPair DatagramMgr::install_local_pair()
 {
     if (stopped_ || local_pairs_.size() + remote_pairs_.size() >= capacity_)
+    {
         throw std::runtime_error(stopped_ ? "server stopping" : "relay capacity reached");
+    }
     const auto uuid = id_allocator_->allocate();
     ScopeGuard rollback([this, uuid] { id_allocator_->release(uuid); });
     auto pair = std::make_shared<LocalPair>(executor_);
@@ -191,17 +189,19 @@ asio::awaitable<void> DatagramMgr::prepare_local_pair(std::uint64_t uuid, SRVTra
 asio::awaitable<void> DatagramMgr::run_local_pair(std::uint64_t uuid)
 {
     auto pair = local_pairs_.at(uuid);
-    if (!pair->active)
-        throw std::runtime_error("local pair unavailable");
     if (!co_await pair->finished.wait())
+    {
         throw asio::system_error(asio::error::operation_aborted);
+    }
 }
 
 void DatagramMgr::close_local_pair(std::uint64_t uuid)
 {
     const auto it = local_pairs_.find(uuid);
     if (it == local_pairs_.end())
+    {
         return;
+    }
     auto pair = it->second;
     local_pairs_.erase(it);
     bindings_.erase(pair->producer_session_id);
@@ -220,7 +220,9 @@ void DatagramMgr::stop()
     asio::error_code ignored;
     socket_.close(ignored);
     while (!local_pairs_.empty())
+    {
         close_local_pair(local_pairs_.begin()->first);
+    }
 }
 
 asio::awaitable<void> DatagramMgr::receive_datagram()
@@ -287,6 +289,10 @@ std::optional<DatagramMgr::RoutedDatagram> DatagramMgr::route_datagram(std::span
         try
         {
             attach = RelayAttach::from_msg(decode_ctrl_datagram(datagram));
+            if (attach.connection_id)
+            {
+                return std::nullopt;
+            }
         }
         catch (...)
         {
@@ -306,16 +312,22 @@ std::optional<DatagramMgr::RoutedDatagram> DatagramMgr::route_datagram(std::span
         }
         const auto owner = local_pairs_.find(attach.uuid);
         if (owner == local_pairs_.end())
+        {
             return std::nullopt;
+        }
         const auto &pair = owner->second;
         const auto side = attach.role == RelayAttach::Producer ? Side::Producer : Side::Consumer;
         auto &source_endpoint = pair->endpoint(side);
         const auto expected = side == Side::Producer ? pair->producer_ticket : pair->consumer_ticket;
         if (source_endpoint || attach.ticket != expected)
+        {
             return std::nullopt;
+        }
         source_endpoint = source;
         if (pair->producer_endpoint && pair->consumer_endpoint)
+        {
             pair->attached.notify_all();
+        }
         return std::nullopt;
     }
 

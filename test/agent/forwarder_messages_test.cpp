@@ -37,7 +37,7 @@ njson endpoint_params(RelayProtocol protocol)
 {
     return njson{{"service", service_name(protocol)}, {"protocol", relay_protocol_name(protocol)},
                  {"data_address", "127.0.0.1"}, {"data_port", 1U}, {"uuid", 11U}, {"ticket", 12U},
-                 {"session_id", 13U}, {"tls_framing", tls_data_framing}};
+                 {"session_id", 13U}};
 }
 
 asio::awaitable<void> start_consumer(Forwarder &owner, RelayProtocol protocol, std::uint64_t request)
@@ -110,11 +110,6 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
         auto missing = endpoint_params(protocol);
         missing.erase("ticket");
         invalid.push_back(std::move(missing));
-        if (protocol == RelayProtocol::Tls)
-        {
-            add("tls_framing", "unsupported");
-            add("tls_framing", 1U);
-        }
         if (protocol == RelayProtocol::Udp)
             add("session_id", 0U);
         for (auto params : invalid)

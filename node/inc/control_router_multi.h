@@ -35,6 +35,13 @@ class ControlRouterMulti
      */
     bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message);
     /**
+     * @brief Authorize a parsed stream attachment against this relay on control_io.
+     * @param session Authenticated Agent source, locally or through its primary Node.
+     * @param request Attachment parsed and validated once by RelayNode.
+     * @return True if this source and UUID match, including ignored roles or expired attachments.
+     */
+    bool handle_attach(const AgentPeer &session, const RelayAttach &request);
+    /**
      * @brief Consume matching authenticated peer messages, including duplicates during cleanup.
      * @param command Control command already parsed by the caller.
      * @param message Control message to dispatch; ownership of its parameters may be transferred.

@@ -27,17 +27,6 @@
     "tx_bytes_per_second": 1003,
     "tx_max_burst_bytes": 1004
   },
-  "tls": {
-    "address": "127.0.0.1",
-    "port": 18446,
-    "max_setup_connections": 8,
-    "max_relays": 10,
-    "setup_timeout_ms": 1800,
-    "rx_bytes_per_second": 3001,
-    "rx_max_burst_bytes": 3002,
-    "tx_bytes_per_second": 3003,
-    "tx_max_burst_bytes": 3004
-  },
   "udp": {
     "address": "127.0.0.1",
     "port": 18445,

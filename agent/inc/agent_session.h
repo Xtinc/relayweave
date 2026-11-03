@@ -68,6 +68,17 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
     void fail(std::string cause);
     void close_io();
     asio::awaitable<void> attach();
+    /** @brief Authenticate the peer and confirm the service before touching the TLS Producer target. */
+    asio::awaitable<void> establish_tls();
+    /** @brief Complete TLS shutdown and carrier EOF on transfer_io within one disconnect deadline. */
+    asio::awaitable<void> finish_tls();
+    /** @brief Connect the Producer local TCP target within the original setup deadline. */
+    asio::awaitable<void> connect_target();
+    /** @brief Limit one setup operation to its remaining absolute establishment budget. */
+    std::chrono::steady_clock::duration remaining(std::chrono::steady_clock::duration timeout) const;
+    enum class Phase { Opening, TunnelReady, Ready };
+    bool ready() const { return phase == Phase::Ready; }
+    bool tunnel_ready() const { return phase >= Phase::TunnelReady; }
 
     Forwarder &owner;
     std::uint64_t request;
@@ -81,7 +92,7 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
     using Data = std::variant<StreamData, DatagramData>;
     Data data;
     asio::steady_timer changed;
-    bool ready = false;
+    Phase phase = Phase::Opening;
     bool node_closed = false;
     std::string reason;
 };

@@ -730,8 +730,20 @@ CtrlMessage RelayAttach::to_msg(const RelayAttach &self)
         throw std::invalid_argument("relay.attach uuid and ticket must not be zero");
     }
 
-    return CtrlMessage{CtrlCommand::RelayAttach,
-                       njson{{"role", self.role}, {"uuid", self.uuid}, {"ticket", self.ticket}}};
+    njson params{{"role", self.role}, {"uuid", self.uuid}, {"ticket", self.ticket}};
+    if (self.connection_id)
+    {
+        constexpr char hex[] = "0123456789abcdef";
+        std::string encoded;
+        encoded.reserve(self.connection_id->size() * 2);
+        for (const auto byte : *self.connection_id)
+        {
+            encoded.push_back(hex[byte >> 4]);
+            encoded.push_back(hex[byte & 15]);
+        }
+        params["connection_id"] = std::move(encoded);
+    }
+    return CtrlMessage{CtrlCommand::RelayAttach, std::move(params)};
 }
 
 RelayAttach RelayAttach::from_msg(const CtrlMessage &message)
@@ -754,7 +766,33 @@ RelayAttach RelayAttach::from_msg(const CtrlMessage &message)
     }
     const auto role = *role_iterator == Producer ? Producer : Consumer;
 
-    return {role, config::require_unsigned(params, "uuid", true), config::require_unsigned(params, "ticket", true)};
+    RelayAttach result{role, config::require_unsigned(params, "uuid", true),
+                       config::require_unsigned(params, "ticket", true), {}};
+    if (params.contains("connection_id"))
+    {
+        const auto encoded = config::optional_string(params, "connection_id", "");
+        result.connection_id.emplace();
+        if (encoded.size() != result.connection_id->size() * 2)
+        {
+            throw std::invalid_argument("Invalid connection_id length");
+        }
+        const auto nibble = [](char ch) -> unsigned {
+            if (ch >= '0' && ch <= '9')
+            {
+                return ch - '0';
+            }
+            if (ch >= 'a' && ch <= 'f')
+            {
+                return ch - 'a' + 10;
+            }
+            throw std::invalid_argument("Invalid connection_id encoding");
+        };
+        for (std::size_t i = 0; i < result.connection_id->size(); ++i)
+        {
+            (*result.connection_id)[i] = (nibble(encoded[i * 2]) << 4) | nibble(encoded[i * 2 + 1]);
+        }
+    }
+    return result;
 }
 
 namespace

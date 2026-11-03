@@ -73,6 +73,13 @@ class NodeSession
      */
     bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message);
     /**
+     * @brief Authorize a parsed stream attachment against this relay on control_io.
+     * @param session Authenticated Agent source, locally or through its primary Node.
+     * @param request Attachment parsed and validated once by RelayNode.
+     * @return True if this source and UUID match, including ignored roles or expired attachments.
+     */
+    bool handle_attach(const AgentPeer &session, const RelayAttach &request);
+    /**
      * @brief Consume matching peer messages until this instance's task has fully drained.
      * @param command Control command already parsed by the caller.
      * @param message Control message to dispatch; ownership of its parameters may be transferred.
@@ -121,16 +128,21 @@ class NodeSession
     asio::awaitable<void> close();
     /** @brief Notify an Agent through its primary Node; throw if local submission fails. */
     void send_agent(const AgentPeer &route, CtrlMessage message) const;
+    /** @brief Validate the installed ticket and submit at most one owned bind task per role. */
+    void attach(const RelayAttach &request);
     std::uint64_t uuid() const;
     RelayNode &node_;
-    using DataManager = std::variant<TcpPipeline *, TlsPipeline *, DatagramMgr *>;
+    using DataManager = std::variant<StreamPipeline *, DatagramMgr *>;
     DataManager data_manager_;
+    RelayProtocol protocol_;
     std::variant<ControlRouterSingle, ControlRouterMulti> control_;
     DataManager select_data(RelayProtocol protocol) const;
     asio::any_io_executor data_executor() const;
     asio::cancellation_signal cancellation_;
     Attachment endpoint_;
     SRVTrafficPtr traffic_;
+    asio::steady_timer bindings_done_;
+    unsigned binding_roles_ = 0;
 };
 
 using NodeSessionList = std::vector<std::shared_ptr<NodeSession>>;

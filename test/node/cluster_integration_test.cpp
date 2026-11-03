@@ -101,7 +101,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
     std::vector<std::shared_ptr<ClusterMgr>> nodes;
     auto make_owner = [&](const ClusterConfig &cluster) {
         auto settings = make_test_node_config();
-        settings.control.address = settings.tcp.address = settings.tls.address = settings.datagram.address =
+        settings.control.address = settings.tcp.address = settings.datagram.address =
             "127.0.0.1";
         settings.cluster = cluster;
         settings.channel = channel;
@@ -577,7 +577,7 @@ void verify_relay_node(asio::ssl::context &context, asio::ssl::context &client_c
 
     auto settings = make_test_node_config();
     context.load_verify_file((test_data::directory() / "tls_channel_test_client_ca.pem").string());
-    settings.control.address = settings.tcp.address = settings.tls.address = settings.datagram.address = "127.0.0.1";
+    settings.control.address = settings.tcp.address = settings.datagram.address = "127.0.0.1";
     settings.cluster.control_port = port;
     settings.channel.disconnect_timeout = 100ms;
     tcp::acceptor client_reservation(control, {asio::ip::address_v4::loopback(), 0});
@@ -648,7 +648,7 @@ void verify_relay_node(asio::ssl::context &context, asio::ssl::context &client_c
         const auto epoch = result.get();
         master->stop();
         auto restarted = make_test_node_config();
-        restarted.control.address = restarted.tcp.address = restarted.tls.address = restarted.datagram.address = "127.0.0.1";
+        restarted.control.address = restarted.tcp.address = restarted.datagram.address = "127.0.0.1";
         restarted.cluster.control_port = port;
         restarted.channel.disconnect_timeout = 100ms;
         restarted.control.port = master_port;

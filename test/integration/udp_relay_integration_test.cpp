@@ -236,8 +236,6 @@ int main()
         settings.control.port = control_port;
         settings.tcp.address = "127.0.0.1";
         settings.tcp.port = tcp_data_port;
-        settings.tls.address = "127.0.0.1";
-        settings.tls.port = 0;
         settings.datagram.address = "127.0.0.1";
         settings.datagram.port = udp_data_port;
         settings.tcp.max_relays = 8;

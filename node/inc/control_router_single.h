@@ -46,6 +46,13 @@ class ControlRouterSingle
      */
     bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message);
     /**
+     * @brief Authorize a parsed stream attachment against this relay on control_io.
+     * @param session Authenticated Agent source, locally or through its primary Node.
+     * @param request Attachment parsed and validated once by RelayNode.
+     * @return True if this source and UUID match, including ignored roles or expired attachments.
+     */
+    bool handle_attach(const AgentPeer &session, const RelayAttach &request);
+    /**
      * @brief Return ready relay metadata, or no report while opening or closing.
      * @return Metadata for a ready, live relay; std::nullopt while opening, closing, or lacking its control
      * session.

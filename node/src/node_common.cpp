@@ -11,10 +11,6 @@ njson AttachInfo::to_params(RelayProtocol protocol) const
     {
         params["session_id"] = session_id;
     }
-    else if (protocol == RelayProtocol::Tls)
-    {
-        params["tls_framing"] = std::string(tls_data_framing);
-    }
     return params;
 }
 

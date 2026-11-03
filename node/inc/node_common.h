@@ -109,7 +109,7 @@ struct AttachInfo
 {
     /**
      * @brief Encode attachment fields for an Agent control notification.
-     * @param protocol Agent-facing transport determining UDP session and TLS framing fields.
+     * @param protocol Logical service protocol; only UDP adds a session ID.
      * @return Parameters containing uuid, ticket, and data_port, plus transport-specific fields.
      * @pre The descriptor belongs to protocol; UDP requires a nonzero session_id.
      */

@@ -12,9 +12,7 @@ ControlRouterMulti::ControlRouterMulti(NodeSession &relay, const AgentPeer &sess
 {
     const auto protocol = params.protocol;
     const auto &config = relay.node_.config_;
-    const auto timeout = protocol == RelayProtocol::Udp   ? config.datagram.setup_timeout
-                         : protocol == RelayProtocol::Tls ? config.tls.setup_timeout
-                                                          : config.tcp.setup_timeout;
+    const auto timeout = protocol == RelayProtocol::Udp ? config.datagram.setup_timeout : config.tcp.setup_timeout;
     deadline_ = Clock::now() + timeout;
     if (ingress_)
     {
@@ -63,33 +61,27 @@ std::optional<njson> ControlRouterMulti::status_report() const
 
 void ControlRouterMulti::notify_agent() const
 {
-    if (const auto &session = session_; session)
+    auto values = std::get<AttachInfo>(relay_.endpoint_).to_params(relay_.protocol());
+    values["service"] = service_;
+    values["protocol"] = relay_protocol_name(relay_.protocol());
+    values["epoch"] = epoch_;
+    values["flow_id"] = flow_id_;
+    if (ingress_)
     {
-        auto values = std::get<AttachInfo>(relay_.endpoint_).to_params(relay_.protocol());
-        values["service"] = service_;
-        values["protocol"] = relay_protocol_name(relay_.protocol());
-        values["epoch"] = epoch_;
-        values["flow_id"] = flow_id_;
-        if (ingress_)
-        {
-            values["request_id"] = request_id_;
-        }
-        relay_.send_agent(
-            session, CtrlMessage(ingress_ ? CtrlCommand::RelayOpened : CtrlCommand::RelayOffer, std::move(values)));
+        values["request_id"] = request_id_;
     }
+    relay_.send_agent(session_,
+                      CtrlMessage(ingress_ ? CtrlCommand::RelayOpened : CtrlCommand::RelayOffer, std::move(values)));
 }
 
 void ControlRouterMulti::ready_agent()
 {
+    njson values{{"uuid", relay_.uuid()},
+                 {"protocol", relay_protocol_name(relay_.protocol())},
+                 {"epoch", epoch_},
+                 {"flow_id", flow_id_}};
+    relay_.send_agent(session_, CtrlMessage(CtrlCommand::RelayReady, std::move(values)));
     progress_ = Progress::Ready;
-    if (const auto &session = session_; session)
-    {
-        njson values{{"uuid", relay_.uuid()},
-                     {"protocol", relay_protocol_name(relay_.protocol())},
-                     {"epoch", epoch_},
-                     {"flow_id", flow_id_}};
-        relay_.send_agent(session, CtrlMessage(CtrlCommand::RelayReady, std::move(values)));
-    }
     PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", relay_protocol_name(relay_.protocol()).data(),
                      service_.c_str(), static_cast<unsigned long long>(relay_.uuid()));
 }
@@ -186,6 +178,19 @@ bool ControlRouterMulti::handle(CtrlCommand command, const AgentPeer &session, c
     return true;
 }
 
+bool ControlRouterMulti::handle_attach(const AgentPeer &session, const RelayAttach &request)
+{
+    if (stop_requested_ || session_ != session || request.uuid != relay_.uuid())
+    {
+        return false;
+    }
+    if (Clock::now() < deadline_ && request.role == (ingress_ ? RelayAttach::Consumer : RelayAttach::Producer))
+    {
+        relay_.attach(request);
+    }
+    return true;
+}
+
 void ControlRouterMulti::control_disconnected(const AgentPeer &session)
 {
     if (session_ == session)
@@ -215,12 +220,13 @@ bool ControlRouterMulti::handle_peer(CtrlCommand command, const CtrlMessage &mes
         return true;
     }
 
-    if ((command == CtrlCommand::RelayPeerAttached && ingress_) ||
-        (command == CtrlCommand::RelayPeerReady && !ingress_))
+    if (((command == CtrlCommand::RelayPeerAttached && ingress_) ||
+         (command == CtrlCommand::RelayPeerReady && !ingress_)) &&
+        !peer_prepared_)
     {
         peer_prepared_ = true;
     }
-    else if (command == CtrlCommand::RelayPeerFinished)
+    else if (command == CtrlCommand::RelayPeerFinished && !peer_finished_)
     {
         peer_finished_ = true;
     }
@@ -356,9 +362,9 @@ asio::awaitable<void> ControlRouterMulti::establish_and_transfer()
     {
         send_peer(CtrlCommand::RelayPeerAttached, njson::object());
     }
+    changed_.expires_at(deadline_);
     while (!peer_prepared_ && !stop_requested_)
     {
-        changed_.expires_at(deadline_);
         co_await changed_.async_wait(use_nothrow_awaitable);
         if (Clock::now() >= deadline_)
         {
@@ -382,9 +388,13 @@ asio::awaitable<void> ControlRouterMulti::establish_and_transfer()
     stage_ = "transfer";
     co_await relay_.bridge();
     send_peer(CtrlCommand::RelayPeerFinished, njson::object());
+    changed_.expires_after(relay_.node_.config_.channel.disconnect_timeout);
     while (!peer_finished_ && !stop_requested_)
     {
-        changed_.expires_at(Clock::time_point::max());
+        if (Clock::now() >= changed_.expiry())
+        {
+            throw asio::system_error(asio::error::timed_out, "peer Finished timed out");
+        }
         co_await changed_.async_wait(use_nothrow_awaitable);
     }
 

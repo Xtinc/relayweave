@@ -5,7 +5,7 @@
 | 文件 / 可执行目标 | 测量问题 | 关键指标 |
 |---|---|---|
 | `tcp_relay_benchmark.cpp` / `benchmark_tcp_relay` | TCP relay 相对直连的转发成本；1400 B / 32 KiB 块 | 双向业务吞吐、块/秒、CPU 时间；直连使用相同生成与校验逻辑 |
-| `tls_relay_benchmark.cpp` / `benchmark_tls_relay` | TLS 1.2 / 1.3 的 TLS↔TLS 与 TCP↔TLS relay 成本 | 双向业务吞吐、CPU 时间；握手单独计时，记录协商版本和密码套件 |
+| `tls_relay_benchmark.cpp` / `benchmark_tls_relay` | TLS 1.3 双向 RPK 的 Agent TCP↔TLS relay 成本 | 双向业务吞吐、CPU 时间；握手单独计时，记录协商版本和密码套件 |
 | `udp_relay_benchmark.cpp` / `benchmark_udp_relay` | UDP relay 的往返成本与持续双向发包能力；1400 B 业务报文 | RTT p50/p95/p99、发包/转发 pps、业务吞吐、各方向接收量、丢包率、乱序数 |
 | `flow_benchmark.cpp` / `benchmark_flow` | Flow 复用与多跳转发的开销 | 终点吞吐、每流发送等待 p50/p95/p99、CPU、RSS、各节点缓存与载荷池占用 |
 | `congestion_benchmark.cpp` / `benchmark_congestion` | 带宽降低、恢复与单流暂停时的信用流控及背压能力 | 稳态吞吐、收敛时间、超额字节、公平性、健康流进展、缓存上限与排空 |

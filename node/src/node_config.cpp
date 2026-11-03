@@ -48,7 +48,7 @@ StreamNodeConfig parse_stream_node_config(const njson &root, std::string_view na
     result.traffic = parse_traffic_limit_config(stream, name);
     return result;
 }
-}
+} // namespace
 
 ClusterConfig parse_cluster_config(const njson &root)
 {
@@ -78,12 +78,10 @@ ClusterConfig parse_cluster_config(const njson &root)
 
     const auto control = required_port(required_object(root, "control", "root"), "port", "control");
     const auto tcp = required_port(required_object(root, "tcp", "root"), "port", "tcp");
-    const auto tls = required_port(required_object(root, "tls", "root"), "port", "tls");
     const auto udp = required_port(required_object(root, "udp", "root"), "port", "udp");
-    if (result.tcp_port == control || result.tcp_port == tcp || result.tcp_port == tls || result.udp_port == udp ||
+    if (result.tcp_port == control || result.tcp_port == tcp || result.udp_port == udp ||
         (result.role == ClusterConfig::Role::Master &&
-         (result.control_port == control || result.control_port == tcp || result.control_port == tls ||
-          result.control_port == result.tcp_port)))
+         (result.control_port == control || result.control_port == tcp || result.control_port == result.tcp_port)))
     {
         throw std::invalid_argument("cluster listener ports conflict with another local listener");
     }
@@ -95,8 +93,8 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     using namespace config;
     const auto root = load_json(path);
 
-    reject_unknown_fields(
-        root, {"log", "bandwidth_mbps", "control", "cluster", "tcp", "tls", "udp", "certificate", "channel"}, "root");
+    reject_unknown_fields(root, {"log", "bandwidth_mbps", "control", "cluster", "tcp", "udp", "certificate", "channel"},
+                          "root");
     const auto &control = required_object(root, "control", "root");
     reject_unknown_fields(
         control,
@@ -137,7 +135,6 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     }
 
     result.tcp = parse_stream_node_config(root, "tcp");
-    result.tls = parse_stream_node_config(root, "tls");
     result.datagram.address = required_string(udp, "address", "udp");
     result.datagram.port = required_port(udp, "port", "udp");
     result.datagram.max_relays = required_capacity(udp, "max_relays", "udp");

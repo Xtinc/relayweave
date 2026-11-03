@@ -56,7 +56,7 @@ void integration()
     {
         auto config = make_test_node_config();
         const auto address = "127.0.0." + std::to_string(i + 1);
-        config.control.address = config.control.advertise_address = config.tcp.address = config.tls.address =
+        config.control.address = config.control.advertise_address = config.tcp.address =
             config.datagram.address = address;
         config.cluster = {i == 0 ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave,
                           i == 0   ? "master"

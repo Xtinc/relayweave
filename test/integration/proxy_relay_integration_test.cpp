@@ -229,13 +229,12 @@ int main()
         asio::io_context proxy_io(1);
         const auto control_port = unused_port(control_io);
         const auto tcp_port = unique_port(transfer_tcp_io, {control_port});
-        const auto tls_port = unique_port(transfer_tcp_io, {control_port, tcp_port});
-        const auto proxy_socks_port = unique_port(proxy_io, {control_port, tcp_port, tls_port});
-        const auto proxy_http_port = unique_port(proxy_io, {control_port, tcp_port, tls_port, proxy_socks_port});
+        const auto proxy_socks_port = unique_port(proxy_io, {control_port, tcp_port});
+        const auto proxy_http_port = unique_port(proxy_io, {control_port, tcp_port, proxy_socks_port});
         const auto http_origin_port = unique_port(proxy_io, {proxy_socks_port, proxy_http_port});
         const auto echo_port = unique_port(proxy_io, {proxy_socks_port, proxy_http_port, http_origin_port});
-        const auto local_http_port = unique_port(transfer_tcp_io, {control_port, tcp_port, tls_port});
-        const auto local_socks_port = unique_port(transfer_tcp_io, {control_port, tcp_port, tls_port, local_http_port});
+        const auto local_http_port = unique_port(transfer_tcp_io, {control_port, tcp_port});
+        const auto local_socks_port = unique_port(transfer_tcp_io, {control_port, tcp_port, local_http_port});
 
         tcp::acceptor http_origin(proxy_io, {asio::ip::address_v4::loopback(), http_origin_port});
         tcp::acceptor echo_origin(proxy_io, {asio::ip::address_v4::loopback(), echo_port});
@@ -255,7 +254,7 @@ int main()
         node_config.control.max_services = 8;
         node_config.control.max_services_per_session = 4;
         node_config.tcp = {"127.0.0.1", tcp_port};
-        node_config.tls = {"127.0.0.1", tls_port};
+
         node_config.datagram.address = "127.0.0.1";
         node_config.datagram.port = tcp_port;
         node_config.channel = channel_config();

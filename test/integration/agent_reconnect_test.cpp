@@ -96,8 +96,6 @@ NodeConfig server_config(std::uint16_t control_port, std::uint16_t transfer_port
     config.control.port = control_port;
     config.tcp.address = "127.0.0.1";
     config.tcp.port = transfer_port;
-    config.tls.address = "127.0.0.1";
-    config.tls.port = 0;
     config.datagram.address = "127.0.0.1";
     config.datagram.port = transfer_port;
     config.tcp.setup_timeout = 1s;

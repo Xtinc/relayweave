@@ -51,7 +51,7 @@ int main()
         asio::io_context udp_io(1);
         TestClusterDataIO cluster_data;
         auto settings = make_test_node_config();
-        settings.control.address = settings.tcp.address = settings.tls.address = settings.datagram.address =
+        settings.control.address = settings.tcp.address = settings.datagram.address =
             "127.0.0.1";
         asio::ssl::context context(asio::ssl::context::tls);
         context.use_certificate_chain_file(settings.certificate_chain.string());

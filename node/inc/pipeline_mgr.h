@@ -3,92 +3,22 @@
 
 #include "flow_protocol.h"
 #include "node_common.h"
-#include "tls_channel.h"
 #include "xfr_channel.h"
 #include <atomic>
+#include <map>
 #include <stdexcept>
-
-/** @brief Prepare plain TCP sockets and provide bidirectional service copying on transfer_tcp_io. */
-struct TcpTransport
-{
-    using Stream = asio::ip::tcp::socket;
-
-    /**
-     * @brief Accept the common transport constructor's TLS context without using it.
-     * @note The unnamed TLS context argument exists only to share the transport construction interface.
-     */
-    explicit TcpTransport(asio::ssl::context &) noexcept;
-
-    static constexpr std::string_view name = "TCP";
-
-    /**
-     * @brief Return the accepted socket unchanged; plain TCP needs no transport handshake.
-     * @param socket Accepted socket whose ownership is transferred into transport preparation.
-     * @param deadline Absolute setup deadline; plain TCP returns immediately, while TLS must finish its
-     * handshake before it.
-     * @return An owned stream ready for RelayAttach parsing.
-     */
-    asio::awaitable<Stream> prepare(Stream socket, std::chrono::steady_clock::time_point deadline) const;
-    /**
-     * @brief Copy both directions with service limits, accounting, and independent TCP half-closes.
-     * @param producer Attached Producer data stream; borrowed until both copy directions finish.
-     * @param consumer Attached Consumer data stream; borrowed until both copy directions finish.
-     * @param rx_limiter Limiter for Producer-to-Consumer payload bytes.
-     * @param tx_limiter Limiter for Consumer-to-Producer payload bytes.
-     * @param traffic Service counters updated only after successful payload writes.
-     */
-    static asio::awaitable<void> relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
-                                       TokenBucket &tx_limiter, ServiceTraffic &traffic);
-};
-
-/** @brief Borrow the server TLS context for Agent handshakes and framed stream copying. */
-struct TlsTransport
-{
-    using Stream = TLSStream;
-
-    /**
-     * @brief Borrow a TLS context that must outlive the pipeline and all accepted streams.
-     * @param context TLS context borrowed for the lifetime of the connection resources.
-     */
-    explicit TlsTransport(asio::ssl::context &context) noexcept;
-
-    static constexpr std::string_view name = "TLS";
-
-    /**
-     * @brief Complete a server TLS handshake within the remaining absolute setup deadline.
-     * @param socket Accepted socket whose ownership is transferred into transport preparation.
-     * @param deadline Absolute setup deadline; plain TCP returns immediately, while TLS must finish its
-     * handshake before it.
-     * @return An owned stream ready for RelayAttach parsing.
-     */
-    asio::awaitable<Stream> prepare(asio::ip::tcp::socket socket, std::chrono::steady_clock::time_point deadline) const;
-    /**
-     * @brief Copy framed TLS data with service limits, accounting, and independent FIN directions.
-     * @param producer Attached Producer data stream; borrowed until both copy directions finish.
-     * @param consumer Attached Consumer data stream; borrowed until both copy directions finish.
-     * @param rx_limiter Limiter for Producer-to-Consumer payload bytes.
-     * @param tx_limiter Limiter for Consumer-to-Producer payload bytes.
-     * @param traffic Service counters updated only after successful payload writes.
-     */
-    static asio::awaitable<void> relay(Stream &producer, Stream &consumer, TokenBucket &rx_limiter,
-                                       TokenBucket &tx_limiter, ServiceTraffic &traffic);
-
-  private:
-    asio::ssl::context &context_;
-};
 
 /**
  * @brief Own one Agent stream listener and its local pairs and remote Flow bridges.
- * @tparam Transport TcpTransport or TlsTransport, selecting preparation and copy semantics.
  * @details Pair operations require transfer_tcp_io. RelayNode calls start() during serialized startup;
- * wait_for_pending() blocks the owner outside this executor. Controllers own and drain copy
+ * wait_for_setup_tasks() blocks the owner outside this executor. Controllers own and drain copy
  * tasks before close; setup tasks retain the pipeline until timeout or attachment completes.
  * Closing removes lookup entries before waking tasks that still retain a pair.
  */
-template <typename Transport> class StreamPipeline : public std::enable_shared_from_this<StreamPipeline<Transport>>
+class StreamPipeline : public std::enable_shared_from_this<StreamPipeline>
 {
     using tcp = asio::ip::tcp;
-    using Stream = typename Transport::Stream;
+    using ConnectionId = RelayAttach::ConnectionId;
 
     /** @brief Own one attached Agent stream and its bound multi-node Flow endpoint. */
     struct RemotePair : RemoteRelayPair
@@ -110,7 +40,8 @@ template <typename Transport> class StreamPipeline : public std::enable_shared_f
         }
 
         std::shared_ptr<lnk::FlowStream> flow;
-        std::optional<Stream> stream;
+        std::optional<tcp::socket> stream;
+        ConnectionId connection_id{};
 
       private:
         /** @brief Bind and retain a FlowStream on the owning transfer executor. */
@@ -150,29 +81,34 @@ template <typename Transport> class StreamPipeline : public std::enable_shared_f
             LocalRelayPair::close();
         }
 
-        std::optional<Stream> producer_stream;
-        std::optional<Stream> consumer_stream;
+        std::optional<tcp::socket> producer_stream;
+        std::optional<tcp::socket> consumer_stream;
+        ConnectionId producer_id{};
+        ConnectionId consumer_id{};
     };
 
   public:
     /**
      * @brief Configure listener, setup admission, relay capacity, deadline, and traffic limits.
      * @param executor Single-threaded transfer_tcp_io executor owning listener, pair state, and stream I/O.
-     * @param ssl_context TLS server context borrowed for Agent TLS handshakes.
      * @param id_allocator Node-wide allocator shared by TCP, TLS, and UDP relay resources.
      * @param listen_address Local address on which Agent stream connections are accepted.
      * @param data_port Local Agent data listener port advertised in attachment descriptors.
-     * @param max_setup_connections Maximum accepted stream sockets still performing handshake or attachment.
+     * @param max_setup_connections Maximum accepted TCP sockets awaiting control authorization.
      * @param capacity Combined limit for local pairs and remote endpoints managed by this listener.
-     * @param setup_timeout Maximum duration of transport handshake and RelayAttach parsing for an accepted
-     * socket.
+     * @param setup_timeout Maximum duration of greeting and control authorization for an accepted socket.
      * @param config Per-direction service byte rates and burst sizes.
      */
-    StreamPipeline(asio::any_io_executor executor, asio::ssl::context &ssl_context,
-                   std::shared_ptr<RelayIdAllocator> id_allocator, std::string listen_address, std::uint16_t data_port,
-                   std::size_t max_setup_connections, std::size_t capacity,
-                   std::chrono::steady_clock::duration setup_timeout, TrafficLimitConfig config);
+    StreamPipeline(asio::any_io_executor executor, std::shared_ptr<RelayIdAllocator> id_allocator,
+                   std::string listen_address, std::uint16_t data_port, std::size_t max_setup_connections,
+                   std::size_t capacity, std::chrono::steady_clock::duration setup_timeout, TrafficLimitConfig config);
 
+    /**
+     * @brief Bind an authorized control request on transfer_tcp_io; the caller drains this task.
+     * @param request Validated role, pair ticket, and one-use pending connection identifier.
+     * @return Completes after the greeting is sent and the socket is atomically attached; throws on failure.
+     */
+    asio::awaitable<void> bind(RelayAttach request);
     /** @brief Open the listener and launch its receive or accept task exactly once during bootstrap. */
     void start();
     /**
@@ -246,18 +182,26 @@ template <typename Transport> class StreamPipeline : public std::enable_shared_f
     /** @brief Reject admission and close the listener and all pairs on the owning transfer executor. */
     void stop();
     /** @brief Block outside transfer_tcp_io until accepted setup tasks finish; workers must remain live. */
-    void wait_for_pending() noexcept;
+    void wait_for_setup_tasks() noexcept;
 
   private:
     asio::awaitable<void> accept_loop();
-    asio::awaitable<void> run_transfer_session(tcp::socket socket);
-    bool attach_remote_pair(int role, std::uint64_t uuid, std::uint64_t ticket, Stream &stream);
-    void attach(int role, std::uint64_t uuid, std::uint64_t ticket, Stream stream);
+    /** @brief Own an unbound socket through greeting, authorization, timeout, and shutdown. */
+    struct PendingConnection
+    {
+        PendingConnection(tcp::socket socket, std::chrono::steady_clock::time_point deadline)
+            : socket(std::move(socket)), deadline(deadline), announced(this->socket.get_executor())
+        {
+        }
+        tcp::socket socket;
+        std::chrono::steady_clock::time_point deadline;
+        AsyncEvent announced;
+    };
+    asio::awaitable<void> run_transfer_session(ConnectionId id, std::shared_ptr<PendingConnection> pending);
     asio::awaitable<void> read_remote_pair(std::shared_ptr<RemotePair> endpoint);
     asio::awaitable<void> write_remote_pair(std::shared_ptr<RemotePair> endpoint);
 
     asio::any_io_executor executor_;
-    Transport transport_;
     std::shared_ptr<RelayIdAllocator> id_allocator_;
     std::string listen_address_;
     std::uint16_t data_port_;
@@ -268,15 +212,12 @@ template <typename Transport> class StreamPipeline : public std::enable_shared_f
     tcp::acceptor acceptor_;
     std::unordered_map<std::uint64_t, std::shared_ptr<LocalPair>> local_pairs_;
     std::unordered_map<std::uint64_t, std::shared_ptr<RemotePair>> remote_pairs_;
-    std::atomic_size_t pending_sockets_{0};
+    /** @brief Unclaimed sockets on the data executor; its size controls setup admission. */
+    std::map<ConnectionId, std::shared_ptr<PendingConnection>> unbound_;
+    /** @brief Live setup tasks, including claimed sockets awaiting cleanup; used for cross-domain drainage. */
+    std::atomic_size_t setup_tasks_{0};
     bool started_ = false;
     bool stopped_ = false;
 };
-
-using TcpPipeline = StreamPipeline<TcpTransport>;
-using TlsPipeline = StreamPipeline<TlsTransport>;
-
-extern template class StreamPipeline<TcpTransport>;
-extern template class StreamPipeline<TlsTransport>;
 
 #endif

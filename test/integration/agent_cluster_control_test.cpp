@@ -1,3 +1,4 @@
+#include "stream_attach.h"
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
@@ -108,8 +109,6 @@ NodeConfig server_config(std::string node_id, ClusterConfig::Role role, std::uin
     config.tcp.address = "127.0.0.1";
     config.tcp.port = transfer_port;
     config.tcp.setup_timeout = 1s;
-    config.tls.address = "127.0.0.1";
-    config.tls.port = unused_port(port_io, used);
     config.datagram.address = "127.0.0.1";
     config.datagram.port = datagram_port;
     config.channel = channel_config();
@@ -342,15 +341,15 @@ asio::awaitable<std::shared_ptr<TLSChannel>> connect_control(asio::ssl::context 
     co_return channel;
 }
 
-asio::awaitable<tcp::socket> attach_stream(const njson &endpoint, int role)
+asio::awaitable<tcp::socket> attach_stream(const std::shared_ptr<TLSChannel> &control, const njson &endpoint, int role)
 {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     co_await socket.async_connect({asio::ip::make_address(endpoint.at("data_address").get<std::string>()),
                                   config::message_data_port(endpoint)}, asio::use_awaitable);
-    const auto frame = WireMessage::pack(RelayAttach::to_msg({role,
-        endpoint.at("uuid").get<std::uint64_t>(), endpoint.at("ticket").get<std::uint64_t>()}));
-    co_await asio::async_write(socket, asio::buffer(frame), asio::use_awaitable);
+    co_await attach_stream_control(socket, control, {role,
+        endpoint.at("uuid").get<std::uint64_t>(), endpoint.at("ticket").get<std::uint64_t>()},
+        endpoint.at("node_id").get<std::string>());
     co_return socket;
 }
 
@@ -372,11 +371,10 @@ asio::awaitable<void> verify_attach_wait(asio::ssl::context &context, std::uint1
         const auto offer = co_await producer->async_receive(2s);
         require(opened.type() == CtrlCommand::RelayOpened && offer.type() == CtrlCommand::RelayOffer,
                 "Delayed attach did not get endpoints");
-        auto consumer_data = co_await attach_stream(*opened.params, RelayAttach::Consumer);
+        auto consumer_data = co_await attach_stream(consumer, *opened.params, RelayAttach::Consumer);
         if (request == 1)
         {
             const std::string payload = "delayed-peer";
-            co_await asio::async_write(consumer_data, asio::buffer(payload), asio::use_awaitable);
             bool waiting = false;
             try
             {
@@ -388,10 +386,11 @@ asio::awaitable<void> verify_attach_wait(asio::ssl::context &context, std::uint1
                           error.code() == asio::error::operation_aborted;
             }
             require(waiting, "Relay became ready or failed before its producer attached");
-            auto producer_data = co_await attach_stream(*offer.params, RelayAttach::Producer);
+            auto producer_data = co_await attach_stream(producer, *offer.params, RelayAttach::Producer);
             require((co_await consumer->async_receive(1s)).type() == CtrlCommand::RelayReady &&
                     (co_await producer->async_receive(1s)).type() == CtrlCommand::RelayReady,
                     "Delayed second attach did not wake both sides");
+            co_await asio::async_write(consumer_data, asio::buffer(payload), asio::use_awaitable);
             std::string received(payload.size(), '\0');
             co_await asio::async_read(producer_data, asio::buffer(received), asio::cancel_after(1s, asio::use_awaitable));
             require(received == payload, "Data did not cross the delayed relay");

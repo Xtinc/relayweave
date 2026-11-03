@@ -450,8 +450,6 @@ int main()
         config.control.port = control_port;
         config.tcp.address = "127.0.0.1";
         config.tcp.port = tcp_port;
-        config.tls.address = "127.0.0.1";
-        config.tls.port = 0;
         config.datagram.address = "127.0.0.1";
         config.datagram.port = udp_port;
         config.tcp.max_relays = 1;

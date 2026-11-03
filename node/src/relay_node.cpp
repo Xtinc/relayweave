@@ -13,12 +13,9 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
       registry_(config_.control.max_connections, config_.control.max_services,
                 config_.control.max_services_per_session),
       relay_id_allocator_(std::make_shared<RelayIdAllocator>()),
-      tcp_pipeline_(std::make_shared<TcpPipeline>(
-          transfer_tcp_executor_, ssl_context_, relay_id_allocator_, config_.tcp.address, config_.tcp.port,
+      tcp_pipeline_(std::make_shared<StreamPipeline>(
+          transfer_tcp_executor_, relay_id_allocator_, config_.tcp.address, config_.tcp.port,
           config_.tcp.max_setup_connections, config_.tcp.max_relays, config_.tcp.setup_timeout, config_.tcp.traffic)),
-      tls_pipeline_(std::make_shared<TlsPipeline>(
-          transfer_tcp_executor_, ssl_context_, relay_id_allocator_, config_.tls.address, config_.tls.port,
-          config_.tls.max_setup_connections, config_.tls.max_relays, config_.tls.setup_timeout, config_.tls.traffic)),
       datagram_mgr_(std::make_shared<DatagramMgr>(
           transfer_udp_executor_, relay_id_allocator_,
           asio::ip::udp::endpoint(asio::ip::make_address(config_.datagram.address), config_.datagram.port),
@@ -79,7 +76,6 @@ void RelayNode::start(std::function<void(std::string)> failure_handler)
     control_acceptor_.bind(endpoint);
     control_acceptor_.listen();
     tcp_pipeline_->start();
-    tls_pipeline_->start();
     datagram_mgr_->start();
     nodelink_mgr_->start();
     metrics_->start(nodelink_mgr_->protocol(), std::chrono::steady_clock::now());
@@ -92,10 +88,9 @@ void RelayNode::start(std::function<void(std::string)> failure_handler)
     metrics_->activate();
     rollback.dismiss();
 
-    PROXY_INFO_PRINT("Node listening control=%s:%u tcp=%s:%u tls=%s:%u udp=%s:%u", config_.control.address.c_str(),
+    PROXY_INFO_PRINT("Node listening control=%s:%u data=%s:%u udp=%s:%u", config_.control.address.c_str(),
                      static_cast<unsigned int>(config_.control.port), config_.tcp.address.c_str(),
-                     static_cast<unsigned int>(config_.tcp.port), config_.tls.address.c_str(),
-                     static_cast<unsigned int>(config_.tls.port), config_.datagram.address.c_str(),
+                     static_cast<unsigned int>(config_.tcp.port), config_.datagram.address.c_str(),
                      static_cast<unsigned int>(config_.datagram.port));
 }
 
@@ -116,11 +111,9 @@ bool RelayNode::stop()
         asio::post(transfer_tcp_executor_, asio::use_future([self] {
                        self->metrics_->stop_tcp();
                        self->tcp_pipeline_->stop();
-                       self->tls_pipeline_->stop();
                    }))
             .get();
-        tcp_pipeline_->wait_for_pending();
-        tls_pipeline_->wait_for_pending();
+        tcp_pipeline_->wait_for_setup_tasks();
 
         asio::post(transfer_udp_executor_, asio::use_future([self] {
                        self->metrics_->stop_udp();
@@ -342,6 +335,7 @@ void RelayNode::handle_control_message(SessionId id, const ControlSessionPtr &se
     switch (command)
     {
     case CtrlCommand::RelayOpen:
+    case CtrlCommand::RelayAttach:
     case CtrlCommand::RelayReject:
     case CtrlCommand::RelayCancel:
         if (const auto target = config::optional_string(params, "node_id", config_.cluster.node_id);
@@ -393,11 +387,11 @@ void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
         throw std::runtime_error("relay path capacity reached");
     }
     const auto protocol = relay->protocol();
-    const auto capacity = protocol == RelayProtocol::Tcp   ? config_.tcp.max_relays
-                          : protocol == RelayProtocol::Tls ? config_.tls.max_relays
-                                                           : config_.datagram.max_relays;
-    const auto count = std::ranges::count_if(relay_sessions_,
-                                             [protocol](const auto &active) { return active->protocol() == protocol; });
+    const bool datagram = protocol == RelayProtocol::Udp;
+    const auto capacity = datagram ? config_.datagram.max_relays : config_.tcp.max_relays;
+    const auto count = std::ranges::count_if(relay_sessions_, [datagram](const auto &active) {
+        return (active->protocol() == RelayProtocol::Udp) == datagram;
+    });
     if (static_cast<std::size_t>(count) >= capacity)
     {
         throw std::runtime_error("relay capacity reached");
@@ -422,6 +416,27 @@ void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
 
 void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
 {
+    if (command == CtrlCommand::RelayAttach)
+    {
+        RelayAttach request{};
+        try
+        {
+            request = RelayAttach::from_msg(message);
+        }
+        catch (const std::invalid_argument &error)
+        {
+            PROXY_DEBUG_PRINT("Relay attach ignored reason=%s", error.what());
+            return;
+        }
+        for (const auto &relay : relay_sessions_)
+        {
+            if (relay->handle_attach(session, request))
+            {
+                return;
+            }
+        }
+        return;
+    }
     const auto &params = *message.params;
     if (command != CtrlCommand::RelayOpen)
     {
@@ -586,6 +601,7 @@ void RelayNode::handle_cluster_relay(CtrlCommand command, CtrlMessage message)
     {
     case CtrlCommand::RelayOpen:
     case CtrlCommand::RelayCancel:
+    case CtrlCommand::RelayAttach:
     case CtrlCommand::RelayReject:
         if (state_.load() == State::Running || command != CtrlCommand::RelayOpen)
         {

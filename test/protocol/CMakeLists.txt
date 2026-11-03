@@ -1,4 +1,4 @@
-foreach(name IN ITEMS relay_protocol lnk_frame)
+foreach(name IN ITEMS relay_protocol lnk_frame tls_rpk)
     relayweave_test(${name} ${name}_test.cpp
         LIBRARIES relayweave_protocol LABELS protocol unit)
 endforeach()

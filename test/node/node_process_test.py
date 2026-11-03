@@ -22,7 +22,7 @@ def configuration(data, reservations):
     config = json.loads((data / "node_config_modern.json").read_text())
     for key, filename in config["certificate"].items():
         config["certificate"][key] = str(data / filename)
-    for section in ("control", "tcp", "tls"):
+    for section in ("control", "tcp"):
         config[section]["port"] = reserve(reservations, socket.SOCK_STREAM).getsockname()[1]
     config["udp"]["port"] = reserve(reservations, socket.SOCK_DGRAM).getsockname()[1]
     config["control"]["advertise_address"] = "127.0.0.1"
@@ -31,14 +31,12 @@ def configuration(data, reservations):
                       ("udp_port", socket.SOCK_DGRAM)):
         config["cluster"][key] = reserve(reservations, kind).getsockname()[1]
     config["tcp"]["setup_timeout_ms"] = 300
-    config["tls"]["setup_timeout_ms"] = 300
     return config
 
 
 def rebind(config):
     for section, key, kind in (("control", "port", socket.SOCK_STREAM),
                                ("tcp", "port", socket.SOCK_STREAM),
-                               ("tls", "port", socket.SOCK_STREAM),
                                ("udp", "port", socket.SOCK_DGRAM),
                                ("cluster", "tcp_port", socket.SOCK_STREAM),
                                ("cluster", "udp_port", socket.SOCK_DGRAM)):
@@ -83,10 +81,9 @@ def run(binary, data, directory, fail_start):
                             raise RuntimeError("Node did not open its control listener")
                         time.sleep(0.01)
                 reject_invalid_control(config, data)
-                # Keep unbound TCP and TLS setup sockets alive while shutdown drains their deadlines.
+                # Keep an unbound stream socket alive while shutdown cancels and drains setup.
                 with contextlib.ExitStack() as pending:
-                    for section in ("tcp", "tls"):
-                        pending.enter_context(socket.create_connection(("127.0.0.1", config[section]["port"])))
+                    pending.enter_context(socket.create_connection(("127.0.0.1", config["tcp"]["port"])))
                     process.send_signal(signal.SIGTERM)
                     output, _ = process.communicate(timeout=5)
             else:

@@ -223,6 +223,22 @@ void test_attach_validation()
         },
         "Zero ticket was accepted");
 
+    RelayAttach stream{RelayAttach::Producer, uuid, ticket, RelayAttach::ConnectionId{}};
+    for (std::size_t i = 0; i < stream.connection_id->size(); ++i)
+    {
+        (*stream.connection_id)[i] = static_cast<std::uint8_t>(i * 7);
+    }
+    const auto encoded = RelayAttach::to_msg(stream);
+    require(RelayAttach::from_msg(encoded).connection_id == stream.connection_id,
+            "Connection ID failed its exact-byte round trip");
+    for (const auto &invalid : {njson(1), njson(""), njson(std::string(63, '0')),
+                               njson(std::string(65, '0')), njson(std::string(64, 'g'))})
+    {
+        auto bad = encoded;
+        (*bad.params)["connection_id"] = invalid;
+        require_throws([&] { RelayAttach::from_msg(bad); }, "Malformed connection ID accepted");
+    }
+
     auto extended_params = valid_params;
     extended_params["future_field"] = true;
     const auto extended = RelayAttach::from_msg(CtrlMessage{"relay.attach", std::move(extended_params)});

@@ -11,9 +11,7 @@ ControlRouterSingle::ControlRouterSingle(NodeSession &relay, const AgentPeer &co
 {
     const auto protocol = params.protocol;
     const auto &config = relay.node_.config_;
-    const auto timeout = protocol == RelayProtocol::Udp   ? config.datagram.setup_timeout
-                         : protocol == RelayProtocol::Tls ? config.tls.setup_timeout
-                                                          : config.tcp.setup_timeout;
+    const auto timeout = protocol == RelayProtocol::Udp ? config.datagram.setup_timeout : config.tcp.setup_timeout;
     deadline_ = Clock::now() + timeout;
 }
 
@@ -41,11 +39,12 @@ std::optional<njson> ControlRouterSingle::status_report() const
 bool ControlRouterSingle::matches(const AgentPeer &session, const njson &params) const
 {
     if (stop_requested_ || !belongs_to(session))
+    {
         return false;
+    }
     const auto uuid = config::optional_unsigned(params, "uuid", true);
     const auto request = config::optional_unsigned(params, "request_id");
-    return (uuid && relay_.uuid() == *uuid) ||
-           (request && consumer_ == session && request_id_ == *request);
+    return (uuid && relay_.uuid() == *uuid) || (request && consumer_ == session && request_id_ == *request);
 }
 
 bool ControlRouterSingle::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
@@ -65,6 +64,19 @@ bool ControlRouterSingle::handle(CtrlCommand command, const AgentPeer &session, 
     }
     const auto fallback = command == CtrlCommand::RelayReject ? "producer rejected relay" : "relay cancelled";
     cancel("control", config::optional_string(params, "reason", fallback));
+    return true;
+}
+
+bool ControlRouterSingle::handle_attach(const AgentPeer &session, const RelayAttach &request)
+{
+    if (stop_requested_ || !belongs_to(session) || request.uuid != relay_.uuid())
+    {
+        return false;
+    }
+    if (Clock::now() < deadline_ && (request.role == RelayAttach::Producer ? producer_ : consumer_) == session)
+    {
+        relay_.attach(request);
+    }
     return true;
 }
 
@@ -91,7 +103,9 @@ void ControlRouterSingle::invalidate(std::uint64_t, std::string reason)
 void ControlRouterSingle::cancel(std::string, std::string reason)
 {
     if (stop_requested_)
+    {
         return;
+    }
     stop_requested_ = true;
     reason_ = std::move(reason);
     relay_.cancellation_.emit(asio::cancellation_type::all);
@@ -102,30 +116,26 @@ void ControlRouterSingle::notify_agents() const
     const auto &pair = std::get<AttachPair>(relay_.endpoint_);
     for (const auto producer : {false, true})
     {
-        if (const auto &session = producer ? producer_ : consumer_; session)
+        const auto &session = producer ? producer_ : consumer_;
+        auto values = (producer ? pair.producer : pair.consumer).to_params(relay_.protocol());
+        values["service"] = service_;
+        values["protocol"] = relay_protocol_name(relay_.protocol());
+        if (!producer)
         {
-            auto values = (producer ? pair.producer : pair.consumer).to_params(relay_.protocol());
-            values["service"] = service_;
-            values["protocol"] = relay_protocol_name(relay_.protocol());
-            if (!producer)
-                values["request_id"] = request_id_;
-            relay_.send_agent(
-                session, CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
+            values["request_id"] = request_id_;
         }
+        relay_.send_agent(
+            session, CtrlMessage(producer ? CtrlCommand::RelayOffer : CtrlCommand::RelayOpened, std::move(values)));
     }
 }
 
 void ControlRouterSingle::ready_agents() const
 {
     const njson values{{"uuid", relay_.uuid()}, {"protocol", relay_protocol_name(relay_.protocol())}};
-    const auto &consumer = consumer_;
-    if (consumer)
+    relay_.send_agent(consumer_, CtrlMessage(CtrlCommand::RelayReady, values));
+    if (producer_ != consumer_)
     {
-        relay_.send_agent(consumer, CtrlMessage(CtrlCommand::RelayReady, values));
-    }
-    if (const auto &session = producer_; session && session != consumer)
-    {
-        relay_.send_agent(session, CtrlMessage(CtrlCommand::RelayReady, values));
+        relay_.send_agent(producer_, CtrlMessage(CtrlCommand::RelayReady, values));
     }
 }
 
@@ -142,7 +152,9 @@ void ControlRouterSingle::close_agents() const
                  {"reason", reason_}};
     const auto id = relay_.uuid();
     if (id)
+    {
         values["uuid"] = id;
+    }
     const auto &consumer = consumer_;
     if (const auto &producer = producer_; producer && producer != consumer && id)
     {
@@ -169,12 +181,7 @@ asio::awaitable<void> ControlRouterSingle::run()
             throw asio::system_error(asio::error::operation_aborted);
         }
         notify_agents();
-        const auto &consumer = consumer_;
-        if (!consumer)
-        {
-            throw asio::system_error(asio::error::operation_aborted);
-        }
-        co_await relay_.prepare_local(deadline_, std::string(consumer.peer()));
+        co_await relay_.prepare_local(deadline_, std::string(consumer_.peer()));
         if (stop_requested_ || Clock::now() >= deadline_)
         {
             throw asio::system_error(asio::error::operation_aborted);
@@ -182,8 +189,7 @@ asio::awaitable<void> ControlRouterSingle::run()
         ready_agents();
         ready_ = true;
         PROXY_INFO_PRINT("Relay [+] %s service=%s uuid=%llu", relay_protocol_name(relay_.protocol()).data(),
-                         service_.c_str(),
-                         static_cast<unsigned long long>(relay_.uuid()));
+                         service_.c_str(), static_cast<unsigned long long>(relay_.uuid()));
         co_await relay_.bridge();
         if (reason_.empty())
         {
@@ -201,10 +207,8 @@ asio::awaitable<void> ControlRouterSingle::run()
     stop_requested_ = true;
     if (ready_)
     {
-        PROXY_INFO_PRINT("Relay [x] %s service=%s uuid=%llu reason=%s",
-                         relay_protocol_name(relay_.protocol()).data(),
-                         service_.c_str(),
-                         static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
+        PROXY_INFO_PRINT("Relay [x] %s service=%s uuid=%llu reason=%s", relay_protocol_name(relay_.protocol()).data(),
+                         service_.c_str(), static_cast<unsigned long long>(relay_.uuid()), reason_.c_str());
     }
     co_await relay_.close();
     close_agents();

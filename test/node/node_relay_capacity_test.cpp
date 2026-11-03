@@ -129,6 +129,13 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
                              egress_cancelled == 0,
                          "Unmatched peer message cancelled an unrelated instance");
     }
+    for (const auto command : {CtrlCommand::RelayPeerReady, CtrlCommand::RelayPeerFinished})
+    {
+        const CtrlMessage notification(command, identity);
+        require_capacity(egress.handle_peer(command, notification) && egress.handle_peer(command, notification) &&
+                             egress_cancelled == 0,
+                         "Duplicate peer notification cancelled its instance");
+    }
     const CtrlMessage close(CtrlCommand::RelayPeerClose, identity);
     require_capacity(!single.handle_peer(CtrlCommand::RelayPeerClose, close), "Single consumed a peer message");
     require_capacity(egress.handle_peer(CtrlCommand::RelayPeerClose, close) && egress_cancelled == 1,
@@ -148,13 +155,13 @@ int main()
         asio::io_context data(1);
         asio::ssl::context ssl(asio::ssl::context::tls_server);
         auto config = make_test_node_config();
-        config.control.address = config.tcp.address = config.tls.address = config.datagram.address = "127.0.0.1";
+        config.control.address = config.tcp.address = config.datagram.address = "127.0.0.1";
         config.control.max_connections = 2;
         config.tcp.max_relays = 1;
-        config.tls.max_relays = 2;
+
         config.datagram.max_relays = 3;
         constexpr std::array cases{
-            std::pair{RelayProtocol::Tcp, 1}, std::pair{RelayProtocol::Tls, 2}, std::pair{RelayProtocol::Udp, 3}};
+            std::pair{RelayProtocol::Tcp, 1}, std::pair{RelayProtocol::Tls, 0}, std::pair{RelayProtocol::Udp, 3}};
         auto node = std::make_shared<RelayNode>(control, tcp_io, udp_io, data, ssl, config);
         auto session = std::make_shared<TLSChannel>(asio::ip::tcp::socket(control), ssl, TLSChannelRole::S);
         auto producer = std::make_shared<TLSChannel>(asio::ip::tcp::socket(control), ssl, TLSChannelRole::S);
@@ -204,14 +211,14 @@ int main()
             stopped.get();
             require_capacity(test_access::RelayNode_relay_sessions_(*node).empty(), "drained Relays retained count capacity");
         };
-        // Each protocol has its own quota. Do not pump either transfer executor:
+        // TCP and TLS share one quota; UDP has its own. Do not pump either transfer executor:
         // all admitted requests must remain counted while install is pending.
         asio::post(control, [&] {
             verify_session_events(*node, session, producer, unrelated);
             admit();
         });
         poll_control();
-        require_capacity(test_access::RelayNode_relay_sessions_(*node).size() == 6, "protocol quotas were combined or exceeded");
+        require_capacity(test_access::RelayNode_relay_sessions_(*node).size() == 4, "shared stream or UDP quota was exceeded");
         asio::post(control, [&] {
             for (const auto &relay : test_access::RelayNode_relay_sessions_(*node))
             {
@@ -226,7 +233,7 @@ int main()
         drain();
         asio::post(control, admit);
         poll_control();
-        require_capacity(test_access::RelayNode_relay_sessions_(*node).size() == 6, "released quotas were not reusable");
+        require_capacity(test_access::RelayNode_relay_sessions_(*node).size() == 4, "released quotas were not reusable");
         drain();
 
         auto make_multi = [&](bool ingress) {

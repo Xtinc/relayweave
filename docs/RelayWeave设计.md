@@ -14,7 +14,7 @@ RelayWeave 通过在不同区域服务器上构建中继节点覆盖网（Overla
 
 系统核心设计目标包括：
 
-1. **多协议全双工中继**：原生支持 TCP、TLS（Agent 与 Node 之间安全加密传输，由 Node 终结 TLS 并桥接后端业务）以及 UDP 业务中继。
+1. **多协议全双工中继**：原生支持 TCP、TLS（Agent 之间端到端加密，Node 透明转发）以及 UDP 业务中继。
 2. **极简高效的数据面**：控制信令与业务载荷严格物理分离。数据面绝不引入 JSON、CBOR 或动态反射序列化框架；跨节点传输使用定长 32 字节二进制帧头，配合 C++20 PMR（多态内存资源）载荷池，实现载荷缓冲复用与所有权转移，杜绝中间节点的重复内存分配与二次深拷贝。
 3. **结构化并发与无锁执行域**：基于 C++20 协程（`asio::awaitable`）与 Boost.Asio 构建。Node 内部按职责划分为 4 个单线程执行域，Agent 划分为 2 个执行域。各执行域内状态串行无锁化，跨执行域通过有界异步通道传递，消除多线程竞态与锁同步开销。
 4. **端到端智能动态选路**：内置持续的主动探测机制（ICMP），基于指数加权移动平均（EMA）与对数正态质量模型量化各跳链路成本；通过带中继惩罚的最短路径算法，动态规避拥塞链路，支持 2~8 节点的多跳透明中继。
@@ -90,14 +90,13 @@ flowchart TB
 
 ### 1.4 网络接口与端口划分
 
-每个 RelayNode 进程对外暴露以下 6 种明确职责的网络接口与监听端口（以示例配置为例）：
+每个 RelayNode 进程对外暴露以下 5 种明确职责的网络接口与监听端口（以示例配置为例）：
 
 | 示例端口 | 传输 | 配置项 | 对端与协议 |
 |---|---|---|---|
 | 18443 | TCP/mTLS | `control.port` | Agent 控制通道，4 字节长度前缀 + CBOR 控制帧。 |
-| 18444 | TCP | `tcp.port` | Agent 先发送 `relay.attach` 控制帧，再传输原始 TCP 数据。 |
+| 18444 | TCP | `tcp.port` | TCP/TLS 共用的数据入口；Node 发送 32 字节连接编号，Agent 经控制 mTLS 授权绑定后传输业务。 |
 | 18445 | UDP | `udp.port` | Agent 先用独立 CBOR `relay.attach` 报文接入；业务报文携带 8 字节 `session_id`。 |
-| 18446 | TLS/mTLS | `tls.port` | TLS 握手后发送 `relay.attach`；业务使用 `length32-fin-v1`。 |
 | 18447 | TCP/mTLS | `cluster.control_port` | Master 监听集群控制；Slave 使用 `cluster.address` 和此端口连接 Master。 |
 | 18448 | 普通 TCP/UDP | `cluster.tcp_port` / `cluster.udp_port` | NodeLink；TCP 先交换 CBOR `link.attach` / `link.attached`，后续使用二进制帧；UDP 还带 8 字节 link ID。 |
 
@@ -118,7 +117,7 @@ flowchart TB
    - Flow 触发释放的典型事件包括：控制连接断开（发起端或对端 Agent 掉线）；Master 纪元变化、路径节点离线或地址变化导致授权失效；承载 Flow 的物理 NodeLink 异常中断；业务数据传输完成（双向 FIN/EOF）、会话取消或进程停机触发显式关闭。
 4. **端到端半关闭语义完整传递**：
    - TCP 与 TLS 业务在中继路径上完全保留标准 BSD Socket 的双向半关闭（Half-Close）能力。
-   - TCP 写半关闭沿路径传递为对向 EOF 或 Flow `Fin` 帧；TLS 数据连接使用零长度业务帧（`length32-fin-v1`）传递 FIN，对向数据通道在完全刷写前保持正常接收。
+   - TCP 写半关闭沿路径传递为对向 EOF 或 Flow `Fin` 帧；TLS 两端 Agent 用加密零长度业务帧传递单向 FIN，双向业务排空并完成 TLS 关闭后才向 Node 传递 TCP EOF。
 5. **面向数据报的拥塞保护与无应用层分片**：
    - UDP 业务在队列满时采取尾丢弃策略，丢包保护健康流而不主动关闭 Flow。
    - 单节点最大载荷 65,499 字节（`65507 - 8`），多节点最大载荷 65,467 字节（`65507 - 8 - 32`）。超出上限的数据报在入口直接丢弃，节点间严禁执行应用层分片。
@@ -139,7 +138,7 @@ flowchart TB
         Listeners["Agent 控制监听 / Master 集群控制监听"]
     end
     subgraph tcp["transfer_tcp_io：一个线程"]
-        Pipeline["TcpPipeline / TlsPipeline / relay_tcp 与 relay_tls"]
+        Pipeline["StreamPipeline / relay_tcp"]
     end
     subgraph udp["transfer_udp_io：一个线程"]
         Datagram["DatagramMgr：会话解复用与地址绑定"]
@@ -164,8 +163,8 @@ flowchart TB
    - **职责范围**：处理来自 Agent 的控制长连接（端口 18443）；Master 节点的集群控制监听（端口 18447）；服务注册与发现；拓扑测量数据聚合与快照生成；Flow 路径安装（`FlowPrepare` / `FlowCommit`）事务驱动；业务会话协调（`ControlRouterSingle` / `ControlRouterMulti`）。
 2. **`transfer_tcp_io`（TCP/TLS 传输执行域）**：
    - **驱动线程**：单线程运行，使用普通调度，Linux 线程名为 `node-tcp`。
-   - **托管组件**：`TcpPipeline`、`TlsPipeline`。
-   - **职责范围**：监听公网 TCP 业务端口（18444）与 TLS 业务端口（18446）；完成接入连接的 TLS 握手与证书校验；接收并验证首个 CBOR `relay.attach` 控制帧；负责 Agent 侧客户端 socket 与本地 `FlowStream` 端口之间全双工异步流式数据拷贝（`xfr_channel.h` 中的转发函数）。
+   - **托管组件**：唯一的 `StreamPipeline`。
+   - **职责范围**：监听 TCP/TLS 共用数据端口（18444）；发送临时连接编号并等待控制授权绑定；负责 Agent 侧客户端 socket 与本地 `FlowStream` 端口之间全双工异步流式数据拷贝（`xfr_channel.h` 中的转发函数）。
 3. **`transfer_udp_io`（UDP 传输执行域）**：
    - **驱动线程**：单线程运行，使用普通调度，Linux 线程名为 `node-udp`。
    - **托管组件**：`DatagramMgr`。
@@ -189,7 +188,7 @@ flowchart TD
     Manager --> Protocol["shared_ptr FlowProtocol"]
     Protocol --> Link["LnkChannel / NodeLink"]
     Protocol --> Flows["FlowState / PMR 载荷池"]
-    Root --> Pipelines["TcpPipeline / TlsPipeline / DatagramMgr"]
+    Root --> Pipelines["StreamPipeline / DatagramMgr"]
     Root --> Sessions["NodeSessionList：shared_ptr NodeSession"]
     Sessions --> Router["variant：ControlRouterSingle 或 ControlRouterMulti"]
 ```
@@ -279,7 +278,11 @@ Agent 和 Node 工作线程保留普通调度策略，仅通过 `set_current_thr
 
 ---
 
-AgentSession 用 `optional<RelayEndpoint>` 表示尚未获得或已获得的接入端点。地址、端口、uuid、ticket、UDP session 与可选 Flow ID 在消息入口完整校验后安装；TLS framing 在入口检查，不保存重复字符串。Forwarder 直接访问这些字段完成原有消息分派和去重；已有 ServiceKey 和 RelaySelection 继续拥有服务协议、选路及 epoch，不将整份 Node 报文留在会话中。
+AgentSession 用 `optional<RelayEndpoint>` 表示尚未获得或已获得的接入端点。地址、端口、uuid、ticket、UDP session 与可选 Flow ID 在消息入口完整校验后安装。旧 TLS framing 协商已删除。Forwarder 直接访问这些字段完成原有消息分派和去重；已有 ServiceKey 和 RelaySelection 继续拥有服务协议、选路及 epoch，不将整份 Node 报文留在会话中。
+
+业务会话使用一个固定的 `relay.open_timeout_ms` 截止时间，覆盖选路、Node 信令、数据接入、TLS 认证和服务确认。阶段限制只用于 DNS/TCP 连接（`server.connect_timeout_ms`）和实际 TLS 握手（`channel.handshake_timeout_ms`），取其与剩余建立预算的较小值。读取连接编号、发送 UDP attach、TLS 服务名和确认字节均直接使用原始建立截止时间，不为每次协议收发重新套用 connect timeout；宣布业务 Ready 前统一检查取消与总期限。
+
+TLS 复制结束后，`finish_tls()` 用一个 `channel.disconnect_timeout_ms` 截止时间完成 close_notify、载体写半关闭和 EOF 校验，各步不续期。传输阶段不套用建立期限；Consumer UDP 的双向空闲回收、控制通道的心跳失联判定、Node 未绑定 socket 的准入期限和多跳 Finished 收尾分别保护不同资源，独立保留。
 
 UDP 本地 forward 按 `(forward_id, 客户端 IP, 客户端端口)` 查找独立关联。每个监听器只保存 endpoint → request ID 索引，`relays_` 持有会话；客户端 endpoint 固定保存在该会话的 DatagramData 中。不同客户端复用现有协议分别建立 Node session / Flow，Producer 为每个会话创建独立目标 socket；回包不会再根据最后一次本地发送者选择地址。
 
@@ -410,8 +413,8 @@ sequenceDiagram
     C->>N: relay.open
     N->>P: relay.offer（Producer ticket）
     N->>C: relay.opened（Consumer ticket）
-    C->>N: 数据端口接入 + CBOR relay.attach
-    P->>N: 数据端口接入 + CBOR relay.attach
+    C->>N: 数据 TCP 读取编号，控制 mTLS relay.attach
+    P->>N: 数据 TCP 读取编号，控制 mTLS relay.attach
     N->>N: 校验双方独立 ticket、配对并激活
     N->>C: relay.ready
     N->>P: relay.ready
@@ -421,7 +424,7 @@ sequenceDiagram
 
 1. **参数提取与分配**：为本次会话分配 Node 本地唯一的 64 位 `uuid` 及双端独立的鉴权令牌 `ticket`，设置绝对建立截止时间（默认 10s）。
 2. **双端通知**：同时向 Consumer 发送 `relay.opened`，向 Producer 发送 `relay.offer`。
-3. **数据端口接入拦截**：两端 Agent 收到信令后，分别连接 Node 的公网数据端口（TCP/TLS 为 18444/18446，UDP 为 18445），并发送 `WireMessage` 封装的 CBOR `relay.attach`；UDP 接入报文独立发送，业务数据报另加会话头。
+3. **数据端口接入拦截**：两端 Agent 收到信令后，分别连接共用 TCP 数据端口（18444），读取 Node 的连接编号，再经现有控制 mTLS 发送 `relay.attach` 授权绑定。UDP 仍在 18445 发送独立 CBOR attach，业务数据报另加会话头。
 4. **配对与激活**：Node 的数据执行域验证每端的 `uuid`、角色与对应 `ticket` 后，将双端 Socket 配对，触发 `bridge()` 开启直接流式数据拷贝，同时控制面回送 `relay.ready`。
 
 #### 3.3.2 多节点首末协调：ControlRouterMulti
@@ -847,15 +850,15 @@ flowchart LR
 
 #### 5.1.3 Agent 业务接入头
 
-1. **TCP/TLS 接入消息 `RelayAttach`**：接入参数包含 `role`、`uuid`、`ticket`。`RelayAttach::to_msg()` 生成 `relay.attach`，通过 `WireMessage` 编成 4 字节大端长度 + CBOR：
+1. **TCP/TLS 控制绑定 `RelayAttach`**：Node 接受普通 TCP socket，生成密码学安全的 32 字节随机 `connection_id` 并原样发送。Agent 精确读取后，经原主控 mTLS 发送下列报文；主控按 `node_id` 转送至数据 Node，携带经过认证的来源 Node 和 Agent session 身份。
 
    ```json
-   {"command":"relay.attach","params":{"role":2,"uuid":1048576,"ticket":9876543210}}
+   {"command":"relay.attach","params":{"role":2,"uuid":1048576,"ticket":9876543210,"connection_id":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","node_id":"edge-1"}}
    ```
 
-   `Producer=1`、`Consumer=2`，UUID 与 ticket 非零。TLS 先完成双向 TLS 握手，并在参数中附加 `tls_framing: "length32-fin-v1"`。单节点两端有相同 UUID、不同 ticket；多节点首末端的 UUID 是各自 Node 本地分配的，不要求相同。
+   `Producer=1`、`Consumer=2`，UUID 与 ticket 非零；编号为固定 64 位小写十六进制字符串。数据 Node 校验实际 AgentPeer、角色和当前票据，随后在 transfer_tcp_io 原子地消费待绑定 socket。相同请求幂等，不同连接不能覆盖已有槽位。编号公开而无授权能力，ticket 不在数据 TCP 上发送。未绑定连接受 `tcp.max_setup_connections` 和 `tcp.setup_timeout_ms` 限制；提前业务数据、断开、超时或停止均回收。单节点两端 UUID 相同、票据不同；多节点首末 UUID 各自分配。
 
-2. **TLS 业务分帧**：`protocol/inc/xfr_channel.h` 定义 `tls_data_framing = "length32-fin-v1"`。每帧为 4 字节大端长度 + 数据，长度上限 65,467；长度为 0 表示本方向业务 FIN，独立于 TLS `close_notify`，以支持 TLS 1.2 的业务半关闭。TCP 数据端口在 attach 后直接传输原始字节流。
+2. **端到端 TLS 业务**：收到 `relay.ready` 后，两端 Agent 使用 TLS 1.3 双向 RPK 握手，Consumer 为 client、Producer 为 server。固定公钥来自双方原共享客户端证书，私钥沿用原配置，无需签发 Producer 证书。Consumer 在加密通道内发送 4 字节大端长度及服务名（最多 64 字节）；Producer 核对服务、连接目标后返回单字节 `1`。随后每个加密业务帧为 4 字节大端长度及数据，最大 64 KiB，与 NodeLink 载荷上限无关；零长度是单方向业务 FIN。两方向排空后才交换 TLS close_notify，再半关闭 TCP 并等待对端 EOF。Node 始终只转发原始 TCP 字节，既不解密也不解析业务帧。
 
 3. **UDP `DatagramHeader`**：Agent 的业务数据报以 8 字节大端非零 `session_id` 开头。首次接入直接发送 `WireMessage::pack(relay.attach)`，不加 session 头；收到 ready 前每 500ms 重试 attach，业务报文为会话头 + 用户载荷。Node 根据会话 ID 解复用并绑定来源地址。UDP 两端有各自的会话 ID，无 TCP 式接入连接。
 
@@ -1124,14 +1127,14 @@ class PooledBuffer {
 #### 5.6.3 数据热路径分配与拷贝分析
 
 在整个数据流转的热路径上：
-1. Agent 的多跳 TCP 接入复用 32 KiB 堆读取缓冲，再将实际读取的字节复制到对应大小的池块；多跳 TLS 在 `read_remote_pair` 的 TLS 分支读取帧头，校验后按长度构造池块并直接读取帧体。NodeLink TCP 同样按帧体长度直接读入池缓冲；
+1. Node 对多跳 TCP/TLS 使用同一个 32 KiB 堆读取缓冲，再将实际收到的原始字节复制到对应大小的池块；TLS 字节保持密文。NodeLink TCP 按载体帧长度直接读入池缓冲；
 2. 构建 `Frame` 对象（占用栈帧或队列节点，不分配载荷堆空间）；
 3. 移交所有权至 `FlowStream` 并挂入 `FairQueue`；
 4. 物理 TCP Socket 集中调用 `async_write` 发送；
 5. 发送完成后归还信用并触发 `PooledBuffer` 析构还池。
-TCP 入口从复用读取缓冲向实际长度的池块复制一次，之后接入 Stream 和各中继跳之间均通过移动语义传递池缓冲。TCP 入口读协程复用一块 32 KiB 读取缓冲；跨域发送仍是零容量交接，协议发送循环最多暂存一块等待本地窗口的载荷，两者需要在已计费窗口之外计入。TLS 入口两处暂存分别不超过一个合法帧（65,467 字节），FIN 不分配载荷。
+TCP 入口从复用读取缓冲向实际长度的池块复制一次，之后接入 Stream 和各中继跳之间均通过移动语义传递池缓冲。TCP 入口读协程复用一块 32 KiB 读取缓冲；跨域发送仍是零容量交接，协议发送循环最多暂存一块等待本地窗口的载荷，两者需要在已计费窗口之外计入。TCP/TLS 共用相同入口缓冲与背压路径。
 
-TLS 读写直接融合进实际转发协程：`transfer_tls` 在循环外一次分配堆缓冲，TLS 读取使用 64 KiB，TCP 读取使用 32 KiB；每帧只按校验后的实际长度读写，不再调整缓冲大小。`read_remote_pair` 按帧长构造独立的 `PooledBuffer` 并移交 Flow。两处读取后继续共用各自的结束、限速及发送流程。TLS 写入处直接组合四字节长度头和载荷发送，结束时发送零长度头；Flow 的空 DATA 不写入 TLS，也不视为 FIN。共享的 `decode_tls_data_size` 和 `encode_tls_data_size` 是普通同步函数，仅编解码四字节长度；解码时校验接收长度，编码时使用调用处已受限的发送长度，不操作缓冲或执行 I/O。它们不再把约 64 KiB 数组嵌入协程帧，且没有增加发送队列。单节点普通 TCP 复制继续使用原有 32 KiB 数组。
+Agent 的 `send_tls` / `receive_tls` 分别复用 32 KiB 本地 TCP 接收缓冲及 64 KiB TLS 接收缓冲，校验业务长度并发送 DATA/FIN；只支持实际使用的 TCP↔TLS 两个方向。同步 `decode_tls_data_size` / `encode_tls_data_size` 只编解码业务长度头。Node 删除 TLS 帧分支与 TLS↔TLS 复制，单节点统一 `relay_tcp`，多节点统一 TCP↔Flow；计数及限速按实际转发字节计费，TLS 包含握手、record 与加密业务帧开销，连接编号及控制 attach 不计入业务流量。
 
 
 ## 6. 安全体系与证书信任模型
@@ -1142,7 +1145,7 @@ RelayWeave 构建在**严格的双向 TLS（mTLS）与物理隔离的双证书�
 flowchart TD
     ServerCA["Server CA"] -->|"签发 serverAuth + clientAuth"| NodeCert["Node 证书"]
     ClientCA["Client CA"] -->|"签发 clientAuth"| AgentCert["Agent 证书"]
-    AgentCert -->|"客户端身份"| AgentTLS["Agent 到 Node：控制与 TLS 数据接入"]
+    AgentCert -->|"客户端身份"| AgentTLS["Agent 到 Node：控制 mTLS"]
     NodeCert -->|"服务端身份"| AgentTLS
     NodeCert --> ClusterTLS["Node 到 Master：集群控制 mTLS"]
     AgentTLS -->|"Node 用 Client CA 验证 Agent"| ClientCA
@@ -1165,7 +1168,7 @@ RelayWeave 确立了**两条互不相交的根信任链**：
    - **分发范围**：分发给所有 RelayAgent（作为受信任服务端根）以及所有 RelayNode（作为节点间集群控制的互信根）。
 2. **Client CA (`client-ca.pem`)**：
    - 唯一的职能是为授权接入的 RelayAgent 签发客户端身份证书（`shared-client.pem`）。
-   - **分发范围**：分发给 RelayNode 节点，作为 Agent 控制端口 18443 与 TLS 数据端口 18446 的客户端验证根 `ca_file`；Agent 使用 Server CA 验证 Node。
+   - **分发范围**：分发给 RelayNode 节点，作为 Agent 控制端口 18443 的客户端验证根 `ca_file`；Agent 使用 Server CA 验证 Node。
 
 #### 6.1.2 节点证书与客户端证书职能划分
 
@@ -1174,9 +1177,15 @@ RelayWeave 确立了**两条互不相交的根信任链**：
   - 在集群控制连接（端口 18447）上，发起端节点以其作为客户端身份、对端节点以其作为服务端身份，完成同 CA 下的对等 mTLS 握手。
 - **客户端接入证书（`shared-client.pem`）**：
   - 拥有扩展密钥用法：`extendedKeyUsage = clientAuth`。
-  - 仅用于在端口 18443 向 Node 出示身份，无法伪装成中继节点。
+  - X.509 证书用于端口 18443 的控制身份认证，无法伪装成中继节点；同一私钥及证书公钥也用于 Agent 间 TLS 1.3 RPK，不受 X.509 serverAuth/SAN 约束。
 
 ---
+
+### 6.1.3 Agent 端到端身份与信任边界
+
+Forwarder 拥有独立业务 TLS context，复用原控制凭据，并严格固定对端 RPK 为本地证书公钥。只接受 TLS 1.3 与双向 RPK，关闭会话恢复及 0-RTT；NodeConnection 的 CA、有效期及名称校验不变。需要支持 RPK 的 OpenSSL 3.2 或更高版本。
+
+共享私钥提供群体认证，不能区分具体客户；持有同一私钥的成员能相互冒充。只有自身节点凭据的 Node 无法冒充 Agent 或解密业务，但仍掌握服务路由、流量大小和时序，并能中断连接。服务确认不替代独立用户认证。双方共享同一凭据时，启用 TLS 只需改双方 service/forward 的 `protocol`；凭据轮换需统一部署。
 
 ### 6.2 身份校验与 SAN 规划规范
 
@@ -1219,8 +1228,8 @@ sequenceDiagram
     N->>P: relay.offer（data_port, uuid, ticket）
     N->>C: relay.opened（request_id, data_port, uuid, ticket）
     P->>T: 连接目标服务
-    C->>D: 连接数据端口 + CBOR relay.attach
-    P->>D: 连接数据端口 + CBOR relay.attach
+    C->>D: 数据 TCP 读取编号，控制 mTLS relay.attach
+    P->>D: 数据 TCP 读取编号，控制 mTLS relay.attach
     D->>D: 验证并配对
     N->>C: relay.ready
     N->>P: relay.ready
@@ -1245,12 +1254,12 @@ sequenceDiagram
    - Node 在 `control_io` 上创建 `ControlRouterSingle`，并发向 Producer 发送 `relay.offer`、向 Consumer 返回 `relay.opened`，通知双方连接数据端口（18444）。
 2. **数据接入与配对（接入屏障）**：
    - 双端 Agent 异步建立到 Node 数据端口（18444）的 TCP 连接。
-   - 双端在 Socket 建立后的第一个包发送长度前缀 + CBOR 编码的 `relay.attach`，附带各自的角色（`Consumer=2` / `Producer=1`）、`uuid` 与 `ticket`。
+   - Node 在数据 socket 发送连接编号，双端经控制 mTLS 发送角色、uuid、ticket 和编号；Node 校验归属并授权绑定。
    - `prepare_local` 在传输执行域内等待两端凭证匹配，随后连续绑定流量计数与限速并激活配对，一次返回控制域。
 3. **数据桥接与半关闭（传输阶段）**：
    - 控制面回送 `relay.ready`，通知客户端开始发送业务数据。
-   - 随后调用 `relay_tcp()` / `relay_tls()`，启动双向协程流式复制循环。
-   - **双向半关闭（FIN/EOF）**：当客户端关闭写端（发送 FIN）时，Node 端读取到 EOF，向服务端对向 Socket 发送 `shutdown(SHUT_WR)`。服务端仍可继续反向发送剩余响应数据，直至服务端也发送 EOF。双向均关闭后，Node 清理该会话资源。TLS 接入通过 `length32-fin-v1` 的零长度业务帧传递业务 FIN。
+   - Node 统一调用 `relay_tcp()` 启动字节复制；TLS 业务由两端 Agent 完成握手与服务确认后使用 TCP↔TLS 复制。
+   - **双向半关闭（FIN/EOF）**：当客户端关闭写端（发送 FIN）时，Node 端读取到 EOF，向服务端对向 Socket 发送 `shutdown(SHUT_WR)`。服务端仍可继续反向发送剩余响应数据，直至服务端也发送 EOF。双向均关闭后，Node 清理该会话资源。TLS 业务 FIN 只由 Agent 加解密；两端业务结束并交换 close_notify 后才向 Node 发送 TCP EOF。收尾受固定 `channel.disconnect_timeout_ms` 限制，多跳 Finished 等待同样有界。
 
 ---
 
@@ -1290,9 +1299,9 @@ sequenceDiagram
     Egress->>Egress: install_endpoint（分配 Egress uuid/ticket）
     Egress->>P: relay.offer（data_port, uuid, ticket）
     P->>Target: 连接真实服务
-    C->>Ingress: 连接数据端口 + relay.attach
+    C->>Ingress: 数据 TCP 读取编号，控制 mTLS relay.attach
     Ingress->>Ingress: bind_stream_flow（首端挂接 FlowStream）
-    P->>Egress: 连接数据端口 + relay.attach
+    P->>Egress: 数据 TCP 读取编号，控制 mTLS relay.attach
     Egress->>Egress: bind_stream_flow（尾端挂接 FlowStream）
     Egress->>Ingress: relay.peer.attached（集群单播）
     Ingress->>Ingress: activate() 激活本地端点
@@ -1351,7 +1360,7 @@ sequenceDiagram
 |---|---|---|
 | **Agent 异常离线** | TCP RST 或 `TLSChannel` 心跳超时（20s）。 | Node 立即销毁对应的 `NodeSession`；关闭所有关联的局部数据 Socket；若为多节点 Flow，向上游或下游发送 `LnkFrType::Reset` 帧，随后通过 Master 触发 `flow.close`。 |
 | **中继节点崩溃/离线** | Master 检测到 Slave 集群控制连接断开。 | 1. Master 将该节点从活跃列表中剔除，**递增成员版本 `version`**；<br>2. Master 向全网存活节点广播 `topology.members`；<br>3. 各节点收到新拓扑后，**立即作废所有包含离线节点或基于旧授权构建的 Flow**，数据通道丢弃旧帧并清理；<br>4. Agent 收到拓扑失效通知，在本地清空路由缓存，重新运行 Dijkstra 计算新的替代路径。 |
-| **慢客户端导致流控窗口耗尽** | 接收端停止返还信用，发送端 `sent_bytes == send_limit` 且持续超时。 | 发送队列达到容量上限时触发有界阻塞；若超出配置的会话超时阈值（`setup_timeout_ms`），Node 判定为超时会话，执行优雅熔断（Cancel），回送错误信令并关闭 Flow。 |
+| **慢客户端导致流控窗口耗尽** | 接收端停止返还信用，发送端 `sent_bytes == send_limit`。 | 发送端按信用与有界队列施加背压，等待对端消费后继续；建立期限只用于建立阶段，运行中的连接错误、显式取消或控制失联沿原清理链路释放 Flow。 |
 | **网络分区导致 Master 失联** | Slave 节点的 `ClusterMgr::Connector` 连续超时。 | Slave 节点停止接纳新的多节点 `relay.open` 请求（降级为仅支持单节点本地 Relay）；后台 Connector 启动固定 5 秒间隔自动重连；一旦重连成功并同步新成员列表，自动恢复全功能。 |
 
 
@@ -1372,7 +1381,7 @@ flowchart TD
     Relays --> Links["等待 NodeLinkMgr / FlowProtocol 停止"]
     Cluster["关闭 Topology 与 ClusterMgr，等待控制会话排空"]
     Links --> Cluster
-    TCP["传输域停止 TCP/TLS pipeline 并等待 pending 任务"]
+    TCP["传输域停止 共用 StreamPipeline 并等待 pending 任务"]
     Cluster --> TCP
     UDP["传输域停止 DatagramMgr"]
     TCP --> UDP
@@ -1380,7 +1389,7 @@ flowchart TD
     UDP --> Join
 ```
 
-1. **阶段 1：停止准入**：关闭控制监听器（`control_acceptor_`）与集群监听器，关闭 TCP/TLS/UDP 公网数据接入监听器，拒绝一切新的 Agent 连接与会话创建请求。
+1. **阶段 1：停止准入**：关闭控制监听器（`control_acceptor_`）与集群监听器，关闭 流式 TCP 和 UDP 公网数据接入监听器，拒绝一切新的 Agent 连接与会话创建请求。
 2. **阶段 2：取消活跃会话与路径事务**：向所有活跃的 `NodeSession` 投递取消信号，正在建立中的 Flow 路径触发两阶段回滚与 `close_flow`，正在传输中的 Flow 发送 `LnkFrType::Reset` 帧，断开与 Agent 的业务 Socket。
 3. **阶段 3：协程任务异步排空**：启动 `AsyncEvent` 与 `steady_timer` 异步屏障，等待所有 `NodeSession`、Pipeline 读写协程以及 `LnkChannel` 数据任务自然退出，等待 `active_control_sessions_` 归零。
 4. **阶段 4：执行域终止与线程汇聚**：释放 `control_work`、`tcp_work`、`udp_work`、`data_work` 四个工作守卫，四个单线程 `io_context` 结束 `run()` 循环，主线程调用 `worker.join()` 汇聚所有系统线程，顺次调用对象析构函数。
@@ -1403,7 +1412,7 @@ RelayNode 内部的活体协程由进程常驻任务、控制连接、NodeLink�
 
 | 协程类别 | 归属执行域 | 数量估算公式 | 说明与典型数值 (以并发 1000 连接为例) |
 |---|---|---|---|
-| **进程常驻协程** | 各域 | `C_static = 6～8` | 包括：Control Accept Loop (1), Cluster Accept Loop (1), TCP Accept Loop (1), TLS Accept Loop (1), FlowProtocol Monitor Loop (1), Topology Probe (1~2)。 |
+| **进程常驻协程** | 各域 | `C_static = 5～7` | 包括：Control Accept Loop (1), Cluster Accept Loop (1), Shared TCP Accept Loop (1), FlowProtocol Monitor Loop (1), Topology Probe (1~2)。 |
 | **控制连接协程** | `control_io` | `C_ctrl = 2 × N_agent + 2 × N_cluster` | 每个控制连接维护独立的读消息协程与写排队协程。例如 50 个 Agent + 10 个集群节点 = 120 个协程。 |
 | **业务中继协程** | 数据执行域 | 单节点 TCP：`C_relay = 2 × N_tcp`<br>多节点首尾跳：`C_relay = 4 × N_multi`<br>UDP 会话：`C_relay = 2 × N_udp` | 单节点流式中继包含双向流拷贝 2 个协程；多节点首尾跳各包含 Socket ↔ FlowStream 双向 2 个协程（首尾合计 4 个协程）；UDP 维护 2 个异步循环。 |
 
@@ -1483,17 +1492,6 @@ RelayNode 启动时接受一个 JSON 格式的配置文件，各段落对应不�
     "tx_bytes_per_second": 2000000,
     "tx_max_burst_bytes": 262144
   },
-  "tls": {
-    "address": "0.0.0.0",
-    "port": 18446,
-    "max_setup_connections": 512,
-    "max_relays": 128,
-    "setup_timeout_ms": 10000,
-    "rx_bytes_per_second": 2000000,
-    "rx_max_burst_bytes": 262144,
-    "tx_bytes_per_second": 2000000,
-    "tx_max_burst_bytes": 262144
-  },
   "udp": {
     "address": "0.0.0.0",
     "port": 18445,
@@ -1514,14 +1512,14 @@ RelayNode 启动时接受一个 JSON 格式的配置文件，各段落对应不�
 
 | 配置段落 / 字段 | 类型 | 默认值 / 约束 | 说明 |
 |---|---|---|---|
-| **`certificate.ca_file`** | 路径 | 必填 | Client CA 根证书路径。用于在控制端口（18443）与 TLS 端口上校验接入 Agent 的客户端证书。 |
+| **`certificate.ca_file`** | 路径 | 必填 | Client CA 根证书路径。用于在控制端口（18443）校验接入 Agent 的客户端证书。 |
 | **`certificate.server_ca_file`** | 路径 | 必填 | Server CA 根证书路径。用于在集群控制端口（18447）上校验对端 Node 的身份。 |
 | **`certificate.certificate_chain`** | 路径 | 必填 | 本节点的 TLS 证书链文件。 |
 | **`certificate.private_key`** | 路径 | 必填 | 本节点的 TLS 私钥文件（权限必须为 0600）。 |
 | **`cluster.role`** | 字符串 | `"master"` 或 `"slave"` | 集群角色。`master` 负责路径安装协调；`slave` 需配置连接 Master。 |
 | **`cluster.node_id`** | 字符串 | 必填 | 全网唯一的节点标识字符串（<=256 字节，非保留名 all）。 |
 | **`control.advertise_address`** | 字符串 | 必填 | 向集群和 Agent 广播的本节点公网可达 IP 或主机名。必须包含在节点证书的 SAN 列表中。 |
-| **`tcp/tls/udp.setup_timeout_ms`** | 整数 | 10000 ms (10s) | 会话建立阶段等待两端 `RelayAttach` 握手的绝对超时时限。 |
+| **`tcp/udp.setup_timeout_ms`** | 整数 | 10000 ms (10s) | 会话建立阶段等待两端 `RelayAttach` 握手的绝对超时时限。 |
 | **`rx/tx_bytes_per_second`** | 整数 | 字节/秒 | 令牌桶流量整形速率。设置为 0 时表示不限速。 |
 
 流式限速先通过同步的 `TokenBucket::reserve` 扣款并计算等待截止时间；不限速、空载荷或余额充足时返回空，仅返回截止时间时才进入 `wait_until` 协程等待。一次载荷只进行一次额度计算，定时器在首次等待时创建并复用。UDP 使用同步的 `try_consume`，额度不足时丢包，不预留债务或等待。每个令牌桶在同一执行器上访问，最多一个等待在途。
@@ -1602,6 +1600,10 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 | 配置段落 / 字段 | 类型 | 说明 |
 |---|---|---|
 | **`server.host` / `port`** | 字符串/整数 | 初次启动连接的主控 RelayNode 控制端口（默认 18443）。 |
+| **`relay.open_timeout_ms`** | 正整数，默认 10000 | 单个业务会话从创建到业务 Ready 的总建立预算，各阶段不续期。 |
+| **`server.connect_timeout_ms`** | 正整数，默认 5000 | DNS/TCP 连接操作上限；业务连接同时受剩余总建立预算限制。 |
+| **`channel.handshake_timeout_ms`** | 正整数，默认 5000 | 实际 TLS 握手上限；业务 TLS 同时受剩余总建立预算限制。 |
+| **`channel.disconnect_timeout_ms`** | 正整数，默认 5000 | TLS 业务双向结束后，共享的关闭与载体 EOF 等待预算。 |
 | **`relay.udp_idle_timeout_ms`** | 正整数，默认 60000 | Consumer UDP 关联双向业务空闲期限；回收通过既有取消链路释放 Node/Producer 资源。 |
 | **`routing.max_nodes`** | 整数 (默认 4) | 运行 Dijkstra 算法时计算的最长中继跳数上限。 |
 | **`services`** | 数组 (Producer 配置) | 声明本机对外提供的真实后端服务。Agent 启动后自动向 Node 发起 `ServiceRegister`。 |
@@ -1657,7 +1659,7 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 | `0x09000001` | `Ping` | `"heartbeat.ping"` | TLSChannel 双向心跳探测帧 |
 | `0x09000002` | `Pong` | `"heartbeat.pong"` | TLSChannel 心跳应答帧 |
 | `0x01000000` | `Relay` | `"relay"` | 业务中继组基准 |
-| `0x01000001` | `RelayAttach` | `"relay.attach"` | 数据端口接入认证 |
+| `0x01000001` | `RelayAttach` | `"relay.attach"` | 流式控制授权绑定 / UDP 数据接入 |
 | `0x01000002` | `RelayOpen` | `"relay.open"` | Consumer Agent 向 Ingress Node 发起开通业务 |
 | `0x01000003` | `RelayOpened` | `"relay.opened"` | Ingress Node 向 Consumer Agent 返回已开通 |
 | `0x01000004` | `RelayOffer` | `"relay.offer"` | Egress Node 派发给 Producer Agent 的建连通知 |
@@ -1933,7 +1935,7 @@ Commit、Close 和以上回复均不携带 path、addresses、links、transport�
 | **`node/inc/nodelink_mgr.h`**<br>`node/src/nodelink_mgr.cpp` | `NodeLinkMgr` | `control_io` | 跨节点 Flow 两阶段安装事务状态机与 NodeLink 邻接建立协调器。 |
 | **`node/inc/cluster_mgr.h`**<br>`node/src/cluster_mgr.cpp` | `ClusterMgr`<br>`ClusterRoom` | `control_io` | Master 集群成员网状网维护、重连与消息交换路由。 |
 | **`node/inc/registry_mgr.h`**<br>`node/src/registry_mgr.cpp` | `RegistryMgr` | `control_io` | 本地服务条目注册表。 |
-| **`node/inc/pipeline_mgr.h`**<br>`node/src/pipeline_mgr.cpp` | `TcpPipeline`<br>`TlsPipeline` | `transfer_tcp_io` | 公网 TCP/TLS 业务端口接入与 `xfr_channel.h` 全双工流拷贝。 |
+| **`node/inc/pipeline_mgr.h`**<br>`node/src/pipeline_mgr.cpp` | `StreamPipeline` | `transfer_tcp_io` | 公网 TCP/TLS 业务端口接入与 `xfr_channel.h` 全双工流拷贝。 |
 | **`node/inc/datagram_mgr.h`**<br>`node/src/datagram_mgr.cpp` | `DatagramMgr` | `transfer_udp_io` | 公网 UDP 业务单端口监听与客户端反射地址解复用。 |
 | **`agent/inc/relay_agent.h`**<br>`agent/src/relay_agent.cpp` | `RelayAgent` | 组合根 (协调双执行域) | Agent 进程组合根。管理 control_io 与 transfer_io。 |
 | **`agent/inc/agent_control.h`**<br>`agent/src/agent_control.cpp` | `AgentControl` | `control_io` | Agent 服务注册、服务发现与拓扑轮询驱动。 |

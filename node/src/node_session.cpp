@@ -3,17 +3,17 @@
 
 NodeSession::NodeSession(RelayNode &node, const AgentPeer &session, RelayRequest params, bool ingress,
                          SRVTrafficPtr traffic)
-    : node_(node), data_manager_(select_data(params.protocol)),
+    : node_(node), data_manager_(select_data(params.protocol)), protocol_(params.protocol),
       control_(std::in_place_type<ControlRouterMulti>, *this, session, std::move(params), ingress),
-      traffic_(std::move(traffic))
+      traffic_(std::move(traffic)), bindings_done_(node.control_executor_)
 {
 }
 
 NodeSession::NodeSession(RelayNode &node, const AgentPeer &consumer, const AgentPeer &producer, RelayRequest params,
                          SRVTrafficPtr traffic)
-    : node_(node), data_manager_(select_data(params.protocol)),
+    : node_(node), data_manager_(select_data(params.protocol)), protocol_(params.protocol),
       control_(std::in_place_type<ControlRouterSingle>, *this, consumer, producer, std::move(params)),
-      traffic_(std::move(traffic))
+      traffic_(std::move(traffic)), bindings_done_(node.control_executor_)
 {
 }
 
@@ -23,10 +23,6 @@ NodeSession::DataManager NodeSession::select_data(RelayProtocol protocol) const
     {
         return node_.datagram_mgr_.get();
     }
-    else if (protocol == RelayProtocol::Tls)
-    {
-        return node_.tls_pipeline_.get();
-    }
     else
     {
         return node_.tcp_pipeline_.get();
@@ -35,7 +31,8 @@ NodeSession::DataManager NodeSession::select_data(RelayProtocol protocol) const
 
 asio::any_io_executor NodeSession::data_executor() const
 {
-    return std::holds_alternative<DatagramMgr *>(data_manager_) ? node_.transfer_udp_executor_ : node_.transfer_tcp_executor_;
+    return std::holds_alternative<DatagramMgr *>(data_manager_) ? node_.transfer_udp_executor_
+                                                                : node_.transfer_tcp_executor_;
 }
 
 asio::awaitable<void> NodeSession::run()
@@ -68,6 +65,11 @@ bool NodeSession::handle(CtrlCommand command, const AgentPeer &session, const Ct
     return std::visit([&](auto &controller) { return controller.handle(command, session, message); }, control_);
 }
 
+bool NodeSession::handle_attach(const AgentPeer &session, const RelayAttach &request)
+{
+    return std::visit([&](auto &controller) { return controller.handle_attach(session, request); }, control_);
+}
+
 bool NodeSession::handle_peer(CtrlCommand command, const CtrlMessage &message)
 {
     if (auto *controller = std::get_if<ControlRouterMulti>(&control_))
@@ -79,11 +81,7 @@ bool NodeSession::handle_peer(CtrlCommand command, const CtrlMessage &message)
 
 RelayProtocol NodeSession::protocol() const noexcept
 {
-    if (std::holds_alternative<DatagramMgr *>(data_manager_))
-    {
-        return RelayProtocol::Udp;
-    }
-    return std::holds_alternative<TlsPipeline *>(data_manager_) ? RelayProtocol::Tls : RelayProtocol::Tcp;
+    return protocol_;
 }
 
 bool NodeSession::is_multi() const noexcept
@@ -196,6 +194,56 @@ asio::awaitable<void> NodeSession::close()
             co_return;
         },
         asio::use_awaitable);
+    while (binding_roles_ != 0)
+    {
+        bindings_done_.expires_at(std::chrono::steady_clock::time_point::max());
+        co_await bindings_done_.async_wait(use_nothrow_awaitable);
+    }
+}
+
+void NodeSession::attach(const RelayAttach &request)
+{
+    if (protocol() == RelayProtocol::Udp || !request.connection_id)
+    {
+        return;
+    }
+    const AttachInfo *expected = nullptr;
+    if (const auto *endpoint = std::get_if<AttachInfo>(&endpoint_))
+    {
+        expected = endpoint;
+    }
+    else if (const auto *pair = std::get_if<AttachPair>(&endpoint_))
+    {
+        expected = request.role == RelayAttach::Producer ? &pair->producer : &pair->consumer;
+    }
+    if (!expected || request.ticket != expected->ticket)
+    {
+        return;
+    }
+    const unsigned mask = 1U << request.role;
+    if (binding_roles_ & mask)
+    {
+        return;
+    }
+    binding_roles_ |= mask;
+    asio::co_spawn(
+        node_.control_executor_,
+        [this, request, mask]() -> asio::awaitable<void> {
+            ScopeGuard done([&] {
+                binding_roles_ &= ~mask;
+                bindings_done_.cancel();
+            });
+            try
+            {
+                co_await asio::co_spawn(data_executor(), std::get<StreamPipeline *>(data_manager_)->bind(request),
+                                        asio::use_awaitable);
+            }
+            catch (const std::exception &error)
+            {
+                cancel("attach", error.what());
+            }
+        },
+        asio::detached);
 }
 
 void NodeSession::send_agent(const AgentPeer &route, CtrlMessage message) const

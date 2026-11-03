@@ -7,7 +7,6 @@ TEST_MEMBER(RelayNode, topology_)
 TEST_MEMBER(RelayNode, config_)
 TEST_MEMBER(RelayNode, state_)
 TEST_MEMBER(RelayNode, tcp_pipeline_)
-TEST_MEMBER(RelayNode, tls_pipeline_)
 TEST_MEMBER(RelayNode, datagram_mgr_)
 TEST_MEMBER(Topology, state_)
 TEST_MEMBER(Topology, drain_error_)
@@ -19,8 +18,7 @@ TEST_MEMBER(FlowProtocol, stopping_)
 TEST_MEMBER(FlowProtocol, tasks_)
 TEST_MEMBER(NodeLinkMgr, events_running_)
 TEST_MEMBER(NodeLinkMgr, flow_tasks_)
-TEST_MEMBER(TcpPipeline, stopped_)
-TEST_MEMBER(TlsPipeline, stopped_)
+TEST_MEMBER(StreamPipeline, stopped_)
 TEST_MEMBER(DatagramMgr, stopped_)
 
 using namespace std::chrono_literals;
@@ -50,7 +48,7 @@ struct ShutdownNode
     ShutdownNode()
     {
         auto config = make_test_node_config();
-        config.control.address = config.tcp.address = config.tls.address = config.datagram.address = "127.0.0.1";
+        config.control.address = config.tcp.address = config.datagram.address = "127.0.0.1";
         config.channel.disconnect_timeout = 100ms;
         ssl.use_certificate_chain_file(config.certificate_chain.string());
         ssl.use_private_key_file(config.private_key.string(), asio::ssl::context::pem);
@@ -156,8 +154,7 @@ static void stop_drains_all_domains(bool fail_during_stop)
                          "A shutdown error skipped topology or cluster draining");
     })).get();
     asio::post(f.tcp, asio::use_future([&] {
-        require_shutdown(test_access::TcpPipeline_stopped_(*test_access::RelayNode_tcp_pipeline_(*f.node)) &&
-                             test_access::TlsPipeline_stopped_(*test_access::RelayNode_tls_pipeline_(*f.node)),
+        require_shutdown(test_access::StreamPipeline_stopped_(*test_access::RelayNode_tcp_pipeline_(*f.node)),
                          "A shutdown error skipped TCP/TLS shutdown");
     })).get();
     asio::post(f.udp, asio::use_future([&] {

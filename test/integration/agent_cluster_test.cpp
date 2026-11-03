@@ -74,8 +74,6 @@ NodeConfig server_config(std::string node_id, ClusterConfig::Role role, std::uin
     config.control.port = control_port;
     config.tcp.address = "127.0.0.1";
     config.tcp.port = transfer_port;
-    config.tls.address = "127.0.0.1";
-    config.tls.port = 0;
     config.datagram.address = "127.0.0.1";
     config.datagram.port = 0;
     config.channel = channel_config();

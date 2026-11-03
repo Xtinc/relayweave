@@ -340,7 +340,7 @@ Dashboard、Agent 和 Node 分别由自己的 systemd unit 管理，不绑定彼
 {"service": "dashboard", "listen_address": "127.0.0.1", "listen_port": 15000, "protocol": "tls"}
 ```
 
-客户端可连接同一集群内其他 Node，沿用现有集群服务发现。浏览器访问 **http://127.0.0.1:15000/**，不需要修改浏览器的 HTTP/SOCKS 代理设置。这里的 `tls` 加密的是 Agent 与 Node 之间的数据通道；本地浏览器和服务端回环连接仍是 HTTP/TCP。
+客户端可连接同一集群内其他 Node，沿用现有集群服务发现。浏览器访问 **http://127.0.0.1:15000/**，不需要修改浏览器的 HTTP/SOCKS 代理设置。这里的 `tls` 加密的是两端 Agent 之间的完整业务通道，经过的 Node 透明转发密文；本地浏览器和服务端回环连接仍是 HTTP/TCP。
 
 ### 4. 运维与历史迁移
 

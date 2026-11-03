@@ -1,3 +1,4 @@
+#include "stream_attach.h"
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
@@ -118,15 +119,14 @@ asio::awaitable<CtrlMessage> receive_command(const std::shared_ptr<TLSChannel> &
     co_return message;
 }
 
-asio::awaitable<tcp::socket> connect_relay_half(std::uint16_t transfer_port, int role, uint64_t uuid,
+asio::awaitable<tcp::socket> connect_relay_half(const std::shared_ptr<TLSChannel> &control, std::uint16_t transfer_port, int role, uint64_t uuid,
                                                 uint64_t ticket)
 {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     co_await socket.async_connect(tcp::endpoint(asio::ip::address_v4::loopback(), transfer_port),
                                   asio::cancel_after(1s, asio::use_awaitable));
-    const auto frame = WireMessage::pack(RelayAttach::to_msg({role, uuid, ticket}));
-    co_await asio::async_write(socket, asio::buffer(frame), asio::cancel_after(1s, asio::use_awaitable));
+    co_await attach_stream_control(socket, control, {role, uuid, ticket});
     co_return std::move(socket);
 }
 
@@ -147,7 +147,7 @@ asio::awaitable<tcp::socket> connect_transfer_socket(std::uint16_t transfer_port
     co_return std::move(socket);
 }
 
-asio::awaitable<void> require_socket_closed(tcp::socket &socket, const std::string &message)
+asio::awaitable<void> require_socket_closed(tcp::socket &socket, std::string message)
 {
     std::array<std::uint8_t, 1> buffer{};
     auto [error, _] =
@@ -229,6 +229,8 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     asio::error_code ignored;
     stalled_transfer_one.close(ignored);
     stalled_transfer_two.close(ignored);
+    asio::steady_timer pending_expiry(co_await asio::this_coro::executor, 550ms);
+    co_await pending_expiry.async_wait(asio::use_awaitable);
 
     consumer->send(CtrlMessage{
         "relay.open", njson{{"request_id", 10U}, {"service", "lifecycle"}, {"protocol", "tcp"}}});
@@ -277,17 +279,14 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
 
     const auto wrong_ticket = second_producer_ticket == 1 ? uint64_t{2} : second_producer_ticket ^ uint64_t{1};
     auto wrong_ticket_half =
-        co_await connect_relay_half(transfer_port, RelayAttach::Producer, second_uuid, wrong_ticket);
-    co_await require_socket_closed(wrong_ticket_half, "Incorrect relay ticket was not rejected");
+        co_await connect_relay_half(producer, transfer_port, RelayAttach::Producer, second_uuid, wrong_ticket);
+    wrong_ticket_half.close();
     auto wrong_role_ticket_half =
-        co_await connect_relay_half(transfer_port, RelayAttach::Producer, second_uuid, second_consumer_ticket);
-    co_await require_socket_closed(wrong_role_ticket_half, "Consumer ticket was accepted for Producer role");
+        co_await connect_relay_half(producer, transfer_port, RelayAttach::Producer, second_uuid, second_consumer_ticket);
+    wrong_role_ticket_half.close();
 
     auto producer_half =
-        co_await connect_relay_half(transfer_port, RelayAttach::Producer, second_uuid, second_producer_ticket);
-    auto duplicate_producer_half =
-        co_await connect_relay_half(transfer_port, RelayAttach::Producer, second_uuid, second_producer_ticket);
-    co_await require_socket_closed(duplicate_producer_half, "Duplicate Producer half was not rejected");
+        co_await connect_relay_half(producer, transfer_port, RelayAttach::Producer, second_uuid, second_producer_ticket);
 
     producer->send(CtrlMessage{"relay.reject", njson{{"uuid", second_uuid}, {"reason", "test rejection"}}});
     const auto rejected = co_await receive_command(consumer, "relay.error");
@@ -314,7 +313,7 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     const auto one_half_uuid = params_of(one_half_opened).at("uuid").get<uint64_t>();
     const auto one_half_ticket = params_of(one_half_offer).at("ticket").get<uint64_t>();
     auto timed_out_half =
-        co_await connect_relay_half(transfer_port, RelayAttach::Producer, one_half_uuid, one_half_ticket);
+        co_await connect_relay_half(producer, transfer_port, RelayAttach::Producer, one_half_uuid, one_half_ticket);
     const auto one_half_timeout = co_await receive_command(consumer, "relay.error");
     require(params_of(one_half_timeout).at("request_id") == 14U,
             "One-half Pipe timeout returned the wrong request ID");
@@ -330,10 +329,23 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     const auto active_uuid = params_of(active_opened).at("uuid").get<uint64_t>();
     const auto active_producer_ticket = params_of(active_offer).at("ticket").get<uint64_t>();
     const auto active_consumer_ticket = params_of(active_opened).at("ticket").get<uint64_t>();
-    auto active_producer_half =
-        co_await connect_relay_half(transfer_port, RelayAttach::Producer, active_uuid, active_producer_ticket);
+    auto active_producer_half = co_await connect_transfer_socket(transfer_port);
+    const auto binding = co_await attach_stream_control(active_producer_half, consumer,
+        {RelayAttach::Producer, active_uuid, active_producer_ticket});
+    require((co_await relay_status(consumer, 1002)).empty(),
+            "Consumer claimed the Producer role with a disclosed ticket and connection ID");
+    for (const auto &invalid_fields : std::array<njson, 5>{
+             njson{{"connection_id", "not-a-connection-id"}}, njson{{"role", 3}},
+             njson{{"uuid", 0}}, njson{{"uuid", "invalid"}}, njson{{"ticket", "invalid"}}})
+    {
+        auto invalid_binding = RelayAttach::to_msg(binding);
+        invalid_binding.params->update(invalid_fields);
+        producer->send(std::move(invalid_binding));
+    }
+    producer->send(RelayAttach::to_msg(binding));
+    producer->send(RelayAttach::to_msg(binding));
     auto active_consumer_half =
-        co_await connect_relay_half(transfer_port, RelayAttach::Consumer, active_uuid, active_consumer_ticket);
+        co_await connect_relay_half(consumer, transfer_port, RelayAttach::Consumer, active_uuid, active_consumer_ticket);
     co_await receive_command(producer, "relay.ready");
     co_await receive_command(consumer, "relay.ready");
 
@@ -527,11 +539,6 @@ int main()
         {
             transfer_port = unused_port(transfer_tcp_io);
         }
-        auto tls_transfer_port = unused_port(transfer_tcp_io);
-        while (tls_transfer_port == control_port || tls_transfer_port == transfer_port)
-        {
-            tls_transfer_port = unused_port(transfer_tcp_io);
-        }
         const auto target_port = unused_port(transfer_tcp_io);
         const auto forward_port = unused_port(transfer_tcp_io);
 
@@ -544,19 +551,15 @@ int main()
         server_config.control.port = control_port;
         server_config.tcp.address = "127.0.0.1";
         server_config.tcp.port = transfer_port;
-        server_config.tls.address = "127.0.0.1";
-        server_config.tls.port = tls_transfer_port;
         server_config.datagram.address = "127.0.0.1";
         server_config.datagram.port = transfer_port;
         server_config.control.max_services = 2;
         server_config.control.max_services_per_session = 1;
         server_config.tcp.max_setup_connections = 2;
         server_config.tcp.max_relays = 1;
-        server_config.tls.max_setup_connections = 2;
-        server_config.tls.max_relays = 1;
         server_config.datagram.max_relays = 1;
         server_config.tcp.setup_timeout = 500ms;
-        server_config.tls.setup_timeout = 500ms;
+
         server_config.datagram.setup_timeout = 500ms;
         server_config.channel = channel_config();
         auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
@@ -648,6 +651,8 @@ int main()
 
         tcp::socket stopping_transfer(control_io);
         stopping_transfer.connect(tcp::endpoint(asio::ip::address_v4::loopback(), transfer_port));
+        RelayAttach::ConnectionId stopping_id;
+        asio::read(stopping_transfer, asio::buffer(stopping_id));
         auto stopping_transfer_closed = asio::co_spawn(
             control_io,
             require_socket_closed(stopping_transfer, "Server stop did not close a transfer setup socket"),
@@ -659,7 +664,15 @@ int main()
         consumer.reset();
         producer.reset();
         server->stop();
-        stopping_transfer_closed.get();
+        std::exception_ptr stopping_error;
+        try
+        {
+            stopping_transfer_closed.get();
+        }
+        catch (...)
+        {
+            stopping_error = std::current_exception();
+        }
         asio::post(transfer_tcp_io, [&echo_acceptor]() {
             asio::error_code ignored;
             echo_acceptor.close(ignored);
@@ -668,6 +681,10 @@ int main()
         transfer_tcp_thread.join();
         transfer_udp_thread.join();
 
+        if (stopping_error)
+        {
+            std::rethrow_exception(stopping_error);
+        }
         require(weak_consumer.expired() && weak_producer.expired(), "Stopped Agents are retained by Forwarder tasks");
         require(completed_round_trips == 4, "Pipeline capacity was not released after the first transfer");
         std::cout << "[PASS] Server lifecycle, resource limits, Pipe forwarding, and half-close\n";

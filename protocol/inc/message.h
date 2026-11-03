@@ -246,9 +246,11 @@ struct RelayAttach
     static CtrlMessage to_msg(const RelayAttach &self);
     static RelayAttach from_msg(const CtrlMessage &message);
 
+    using ConnectionId = std::array<std::uint8_t, 32>;
     int role;
     std::uint64_t uuid;
     std::uint64_t ticket;
+    std::optional<ConnectionId> connection_id;
 };
 
 namespace config

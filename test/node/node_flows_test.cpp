@@ -49,7 +49,7 @@ static void verify_flow_transactions()
     asio::io_context data(1);
     asio::ssl::context ssl(asio::ssl::context::tls_server);
     auto config = make_test_node_config();
-    config.control.address = config.tcp.address = config.tls.address = config.datagram.address = "127.0.0.1";
+    config.control.address = config.tcp.address = config.datagram.address = "127.0.0.1";
     auto node = std::make_shared<RelayNode>(control, transfer, udp, data, ssl, config);
     auto &manager = test_node::links(node);
     auto &cluster = test_node::cluster(node);
@@ -277,7 +277,7 @@ void flow_integration()
     {
         auto config = make_test_node_config();
         const auto address = "127.0.0." + std::to_string(i + 1);
-        config.control.address = config.control.advertise_address = config.tcp.address = config.tls.address =
+        config.control.address = config.control.advertise_address = config.tcp.address =
             config.datagram.address = address;
         config.cluster = {
             i == 0 ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave, names[i], "127.0.0.1", cp, tp, up};

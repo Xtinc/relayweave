@@ -1,5 +1,6 @@
 #include "forwarder.h"
 #include "agent_session.h"
+#include "tls_rpk.h"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -21,11 +22,16 @@ Forwarder::DatagramForward::DatagramForward(asio::any_io_executor executor, Agen
 Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ssl::context &ssl_context,
                      const AgentConfig &config)
     : agent_(agent), transfer_work_(asio::make_work_guard(std::move(executor))),
-      session_options_{ssl_context, config.server_name, config.channel.handshake_timeout, config.connect_timeout},
+      session_options_{business_context_, config.channel.handshake_timeout, config.connect_timeout,
+                       config.channel.disconnect_timeout},
       relay_open_timeout_(config.relay_open_timeout), udp_idle_timeout_(config.udp_idle_timeout),
-      udp_idle_timer_(transfer_work_.get_executor()),
-      stopped_event_(transfer_work_.get_executor())
+      udp_idle_timer_(transfer_work_.get_executor()), stopped_event_(transfer_work_.get_executor())
 {
+    if (std::ranges::any_of(config.services, [](const auto &s) { return s.protocol == RelayProtocol::Tls; }) ||
+        std::ranges::any_of(config.forwards, [](const auto &f) { return f.protocol == RelayProtocol::Tls; }))
+    {
+        configure_tls_rpk(business_context_, ssl_context);
+    }
     if (config.udp_idle_timeout <= Clock::duration::zero())
     {
         throw std::invalid_argument("UDP idle timeout must be positive");
@@ -35,8 +41,9 @@ Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ss
         services_.emplace(service.name, service);
     }
 
-    const auto datagram_count = std::count_if(config.forwards.begin(), config.forwards.end(),
-        [](const auto &forward) { return forward.protocol == RelayProtocol::Udp; });
+    const auto datagram_count = std::count_if(config.forwards.begin(), config.forwards.end(), [](const auto &forward) {
+        return forward.protocol == RelayProtocol::Udp;
+    });
     stream_forwards_.reserve(config.forwards.size() - datagram_count);
     datagram_forwards_.reserve(datagram_count);
     for (const auto &forward : config.forwards)
@@ -109,7 +116,7 @@ void Forwarder::clear_service(const ServiceKey &service, std::string reason)
     for (const auto &[request, relay] : relays_)
     {
         if (!relay->producer() && relay->service == service &&
-            (!relay->ready || service.protocol == RelayProtocol::Udp))
+            (!relay->ready() || service.protocol == RelayProtocol::Udp))
         {
             relay->cancel(reason);
         }
@@ -140,7 +147,7 @@ void Forwarder::invalidate_relays(std::string reason)
 {
     for (const auto &[request, relay] : relays_)
     {
-        if (!relay->producer() && !relay->ready)
+        if (!relay->producer() && !relay->ready())
         {
             relay->cancel(reason);
         }
@@ -246,7 +253,7 @@ asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forwa
                 continue;
             }
             const auto opening = std::count_if(relays_.begin(), relays_.end(), [](const auto &entry) {
-                return entry.second->forward && !entry.second->ready;
+                return entry.second->forward && !entry.second->ready();
             });
             if (static_cast<std::size_t>(opening) >= udp_opening_capacity)
             {
@@ -272,7 +279,7 @@ asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forwa
 
         auto relay = relays_.at(client->second);
         auto &sockets = std::get<AgentSession::DatagramData>(relay->data);
-        if (!relay->reason.empty() || !relay->ready || sockets.first_packet || size > sockets.maximum_payload)
+        if (!relay->reason.empty() || !relay->ready() || sockets.first_packet || size > sockets.maximum_payload)
         {
             continue;
         }
@@ -305,7 +312,7 @@ asio::awaitable<void> Forwarder::expire_datagrams()
         const auto now = Clock::now();
         for (const auto &[request, relay] : relays_)
         {
-            if (relay->forward && relay->ready && relay->reason.empty())
+            if (relay->forward && relay->ready() && relay->reason.empty())
             {
                 const auto &sockets = std::get<AgentSession::DatagramData>(relay->data);
                 if (!sockets.first_packet && now - sockets.last_activity >= udp_idle_timeout_)
@@ -349,11 +356,6 @@ void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
 
 void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
 {
-    if (!message.params || !message.params->is_object())
-    {
-        PROXY_ERROR_PRINT("Relay message rejected command=%s: parameters must be an object", message.command.c_str());
-        return;
-    }
     const auto &p = *message.params;
     const auto command = message.type();
     const auto identity = p.find("uuid");
@@ -412,8 +414,8 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
             continue;
         }
         const bool by_request = (command == CtrlCommand::RelayOpened || command == CtrlCommand::RelayError) &&
-                                request != p.end() && request->is_number_unsigned() &&
-                                *request == id && !relay->producer();
+                                request != p.end() && request->is_number_unsigned() && *request == id &&
+                                !relay->producer();
         const bool by_uuid =
             command != CtrlCommand::RelayOpened && uuid && relay->endpoint.has_value() && relay->endpoint->uuid == uuid;
         if (by_request || by_uuid)
@@ -528,7 +530,7 @@ asio::awaitable<void> Forwarder::send_datagram(AgentSession &relay, std::span<co
 {
     auto &sockets = std::get<AgentSession::DatagramData>(relay.data);
     const std::array<asio::const_buffer, 2> buffers{asio::buffer(sockets.session_header),
-                                                  asio::buffer(payload.data(), payload.size())};
+                                                    asio::buffer(payload.data(), payload.size())};
     const auto sent = co_await sockets.transfer.async_send(buffers, asio::use_awaitable);
     if (sent != sockets.session_header.size() + payload.size())
     {

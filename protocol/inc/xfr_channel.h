@@ -70,8 +70,8 @@ asio::awaitable<void> relay_tcp(asio::ip::tcp::socket &left, asio::ip::tcp::sock
                                 TrafficCounter *left_to_right_traffic = nullptr,
                                 TrafficCounter *right_to_left_traffic = nullptr);
 
-inline constexpr std::string_view tls_data_framing = "length32-fin-v1";
-inline constexpr std::size_t tls_data_maximum_payload = LnkFrameHeader::maximum_payload;
+/** @brief Bound endpoint TLS frames independently of NodeLink transport and fragmentation. */
+inline constexpr std::size_t tls_data_maximum_payload = 64 * 1024;
 
 /** @brief Decode and validate a TLS DATA length; zero denotes business FIN. */
 std::size_t decode_tls_data_size(std::span<const std::uint8_t, 4> header);
@@ -80,13 +80,6 @@ std::size_t decode_tls_data_size(std::span<const std::uint8_t, 4> header);
 std::array<std::uint8_t, 4> encode_tls_data_size(std::size_t size);
 
 asio::awaitable<void> relay_tls(asio::ip::tcp::socket &left, asio::ssl::stream<asio::ip::tcp::socket> &right);
-asio::awaitable<void> relay_tls(asio::ssl::stream<asio::ip::tcp::socket> &left,
-                                asio::ssl::stream<asio::ip::tcp::socket> &right,
-                                TokenBucket *left_to_right_limiter = nullptr,
-                                TokenBucket *right_to_left_limiter = nullptr,
-                                TrafficCounter *left_to_right_traffic = nullptr,
-                                TrafficCounter *right_to_left_traffic = nullptr);
-
 // Stream relays preserve the opposite direction after business EOF and propagate I/O failures.
 // Same executor: wait for both normal completions; on failure cancel and drain the sibling.
 asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming);
