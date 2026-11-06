@@ -23,6 +23,11 @@ TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(RelayAgent, connection_)
 TEST_MEMBER(AgentRouting, path_cache_)
 TEST_MEMBER(RelayNode, config_)
+TEST_MEMBER(RelayNode, datagram_mgr_)
+TEST_MEMBER(RelayNode, tcp_pipeline_)
+TEST_MEMBER(RelayNode, relay_sessions_)
+TEST_MEMBER(StreamPipeline, remote_pairs_)
+TEST_MEMBER(DatagramMgr, socket_)
 
 namespace
 {
@@ -379,8 +384,9 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
             const std::array buffers{asio::buffer(header), asio::buffer(expected)};
             co_await datagrams[side].async_send(buffers, asio::use_awaitable);
             std::array<std::uint8_t, 32> data;
-            const auto n = co_await datagrams[1 - side].async_receive(asio::buffer(data),
-                asio::cancel_after(1s, asio::use_awaitable));
+            const auto [receive_error, n] = co_await datagrams[1 - side].async_receive(asio::buffer(data),
+                asio::cancel_after(1s, use_nothrow_awaitable));
+            require(!receive_error, service + " UDP payload side=" + std::to_string(side) + ": " + receive_error.message());
             const auto other_header = DatagramHeader::encode((side == 0 ? last : first).at("session_id").get<std::uint64_t>());
             require(n == other_header.size() + expected.size() &&
                 std::equal(other_header.begin(), other_header.end(), data.begin()) &&
@@ -396,14 +402,16 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
             const std::array<asio::const_buffer, 2> maximum{asio::buffer(header), asio::buffer(payload)};
             co_await datagrams[side].async_send(maximum, asio::use_awaitable);
             BytesBuf maximum_received(other_header.size() + payload.size() + 1);
-            const auto maximum_size = co_await datagrams[1 - side].async_receive(asio::buffer(maximum_received),
-                asio::cancel_after(1s, asio::use_awaitable));
+            const auto [maximum_error, maximum_size] = co_await datagrams[1 - side].async_receive(asio::buffer(maximum_received),
+                asio::cancel_after(1s, use_nothrow_awaitable));
+            require(!maximum_error, service + " UDP maximum payload side=" + std::to_string(side) + ": " + maximum_error.message());
             require(maximum_size == other_header.size() + payload.size() &&
                 std::equal(payload.begin(), payload.end(), maximum_received.begin() + other_header.size()),
                 "UDP maximum payload failed, or a wrong-source/oversized datagram passed");
             co_await datagrams[side].async_send(asio::buffer(header), asio::use_awaitable);
-            const auto empty_size = co_await datagrams[1 - side].async_receive(asio::buffer(data),
-                asio::cancel_after(1s, asio::use_awaitable));
+            const auto [empty_error, empty_size] = co_await datagrams[1 - side].async_receive(asio::buffer(data),
+                asio::cancel_after(1s, use_nothrow_awaitable));
+            require(!empty_error, service + " UDP empty payload side=" + std::to_string(side) + ": " + empty_error.message());
             require(empty_size == other_header.size(), "Empty UDP payload was lost");
         }
         consumer->send(CtrlMessage(CtrlCommand::RelayCancel, njson{{"request_id", request}}));
@@ -592,6 +600,10 @@ void integration()
         config.channel.disconnect_timeout = 100ms;
         auto node = std::make_shared<RelayNode>(control, transfer, udp_io, data, server_ssl, config);
         node->start();
+        // Two parallel boundary checks can queue four full-size datagrams, including rejected inputs.
+        // Reserve fixture capacity for this burst so kernel overflow does not mask protocol validation.
+        test_access::DatagramMgr_socket_(*test_access::RelayNode_datagram_mgr_(*node)).set_option(
+            asio::socket_base::receive_buffer_size(4 * DatagramHeader::maximum_wire_payload));
         nodes.push_back(node);
         configs.push_back(config);
     }
@@ -810,6 +822,75 @@ void integration()
             const auto tail_closed = co_await receive(channels[3], CtrlCommand::RelayClosed);
             require(tail_closed.params->at("stage") == "flow" && tail_closed.params->at("reason") == "closed by caller",
                     "Tail Flow monitor did not cancel pending attachment");
+            // The master must observe its local Flow in both endpoint roles, before or after Ready.
+            channels[0]->send(CtrlMessage(CtrlCommand::ServiceRegister,
+                njson{{"request_id", 160}, {"service", "master-close-tcp"}, {"protocol", "tcp"}}));
+            co_await receive(channels[0], CtrlCommand::ServiceOk);
+            for (const bool master_ingress : {true, false})
+            {
+                const auto entry = master_ingress ? 0U : 1U;
+                const auto exit = master_ingress ? 3U : 0U;
+                const std::vector<std::string> path{names[entry], "b", names[exit]};
+                for (const bool ready : {false, true})
+                {
+                    const auto request = 161U + 2U * unsigned(master_ingress) + unsigned(ready);
+                    channels[entry]->send(CtrlMessage(CtrlCommand::RelayOpen,
+                        njson{{"request_id", request}, {"service", master_ingress ? "manual-tcp" : "master-close-tcp"},
+                              {"protocol", "tcp"}, {"epoch", epoch}, {"path", path}}));
+                    const auto opened = co_await receive(channels[entry], CtrlCommand::RelayOpened);
+                    const auto offer = co_await receive(channels[exit], CtrlCommand::RelayOffer);
+                    std::vector<tcp::socket> sockets;
+                    if (ready)
+                    {
+                        sockets.push_back(co_await attach_tcp(channels[entry], *opened.params, configs[entry], RelayAttach::Consumer));
+                        sockets.push_back(co_await attach_tcp(channels[exit], *offer.params, configs[exit], RelayAttach::Producer));
+                        co_await receive(channels[entry], CtrlCommand::RelayReady);
+                        co_await receive(channels[exit], CtrlCommand::RelayReady);
+                        co_await asio::async_write(sockets[0], asio::buffer(bytes), asio::use_awaitable);
+                        co_await asio::async_read(sockets[1], asio::buffer(echoed), asio::cancel_after(1s, asio::use_awaitable));
+                        require(echoed == bytes, "Master endpoint did not forward before Flow failure");
+                    }
+                    const auto id = opened.params->at("flow_id").get<std::uint64_t>();
+                    const std::string reason = "master local Flow failed " + std::to_string(request);
+                    auto protocol = test_node::links(nodes[0]).protocol().shared_from_this();
+                    co_await asio::co_spawn(protocol->executor(), [protocol, id, reason]() -> asio::awaitable<void> {
+                        protocol->close_flow(id, reason);
+                        co_return;
+                    }, asio::use_awaitable);
+                    const auto first = co_await receive(channels[entry], ready ? CtrlCommand::RelayClosed : CtrlCommand::RelayError);
+                    const auto last = co_await receive(channels[exit], CtrlCommand::RelayClosed);
+                    require(first.params->at("reason") == reason && last.params->at("reason") == reason,
+                            "Master Flow failure lost its first close cause during peer or task cleanup");
+                    const auto deadline = std::chrono::steady_clock::now() + 2s;
+                    for (;;)
+                    {
+                        const auto drained = co_await asio::co_spawn(control, [&nodes, entry, exit]() -> asio::awaitable<bool> {
+                            co_return test_access::RelayNode_relay_sessions_(*nodes[entry]).empty() &&
+                                      test_access::RelayNode_relay_sessions_(*nodes[exit]).empty();
+                        }, asio::use_awaitable);
+                        if (drained)
+                        {
+                            break;
+                        }
+                        require(std::chrono::steady_clock::now() < deadline, "Master Flow failure retained a session task");
+                        co_await pause(1ms);
+                    }
+                    co_await asio::co_spawn(transfer, [&nodes, entry, exit]() -> asio::awaitable<void> {
+                        require(test_access::StreamPipeline_remote_pairs_(*test_access::RelayNode_tcp_pipeline_(*nodes[entry])).empty() &&
+                                test_access::StreamPipeline_remote_pairs_(*test_access::RelayNode_tcp_pipeline_(*nodes[exit])).empty(),
+                                "Master Flow failure left a data pair after its session drained");
+                        co_return;
+                    }, asio::use_awaitable);
+                    for (auto &socket : sockets)
+                    {
+                        std::array<char, 1> byte{};
+                        const auto [error, size] = co_await socket.async_read_some(asio::buffer(byte),
+                            asio::cancel_after(1s, use_nothrow_awaitable));
+                        require((error == asio::error::eof || error == asio::error::connection_reset) && size == 0,
+                                "Master Flow failure retained an Agent data socket");
+                    }
+                }
+            }
             // Unattached endpoints expire using each Node's own protocol setup timeout.
             // TCP expires at the ingress; TLS and UDP expire at the egress and close the ingress.
             for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})

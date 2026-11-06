@@ -277,6 +277,7 @@ asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forwa
             continue;
         }
 
+        // The session task may unregister this association while the listener awaits its send.
         auto relay = relays_.at(client->second);
         auto &sockets = std::get<AgentSession::DatagramData>(relay->data);
         if (!relay->reason.empty() || !relay->ready() || sockets.first_packet || size > sockets.maximum_payload)

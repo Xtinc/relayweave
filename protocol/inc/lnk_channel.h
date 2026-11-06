@@ -17,7 +17,6 @@
 class FlowProtocol;
 namespace lnk
 {
-enum class EventKind;
 using Clock = std::chrono::steady_clock;
 inline constexpr std::size_t max_flow_count = 1000;
 struct FlowState;
@@ -207,7 +206,8 @@ class LnkChannel
     void discard(std::uint64_t link_id, const std::shared_ptr<lnk::FlowState> &flow);
     Clock::time_point poll(Clock::time_point now);
     void close_all();
-    void notify(const lnk::NodeLink &link, lnk::EventKind kind, std::string reason = {}, std::string_view stage = {});
+    /** @brief Queue a Link acknowledgement or failure from the data executor to the control executor. */
+    void notify(const lnk::NodeLink &link, CtrlCommand command, std::string reason = {}, std::string_view stage = {});
     void fail(lnk::NodeLink &link, std::string reason, std::string_view stage = {});
     void mark_ready(lnk::NodeLink &link);
     bool matches(const lnk::NodeLink &link, const CtrlMessage &message) const;
@@ -215,7 +215,7 @@ class LnkChannel
 
     void process(lnk::NodeLink &link, const LnkFrameHeader &header, lnk::PooledBuffer payload);
     asio::awaitable<void> accept_loop();
-    asio::awaitable<void> accept(std::shared_ptr<tcp::socket> socket);
+    asio::awaitable<void> accept(std::unique_ptr<tcp::socket> socket);
     asio::awaitable<void> prepare_udp(std::shared_ptr<lnk::NodeLink> link);
     asio::awaitable<void> establish(std::shared_ptr<lnk::NodeLink> link);
     // The establishment/accept task owns the Link and joins both borrowed I/O loops here.
@@ -236,7 +236,8 @@ class LnkChannel
     std::uint16_t udp_port_;
 
     std::map<std::uint64_t, std::shared_ptr<lnk::NodeLink>> connections_;
-    std::set<std::shared_ptr<tcp::socket>> accepting_;
+    // Bootstrap coroutines own the sockets; this index only lets stop() close them.
+    std::set<tcp::socket *> accepting_;
     asio::experimental::channel<void(asio::error_code, DatagramWrite)> udp_writes_;
     std::size_t udp_pending_data_ = 0;
 };

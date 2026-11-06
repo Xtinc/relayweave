@@ -6,7 +6,7 @@
 #include <filesystem>
 #include <memory>
 #include <string>
-#include <unordered_set>
+#include <vector>
 
 struct ProxyListenerConfig
 {
@@ -46,19 +46,21 @@ class ProxyServer
 {
   public:
     ProxyServer(asio::io_context &io, ProxyConfig config);
+    ~ProxyServer();
 
     void start();
     void stop();
 
   private:
     asio::awaitable<void> accept_loop(asio::ip::tcp::acceptor &acceptor, ProxyProtocol protocol);
-    void session_finished(const std::shared_ptr<ProxySession> &session, std::exception_ptr failure);
+    void session_finished(ProxySession &session, std::exception_ptr failure);
 
     asio::any_io_executor executor_;
     ProxyConfig config_;
     asio::ip::tcp::acceptor http_acceptor_;
     asio::ip::tcp::acceptor socks5_acceptor_;
-    std::unordered_set<std::shared_ptr<ProxySession>> sessions_;
+    // Own each session through its coroutine completion; stop() only cancels its I/O.
+    std::vector<std::unique_ptr<ProxySession>> sessions_;
     bool started_ = false;
     bool running_ = false;
 };

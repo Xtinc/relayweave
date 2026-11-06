@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <asio/experimental/awaitable_operators.hpp>
 #include <random>
-#include <set>
+#include <vector>
 
 /**
  * @brief Define a master-room participant on control_io.
@@ -40,10 +40,11 @@ class ClusterRoom
     }
 
     /** @brief Retain a participant and publish membership if its identity is already known. */
-    void join(const std::shared_ptr<ClusterParticipant> &participant)
+    void join(std::unique_ptr<ClusterParticipant> participant)
     {
-        participants_.insert(participant);
-        if (!participant->node_id().empty())
+        const bool ready = !participant->node_id().empty();
+        participants_.push_back(std::move(participant));
+        if (ready)
         {
             publish_members();
         }
@@ -65,10 +66,10 @@ class ClusterRoom
     }
 
     /** @brief Release a participant, wake shutdown, and publish membership when appropriate. */
-    void leave(const std::shared_ptr<ClusterParticipant> &participant)
+    void leave(ClusterParticipant &participant)
     {
-        const auto was_ready = !participant->node_id().empty();
-        participants_.erase(participant);
+        const auto was_ready = !participant.node_id().empty();
+        std::erase_if(participants_, [leaving = &participant](const auto &owned) { return owned.get() == leaving; });
         changed_.cancel();
         if (was_ready && !stopping_)
         {
@@ -168,7 +169,7 @@ class ClusterRoom
         deliver(master_id_, std::move(message));
     }
 
-    std::set<std::shared_ptr<ClusterParticipant>> participants_;
+    std::vector<std::unique_ptr<ClusterParticipant>> participants_;
     std::string master_id_;
     std::uint64_t epoch_;
     std::uint64_t version_ = 0;
@@ -181,7 +182,7 @@ class ClusterRoom
  * @details The room retains this participant; reader completion removes it only after TLS
  * drainage. The room and borrowed TLS context must outlive the session task.
  */
-class ClusterSession : public ClusterParticipant, public std::enable_shared_from_this<ClusterSession>
+class ClusterSession : public ClusterParticipant
 {
   public:
     /** @brief Adopt an accepted socket and borrow its master room and TLS context. */
@@ -195,13 +196,7 @@ class ClusterSession : public ClusterParticipant, public std::enable_shared_from
     /** @brief Launch the independent reader on the channel executor and leave the room on completion. */
     void start()
     {
-        std::weak_ptr<ClusterSession> weak = shared_from_this();
-        asio::co_spawn(channel_->executor(), reader(), [weak](std::exception_ptr) {
-            if (auto self = weak.lock())
-            {
-                self->room_.leave(self);
-            }
-        });
+        asio::co_spawn(channel_->executor(), reader(), [this](std::exception_ptr) { room_.leave(*this); });
     }
 
     /** @copydoc ClusterParticipant::node_id */
@@ -642,7 +637,7 @@ asio::awaitable<bool> ClusterMgr::async_stop()
 asio::awaitable<void> ClusterMgr::accept_loop()
 {
     ClusterRoom room(executor_, config_.node_id, epoch_);
-    room.join(std::make_shared<LocalParticipant>(config_.node_id, config_.advertise_address, *this));
+    room.join(std::make_unique<LocalParticipant>(config_.node_id, config_.advertise_address, *this));
 
     try
     {
@@ -687,9 +682,12 @@ asio::awaitable<void> ClusterMgr::accept_sessions(ClusterRoom &room)
             continue;
         }
 
-        auto session = std::make_shared<ClusterSession>(std::move(socket), context_, room, channel_config_);
-        room.join(session);
-        session->start();
+        auto session = std::make_unique<ClusterSession>(std::move(socket), context_, room, channel_config_);
+        auto *participant = session.get();
+        room.join(std::move(session));
+        ScopeGuard rollback([&room, participant] { room.leave(*participant); });
+        participant->start();
+        rollback.dismiss();
     }
 }
 

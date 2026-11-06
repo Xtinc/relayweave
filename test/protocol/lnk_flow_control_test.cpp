@@ -800,6 +800,7 @@ static void wire_tests()
         }
         co_await credit(1, window); // Duplicate absolute limit cannot replenish the window.
         co_await credit(1, window - 1); // Old limit cannot replenish it either.
+        co_await credit(1, 1); // A stale limit below already-sent bytes must also be ignored.
         co_await credit(2, window);
         auto small = co_await next_data();
         check(small.header.id == 2 && small.payload.size() == 1 && small.payload.data()[0] == 99,

@@ -19,21 +19,13 @@ struct FlowSpec
     std::chrono::milliseconds prepare_timeout{10000};
 };
 
-enum class EventKind
-{
-    LinkPrepared,
-    LinkReady,
-    LinkError,
-    LinkClosed,
-    FlowPrepared,
-    FlowCommitted,
-    FlowError,
-    FlowClosed
-};
-
+/**
+ * @brief Own a Link or Flow notification transferred from the data executor to the control executor.
+ * @details Use the corresponding CtrlCommand directly; convert the payload to CtrlMessage on the control executor.
+ */
 struct ProtocolEvent
 {
-    EventKind kind;
+    CtrlCommand command;
     std::uint64_t epoch;
     std::uint64_t id;
     std::string stage;
@@ -264,7 +256,8 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     void receive(const lnk::NodeLink &source, lnk::Frame frame);
     void written(lnk::Frame frame);
     void link_flows_closed(std::uint64_t id);
-    void notify_flow(const std::shared_ptr<lnk::FlowState> &flow, lnk::EventKind kind, std::string stage,
+    /** @brief Queue a Flow acknowledgement or failure from the data executor to the control executor. */
+    void notify_flow(const std::shared_ptr<lnk::FlowState> &flow, CtrlCommand command, std::string stage,
                      std::string reason = {});
     void fail_flow(std::shared_ptr<lnk::FlowState> flow, std::string stage, std::string reason);
 

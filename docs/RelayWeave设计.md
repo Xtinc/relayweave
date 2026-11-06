@@ -59,7 +59,7 @@ flowchart TB
    - 业务边缘与核心骨干节点。主动向 Master 发起集群长连接并维持心跳。
    - 暴露公共接入端口：向 Agent 提供控制连接、TCP/TLS/UDP 业务接入端口。
    - 建立并维护与相邻节点的共享数据传输管道（`NodeLink`），执行高性能二进制分帧转发、逐跳信用流控与 FairQueue 调度。
-   - 运行单节点会话控制器（`ControlRouterSingle`）与多节点会话控制器（`ControlRouterMulti`）。
+   - 由 `NodeSession` 提供公共状态和取消操作，`SingleSession`、`MultiSession` 各自运行完整的建立、转发和收尾流程。
 3. **RelayAgent (Consumer 客户端代理)**：
    - 部署在客户端侧（如办公终端、边缘采集机）。
    - 拥有本地监听转发器（`Forwarder`），将本地端口（如 `127.0.0.1:10022`）映射为远端集群服务名（如 `service: prod-ssh`）。
@@ -80,7 +80,7 @@ flowchart TB
 | 实体名称 | 作用域与归属 | 生命周期与核心职责 |
 |---|---|---|
 | **Service** | 全局业务逻辑名 | 业务服务的逻辑标识（如 `web-app`, `mysql-db`），绑定具体的传输协议（TCP/TLS/UDP）与目标网络端点。由 Producer Agent 声明并注册至集群。 |
-| **NodeSession** | Node 进程内 (`control_io`) | 代表 Node 上的一次中继业务会话实例。根据路径类型持有 `ControlRouterSingle`（单节点）或 `ControlRouterMulti`（多节点首末端），负责接入鉴权、就绪协商、状态报告与生命周期收尾。 |
+| **NodeSession** | Node 进程内 (`control_io`) | 代表 Node 上的一次中继业务会话实例。基类持有公共状态与数据任务；SingleSession、MultiSession 各自以完整 run 负责建立、错误处理和关闭，并提供对应的消息匹配、鉴权和状态报告。 |
 | **AgentSession** | Agent 进程内 (`transfer_io`) | 代表 Agent 端一次具体的客户端业务连接。持有本地 socket 与远端 Node 数据 socket，负责首帧认证（`RelayAttach`）、全双工流拷贝以及半关闭收尾。 |
 | **Flow** | 跨节点逻辑通道 | 跨越 2～8 个节点的端到端数据传输流，由 64 位 `flow_id` 与集群纪元 `epoch` 唯一标识。在两端挂接 `FlowStream` 或 `FlowDatagram`，在中间跳挂接相邻的 `NodeLink`。 |
 | **NodeLink** | 两相邻 Node 间物理通道 | 两个相邻 RelayNode 之间基于 TCP 或 UDP 建立的长生命周期物理传输链路。复用承载该链路上的所有并发 Flow，负责固定二进制分帧、心跳保活、信用合并与公平排队。 |
@@ -160,7 +160,7 @@ flowchart TB
 1. **`control_io`（控制执行域）**：
    - **驱动线程**：单线程运行。
    - **托管组件**：`RegistryMgr`、`Topology`、`NodeControl`、`NodeMetrics`、`NodeLinkMgr`（控制事务状态机）、`ClusterMgr`、`NodeSession` 容器。
-   - **职责范围**：处理来自 Agent 的控制长连接（端口 18443）；Master 节点的集群控制监听（端口 18447）；服务注册与发现；拓扑测量数据聚合与快照生成；Flow 路径安装（`FlowPrepare` / `FlowCommit`）事务驱动；业务会话协调（`ControlRouterSingle` / `ControlRouterMulti`）。
+   - **职责范围**：处理来自 Agent 的控制长连接（端口 18443）；Master 节点的集群控制监听（端口 18447）；服务注册与发现；拓扑测量数据聚合与快照生成；Flow 路径安装（`FlowPrepare` / `FlowCommit`）事务驱动；业务会话协调（`SingleSession` / `MultiSession`）。
 2. **`transfer_tcp_io`（TCP/TLS 传输执行域）**：
    - **驱动线程**：单线程运行，使用普通调度，Linux 线程名为 `node-tcp`。
    - **托管组件**：唯一的 `StreamPipeline`。
@@ -169,6 +169,7 @@ flowchart TB
    - **驱动线程**：单线程运行，使用普通调度，Linux 线程名为 `node-udp`。
    - **托管组件**：`DatagramMgr`。
    - **职责范围**：独占监听公网 UDP 业务单端口（18445）；基于 8 字节 `DatagramHeader` 执行数据报解复用；维护客户端远端反射地址（Endpoint Mapping）；与本地 `FlowDatagram` 端口执行异步报文收发。
+   - **收包流程**：`receive_datagram()` 统一完成会话查找、业务校验、转发和计数；多节点数据直接提交给 Flow，单节点数据改写对端 session 头后等待 UDP 发送。未命中会话的报文交给同步 `handle_attach()` 验证 ticket 并绑定来源。单节点发送前复制目的地址并保留流量统计对象，发送完成后不再访问可能已删除的 relay 条目；不增加逐包处理协程或转发结果对象。
 4. **`cluster_data_io`（专网数据链路执行域）**：
    - **驱动线程**：单线程运行。
    - **托管组件**：`FlowProtocol`、`LnkChannel`、`std::pmr::synchronized_pool_resource` 载荷池。
@@ -176,7 +177,7 @@ flowchart TB
 
 #### 对象所有权图谱与依赖生命周期
 
-RelayNode 遵循层次化所有权模型。父对象负责组件生命周期，借用者（Borrower）通过引用访问依赖；异步任务通过 `shared_ptr` 保留在途会话、Flow 与载荷池，关闭时统一排空：
+RelayNode 遵循层次化所有权模型，默认按值或用 `unique_ptr` 持有，借用者通过引用或指针访问依赖。只有查找表移除后仍有独立 I/O、跨域关闭或晚到完成处理需要访问的对象，才使用 `shared_ptr`。异步调用本身不是共享所有权的理由：
 
 ```mermaid
 flowchart TD
@@ -189,8 +190,10 @@ flowchart TD
     Protocol --> Link["LnkChannel / NodeLink"]
     Protocol --> Flows["FlowState / PMR 载荷池"]
     Root --> Pipelines["StreamPipeline / DatagramMgr"]
-    Root --> Sessions["NodeSessionList：shared_ptr NodeSession"]
-    Sessions --> Router["variant：ControlRouterSingle 或 ControlRouterMulti"]
+    Root --> Sessions["NodeSessionList：unique_ptr NodeSession"]
+    Sessions --> Mode["按值 Single / Multi：仅模式差异数据"]
+    Sessions --> DataTask["shared_ptr SessionTransfer：单次启动的数据生命周期"]
+    DataTask -. "RelayTransport& 借用" .-> Pipelines
 ```
 
 - **构造与析构次序**：成员声明顺序严格遵循依赖顺序。底层服务（如 `RegistryMgr`、`Topology`、`ClusterMgr`）优先声明，借用其引用的管理器（如 `NodeLinkMgr`、`NodeControl`）后声明。停机时先排空借用方的任务，再由 C++ 逆序析构释放依赖组件。
@@ -199,7 +202,11 @@ flowchart TD
   - 跨域信令触发：使用 `asio::post(target_executor, ...)` 或 `asio::dispatch`。
   - 跨域流式数据传递：使用 Asio 实验性并发通道 `asio::experimental::concurrent_channel`，其内部实现保证了不同执行域之间线程安全的数据推送与非阻塞等待。
 
-Node 通过普通 `RelayRequest` 将已解析的业务构造参数传入 NodeSession 和控制器。两个 Router 只保留业务推进、匹配和状态报告所需的字段，协议由 NodeSession 已选定的数据管理器确定，epoch/Flow/peer 使用各自已有成员。JSON 只在输入、输出边界出现，不作为内部请求镜像。
+Node 通过普通 `RelayRequest` 将已解析的业务构造参数传入 NodeSession。NodeSession 基类保存公共身份、期限、进度和停止原因；两个具体类各自的 run 主持完整根控制生命周期，SingleSession、MultiSession 是 Node 独占持有的具体会话，自身保存差异状态并运行业务，不再持有模式 variant 或 Router 回指。Single 直接保存 AttachPair，Multi 直接保存 AttachInfo。数据阶段直接调用 SessionTransfer；JSON 只在输入、输出边界出现，不作为内部请求镜像。
+
+NodeSession 由 Node 会话容器独占持有，根协程完成处理器只借用会话地址；具体会话的 run 排空控制子协程、数据任务与 Flow 后才从容器删除它。代理的 ProxySession 使用同样的独占模型。NodeLink 待认证 socket 由握手协程的 unique_ptr 独占，accepting_ 只是停机时用于关闭 socket 的借用索引；握手结束先撤销索引，再销毁或移交 socket。远端 Flow 请求直接保存在 open_flow 的非 Master 分支协程帧中，pending_opens_ 仅登记其地址，退出等待时先撤销登记。
+
+AgentSession 保留共享所有权：除会话主协程之外，共享 UDP 监听任务还会独立等待向该会话发送数据，主协程可能先移除注册表。Flow 端口与协议双向关系则是「协议状态强持有端口、端口弱引用协议」，跨域投递只临时持有它们。排队载荷只延长 PMR 资源寿命，不延长整个协议或 Node 寿命。更完整的持有者、释放时点及审计依据见《会话数据任务改造计划》的“全量共享所有权复核”。
 
 #### 配对状态与跨域准备
 
@@ -215,15 +222,19 @@ classDiagram
     RemoteRelayPair <|-- DatagramRemotePair
 ```
 
-图中的 Stream/Datagram 类型分别是两个管理器内部的 `LocalPair` / `RemotePair`，沿用 RelayPair 系列命名。`RelayPair` 统一接入事件、closed/active、限速和计数绑定，提供虚析构与 `close()`；`LocalRelayPair` 实现完整的双端接入等待、准备、激活及访问者回收；`RemoteRelayPair` 实现单端接入等待、驱动 Flow 绑定、绑定后关闭检查、计数绑定、激活与方向计数。具体派生类持有 socket、UDP session/source 和各自的 Flow 端口，覆盖 `close()`，远端类型另覆盖受保护的 `bind_flow()`。公共准备流程不依赖具体 Flow 类型，也不使用模板或统一 Flow 适配接口。
+图中的 Stream/Datagram 类型分别是两个管理器在各自 .cpp 中定义的私有 `LocalPair` / `RemotePair`；头文件只保留前置声明。`RelayPair` 统一接入事件、closed/active、限速和计数绑定，提供虚析构与 `close()`；`LocalRelayPair` 实现双端接入等待、准备、独立激活及访问者回收，prepare 不开启转发或登记访问者；`RemoteRelayPair` 实现单端接入等待、驱动 Flow 绑定、绑定后关闭检查、计数绑定、激活与方向计数。具体派生类持有 socket、UDP session/source 和各自的 Flow 端口，覆盖 `close()`，远端类型另覆盖受保护的 `bind_flow()`。公共准备流程不依赖具体 Flow 类型，也不使用模板或统一 Flow 适配接口。
 
-管理器负责容量、ID、容器及 UDP session/bindings。准备入口查表后持有局部 `shared_ptr`，直接 `co_await pair->prepare(...)`，共同生命周期只在配对类中实现。NodeSession 仍通过原有 `co_spawn` 投递到传输域，多跳 Flow 绑定仍只跨一次协议域。为共享这些流程，建立期间增加嵌套协程帧：单跳增加配对 prepare，多跳增加配对 prepare 与具体 bind_flow；没有额外的独立协程链或跨域通知，逐包转发也不经过虚函数分派。
+管理器负责容量、ID、容器及 UDP session/bindings。StreamPipeline 与 DatagramMgr 实现纯虚接口 `RelayTransport`。每个 NodeSession 只启动一次 `SessionTransfer`，数据任务借用 `RelayTransport&`，从接口取得执行器，并顺序执行 install、prepare、activate、transfer、close，不再通过管理器 variant/visit 分派或判断具体传输类型。TCP 的 prepare 内部消费控制授权并完成 socket 绑定，UDP 的 prepare 等待共享监听器的来源绑定。管理器准备协程保留局部 pair `shared_ptr`，多跳 Flow 绑定仍只跨一次 `cluster_data_io` 协议域。NodeSession 不为每个数据阶段启动跨域子协程，也不为 attach 安排独立绑定任务。
+
+控制面与数据任务通过有界 `concurrent_channel` 交换接入授权、继续通知与阶段事件。SessionTransfer 的 Event 表示通道通知类型，State 记录控制执行器上的任务生命周期，两者不重复保存业务进度。NodeSession 等待 Installed 后通知 Agent；TCP/TLS attach 经身份与 ticket 校验后提交给同一数据任务的授权入口，每个角色只授权一次，相同连接编号的重放幂等，冲突接入拒绝。流式管理器在该任务的 prepare 调用内等待授权、greeting 写完成及 socket 绑定；UDP 继续由共享接收循环验证 attach 并通知配对。Prepared 后 NodeSession 完成 peer 协调，发送继续通知并等待 Activated，随后才发送 `relay.ready`。ready 提交后再发送下一次继续通知以启动转发。数据任务按固定顺序执行，不另用命令载荷决定下一步；激活前在数据域再次检查原始建立期限。Finished 表示转发结束，端点仍保留到 NodeSession 完成 peer finished 协调并发起关闭。
+
+阶段事件通道容量为 5，对应 Installed、Prepared、Activated、Finished、Stopped 各一次；授权通道容量为 2，每个角色成功提交至多一次；继续通知通道容量为 1，控制流程等待当前阶段确认后才推进下一步。授权去重和任务 State 仅在 control_io 上读写，实际配对资源只在数据执行器上操作。
 
 关闭时管理器先移除查找关联及 UDP bindings，再调用具体配对对象的 `close()`，最后释放 ID。具体类关闭 Flow/socket 或唤醒 UDP 结束事件，公共类负责关闭标记、接入唤醒与本地访问者回收。绑定期间关闭时，管理器协程仍持有对象；晚返回的 Flow 先交给具体配对对象持有，公共 prepare 检查 closed 后再次通过虚 close 回收它并抛出异常。因此具体 close 即使已标记 closed 也会关闭新交付的资源，本地访问者则通过清除已有 active 状态保证只回收一次。
 
-多跳激活仍在 peer 同步后、`relay.ready` 前完成，防止 UDP 提前转发。准备过程沿用控制器的绝对建立期限，取消与关闭继续由原有任务链排空。准备接口返回 `awaitable<void>`，接入、Flow 绑定的失败与取消均通过 `use_awaitable` 自然传播，不把异常作为返回值。Node 将接入、绑定与 peer 就绪协调统一记为 `prepare` 阶段，就绪前收到 Agent 拒绝或业务取消时也使用该阶段；`relay.error`、peer close 的诊断字段不再区分原 attach/bridge。原错误原因与 Flow 关闭、控制断线等独立阶段保留。
+安装、准备与激活事件的等待沿用会话原始绝对建立期限，重复消息不刷新期限。超时、控制断线或 peer/Flow 关闭使 NodeSession 退出阶段等待，随后关闭路径在数据域发出取消信号，能中断授权等待、greeting 等待、Flow 绑定或转发 I/O。数据任务不借用 NodeSession；管理器以引用、FlowProtocol 以可空指针借用，Node 保证先排空会话再停止它们。晚到的完成与停止处理保留任务自身，且不访问这两个借用资源。资源清理和 run() 返回后，由唯一的标准 co_spawn 完成处理器在控制域确认 Stopped，任务入口前取消也会收到确认；不使用手工完成闩锁或额外结束事件。NodeSession 在根任务的统一收尾路径禁用取消并等待完成，才能释放业务实例；不再维护独立的 binding_roles_/bindings_done_。异常通过通道原生 `std::exception_ptr` 完成参数传递，由 use_awaitable 自动抛出；管理器准备接口仍为 `awaitable<void>`。SessionTransfer 的 prepared/activate/transfer 是直接返回 wait 的普通函数，真正的阶段等待只保留一层业务协程；继续通知在该协程被等待后才发送，避免创建等待对象时产生激活或转发副作用。安装凭据由 installed 直接接收，stop 仍独立负责取消与排空。Node 将接入、绑定与 peer 就绪协调统一记为 `prepare` 阶段，独立的 Flow、控制断线等诊断阶段继续保留。
 
-每个管理器的 local/remote 配对接口合计从 12 个减为 9 个。按一次正常生命周期中 NodeSession 发往传输域的调用计数，单跳由 5 次减为 4 次（install、prepare、bridge、close），多跳每个端点由 6 次减为 5 次（额外保留 activate）；多跳绑定 Flow 所需的一次传输域到协议域调用保持不变。
+单跳和多跳每个端点的数据生命周期均只有一个启动点。控制面仍需接收必要的阶段确认，跨线程通知并未消失；改造消除的是分散的跨域协程调用、attach 完成回调和控制面绑定任务记账。实际逐包转发不经过这些阶段通道。详细设计和验证记录见 [会话数据任务改造计划](会话数据任务改造计划.md)。
 
 ---
 
@@ -390,20 +401,21 @@ RelayWeave 采用分布式的服务发现架构，服务注册在节点本地集
 
 ---
 
-### 3.3 NodeSession 与会话控制器
+### 3.3 NodeSession 会话生命周期
 
-每当有新的中继业务请求到达 RelayNode 时，`RelayNode` 会在 `control_io` 执行域为其实例化一个 `NodeSession` 对象。根据业务选取的路径类型，`NodeSession` 按值持有两种互斥的会话控制器之一：
+每当有新的中继业务请求到达 RelayNode 时，`RelayNode` 在 `control_io` 创建 SingleSession 或 MultiSession，并以 unique_ptr<NodeSession> 独占持有。两个具体类各自的 run() 直接推进业务、保留错误首因、禁用取消并完成关闭；基类只提供共同状态与公共操作，不再通过 run_session / close_session 钩子调度生命周期：
 
 ```mermaid
 flowchart TD
-    S["NodeSession"] --> Choice{"路径类型"}
-    Choice -->|"一个 Node"| Single["ControlRouterSingle：本地双端桥接"]
-    Choice -->|"2～8 个 Node"| Multi["ControlRouterMulti：入口或出口"]
+    S["NodeSession：公共状态、取消与数据任务"] --> Single["SingleSession：两个 Agent / AttachPair"]
+    S --> Multi["MultiSession：一个 Agent / AttachInfo / Flow / peer 协调"]
 ```
 
-#### 3.3.1 单节点会话编排：ControlRouterSingle
+每个具体会话只有 run() 一个控制侧收尾入口：Multi 使用同控制域的原生并行组监视 Flow 关闭，并在进入收尾前排空两支；数据任务停止确认后 ingress 才释放 Flow。Single 则停止数据任务后执行原有 Agent 关闭通知。Ready 里程碑保留历史进度，close_reason_ 的存在表示会话进入结束流程，同时保存首次原因（允许空字符串），不再另存停止布尔值；正常完成原因只在根任务收尾时生成。SessionTransfer 的共享持有仅用于其独立任务和晚到停止处理，两个具体类不另建共享会话所有者；取消信号通过根任务的原生并行组传播到阶段和定时器等待。
 
-当 Consumer Agent 与 Producer Agent 恰好接入同一个 RelayNode（或经主控代转到单个服务节点，业务请求不携带 `path`）时，启用 `ControlRouterSingle`：
+#### 3.3.1 单节点会话编排
+
+当 Consumer Agent 与 Producer Agent 恰好接入同一个 RelayNode（或经主控代转到单个服务节点，业务请求不携带 `path`）时，SingleSession 保存两端身份并直接完成本地配对流程：
 
 ```mermaid
 sequenceDiagram
@@ -425,11 +437,11 @@ sequenceDiagram
 1. **参数提取与分配**：为本次会话分配 Node 本地唯一的 64 位 `uuid` 及双端独立的鉴权令牌 `ticket`，设置绝对建立截止时间（默认 10s）。
 2. **双端通知**：同时向 Consumer 发送 `relay.opened`，向 Producer 发送 `relay.offer`。
 3. **数据端口接入拦截**：两端 Agent 收到信令后，分别连接共用 TCP 数据端口（18444），读取 Node 的连接编号，再经现有控制 mTLS 发送 `relay.attach` 授权绑定。UDP 仍在 18445 发送独立 CBOR attach，业务数据报另加会话头。
-4. **配对与激活**：Node 的数据执行域验证每端的 `uuid`、角色与对应 `ticket` 后，将双端 Socket 配对，触发 `bridge()` 开启直接流式数据拷贝，同时控制面回送 `relay.ready`。
+4. **配对与激活**：NodeSession 验证来源、角色与 ticket，数据任务完成授权绑定与准备；实际激活后控制面发送 `relay.ready`，再提交 Transfer 开始流式复制。
 
-#### 3.3.2 多节点首末协调：ControlRouterMulti
+#### 3.3.2 多节点首末协调
 
-当选路结果跨越多个节点（如 `path: [node-A, node-B, node-C]`）时，首节点（Ingress）与尾节点（Egress）分别实例化 `ControlRouterMulti` 进行分布式协同：
+当选路结果跨越多个节点（如 `path: [node-A, node-B, node-C]`）时，首节点（Ingress）与尾节点（Egress）分别创建 MultiSession，持有路径、Flow 和对端协调状态：
 
 1. **Ingress 节点动作**：
    - 接收 Consumer Agent 的 `relay.open` 报文。
@@ -493,7 +505,26 @@ sequenceDiagram
     Note over M: committed = 0x07，完成事务
 ```
 
-NodeLinkMgr 在 control_io 用普通 `LinkParams`、`FlowParams` 保存已解析的授权参数；Master 请求另持有确认位图、结果和期限，本地 Flow 端点另持有 committed 状态。路径、地址和 transport 在输入边界解析，成员变化校验及事务推进直接访问类型字段，不保存 JSON 镜像。跨域仍使用现有 `LinkSpec`、`FlowSpec`。Prepare 是内存预留，不包含持久化。
+NodeLinkMgr 在 control_io 用普通 `LinkParams`、`FlowParams` 保存已解析的授权参数；MasterPath 持有阶段、阶段内复用的确认位图、结果、期限和可选远端回复目标，LocalFlow 持有本节点 committed 状态。路径、地址和 transport 在输入边界解析，成员变化校验及事务推进直接访问类型字段，不保存 JSON 镜像。跨域仍使用现有 `LinkSpec`、`FlowSpec`。Link/Flow 的入口统一校验事务信封，再分别交给本地端点命令处理或 Master 应答处理；两种角色的状态推进不交错嵌套。Prepare 是内存预留，不包含持久化。
+
+数据面通过 ProtocolEvent 向控制面传递 Link/Flow 通知；command 直接使用已有 CtrlCommand 的对应通知值，不另设通知枚举及映射。通知负载持有 epoch、id、stage 和 reason，控制域收到后结合本地授权构造 CtrlMessage 并发送，跨域通知不构造 JSON。
+
+控制记录按职责分为五个容器，不另建关闭中路径表或观察者表：
+
+| 成员 | 职责与寿命 |
+|---|---|
+| shared_links_ / SharedLink | Master 保留的共享相邻 Link，建立后继续用于复用。 |
+| paths_ / MasterPath | Master 整条路径从建立到关闭协调结束的唯一记录；Closing 仍占用容量及身份。 |
+| local_links_ | 当前 Node 的 Link 授权。 |
+| local_flows_ / LocalFlow | 当前 Node 的 Flow 授权，包括中间节点；按需关联一个 CloseNotice。 |
+| pending_opens_ / PendingOpen | 非 Master 入口等待建立应答的借用索引；请求状态由协程帧独占。 |
+
+open_flow 在控制域检查状态并按角色直接推进：非 Master 分支发送请求、以 30 秒上限等待应答，并在退出前注销 pending_opens_；未接受的请求同时发送远端关闭请求。Master 分支同步登记路径并启动或复用全部相邻 Link，随后只等待 opened；取消等待时关闭该路径，共享 Link 继续由管理器持有。构造 open_flow 的 awaitable 不读取运行状态或发起事务，实际工作在等待时开始。远端 FlowOpen 同样同步登记和启动路径，MasterPath.reply_to 保存回复目标；进入 Active 或提前 Closing 时统一发布结果并取走回复目标，保证每个远端请求只应答一次。没有独立远端应答任务或应答任务计数，events_done_ 仅等待通知接收任务退出。
+
+MasterPath 阶段为 Linking → Preparing → Committing → Active → Closing → Released；建立失败从当前阶段直接进入 Closing。SharedLink 直接保存阶段、失败原因和完成标志，Link 身份只在 params.id 保存；生产代码不再提供单独的 Link 等待协程或完成广播事件。 共享 Link 的创建保留管理器存活、Master 角色和容量约束；路径入口已同步校验的端点、协议、epoch 和成员条件不再逐边重验。Linking 中 acknowledged 的位对应相邻边；Link 完成后在现有路径表中查找仍处于 Linking 的相关事务，直接记就绪位或关闭失败路径。所有边就绪后进入 Preparing 并清零位图，之后复用它记录各节点的 Prepare、Commit 或 Close 应答。 prepare_path 只接受调用方已确认的 Linking 事务：新建启动全程同步执行，Link 完成处理先筛选阶段，成员变化/控制失败在发布 Link 结果前已关闭路径，因此不再重复检查全局运行状态与成员快照。阶段决定接受哪种确认，诊断字符串 result.stage 不参与状态判断；没有每条边的等待协程、Edge 结果对象、聚合 channel 或完成回调。Link 完成的扫描只访问建立中的控制记录，每条路径最多七条边，不新增订阅表或反向索引。opened 通知建立结果，released 通知路径释放完成；重复关闭不刷新期限，迟到的 LinkReady、Prepare/Commit 确认均不推进 Closing。关闭超时归还身份并通过 close_error 通知主动关闭者。 成员变化或控制失败时先以原始原因结束路径，再结束相关共享 Link，避免即时链路结果传播覆盖 membership/control 首因。
+
+LocalFlow 的 CloseNotice 只保存原因及广播事件。最后一份本地授权可先删除，等待协程持有的小通知对象继续存活到恢复结束；取消某个等待不会关闭 Flow 或唤醒其他等待者。wait_flow_closed 在所有 Node（包括 Master）上统一观察本地关闭/授权失效，不等待其他节点的关闭确认。本地授权不存在或 epoch 不匹配时立即返回 flow closed，不保存历史原因。Master 的 close_flow 另行等待 MasterPath.released；本地失效、全路径释放与会话数据任务排空是三个独立完成点。
+
 
 1. **第一阶段：准备（`FlowPrepare`）**：
    - Master 协调非零 64 位 `flow_id`（远程入口请求时由入口生成），向路径中所有节点下发 `flow.prepare`，携带完整的 `path`、`addresses`、`links`、`request_id` 与 `ttl_ms`，各节点据此派生上一跳与下一跳信息。
@@ -507,8 +538,8 @@ NodeLinkMgr 在 control_io 用普通 `LinkParams`、`FlowParams` 保存已解析
 
 #### 3.4.3 事务超时、回滚与主动释放机制
 
-- **超时回滚**：创建事务时设置 10 秒期限，邻接建链完成、发送 prepare 前重设 10 秒期限，准备与提交共用后一个期限。若超时时间内任何一个节点未响应或返回错误，Master 立即判定事务失败，向全路径节点发送 `flow.close` 触发回滚清理，并向发起端报错。
-- **主动释放（`FlowClose`）**：业务结束或客户端断开时，远程入口发送 `flow.close.request`，由 Master 下发 `flow.close`。Master 收集路径上所有节点的 `flow.closed` 确认，完成全路径清理确认；关闭确认最多等待 10 秒，超时记录错误并释放协调状态，**但物理共享的 NodeLink 保持长连接常驻，不随单条 Flow 的关闭而断开**。
+- **超时回滚**：Link 建立、Flow 建立、Flow 关闭和远端开流等待分别使用具名的 10/10/10/30 秒期限，Prepare 报文 TTL 上限从 Flow 建立期限推导。Session 保持自己的绝对建立期限，共享 Link 保持独立期限。创建事务时设置 10 秒期限，邻接建链完成、发送 prepare 前重设 10 秒期限，准备与提交共用后一个期限。若超时时间内任何一个节点未响应或返回错误，Master 立即判定事务失败，向全路径节点发送 `flow.close` 触发回滚清理，并向发起端报错。
+- **主动释放（`FlowClose`）**：业务结束或客户端断开时，远程入口发送 `flow.close.request`，由 Master 下发 `flow.close`。Master 收集路径上所有节点的 `flow.closed` 确认，完成全路径清理确认；关闭确认最多等待 10 秒，超时记录错误并释放协调状态；非 Master 的 close_flow 在关闭请求提交失败时抛出带提交状态的异常，提交成功后最多等待 10 秒确认本地失效，**但物理共享的 NodeLink 保持长连接常驻，不随单条 Flow 的关闭而断开**。
 
 ---
 
@@ -1251,14 +1282,14 @@ sequenceDiagram
 1. **会话协商（信令阶段）**：
    - Consumer Agent 捕获本地客户端连接，向 Node 控制端口（18443）发送 `relay.open`。
    - Node 验证服务存在并分配 Node 本地唯一的 `uuid` 与双端独立的鉴权凭证 `ticket`。
-   - Node 在 `control_io` 上创建 `ControlRouterSingle`，并发向 Producer 发送 `relay.offer`、向 Consumer 返回 `relay.opened`，通知双方连接数据端口（18444）。
+   - Node 在 `control_io` 上创建 `SingleSession`，向 Producer 发送 `relay.offer`、向 Consumer 返回 `relay.opened`，通知双方连接数据端口（18444）。
 2. **数据接入与配对（接入屏障）**：
    - 双端 Agent 异步建立到 Node 数据端口（18444）的 TCP 连接。
    - Node 在数据 socket 发送连接编号，双端经控制 mTLS 发送角色、uuid、ticket 和编号；Node 校验归属并授权绑定。
-   - `prepare_local` 在传输执行域内等待两端凭证匹配，随后连续绑定流量计数与限速并激活配对，一次返回控制域。
+   - 同一个 SessionTransfer 在传输执行域完成两端授权绑定及准备，配置计费与限速；控制面等待 Prepared，提交激活并等待 Activated，随后才发送 Ready。
 3. **数据桥接与半关闭（传输阶段）**：
    - 控制面回送 `relay.ready`，通知客户端开始发送业务数据。
-   - Node 统一调用 `relay_tcp()` 启动字节复制；TLS 业务由两端 Agent 完成握手与服务确认后使用 TCP↔TLS 复制。
+   - NodeSession 在 Ready 提交后通过同一个 SessionTransfer 启动字节复制；TLS 业务由两端 Agent 完成握手与服务确认后使用 TCP↔TLS 复制。
    - **双向半关闭（FIN/EOF）**：当客户端关闭写端（发送 FIN）时，Node 端读取到 EOF，向服务端对向 Socket 发送 `shutdown(SHUT_WR)`。服务端仍可继续反向发送剩余响应数据，直至服务端也发送 EOF。双向均关闭后，Node 清理该会话资源。TLS 业务 FIN 只由 Agent 加解密；两端业务结束并交换 close_notify 后才向 Node 发送 TCP EOF。收尾受固定 `channel.disconnect_timeout_ms` 限制，多跳 Finished 等待同样有界。
 
 ---
@@ -1358,7 +1389,7 @@ sequenceDiagram
 
 | 异常故障场景 | 检测与触发机制 | 自动化收敛与自愈行为 |
 |---|---|---|
-| **Agent 异常离线** | TCP RST 或 `TLSChannel` 心跳超时（20s）。 | Node 立即销毁对应的 `NodeSession`；关闭所有关联的局部数据 Socket；若为多节点 Flow，向上游或下游发送 `LnkFrType::Reset` 帧，随后通过 Master 触发 `flow.close`。 |
+| **Agent 异常离线** | TCP RST 或 `TLSChannel` 心跳超时（20s）。 | Node 请求对应的 `NodeSession` 取消；数据任务关闭关联端点并排空，多节点完成必要的 peer/Flow 收尾；根控制任务返回后才移除会话。 |
 | **中继节点崩溃/离线** | Master 检测到 Slave 集群控制连接断开。 | 1. Master 将该节点从活跃列表中剔除，**递增成员版本 `version`**；<br>2. Master 向全网存活节点广播 `topology.members`；<br>3. 各节点收到新拓扑后，**立即作废所有包含离线节点或基于旧授权构建的 Flow**，数据通道丢弃旧帧并清理；<br>4. Agent 收到拓扑失效通知，在本地清空路由缓存，重新运行 Dijkstra 计算新的替代路径。 |
 | **慢客户端导致流控窗口耗尽** | 接收端停止返还信用，发送端 `sent_bytes == send_limit`。 | 发送端按信用与有界队列施加背压，等待对端消费后继续；建立期限只用于建立阶段，运行中的连接错误、显式取消或控制失联沿原清理链路释放 Flow。 |
 | **网络分区导致 Master 失联** | Slave 节点的 `ClusterMgr::Connector` 连续超时。 | Slave 节点停止接纳新的多节点 `relay.open` 请求（降级为仅支持单节点本地 Relay）；后台 Connector 启动固定 5 秒间隔自动重连；一旦重连成功并同步新成员列表，自动恢复全功能。 |
@@ -1425,7 +1456,7 @@ RelayNode 内部的活体协程由进程常驻任务、控制连接、NodeLink�
 | 对象/数据结构名称 | 对象尺寸 (sizeof) | 内存归属与生命周期 | 计费与分配口径 |
 |---|---|---|---|
 | **`Frame`** | **80 字节** | 栈/发送队列节点 | 静态断言约束 `sizeof(Frame) <= 128`。本地占额与线上 DATA 信用按同一载荷长度计费。 |
-| **`NodeSession`** | **288 字节** | `control_io` | 会话存活期间由 `NodeSessionList` 智能指针持有，会话结束即刻释放。按值持有控制器。 |
+| **`NodeSession` / `SessionTransfer`** | 随构建测量 | 控制状态 / 数据生命周期 | SingleSession / MultiSession 持有各自的端点与业务状态，并通过 NodeSession 持有一个数据任务；须合计数据任务对象、有界阶段/授权通道及协程帧的实际分配，不能沿用改造前仅统计 NodeSession 的尺寸。 |
 | **`FlowState`** | **~480 字节** | `cluster_data_io` | 包含流状态、双向流控计数器、等待队列。由 `FlowProtocol::flows_` 持有。 |
 | **`NodeLink`** | **832 字节** | `cluster_data_io` | 包含物理 Socket、FairQueue 发送队列、信用合并表等。每对节点按 transport 复用一条，常驻内存。 |
 | **`PooledBuffer`** | **32 字节** | 跨域移动持有 | 包含 `unique_ptr` 及携带分配长度和共享资源的 `Deleter`。底层内存块来自 PMR 池。 |
@@ -1929,9 +1960,8 @@ Commit、Close 和以上回复均不携带 path、addresses、links、transport�
 | **`route/inc/link_quality.h`**<br>`route/src/link_quality.cpp` | `LinkQuality` | `control_io` | 基于 EMA 与打分截断的单尺度网络链路质量评估器。 |
 | **`route/inc/route_graph.h`**<br>`route/src/route_graph.cpp` | `RouteGraph` | `control_io` | 有向加权图模型，执行带 `relay_penalty` 的 Dijkstra 最短路径搜索。 |
 | **`node/inc/relay_node.h`**<br>`node/src/relay_node.cpp` | `RelayNode` | 组合根 (协调四执行域) | Node 进程组合根。管理四执行域生命周期、监听器启动与停机排空。 |
-| **`node/inc/node_session.h`**<br>`node/src/node_session.cpp` | `NodeSession` | `control_io` | 单次中继业务会话容器，按值持有会话控制器。 |
-| **`node/inc/control_router_single.h`**<br>`node/src/control_router_single.cpp` | `ControlRouterSingle` | `control_io` | 单节点中继业务双 Agent 协调器。 |
-| **`node/inc/control_router_multi.h`**<br>`node/src/control_router_multi.cpp` | `ControlRouterMulti` | `control_io` | 多节点首末中继业务集群单播协调器。 |
+| **`node/inc/node_session.h`**<br>`node/src/node_session.cpp` | `NodeSession` / `SingleSession` / `MultiSession` / `SessionTransfer` | `control_io` / 对应传输执行域 | 控制会话与其单次启动的传输任务；同一模块维护建立、确认、转发及收尾。 |
+| **`node/inc/node_common.h`** | `RelayTransport` | 对应传输执行域 | StreamPipeline / DatagramMgr 的纯虚会话资源接口；使用者借用，不拥有管理器。 |
 | **`node/inc/nodelink_mgr.h`**<br>`node/src/nodelink_mgr.cpp` | `NodeLinkMgr` | `control_io` | 跨节点 Flow 两阶段安装事务状态机与 NodeLink 邻接建立协调器。 |
 | **`node/inc/cluster_mgr.h`**<br>`node/src/cluster_mgr.cpp` | `ClusterMgr`<br>`ClusterRoom` | `control_io` | Master 集群成员网状网维护、重连与消息交换路由。 |
 | **`node/inc/registry_mgr.h`**<br>`node/src/registry_mgr.cpp` | `RegistryMgr` | `control_io` | 本地服务条目注册表。 |

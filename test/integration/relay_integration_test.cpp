@@ -112,9 +112,11 @@ asio::awaitable<std::shared_ptr<TLSChannel>> connect_control(asio::ssl::context 
     co_return channel;
 }
 
-asio::awaitable<CtrlMessage> receive_command(const std::shared_ptr<TLSChannel> &channel, std::string expected)
+asio::awaitable<CtrlMessage> receive_command(
+    const std::shared_ptr<TLSChannel> &channel, std::string expected,
+    std::chrono::steady_clock::duration timeout = std::chrono::steady_clock::duration::max())
 {
-    auto message = co_await channel->async_receive();
+    auto message = co_await channel->async_receive(timeout);
     require(message.command == expected, "Expected control command " + expected + ", received " + message.command);
     co_return message;
 }
@@ -368,11 +370,25 @@ asio::awaitable<void> verify_incomplete_relay_lifecycle(asio::ssl::context &prod
     co_await asio::async_read(active_producer_half, asio::buffer(received_tx), asio::use_awaitable);
     require(received_tx == tx_payload, "TX traffic test payload was not forwarded");
 
-    consumer->send(CtrlMessage{"server.traffic", njson{{"request_id", 32U}}});
-    const auto counted_traffic = co_await receive_command(consumer, "server.traffic.reported");
-    const auto &counted_stats = params_of(counted_traffic).at("services").at(0);
-    require(counted_stats.at("rx_bytes") == rx_payload.size(), "TCP RX payload bytes were counted incorrectly");
-    require(counted_stats.at("tx_bytes") == tx_payload.size(), "TCP TX payload bytes were counted incorrectly");
+    njson counted_stats;
+    const auto accounting_deadline = std::chrono::steady_clock::now() + 1s;
+    for (;;)
+    {
+        // Client reads may complete before the relay's send-completion accounting.
+        consumer->send(CtrlMessage{"server.traffic", njson{{"request_id", 32U}}});
+        const auto traffic = co_await receive_command(
+            consumer, "server.traffic.reported", accounting_deadline - std::chrono::steady_clock::now());
+        counted_stats = params_of(traffic).at("services").at(0);
+        const auto rx = counted_stats.at("rx_bytes").get<std::uint64_t>();
+        const auto tx = counted_stats.at("tx_bytes").get<std::uint64_t>();
+        require(rx <= rx_payload.size() && tx <= tx_payload.size(), "TCP payload bytes were overcounted");
+        if (rx == rx_payload.size() && tx == tx_payload.size())
+        {
+            break;
+        }
+        require(std::chrono::steady_clock::now() < accounting_deadline,
+                "TCP traffic did not reach the completed payload totals");
+    }
     const auto &active_accessors = counted_stats.at("accessors");
     require(active_accessors.size() == 1 && !active_accessors.begin().key().empty() &&
                 active_accessors.begin().value() == 1,
@@ -566,31 +582,6 @@ int main()
                                                   std::move(server_config));
         server->start();
 
-        AgentConfig producer_config;
-        producer_config.host = "127.0.0.1";
-        producer_config.port = control_port;
-        producer_config.connect_timeout = 1s;
-        producer_config.reconnect_initial_delay = 50ms;
-        producer_config.reconnect_max_delay = 200ms;
-        producer_config.channel = channel_config();
-        producer_config.services.push_back(
-            AgentServiceConfig{"echo", "127.0.0.1", target_port, RelayProtocol::Tls});
-        auto producer =
-            std::make_shared<RelayAgent>(control_io, transfer_tcp_io, producer_context, std::move(producer_config));
-
-        AgentConfig consumer_config;
-        consumer_config.host = "127.0.0.1";
-        consumer_config.port = control_port;
-        consumer_config.connect_timeout = 1s;
-        consumer_config.reconnect_initial_delay = 50ms;
-        consumer_config.reconnect_max_delay = 200ms;
-        consumer_config.relay_open_timeout = 2s;
-        consumer_config.channel = channel_config();
-        consumer_config.forwards.push_back(
-            AgentForwardConfig{"echo", "127.0.0.1", forward_port, RelayProtocol::Tls});
-        auto consumer =
-            std::make_shared<RelayAgent>(control_io, transfer_tcp_io, consumer_context, std::move(consumer_config));
-
         asio::post(transfer_tcp_io, []() { std::this_thread::sleep_for(1200ms); });
         asio::post(transfer_udp_io, []() { std::this_thread::sleep_for(1200ms); });
 
@@ -622,6 +613,31 @@ int main()
         require(!control_io.stopped(), "Control io_context stopped after lifecycle verification");
         require(!transfer_tcp_io.stopped(), "TCP transfer io_context stopped after lifecycle verification");
         require(!transfer_udp_io.stopped(), "UDP transfer io_context stopped after lifecycle verification");
+        AgentConfig producer_config;
+        producer_config.host = "127.0.0.1";
+        producer_config.port = control_port;
+        producer_config.connect_timeout = 1s;
+        producer_config.reconnect_initial_delay = 50ms;
+        producer_config.reconnect_max_delay = 200ms;
+        producer_config.channel = channel_config();
+        producer_config.services.push_back(
+            AgentServiceConfig{"echo", "127.0.0.1", target_port, RelayProtocol::Tls});
+        auto producer =
+            std::make_shared<RelayAgent>(control_io, transfer_tcp_io, producer_context, std::move(producer_config));
+
+        AgentConfig consumer_config;
+        consumer_config.host = "127.0.0.1";
+        consumer_config.port = control_port;
+        consumer_config.connect_timeout = 1s;
+        consumer_config.reconnect_initial_delay = 50ms;
+        consumer_config.reconnect_max_delay = 200ms;
+        consumer_config.relay_open_timeout = 2s;
+        consumer_config.channel = channel_config();
+        consumer_config.forwards.push_back(
+            AgentForwardConfig{"echo", "127.0.0.1", forward_port, RelayProtocol::Tls});
+        auto consumer =
+            std::make_shared<RelayAgent>(control_io, transfer_tcp_io, consumer_context, std::move(consumer_config));
+
         producer->start();
         consumer->start();
         std::size_t completed_round_trips = 0;

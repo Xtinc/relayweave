@@ -9,7 +9,8 @@
 TEST_MEMBER(RelayNode, nodelink_mgr_)
 TEST_MEMBER(RelayNode, cluster_mgr_)
 TEST_MEMBER(RelayNode, metrics_)
-TEST_MEMBER(NodeLinkMgr, link_requests_)
+TEST_MEMBER(NodeLinkMgr, shared_links_)
+TEST_MEMBER(NodeLinkMgr, start_link)
 
 namespace test_node
 {
@@ -25,11 +26,56 @@ inline ClusterMgr &cluster(const std::shared_ptr<RelayNode> &node)
 {
     return *test_access::RelayNode_cluster_mgr_(*node);
 }
-// Scenarios run on control_io, like the production NodeSession callers.
+/** @brief Snapshot one Link attempt for tests without adding a production waiting API. */
+struct LinkResult
+{
+    std::uint64_t id = 0;
+    std::string stage;
+    std::string reason;
+    /**
+     * @brief Report whether the observed Link completed successfully.
+     * @return True for a nonzero identity without a failure reason.
+     */
+    explicit operator bool() const noexcept
+    {
+        return id != 0 && reason.empty();
+    }
+};
+
+/**
+ * @brief Start or reuse a Link and observe its completion on control_io for tests.
+ * @param node Node retained until observation ends.
+ * @param left First adjacent Node identity.
+ * @param right Second adjacent Node identity; order is normalized by the production starter.
+ * @param transport TCP or UDP transport to observe.
+ * @return Observed Link identity, stage and reason; invalid start requests return an ensure failure.
+ * @details The bounded test-only poll leaves production free of Link waiter events and coroutine wrappers.
+ */
 inline asio::awaitable<LinkResult> ensure_link(std::shared_ptr<RelayNode> node, std::string left,
                                                std::string right, RelayProtocol transport)
 {
-    co_return co_await links(node).ensure_link(std::move(left), std::move(right), transport);
+    using Request = decltype(test_access::NodeLinkMgr_start_link(links(node), left, right, transport));
+    Request request;
+    try
+    {
+        request = test_access::NodeLinkMgr_start_link(links(node), std::move(left), std::move(right), transport);
+    }
+    catch (const std::exception &error)
+    {
+        co_return LinkResult{0, "ensure", error.what()};
+    }
+    asio::steady_timer changed(co_await asio::this_coro::executor);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+    while (!request->completed)
+    {
+        if (std::chrono::steady_clock::now() >= deadline)
+        {
+            throw std::runtime_error("Link completion exceeded the test deadline");
+        }
+        changed.expires_after(std::chrono::milliseconds(1));
+        co_await changed.async_wait(asio::use_awaitable);
+    }
+    co_return LinkResult{request->params.id, request->stage, request->reason};
 }
 inline asio::awaitable<FlowResult> open_flow(std::shared_ptr<RelayNode> node, std::vector<std::string> path,
                                             RelayProtocol transport)
@@ -60,7 +106,7 @@ inline asio::awaitable<void> close_link(std::shared_ptr<RelayNode> node, std::ui
 {
     // Inject the same authenticated endpoint notification as a closed data socket.
     auto &manager = links(node);
-    for (const auto &[_, request] : test_access::NodeLinkMgr_link_requests_(manager))
+    for (const auto &[_, request] : test_access::NodeLinkMgr_shared_links_(manager))
     {
         if (request->params.id == id)
         {

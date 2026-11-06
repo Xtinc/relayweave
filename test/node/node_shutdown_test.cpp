@@ -17,7 +17,8 @@ TEST_MEMBER(FlowProtocol, spawn)
 TEST_MEMBER(FlowProtocol, stopping_)
 TEST_MEMBER(FlowProtocol, tasks_)
 TEST_MEMBER(NodeLinkMgr, events_running_)
-TEST_MEMBER(NodeLinkMgr, flow_tasks_)
+TEST_MEMBER(NodeLinkMgr, paths_)
+TEST_MEMBER(NodeLinkMgr, pending_opens_)
 TEST_MEMBER(StreamPipeline, stopped_)
 TEST_MEMBER(DatagramMgr, stopped_)
 
@@ -148,7 +149,8 @@ static void stop_drains_all_domains(bool fail_during_stop)
         require_shutdown(test_access::RelayNode_state_(*f.node).load() == State::Stopped &&
                              test_access::Topology_state_(topology) == TopologyState::Stopped &&
                              !test_access::NodeLinkMgr_events_running_(links) &&
-                             test_access::NodeLinkMgr_flow_tasks_(links) == 0 &&
+                             test_access::NodeLinkMgr_paths_(links).empty() &&
+                             test_access::NodeLinkMgr_pending_opens_(links).empty() &&
                              !test_access::ClusterMgr_running_(test_node::cluster(f.node)) &&
                              test_access::AsyncEvent_notified_(test_access::ClusterMgr_loop_done_(test_node::cluster(f.node))),
                          "A shutdown error skipped topology or cluster draining");

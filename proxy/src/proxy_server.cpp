@@ -750,6 +750,8 @@ ProxyConfig load_proxy_config(const std::filesystem::path &path)
     return result;
 }
 
+ProxyServer::~ProxyServer() = default;
+
 ProxyServer::ProxyServer(asio::io_context &io, ProxyConfig config)
     : executor_(io.get_executor()), config_(std::move(config)), http_acceptor_(executor_), socks5_acceptor_(executor_)
 {
@@ -840,20 +842,25 @@ asio::awaitable<void> ProxyServer::accept_loop(tcp::acceptor &acceptor, ProxyPro
             continue;
         }
 
-        auto session = std::make_shared<ProxySession>(std::move(socket), protocol, config_);
-        sessions_.insert(session);
+        auto owned = std::make_unique<ProxySession>(std::move(socket), protocol, config_);
+        auto *session = owned.get();
+        sessions_.push_back(std::move(owned));
+        ScopeGuard rollback([this, session] {
+            std::erase_if(sessions_, [session](const auto &owned) { return owned.get() == session; });
+        });
         asio::co_spawn(executor_, session->run(),
-                       [this, session](std::exception_ptr failure) { session_finished(session, failure); });
+                       [this, session](std::exception_ptr failure) { session_finished(*session, failure); });
+        rollback.dismiss();
     }
 }
 
-void ProxyServer::session_finished(const std::shared_ptr<ProxySession> &session, std::exception_ptr failure)
+void ProxyServer::session_finished(ProxySession &session, std::exception_ptr failure)
 {
-    session->cancel();
-    sessions_.erase(session);
+    session.cancel();
     if (failure && running_)
     {
-        PROXY_ERROR_PRINT("Proxy session failed %s peer=%s reason=%s", session->protocol_name(),
-                          session->peer().c_str(), exception_description(failure).c_str());
+        PROXY_ERROR_PRINT("Proxy session failed %s peer=%s reason=%s", session.protocol_name(),
+                          session.peer().c_str(), exception_description(failure).c_str());
     }
+    std::erase_if(sessions_, [finished = &session](const auto &owned) { return owned.get() == finished; });
 }

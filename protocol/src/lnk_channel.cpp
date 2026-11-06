@@ -74,29 +74,22 @@ LnkChannel::LnkChannel(FlowProtocol &protocol, asio::any_io_executor executor, s
 
 void LnkChannel::start()
 {
-    try
+    ScopeGuard rollback_on_failure([this]() noexcept { rollback(); });
+    if (!tcp_port_ || !udp_port_)
     {
-        if (!tcp_port_ || !udp_port_)
-        {
-            throw std::invalid_argument("cluster.tcp_port and cluster.udp_port must be nonzero");
-        }
-        const tcp::endpoint tcp_endpoint(asio::ip::make_address(tcp_address_), tcp_port_);
-        const udp::endpoint udp_endpoint(asio::ip::make_address(udp_address_), udp_port_);
-        acceptor_.open(tcp_endpoint.protocol());
-        acceptor_.set_option(tcp::acceptor::reuse_address(true));
-        acceptor_.bind(tcp_endpoint);
-        acceptor_.listen();
-        udp_socket_.open(udp_endpoint.protocol());
-        udp_socket_.bind(udp_endpoint);
-        PROXY_INFO_PRINT("Node data listening tcp=%s:%u udp=%s:%u", tcp_address_.c_str(),
-                         static_cast<unsigned int>(tcp_port_), udp_address_.c_str(),
-                         static_cast<unsigned int>(udp_port_));
+        throw std::invalid_argument("cluster.tcp_port and cluster.udp_port must be nonzero");
     }
-    catch (...)
-    {
-        rollback();
-        throw;
-    }
+    const tcp::endpoint tcp_endpoint(asio::ip::make_address(tcp_address_), tcp_port_);
+    const udp::endpoint udp_endpoint(asio::ip::make_address(udp_address_), udp_port_);
+    acceptor_.open(tcp_endpoint.protocol());
+    acceptor_.set_option(tcp::acceptor::reuse_address(true));
+    acceptor_.bind(tcp_endpoint);
+    acceptor_.listen();
+    udp_socket_.open(udp_endpoint.protocol());
+    udp_socket_.bind(udp_endpoint);
+    PROXY_INFO_PRINT("Node data listening tcp=%s:%u udp=%s:%u", tcp_address_.c_str(),
+                     static_cast<unsigned int>(tcp_port_), udp_address_.c_str(), static_cast<unsigned int>(udp_port_));
+    rollback_on_failure.dismiss();
 }
 
 void LnkChannel::rollback() noexcept
@@ -106,9 +99,9 @@ void LnkChannel::rollback() noexcept
     udp_socket_.close(ignored);
 }
 
-void LnkChannel::notify(const NodeLink &link, lnk::EventKind kind, std::string reason, std::string_view stage)
+void LnkChannel::notify(const NodeLink &link, CtrlCommand command, std::string reason, std::string_view stage)
 {
-    protocol_.emit({kind, link.spec.epoch, link.spec.id, std::string(stage.empty() ? link_stage(link.phase) : stage),
+    protocol_.emit({command, link.spec.epoch, link.spec.id, std::string(stage.empty() ? link_stage(link.phase) : stage),
                     std::move(reason)});
 }
 
@@ -118,7 +111,7 @@ void LnkChannel::fail(NodeLink &link, std::string reason, std::string_view stage
     {
         return;
     }
-    notify(link, lnk::EventKind::LinkError, std::move(reason), stage);
+    notify(link, CtrlCommand::LinkError, std::move(reason), stage);
     close(link.spec.id);
 }
 
@@ -150,7 +143,7 @@ void LnkChannel::close(std::uint64_t id)
     link->controls.clear();
     link->credits.clear();
     protocol_.link_flows_closed(id);
-    notify(*link, lnk::EventKind::LinkClosed, {}, link_stage(state));
+    notify(*link, CtrlCommand::LinkClosed, {}, link_stage(state));
 }
 
 void LnkChannel::prepare(lnk::LinkSpec spec)
@@ -172,7 +165,7 @@ void LnkChannel::prepare(lnk::LinkSpec spec)
     else
     {
         link->phase = LinkPhase::Prepared;
-        notify(*link, lnk::EventKind::LinkPrepared);
+        notify(*link, CtrlCommand::LinkPrepared);
     }
 }
 
@@ -203,7 +196,7 @@ asio::awaitable<void> LnkChannel::prepare_udp(std::shared_ptr<NodeLink> link)
             co_return;
         }
         link->phase = LinkPhase::Prepared;
-        notify(*link, lnk::EventKind::LinkPrepared);
+        notify(*link, CtrlCommand::LinkPrepared);
     }
     catch (const std::exception &e)
     {
@@ -269,7 +262,7 @@ void LnkChannel::mark_ready(NodeLink &link)
                      relay_protocol_name(link.spec.transport).data(), link.spec.peer.c_str());
     link.last_response = link.last_ping = Clock::now();
     protocol_.schedule_monitor(link.last_ping + heartbeat_interval);
-    notify(link, lnk::EventKind::LinkReady);
+    notify(link, CtrlCommand::LinkReady);
 }
 
 asio::awaitable<void> LnkChannel::establish(std::shared_ptr<NodeLink> link)
@@ -359,23 +352,25 @@ asio::awaitable<void> LnkChannel::accept_loop()
         }
         if (accepting_.size() >= max_pending_accepts)
         {
-            socket.close();
             continue;
         }
-        auto pending = std::make_shared<tcp::socket>(std::move(socket));
-        accepting_.insert(pending);
-        protocol_.spawn(accept(pending));
+        auto pending = std::make_unique<tcp::socket>(std::move(socket));
+        auto *observed = pending.get();
+        accepting_.insert(observed);
+        ScopeGuard rollback([this, observed] { accepting_.erase(observed); });
+        protocol_.spawn(accept(std::move(pending)));
+        rollback.dismiss();
     }
 }
 
-asio::awaitable<void> LnkChannel::accept(std::shared_ptr<tcp::socket> socket)
+asio::awaitable<void> LnkChannel::accept(std::unique_ptr<tcp::socket> socket)
 {
     std::shared_ptr<NodeLink> link;
     try
     {
         {
             // Only bootstrap owns the pending socket; the authenticated Link takes over its I/O.
-            ScopeGuard cleanup([this, &socket]() { accepting_.erase(socket); });
+            ScopeGuard cleanup([this, &socket]() { accepting_.erase(socket.get()); });
             auto message = co_await read_ctrl_frame(*socket, Clock::now() + link_setup_timeout);
             if (message.type() != CtrlCommand::LinkAttach)
             {
@@ -713,28 +708,25 @@ asio::awaitable<void> LnkChannel::udp_write()
         {
             continue;
         }
-        udp::endpoint endpoint;
+        const auto found = connections_.find(datagram.link_id);
+        if (found == connections_.end() || found->second->spec.epoch != datagram.frame.header.epoch)
         {
-            const auto found = connections_.find(datagram.link_id);
-            if (found == connections_.end() || found->second->spec.epoch != datagram.frame.header.epoch)
-            {
-                continue;
-            }
-            endpoint = found->second->endpoint;
+            continue;
         }
+        const auto endpoint = found->second->endpoint;
         const auto link_header = DatagramHeader::encode(datagram.link_id);
         const auto frame_header = datagram.frame.header.encode();
         const std::array<asio::const_buffer, 3> buffers{
             asio::buffer(link_header), asio::buffer(frame_header),
             asio::buffer(datagram.frame.payload.data(), datagram.frame.payload.size())};
-        // The endpoint and buffers outlive the send; no link reference or table iterator crosses this await.
+        // Copy the destination; the Link may be removed during the send.
         auto [error, size] = co_await udp_socket_.async_send_to(buffers, endpoint, use_nothrow_awaitable);
         if (error)
         {
-            const auto found = connections_.find(datagram.link_id);
-            if (found != connections_.end() && found->second->spec.epoch == datagram.frame.header.epoch)
+            const auto current = connections_.find(datagram.link_id);
+            if (current != connections_.end() && current->second->spec.epoch == datagram.frame.header.epoch)
             {
-                auto link = found->second;
+                auto link = current->second;
                 fail(*link, error.message());
             }
         }

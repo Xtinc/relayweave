@@ -7,12 +7,28 @@
 #include <asio/awaitable.hpp>
 #include <asio/experimental/channel.hpp>
 #include <asio/use_awaitable.hpp>
+#include <list>
 #include <utility>
 #include <vector>
 
 // One-shot broadcast. Access requires one executor, and the event must outlive every wait().
 class AsyncEvent
 {
+    template <typename... Signatures> struct ChannelTraits : asio::experimental::channel_traits<Signatures...>
+    {
+        template <typename... OtherSignatures> struct rebind
+        {
+            using other = ChannelTraits<OtherSignatures...>;
+        };
+
+        // Asio stores the first error_code inline. Avoid the default deque's
+        // empty allocations; this capacity-one notification needs no list nodes.
+        template <typename Element> struct container
+        {
+            using type = std::list<Element>;
+        };
+    };
+
     struct Waiter
     {
         explicit Waiter(AsyncEvent &event) : event(event), notification(event.executor_, 1)
@@ -26,7 +42,9 @@ class AsyncEvent
         }
 
         AsyncEvent &event;
-        asio::experimental::channel<void(asio::error_code)> notification;
+        asio::experimental::basic_channel<asio::any_io_executor, ChannelTraits<void(asio::error_code)>,
+                                          void(asio::error_code)>
+            notification;
     };
 
   public:
@@ -57,7 +75,8 @@ class AsyncEvent
         {
             waiter->notification.try_send(asio::error_code{});
         }
-        waiters_.clear();
+        // This one-shot event never registers another waiter after notification.
+        std::vector<Waiter *>{}.swap(waiters_);
     }
 
   private:

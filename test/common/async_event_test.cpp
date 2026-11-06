@@ -75,6 +75,23 @@ void individual_cancellation()
     cancellation.emit(asio::cancellation_type::all);
     io.run();
     require(result.get(), "cancellation changed an already submitted notification");
+
+    io.restart();
+    AsyncEvent interrupted(io.get_executor());
+    auto first = asio::co_spawn(io, interrupted.wait(),
+                               asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
+    auto second = asio::co_spawn(io, interrupted.wait(), asio::use_future);
+    io.poll();
+    asio::post(io, [&] {
+        cancellation.emit(asio::cancellation_type::all);
+        // Cancel on the executor before notifying, while the cancelled Waiter
+        // is still alive. Notification may buffer a value until it exits.
+        interrupted.notify_all();
+        interrupted.notify_all();
+    });
+    io.run();
+    require(!first.get(), "notification changed an already submitted cancellation");
+    require(second.get(), "notification lost another waiter during cancellation");
 }
 
 void separate_completion_and_release()

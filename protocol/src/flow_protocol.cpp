@@ -162,10 +162,7 @@ bool lnk::FlowDatagram::try_send(std::span<const std::uint8_t> payload)
     }
     try
     {
-        if (send_queue_.try_send(asio::error_code{}, PooledBuffer(pool_, payload)))
-        {
-            return true;
-        }
+        return send_queue_.try_send(asio::error_code{}, PooledBuffer(pool_, payload));
     }
     catch (const std::bad_alloc &)
     {
@@ -448,10 +445,10 @@ lnk::FlowState::FlowState(asio::any_io_executor executor, FlowSpec spec)
     }
 }
 
-void FlowProtocol::notify_flow(const std::shared_ptr<FlowState> &flow, lnk::EventKind kind, std::string stage,
+void FlowProtocol::notify_flow(const std::shared_ptr<FlowState> &flow, CtrlCommand command, std::string stage,
                                std::string reason)
 {
-    emit({kind, flow->epoch, flow->id, std::move(stage), std::move(reason)});
+    emit({command, flow->epoch, flow->id, std::move(stage), std::move(reason)});
 }
 
 void FlowProtocol::prepare_flow(lnk::FlowSpec spec)
@@ -465,12 +462,12 @@ void FlowProtocol::prepare_flow(lnk::FlowSpec spec)
     const auto id = spec.id;
     if (auto it = flows_.find(id); it != flows_.end())
     {
-        notify_flow(it->second, lnk::EventKind::FlowPrepared, "prepare");
+        notify_flow(it->second, CtrlCommand::FlowPrepared, "prepare");
         return;
     }
 
     const auto reject = [&](std::string reason) {
-        emit({lnk::EventKind::FlowError, spec.epoch, id, "prepare", std::move(reason)});
+        emit({CtrlCommand::FlowError, spec.epoch, id, "prepare", std::move(reason)});
     };
     if (flows_.size() + retired_.size() >= lnk::max_flow_count || retired_.contains(id))
     {
@@ -495,7 +492,7 @@ void FlowProtocol::prepare_flow(lnk::FlowSpec spec)
     auto s = std::make_shared<FlowState>(executor_, std::move(spec));
     flows_.emplace(id, s);
     schedule_monitor(s->prepare_deadline);
-    notify_flow(s, lnk::EventKind::FlowPrepared, "prepare");
+    notify_flow(s, CtrlCommand::FlowPrepared, "prepare");
 }
 
 void FlowProtocol::commit_flow(std::uint64_t id)
@@ -525,7 +522,7 @@ void FlowProtocol::commit_flow(std::uint64_t id)
             }
         }
     }
-    notify_flow(s, lnk::EventKind::FlowCommitted, "commit");
+    notify_flow(s, CtrlCommand::FlowCommitted, "commit");
 }
 
 void FlowProtocol::close_flow(std::uint64_t id, std::string reason)
@@ -557,9 +554,10 @@ void FlowProtocol::close_flow(std::uint64_t id, std::string reason)
     }
     flows_.erase(it);
 
-    retired_[id] = Clock::now() + retired_flow_ttl;
-    schedule_monitor(retired_.at(id));
-    notify_flow(s, lnk::EventKind::FlowClosed, "close", s->reason);
+    const auto retirement_deadline = Clock::now() + retired_flow_ttl;
+    retired_[id] = retirement_deadline;
+    schedule_monitor(retirement_deadline);
+    notify_flow(s, CtrlCommand::FlowClosed, "close", s->reason);
 }
 
 void FlowProtocol::fail_flow(std::shared_ptr<FlowState> s, std::string stage, std::string reason)
@@ -569,7 +567,7 @@ void FlowProtocol::fail_flow(std::shared_ptr<FlowState> s, std::string stage, st
         return;
     }
     s->reason = reason;
-    notify_flow(s, lnk::EventKind::FlowError, std::move(stage), std::move(reason));
+    notify_flow(s, CtrlCommand::FlowError, std::move(stage), std::move(reason));
     // Keep the exact instance alive while removing it from the routing table.
     close_flow(s->id);
 }
@@ -622,7 +620,7 @@ void FlowProtocol::receive(const NodeLink &link, Frame f)
 void FlowProtocol::written(Frame frame)
 {
     const auto memory_bytes = frame.charge();
-    const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
+    const auto credit_bytes = frame.header.kind == LnkFrType::Data ? memory_bytes : 0;
     frame.payload = {};
     if (frame.owner && frame.owner->transport == RelayProtocol::Tcp)
     {
@@ -863,7 +861,8 @@ void FlowProtocol::Stream::receive_credit(const NodeLink &link, const LnkFrameHe
     {
         return;
     }
-    if (header.sequence < direction.sent_bytes || header.sequence - direction.sent_bytes > flow_window_bytes)
+    // Older limits were ignored above; sent_bytes never exceeds send_limit.
+    if (header.sequence - direction.sent_bytes > flow_window_bytes)
     {
         protocol_.fail_flow(flow, "credit", "flow credit exceeds peer window");
         return;
@@ -1031,7 +1030,7 @@ asio::awaitable<void> FlowProtocol::Stream::receive_loop(const std::shared_ptr<F
             co_return;
         }
         const auto memory_bytes = frame.charge();
-        const auto credit_bytes = frame.header.kind == LnkFrType::Data ? frame.charge() : 0;
+        const auto credit_bytes = frame.header.kind == LnkFrType::Data ? memory_bytes : 0;
         const auto reverse = frame.header.reverse;
         const auto kind = frame.header.kind;
         std::optional<PooledBuffer> data;

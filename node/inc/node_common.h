@@ -4,12 +4,14 @@
 #include "async_event.h"
 #include "tls_channel.h"
 #include "xfr_channel.h"
+#include <asio/experimental/concurrent_channel.hpp>
 #include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <unordered_set>
 #include <utility>
+#include <variant>
 #include <vector>
 
 class FlowProtocol;
@@ -128,6 +130,9 @@ struct AttachPair
     AttachInfo consumer;
 };
 
+/** @brief Installed relay credentials: absent, one multi-node role, or both local roles. */
+using AttachResult = std::variant<std::monostate, AttachInfo, AttachPair>;
+
 /**
  * @brief Share service byte counters, sampled rates, and active accessor counts.
  * @details Transfer executors update atomic counters and mutex-protected accessors. Sampling
@@ -194,6 +199,41 @@ class ServiceTraffic
 using SRVTrafficPtr = std::shared_ptr<ServiceTraffic>;
 
 /**
+ * @brief Borrowed interface for a relay's transport resources on one transfer executor.
+ * @details The Node owns the concrete manager and drains its sessions before stopping it. This
+ * interface carries no shared ownership or transport state. Pair operations require executor();
+ * the immutable executor may also be read when constructing a task on control_io.
+ */
+class RelayTransport
+{
+  public:
+    using Authorizations = asio::experimental::concurrent_channel<void(asio::error_code, RelayAttach)>;
+
+    virtual ~RelayTransport() = default;
+    virtual asio::any_io_executor executor() const = 0;
+
+    virtual AttachPair install_local_pair() = 0;
+    virtual AttachInfo install_remote_pair(int role) = 0;
+
+    /** @brief Await transport attachment and prepare accounting; streams consume control authorizations,
+     * while datagrams await the authenticated sources supplied by their shared listener. */
+    virtual asio::awaitable<void> prepare_local_pair(std::uint64_t uuid, Authorizations &authorizations,
+                                                     SRVTrafficPtr traffic, std::string accessor) = 0;
+    /** @brief Await attachment and bind the borrowed protocol's Flow; it must outlive this operation. */
+    virtual asio::awaitable<void> prepare_remote_pair(std::uint64_t uuid, Authorizations &authorizations,
+                                                      FlowProtocol &protocol, std::uint64_t epoch,
+                                                      std::uint64_t flow_id, SRVTrafficPtr traffic,
+                                                      std::string accessor) = 0;
+
+    virtual void activate_local_pair(std::uint64_t uuid) = 0;
+    virtual void activate_remote_pair(std::uint64_t uuid) = 0;
+    virtual asio::awaitable<void> run_local_pair(std::uint64_t uuid) = 0;
+    virtual asio::awaitable<void> run_remote_pair(std::uint64_t uuid) = 0;
+    virtual void close_local_pair(std::uint64_t uuid) = 0;
+    virtual void close_remote_pair(std::uint64_t uuid) = 0;
+};
+
+/**
  * @brief Hold attachment, traffic and lifetime state shared by local and remote relay pairs.
  * @details All access requires the owning transfer executor. Managers retain concrete resource-owning pairs
  * and remove their lookup entries before close(); awaiting tasks retain the pair until they drain.
@@ -234,14 +274,16 @@ struct LocalRelayPair : RelayPair
      */
     explicit LocalRelayPair(asio::any_io_executor executor);
     /**
-     * @brief Await both attachments, then bind accounting and activate on the transfer executor.
+     * @brief Await both attachments, then prepare accounting on the transfer executor.
      * @param limits Per-direction byte rates and burst sizes.
      * @param traffic Nonempty local service accounting record.
      * @param accessor Consumer peer label used for accounting.
-     * @return Completes after activation; attachment closure or cancellation throws.
+     * @return Completes after preparation; attachment closure or cancellation throws.
      * @details The caller must retain this pair until the coroutine exits.
      */
     asio::awaitable<void> prepare(const TrafficLimitConfig &limits, SRVTrafficPtr traffic, std::string accessor);
+    /** @brief Activate a prepared pair and register its accessor after control coordination. */
+    void activate();
     /** @brief Wake attachment waiters and remove an active pair's accessor after lookup removal. */
     void close() override;
 

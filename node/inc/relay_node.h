@@ -133,9 +133,9 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 
   private:
     friend class ClusterMgr;
-    friend class ControlRouterSingle;
-    friend class ControlRouterMulti;
     friend class NodeSession;
+    friend class SingleSession;
+    friend class MultiSession;
 
     asio::awaitable<void> control_accept_loop();
     asio::awaitable<void> run_control_session(SessionId id, ControlSessionPtr session);
@@ -151,7 +151,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     /** @brief Route incoming business messages without creating remote control sessions. */
     void handle_cluster_relay(CtrlCommand command, CtrlMessage message);
     void handle_relay_peer(CtrlCommand command, const CtrlMessage &message);
-    void start_relay(std::shared_ptr<NodeSession> relay);
+    void start_relay(std::unique_ptr<NodeSession> relay);
     void invalidate_relays(std::string reason = {});
     /** @brief Drain control-owned tasks on control_io before transfer executors are stopped. */
     asio::awaitable<bool> stop_control();

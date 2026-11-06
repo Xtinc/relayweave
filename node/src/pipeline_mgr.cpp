@@ -5,11 +5,86 @@
 #include <exception>
 #include <openssl/rand.h>
 
-StreamPipeline::StreamPipeline(asio::any_io_executor executor,
-                                          std::shared_ptr<RelayIdAllocator> id_allocator, std::string listen_address,
-                                          std::uint16_t data_port, std::size_t max_setup_connections,
-                                          std::size_t capacity, std::chrono::steady_clock::duration setup_timeout,
-                                          TrafficLimitConfig config)
+/** @brief Own one attached Agent stream and its bound multi-node Flow endpoint. */
+struct StreamPipeline::RemotePair : RemoteRelayPair
+{
+    using RemoteRelayPair::RemoteRelayPair;
+    /** @copydoc RelayPair::close */
+    void close() override
+    {
+        if (flow)
+        {
+            flow->close("relay endpoint closed");
+        }
+        if (stream)
+        {
+            asio::error_code ignored;
+            stream->lowest_layer().close(ignored);
+        }
+        RemoteRelayPair::close();
+    }
+
+    std::shared_ptr<lnk::FlowStream> flow;
+    std::optional<tcp::socket> stream;
+
+  private:
+    /** @brief Bind and retain a FlowStream on the owning transfer executor. */
+    asio::awaitable<void> bind_flow(FlowProtocol &channel, std::uint64_t epoch, std::uint64_t flow_id,
+                                    asio::any_io_executor transfer) override
+    {
+        if (flow)
+        {
+            throw std::runtime_error("relay endpoint cannot bind flow");
+        }
+        flow = co_await asio::co_spawn(
+            channel.executor(),
+            [&channel, epoch, flow_id, reverse = role == RelayAttach::Producer,
+             transfer]() -> asio::awaitable<std::shared_ptr<lnk::FlowStream>> {
+                co_return channel.bind_stream_flow(epoch, flow_id, reverse, transfer);
+            },
+            asio::use_awaitable);
+    }
+};
+
+/** @brief Own both Agent streams, attachment credentials, and single-node service accounting. */
+struct StreamPipeline::LocalPair : LocalRelayPair
+{
+    using LocalRelayPair::LocalRelayPair;
+    /** @copydoc LocalRelayPair::close */
+    void close() override
+    {
+        asio::error_code ignored;
+        if (producer_stream)
+        {
+            producer_stream->lowest_layer().close(ignored);
+        }
+        if (consumer_stream)
+        {
+            consumer_stream->lowest_layer().close(ignored);
+        }
+        LocalRelayPair::close();
+    }
+
+    std::optional<tcp::socket> producer_stream;
+    std::optional<tcp::socket> consumer_stream;
+};
+
+/** @brief Own an unbound socket through greeting, authorization, timeout, and shutdown. */
+struct StreamPipeline::PendingConnection
+{
+    PendingConnection(tcp::socket socket, std::chrono::steady_clock::time_point deadline)
+        : socket(std::move(socket)), deadline(deadline), announced(this->socket.get_executor())
+    {
+    }
+    tcp::socket socket;
+    std::chrono::steady_clock::time_point deadline;
+    AsyncEvent announced;
+};
+
+StreamPipeline::StreamPipeline(asio::any_io_executor executor, std::shared_ptr<RelayIdAllocator> id_allocator,
+                               std::string listen_address, std::uint16_t data_port, std::size_t max_setup_connections,
+                               std::size_t capacity, std::chrono::steady_clock::duration setup_timeout,
+                               TrafficLimitConfig config)
     : executor_(std::move(executor)), id_allocator_(std::move(id_allocator)),
       listen_address_(std::move(listen_address)), data_port_(data_port), max_setup_connections_(max_setup_connections),
       capacity_(capacity), setup_timeout_(setup_timeout), config_(std::move(config)), acceptor_(executor_)
@@ -31,16 +106,15 @@ void StreamPipeline::start()
     acceptor_.bind(endpoint);
     acceptor_.listen();
     started_ = true;
-    close_acceptor.dismiss();
 
-    asio::co_spawn(executor_, [self = shared_from_this()] { return self->accept_loop(); },
-        [self = shared_from_this()](std::exception_ptr error) {
-            if (error)
-            {
-                PROXY_ERROR_PRINT("Data listener failed reason=%s", exception_description(error).c_str());
-                self->stop();
-            }
-        });
+    asio::co_spawn(executor_, accept_loop(), [self = shared_from_this()](std::exception_ptr error) {
+        if (error)
+        {
+            PROXY_ERROR_PRINT("Data listener failed reason=%s", exception_description(error).c_str());
+            self->stop();
+        }
+    });
+    close_acceptor.dismiss();
 }
 
 asio::awaitable<void> StreamPipeline::accept_loop()
@@ -48,24 +122,21 @@ asio::awaitable<void> StreamPipeline::accept_loop()
     for (;;)
     {
         auto [error, socket] = co_await acceptor_.async_accept(use_nothrow_awaitable);
-        if (error)
-        {
-            if (stopped_ || error == asio::error::operation_aborted)
-                co_return;
-            PROXY_ERROR_PRINT("Transfer accept failed TCP reason=%s category=%s",
-                              error.message().c_str(), error.category().name());
-            continue;
-        }
-        if (stopped_)
+        if (stopped_ || error == asio::error::operation_aborted)
         {
             co_return;
+        }
+        if (error)
+        {
+            PROXY_ERROR_PRINT("Transfer accept failed TCP reason=%s category=%s", error.message().c_str(),
+                              error.category().name());
+            continue;
         }
 
         const auto pending = unbound_.size();
         if (pending >= max_setup_connections_)
         {
-            PROXY_ERROR_PRINT("Transfer rejected TCP setting_up=%zu limit=%zu", pending,
-                              max_setup_connections_);
+            PROXY_ERROR_PRINT("Transfer rejected TCP setting_up=%zu limit=%zu", pending, max_setup_connections_);
             continue;
         }
 
@@ -77,18 +148,18 @@ asio::awaitable<void> StreamPipeline::accept_loop()
                 throw std::runtime_error("connection ID generation failed");
             }
         } while (unbound_.contains(id));
-        auto connection = std::make_shared<PendingConnection>(std::move(socket),
-            std::chrono::steady_clock::now() + setup_timeout_);
+        auto connection =
+            std::make_shared<PendingConnection>(std::move(socket), std::chrono::steady_clock::now() + setup_timeout_);
         unbound_.emplace(id, connection);
         setup_tasks_.fetch_add(1);
-        asio::co_spawn(executor_,
+        asio::co_spawn(
+            executor_,
             [self = shared_from_this(), id, connection] { return self->run_transfer_session(id, connection); },
             asio::detached);
     }
 }
 
-asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id,
-                                                          std::shared_ptr<PendingConnection> pending)
+asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id, std::shared_ptr<PendingConnection> pending)
 {
     ScopeGuard cleanup([&]() noexcept {
         unbound_.erase(id);
@@ -101,12 +172,12 @@ asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id,
     try
     {
         co_await asio::async_write(pending->socket, asio::buffer(id),
-            asio::cancel_at(pending->deadline, asio::use_awaitable));
+                                   asio::cancel_at(pending->deadline, asio::use_awaitable));
         pending->announced.notify_all();
         if (unbound_.contains(id))
         {
             co_await pending->socket.async_wait(tcp::socket::wait_read,
-                asio::cancel_at(pending->deadline, use_nothrow_awaitable));
+                                                asio::cancel_at(pending->deadline, use_nothrow_awaitable));
         }
     }
     catch (const std::exception &error)
@@ -120,11 +191,6 @@ asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id,
 
 asio::awaitable<void> StreamPipeline::bind(RelayAttach request)
 {
-    if (stopped_ || !request.connection_id ||
-        (request.role != RelayAttach::Producer && request.role != RelayAttach::Consumer))
-    {
-        throw std::invalid_argument("invalid stream attachment");
-    }
     const auto id = *request.connection_id;
     const auto unbound_it = unbound_.find(id);
     std::shared_ptr<PendingConnection> pending;
@@ -137,8 +203,8 @@ asio::awaitable<void> StreamPipeline::bind(RelayAttach request)
         }
     }
     std::optional<tcp::socket> *slot;
-    ConnectionId *bound_id;
-    std::shared_ptr<RelayPair> pair;
+    // Lookup follows the greeting wait; no suspension occurs while borrowing this pair.
+    RelayPair *pair;
     bool attached = true;
     if (const auto it = remote_pairs_.find(request.uuid); it != remote_pairs_.end())
     {
@@ -148,8 +214,7 @@ asio::awaitable<void> StreamPipeline::bind(RelayAttach request)
             throw std::invalid_argument("invalid endpoint ticket or role");
         }
         slot = &endpoint.stream;
-        bound_id = &endpoint.connection_id;
-        pair = it->second;
+        pair = &endpoint;
     }
     else if (const auto it = local_pairs_.find(request.uuid); it != local_pairs_.end())
     {
@@ -160,34 +225,19 @@ asio::awaitable<void> StreamPipeline::bind(RelayAttach request)
             throw std::invalid_argument("invalid pair ticket");
         }
         slot = producer ? &local.producer_stream : &local.consumer_stream;
-        bound_id = producer ? &local.producer_id : &local.consumer_id;
-        pair = it->second;
+        pair = &local;
         attached = (producer ? local.consumer_stream : local.producer_stream).has_value();
     }
     else
     {
         throw std::invalid_argument("relay attachment expired");
     }
-    if (pair->closed)
-    {
-        throw std::invalid_argument("relay attachment closed");
-    }
-    if (*slot)
-    {
-        if (*bound_id == id)
-        {
-            co_return;
-        }
-        throw std::invalid_argument("relay role already bound");
-    }
-    if (!pending || !unbound_.contains(id) || !pending->socket.is_open() ||
-        std::chrono::steady_clock::now() >= pending->deadline)
+    if (!pending || !pending->socket.is_open() || std::chrono::steady_clock::now() >= pending->deadline)
     {
         throw std::invalid_argument("connection ID unknown or expired");
     }
     pending->socket.cancel();
     slot->emplace(std::move(pending->socket));
-    *bound_id = id;
     unbound_.erase(id);
     if (attached)
     {
@@ -209,20 +259,33 @@ AttachPair StreamPipeline::install_local_pair()
     return {{uuid, pair->producer_ticket, data_port_}, {uuid, pair->consumer_ticket, data_port_}};
 }
 
-asio::awaitable<void> StreamPipeline::prepare_local_pair(std::uint64_t uuid, SRVTrafficPtr traffic,
-                                                                    std::string accessor)
+asio::awaitable<void> StreamPipeline::attach_streams(Authorizations &authorizations, int count)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        auto request = co_await authorizations.async_receive(asio::use_awaitable);
+        co_await bind(std::move(request));
+    }
+}
+
+asio::awaitable<void> StreamPipeline::prepare_local_pair(std::uint64_t uuid, Authorizations &authorizations,
+                                                         SRVTrafficPtr traffic, std::string accessor)
 {
     auto pair = local_pairs_.at(uuid);
+    co_await attach_streams(authorizations, 2);
     co_await pair->prepare(config_, std::move(traffic), std::move(accessor));
+}
+
+void StreamPipeline::activate_local_pair(std::uint64_t uuid)
+{
+    local_pairs_.at(uuid)->activate();
 }
 
 asio::awaitable<void> StreamPipeline::run_local_pair(std::uint64_t uuid)
 {
     auto pair = local_pairs_.at(uuid);
-    if (!pair->active)
-        throw std::runtime_error("local pair unavailable");
     co_await relay_tcp(*pair->producer_stream, *pair->consumer_stream, &pair->rx_limiter, &pair->tx_limiter,
-                      &pair->traffic->rx, &pair->traffic->tx);
+                       &pair->traffic->rx, &pair->traffic->tx);
 }
 
 void StreamPipeline::close_local_pair(std::uint64_t uuid)
@@ -230,7 +293,7 @@ void StreamPipeline::close_local_pair(std::uint64_t uuid)
     const auto it = local_pairs_.find(uuid);
     if (it == local_pairs_.end())
         return;
-    auto pair = it->second;
+    auto pair = std::move(it->second);
     local_pairs_.erase(it);
     pair->close();
     id_allocator_->release(uuid);
@@ -254,9 +317,10 @@ AttachInfo StreamPipeline::install_remote_pair(int role)
     return {uuid, endpoint->ticket, data_port_};
 }
 
-asio::awaitable<void> StreamPipeline::prepare_remote_pair(std::uint64_t uuid, FlowProtocol &channel,
-                                                                     std::uint64_t epoch, std::uint64_t flow_id,
-                                                                     SRVTrafficPtr traffic, std::string accessor)
+asio::awaitable<void> StreamPipeline::prepare_remote_pair(std::uint64_t uuid, Authorizations &authorizations,
+                                                          FlowProtocol &channel, std::uint64_t epoch,
+                                                          std::uint64_t flow_id, SRVTrafficPtr traffic,
+                                                          std::string accessor)
 {
     const auto it = remote_pairs_.find(uuid);
     if (it == remote_pairs_.end())
@@ -264,47 +328,47 @@ asio::awaitable<void> StreamPipeline::prepare_remote_pair(std::uint64_t uuid, Fl
         throw std::runtime_error("relay endpoint closed before attach");
     }
     auto endpoint = it->second;
+    co_await attach_streams(authorizations, 1);
     co_await endpoint->prepare(channel, epoch, flow_id, executor_, config_, std::move(traffic), std::move(accessor));
 }
 
-asio::awaitable<void> StreamPipeline::read_remote_pair(std::shared_ptr<RemotePair> endpoint)
+asio::awaitable<void> StreamPipeline::read_remote_pair(RemotePair &endpoint)
 {
-    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->rx_limiter : endpoint->tx_limiter;
+    auto &limiter = endpoint.role == RelayAttach::Producer ? endpoint.rx_limiter : endpoint.tx_limiter;
     BytesBuf read_buffer(32 * 1024);
     for (;;)
     {
         const auto [error, received] =
-            co_await endpoint->stream->async_read_some(asio::buffer(read_buffer), use_nothrow_awaitable);
+            co_await endpoint.stream->async_read_some(asio::buffer(read_buffer), use_nothrow_awaitable);
         if (error && error != asio::error::eof)
         {
             throw asio::system_error(error);
         }
-        lnk::PooledBuffer data(endpoint->flow->pool, std::span(read_buffer).first(received));
-        const auto size = data.size();
-        if (size == 0)
+        if (received == 0)
         {
-            co_await endpoint->flow->finish_send();
+            co_await endpoint.flow->finish_send();
             co_return;
         }
-        if (const auto deadline = limiter.reserve(size))
+        lnk::PooledBuffer data(endpoint.flow->pool, std::span(read_buffer).first(received));
+        if (const auto deadline = limiter.reserve(received))
         {
             co_await limiter.wait_until(*deadline);
         }
-        co_await endpoint->flow->send(std::move(data));
-        endpoint->count(true, size);
+        co_await endpoint.flow->send(std::move(data));
+        endpoint.count(true, received);
     }
 }
 
-asio::awaitable<void> StreamPipeline::write_remote_pair(std::shared_ptr<RemotePair> endpoint)
+asio::awaitable<void> StreamPipeline::write_remote_pair(RemotePair &endpoint)
 {
-    auto &limiter = endpoint->role == RelayAttach::Producer ? endpoint->tx_limiter : endpoint->rx_limiter;
+    auto &limiter = endpoint.role == RelayAttach::Producer ? endpoint.tx_limiter : endpoint.rx_limiter;
     for (;;)
     {
-        auto data = co_await endpoint->flow->receive();
+        auto data = co_await endpoint.flow->receive();
         if (!data)
         {
             asio::error_code error;
-            endpoint->stream->shutdown(tcp::socket::shutdown_send, error);
+            endpoint.stream->shutdown(tcp::socket::shutdown_send, error);
             if (error && error != asio::error::not_connected)
             {
                 throw asio::system_error(error);
@@ -315,51 +379,42 @@ asio::awaitable<void> StreamPipeline::write_remote_pair(std::shared_ptr<RemotePa
         {
             co_await limiter.wait_until(*deadline);
         }
-        co_await asio::async_write(*endpoint->stream, asio::buffer(data->data(), data->size()), asio::use_awaitable);
-        endpoint->count(false, data->size());
+        co_await asio::async_write(*endpoint.stream, asio::buffer(data->data(), data->size()), asio::use_awaitable);
+        endpoint.count(false, data->size());
         data.reset();
-        endpoint->flow->complete_receive();
+        endpoint.flow->complete_receive();
     }
 }
 
 void StreamPipeline::activate_remote_pair(std::uint64_t uuid)
 {
-    auto endpoint = remote_pairs_.at(uuid);
-    endpoint->activate(endpoint->stream.has_value() && endpoint->flow);
+    auto &endpoint = *remote_pairs_.at(uuid);
+    endpoint.activate(endpoint.stream.has_value() && endpoint.flow);
 }
 
 asio::awaitable<void> StreamPipeline::run_remote_pair(std::uint64_t uuid)
 {
     auto endpoint = remote_pairs_.at(uuid);
-    if (!endpoint->active)
-    {
-        throw std::runtime_error("relay bridge unavailable");
-    }
     const auto accessor = endpoint->track_accessor();
-    std::exception_ptr failure;
+    const auto cancellation = co_await asio::this_coro::cancellation_state;
     try
     {
-        co_await await_transfers(read_remote_pair(endpoint), write_remote_pair(endpoint));
+        co_await await_transfers(read_remote_pair(*endpoint), write_remote_pair(*endpoint));
     }
     catch (...)
     {
-        failure = std::current_exception();
-    }
-    const auto cancellation = co_await asio::this_coro::cancellation_state;
-    if (failure && !endpoint->closed && cancellation.cancelled() == asio::cancellation_type::none)
-    {
-        try
+        if (!endpoint->closed && cancellation.cancelled() == asio::cancellation_type::none)
         {
-            auto reason = exception_description(failure);
-            endpoint->flow->reset(std::move(reason));
+            try
+            {
+                endpoint->flow->reset(exception_description(std::current_exception()));
+            }
+            catch (const std::exception &)
+            {
+                // RESET submission is best effort; preserve the original transfer failure.
+            }
         }
-        catch (const std::exception &)
-        {
-        }
-    }
-    if (failure)
-    {
-        std::rethrow_exception(failure);
+        throw;
     }
 }
 
@@ -370,7 +425,7 @@ void StreamPipeline::close_remote_pair(std::uint64_t uuid)
     {
         return;
     }
-    auto endpoint = it->second;
+    auto endpoint = std::move(it->second);
     remote_pairs_.erase(it);
     endpoint->close();
     id_allocator_->release(uuid);
@@ -390,7 +445,9 @@ void StreamPipeline::stop()
         close_remote_pair(remote_pairs_.begin()->first);
     }
     while (!local_pairs_.empty())
+    {
         close_local_pair(local_pairs_.begin()->first);
+    }
 }
 
 void StreamPipeline::wait_for_setup_tasks() noexcept

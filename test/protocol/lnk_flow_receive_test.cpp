@@ -266,7 +266,7 @@ int main()
                 const auto result = event.get();
                 if (i == 2)
                 {
-                    check(result.kind == lnk::EventKind::FlowError && result.stage == "send",
+                    check(result.command == CtrlCommand::FlowError && result.stage == "send",
                           "normal FIN hid the later sender error");
                 }
             }

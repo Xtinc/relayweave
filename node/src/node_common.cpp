@@ -124,6 +124,14 @@ asio::awaitable<void> LocalRelayPair::prepare(const TrafficLimitConfig &limits, 
         throw std::runtime_error("local pair cannot bind service");
     }
     bind_traffic(limits, std::move(service_traffic), std::move(client));
+}
+
+void LocalRelayPair::activate()
+{
+    if (closed || active || !traffic)
+    {
+        throw std::runtime_error("local pair unavailable for activation");
+    }
     active = true;
     traffic->add_accessor(accessor);
 }

@@ -251,10 +251,15 @@ class Benchmark
             for (;;)
             {
                 auto event = co_await node->receive_event();
-                if (event.kind == lnk::EventKind::LinkReady) ++ready_;
-                if (!stopping_ && (event.kind == lnk::EventKind::LinkError || event.kind == lnk::EventKind::FlowError ||
-                                   event.kind == lnk::EventKind::LinkClosed || event.kind == lnk::EventKind::FlowClosed))
+                if (event.command == CtrlCommand::LinkReady)
+                {
+                    ++ready_;
+                }
+                if (!stopping_ && (event.command == CtrlCommand::LinkError || event.command == CtrlCommand::FlowError ||
+                                   event.command == CtrlCommand::LinkClosed || event.command == CtrlCommand::FlowClosed))
+                {
                     errors_.push_back(event.stage + ": " + event.reason);
+                }
             }
         }
         catch (const asio::system_error &error)

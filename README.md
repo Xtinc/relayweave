@@ -4,7 +4,7 @@
 `protocol/src/xfr_channel.cpp` 和 `protocol/src/tls_channel.cpp` 的既有风格。
 
 系统架构、执行域模型、路由质量与端到端协议集中见 [RelayWeave 设计](docs/RelayWeave设计.md)；
-Node 的四大执行域、部件结构与会话控制器见 [RelayNode 部件拓扑与四大独立执行域](docs/RelayWeave设计.md#21-relaynode-部件拓扑与四大独立执行域)；
+Node 的四大执行域、部件结构与会话生命周期见 [RelayNode 部件拓扑与四大独立执行域](docs/RelayWeave设计.md#21-relaynode-部件拓扑与四大独立执行域)；
 Agent 的双执行域、部件、主控连接、业务生命周期及停止顺序见 [RelayAgent 部件拓扑与双执行域](docs/RelayWeave设计.md#22-relayagent-部件拓扑与双执行域)；
 集群编排、两阶段路径安装与事务管理见 [控制面：集群编排与路径事务](docs/RelayWeave设计.md#3-控制面集群编排与路径事务)；
 链路测量模型与带惩罚的动态图选路见 [路由面：链路测量与路径决策](docs/RelayWeave设计.md#4-路由面链路测量与路径决策)；
@@ -22,11 +22,11 @@ protocol/message 定义 Node 固定二进制帧，业务载荷不经过 JSON/CBO
 控制通知使用有界协程收发接口，数据域直接逐跳分派，不通过模块回调注册。
 Flow 提交后不做周期续租；控制连接断开、epoch/路径成员失效、NodeLink 断开或显式关闭时清理。
 路径超时用于建立阶段和关闭确认，UDP 客户端关联另有业务空闲回收；NodeLink 与集群控制连接使用各自的心跳检测失联。
-NodeSession 按所选路径直接持有 ControlRouterSingle 或 ControlRouterMulti，两者都在 control_io 协调业务；多跳首尾通过集群单播通信。
-RelayNode 直接持有唯一 RegistryMgr 和 NodeSession 容器，负责全局业务创建、查找分派和停止排空；控制器只推进自己的实例。
+NodeSession 保存共同状态、取消和数据任务所有权；SingleSession、MultiSession 在 control_io 各自以完整 run 负责业务、错误首因和收尾，多跳首尾通过集群单播通信。
+RelayNode 直接持有唯一 RegistryMgr 和 NodeSession 容器，负责全局业务创建、查找分派和停止排空；两个具体会话各自主持完整生命周期。
 NodeControl 借用注册表、拓扑和业务元数据，统一处理公共注册、查询与集群响应回送；NodeMetrics 拥有队列探针、流量采样和运行指标。
 两者统一声明和实现在 `node_control.h/.cpp` 中，保持各自的所有权和执行域。
-重复请求、peer 身份匹配、控制断线与 epoch 失效判断通过 NodeSession 交给控制器，RelayNode 不读取控制器内部状态。
+重复请求、peer 身份匹配、控制断线与 epoch 失效判断由 NodeSession 处理，RelayNode 只创建、分派并等待会话排空。
 master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
 Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
 RelayAgent 直接持有 AgentControl、NodeConnection、AgentRouting 和 Forwarder，配置保留在 relay_agent.h/.cpp。
