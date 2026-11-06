@@ -9,7 +9,7 @@
 
 #include "member_access.h"
 TEST_MEMBER(NodeConnection, channel_)
-TEST_MEMBER(RelayAgent, connections_)
+TEST_MEMBER(RelayAgent, connection_)
 TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(AgentControl, running_)
 TEST_MEMBER(AgentControl, service_locations_)
@@ -71,11 +71,7 @@ class Peer
                 }
                 while (acceptor.is_open())
                 {
-                    const auto message = co_await channel->async_receive();
-                    if (message.type() == CtrlCommand::NodeLookup)
-                    {
-                        ++lookups;
-                    }
+                    co_await channel->async_receive();
                 }
             }
             catch (const asio::system_error &)
@@ -107,17 +103,15 @@ class Peer
     bool hold_identification = false;
     std::size_t accepted = 0;
     std::size_t identified = 0;
-    std::size_t lookups = 0;
 };
 
-asio::awaitable<void> exercise(NodeConnectionMgr &manager, Peer &primary, Peer &entry,
-                                                        std::shared_ptr<RelayAgent> agent)
+asio::awaitable<void> exercise(NodeConnection &connection, Peer &primary, Peer &entry,
+                               std::shared_ptr<RelayAgent> agent)
 {
     co_await wait_for([&] { return primary.identified == 1; });
-    require(!manager.primary()->ready(), "Primary became ready before server identification");
+    require(!connection.ready(), "Primary became ready before server identification");
     primary.identify_node();
-    co_await wait_for([&] { return manager.primary()->ready(); });
-    const auto connection = manager.primary();
+    co_await wait_for([&] { return connection.ready(); });
     auto &control = test_access::RelayAgent_control_(*agent);
     test_access::AgentControl_running_(control) = true;
     const ServiceKey service{"ready-entry", RelayProtocol::Tcp};
@@ -129,10 +123,10 @@ asio::awaitable<void> exercise(NodeConnectionMgr &manager, Peer &primary, Peer &
             {0, destination, "127.0.0.1"};
         auto selected = co_await agent->select_relay(service, destination, Clock::now() + 1s);
         require(selected.server.node == destination &&
-                    selected.server.channel.lock() == test_access::NodeConnection_channel_(*connection).lock(),
+                    selected.server.channel.lock() == test_access::NodeConnection_channel_(connection).lock(),
                 "Destination selection did not reuse the primary channel");
     }
-    require(entry.accepted == 0 && primary.accepted == 1 && primary.lookups == 0 &&
+    require(entry.accepted == 0 && primary.accepted == 1 &&
                 test_access::AgentControl_next_request_id_(control) == request,
             "Ten entrances opened extra controls or allocated entry lookup requests");
     bool expired = false;
@@ -148,15 +142,14 @@ asio::awaitable<void> exercise(NodeConnectionMgr &manager, Peer &primary, Peer &
     primary.node = "replacement-primary";
     primary.hold_identification = false;
     primary.channel->disconnect();
-    co_await wait_for([&] { return manager.primary()->ready() && manager.primary()->node_id() == primary.node; });
-    require(manager.primary() == connection, "Reidentification replaced the primary owner");
+    co_await wait_for([&] { return connection.ready() && connection.node_id() == primary.node; });
     primary.hold_identification = true;
     primary.channel->disconnect();
     co_await wait_for([&] { return primary.identified == 3; });
-    require(manager.primary() == connection && !connection->ready(), "Primary retry skipped identification");
-    const auto channel = test_access::NodeConnection_channel_(*connection);
+    require(!connection.ready(), "Primary retry skipped identification");
+    const auto channel = test_access::NodeConnection_channel_(connection);
     co_await test_agent::stop_from_owner(agent);
-    require(!manager.primary() && channel.expired(), "Stop did not drain the sole primary control");
+    require(!connection.ready() && channel.expired(), "Stop did not drain the sole primary control");
     primary.stop();
     entry.stop();
 }
@@ -185,11 +178,11 @@ int main()
         config.channel.disconnect_timeout = 100ms;
         asio::io_context transfer(1);
         auto agent = std::make_shared<RelayAgent>(io, transfer, client, config);
-        auto &manager = test_access::RelayAgent_connections_(*agent);
-        manager.start();
+        auto &connection = test_access::RelayAgent_connection_(*agent);
+        connection.start();
         auto primary_done = asio::co_spawn(io, primary.run(), asio::use_future);
         auto entry_done = asio::co_spawn(io, entry.run(), asio::use_future);
-        auto result = asio::co_spawn(io, exercise(manager, primary, entry, agent), asio::use_future);
+        auto result = asio::co_spawn(io, exercise(connection, primary, entry, agent), asio::use_future);
         const auto deadline = Clock::now() + 8s;
         while (result.wait_for(0ms) != std::future_status::ready)
         {

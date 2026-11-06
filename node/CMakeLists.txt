@@ -3,8 +3,6 @@ add_library(relayweave_node_lib
     src/pipeline_mgr.cpp
     src/datagram_mgr.cpp
     src/registry_mgr.cpp
-    src/control_router_single.cpp
-    src/control_router_multi.cpp
     src/node_session.cpp
     src/node_config.cpp
     src/node_control.cpp

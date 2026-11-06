@@ -1,15 +1,12 @@
 #include "xfr_channel.h"
 #include "asio/experimental/parallel_group.hpp"
 #include <algorithm>
+#include <array>
 #include <limits>
 #include <stdexcept>
-#include <type_traits>
 
-#if defined(_WIN32)
-#include <windows.h>
-#elif defined(__linux__)
+#if defined(__linux__)
 #include <pthread.h>
-#include <sched.h>
 #endif
 
 using tcp = asio::ip::tcp;
@@ -18,34 +15,12 @@ using tls_stream = asio::ssl::stream<tcp::socket>;
 
 constexpr auto use_nothrow_awaitable = asio::as_tuple(asio::use_awaitable);
 
-void set_current_thread_scheduler_policy()
+void set_current_thread_name(const char *name)
 {
-#if defined(_WIN32)
-    if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL))
-    {
-        PROXY_ERROR_PRINT("SetThreadPriority failed: error=%lu.", GetLastError());
-    }
-#elif defined(__linux__)
-    pthread_t thread = pthread_self();
-    struct sched_param param{};
-    const int max_priority = sched_get_priority_max(SCHED_RR);
-    const int min_priority = sched_get_priority_min(SCHED_RR);
-    if (max_priority < 0)
-    {
-        PROXY_ERROR_PRINT("sched_get_priority_max failed: error=%s.", std::strerror(errno));
-        return;
-    }
-    param.sched_priority = max_priority > min_priority ? max_priority - 1 : max_priority;
-    const auto error = pthread_setschedparam(thread, SCHED_RR, &param);
-    if (error != 0)
-    {
-        if (error == EPERM || error == EACCES)
-            PROXY_DEBUG_PRINT("Thread priority unchanged: SCHED_RR requires permission (%s)", std::strerror(error));
-        else
-            PROXY_ERROR_PRINT("Thread priority failed: SCHED_RR error=%s", std::strerror(error));
-        return;
-    }
-    pthread_setname_np(thread, "audio_thd");
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), name);
+#else
+    (void)name;
 #endif
 }
 
@@ -89,11 +64,11 @@ TokenBucket::TokenBucket(std::uint64_t bytes_per_second, std::uint64_t burst_byt
 {
 }
 
-TokenBucket::TimePoint TokenBucket::reserve(std::size_t bytes, TimePoint now)
+std::optional<TokenBucket::TimePoint> TokenBucket::reserve(std::size_t bytes, TimePoint now)
 {
     if (rate_ == 0 || bytes == 0)
     {
-        return now;
+        return std::nullopt;
     }
 
     refill(now);
@@ -102,18 +77,22 @@ TokenBucket::TimePoint TokenBucket::reserve(std::size_t bytes, TimePoint now)
     if (last_update_ <= now && tokens_ >= requested)
     {
         tokens_ -= requested;
-        return now;
+        return std::nullopt;
     }
 
     const auto deficit = std::max(0.0, requested - tokens_);
     tokens_ = 0.0;
-    last_update_ = std::max(last_update_, now) + duration_for(deficit);
+    last_update_ += duration_for(deficit);
     return last_update_;
 }
 
-bool TokenBucket::try_consume_at(std::size_t bytes, TimePoint now)
+bool TokenBucket::try_consume(std::size_t bytes)
 {
-    refill(now);
+    if (rate_ == 0 || bytes == 0)
+    {
+        return true;
+    }
+    refill(Clock::now());
     const auto requested = static_cast<double>(bytes);
     if (tokens_ < requested)
     {
@@ -123,22 +102,8 @@ bool TokenBucket::try_consume_at(std::size_t bytes, TimePoint now)
     return true;
 }
 
-bool TokenBucket::try_consume(std::size_t bytes)
-{
-    if (rate_ == 0 || bytes == 0)
-    {
-        return true;
-    }
-    return try_consume_at(bytes, Clock::now());
-}
-
 void TokenBucket::refill(TimePoint now) noexcept
 {
-    if (!initialised_)
-    {
-        last_update_ = now;
-        initialised_ = true;
-    }
     if (now > last_update_)
     {
         const auto elapsed = std::chrono::duration<double>(now - last_update_).count();
@@ -154,37 +119,29 @@ TokenBucket::Clock::duration TokenBucket::duration_for(double bytes) const noexc
     return std::chrono::duration_cast<Clock::duration>(std::chrono::nanoseconds(rounded));
 }
 
-asio::awaitable<void> TokenBucket::consume(std::size_t bytes)
+asio::awaitable<void> TokenBucket::wait_until(TimePoint deadline)
 {
-    if (rate_ == 0 || bytes == 0)
-    {
-        co_return;
-    }
-    const auto now = Clock::now();
-    const auto target = reserve(bytes, now);
-    if (target <= now)
-    {
-        co_return;
-    }
     if (!timer_)
     {
         timer_.emplace(co_await asio::this_coro::executor);
     }
-    timer_->expires_at(target);
+    timer_->expires_at(deadline);
     co_await timer_->async_wait(asio::use_awaitable);
 }
 
-template <class From, class To>
-static void log_transfer_end(const asio::error_code &error, const char *protocol, const char *operation,
-                             const From &from, const To &to)
+static void log_transfer_end(const asio::error_code &error, const char *operation,
+                             const tcp::socket &from, const tcp::socket &to)
 {
-    if (error == asio::error::eof || error == asio::error::operation_aborted ||
-        error == asio::ssl::error::stream_truncated)
-        PROXY_DEBUG_PRINT("Transfer ended %s %s %s -> %s reason=%s", protocol, operation, socket_peer(from).c_str(),
+    if (error == asio::error::eof || error == asio::error::operation_aborted)
+    {
+        PROXY_DEBUG_PRINT("Transfer ended tcp %s %s -> %s reason=%s", operation, socket_peer(from).c_str(),
                           socket_peer(to).c_str(), error.message().c_str());
+    }
     else
-        PROXY_ERROR_PRINT("Transfer failed %s %s %s -> %s reason=%s", protocol, operation,
-                          socket_peer(from).c_str(), socket_peer(to).c_str(), error.message().c_str());
+    {
+        PROXY_ERROR_PRINT("Transfer failed tcp %s %s -> %s reason=%s", operation, socket_peer(from).c_str(),
+                          socket_peer(to).c_str(), error.message().c_str());
+    }
 }
 
 static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, TokenBucket *limiter,
@@ -196,7 +153,7 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
         auto [er, nr] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
         if (er)
         {
-            log_transfer_end(er, "tcp", "read", from, to);
+            log_transfer_end(er, "read", from, to);
             if (er == asio::error::eof)
             {
                 asio::error_code shutdown_error;
@@ -212,7 +169,10 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
 
         if (limiter)
         {
-            co_await limiter->consume(nr);
+            if (const auto deadline = limiter->reserve(nr))
+            {
+                co_await limiter->wait_until(*deadline);
+            }
         }
 
         auto [ew, nw] = co_await asio::async_write(to, asio::buffer(buffer.data(), nr), use_nothrow_awaitable);
@@ -223,7 +183,7 @@ static asio::awaitable<void> transfer_tcp(tcp::socket &from, tcp::socket &to, To
 
         if (ew)
         {
-            log_transfer_end(ew, "tcp", "write", from, to);
+            log_transfer_end(ew, "write", from, to);
             throw asio::system_error(ew, "write TCP stream");
         }
     }
@@ -237,132 +197,74 @@ asio::awaitable<void> relay_tcp(tcp::socket &left, tcp::socket &right, TokenBuck
                            transfer_tcp(right, left, right_to_left_limiter, right_to_left_traffic));
 }
 
-asio::awaitable<std::size_t> read_tls_data(tls_stream &stream, std::span<std::uint8_t> buffer)
+std::size_t decode_tls_data_size(std::span<const std::uint8_t, 4> header)
 {
-    std::array<std::uint8_t, 4> header{};
-    co_await asio::async_read(stream, asio::buffer(header), asio::use_awaitable);
     std::uint32_t size = 0;
     for (const auto byte : header)
     {
         size = (size << 8) | byte;
     }
-    if (size > tls_data_maximum_payload || size > buffer.size())
+    if (size > tls_data_maximum_payload)
     {
         throw std::invalid_argument("Invalid TLS DATA length");
     }
-    if (size != 0)
-    {
-        co_await asio::async_read(stream, asio::buffer(buffer.data(), size), asio::use_awaitable);
-    }
-    co_return size;
+    return size;
 }
 
-asio::awaitable<void> write_tls_data(tls_stream &stream, std::span<const std::uint8_t> payload,
-                                    TrafficCounter *traffic)
+std::array<std::uint8_t, 4> encode_tls_data_size(std::size_t size)
 {
-    while (!payload.empty())
-    {
-        const auto size = std::min(payload.size(), tls_data_maximum_payload);
-        const std::array<std::uint8_t, 4> header{
-            static_cast<std::uint8_t>(size >> 24), static_cast<std::uint8_t>(size >> 16),
+    return {static_cast<std::uint8_t>(size >> 24), static_cast<std::uint8_t>(size >> 16),
             static_cast<std::uint8_t>(size >> 8), static_cast<std::uint8_t>(size)};
-        const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(payload.data(), size)};
-        const auto [error, written] = co_await asio::async_write(stream, buffers, use_nothrow_awaitable);
-        if (traffic && written > header.size())
-        {
-            traffic->add(written - header.size());
-        }
-        if (error)
-        {
-            throw asio::system_error(error, "write TLS DATA");
-        }
-        payload = payload.subspan(size);
-    }
 }
 
-asio::awaitable<void> finish_tls_data(tls_stream &stream)
+/** @brief Frame local TCP data and its send EOF inside the authenticated TLS stream. */
+static asio::awaitable<void> send_tls(tcp::socket &from, tls_stream &to)
 {
-    const std::array<std::uint8_t, 4> fin{};
-    co_await asio::async_write(stream, asio::buffer(fin), asio::use_awaitable);
-}
-
-// Business FIN is independent of TLS shutdown, including on TLS 1.2 connections.
-template <typename From, typename To>
-static asio::awaitable<void> transfer_tls(From &from, To &to, TokenBucket *limiter, TrafficCounter *traffic)
-{
-    std::array<std::uint8_t, tls_data_maximum_payload> buffer{};
+    BytesBuf buffer(32 * 1024);
     for (;;)
     {
-        std::size_t size;
-        if constexpr (std::is_same_v<From, tls_stream>)
+        const auto [error, size] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
+        if (error && error != asio::error::eof)
         {
-            size = co_await read_tls_data(from, buffer);
+            throw asio::system_error(error, "read local TCP stream");
         }
-        else
-        {
-            const auto [error, received] = co_await from.async_read_some(asio::buffer(buffer), use_nothrow_awaitable);
-            if (error && error != asio::error::eof)
-            {
-                throw asio::system_error(error, "read local TCP stream");
-            }
-            size = received;
-            // Deliver any final bytes before propagating EOF.
-            if (!error && size == 0)
-            {
-                continue;
-            }
-        }
+        const auto header = encode_tls_data_size(size);
+        const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(buffer.data(), size)};
+        co_await asio::async_write(to, buffers, asio::use_awaitable);
         if (size == 0)
         {
-            if constexpr (std::is_same_v<To, tls_stream>)
+            co_return;
+        }
+    }
+}
+
+/** @brief Decode bounded TLS DATA and translate business FIN into local TCP half-close. */
+static asio::awaitable<void> receive_tls(tls_stream &from, tcp::socket &to)
+{
+    BytesBuf buffer(tls_data_maximum_payload);
+    for (;;)
+    {
+        std::array<std::uint8_t, 4> header{};
+        co_await asio::async_read(from, asio::buffer(header), asio::use_awaitable);
+        const auto size = decode_tls_data_size(header);
+        if (size == 0)
+        {
+            asio::error_code error;
+            to.shutdown(tcp::socket::shutdown_send, error);
+            if (error && error != asio::error::not_connected)
             {
-                co_await finish_tls_data(to);
-            }
-            else
-            {
-                asio::error_code error;
-                to.shutdown(tcp::socket::shutdown_send, error);
-                if (error && error != asio::error::not_connected)
-                {
-                    throw asio::system_error(error, "shutdown local TCP send");
-                }
+                throw asio::system_error(error, "shutdown local TCP send");
             }
             co_return;
         }
-        if (limiter)
-        {
-            co_await limiter->consume(size);
-        }
-        if constexpr (std::is_same_v<To, tls_stream>)
-        {
-            co_await write_tls_data(to, std::span<const std::uint8_t>(buffer.data(), size), traffic);
-        }
-        else
-        {
-            const auto [error, written] = co_await asio::async_write(to, asio::buffer(buffer.data(), size), use_nothrow_awaitable);
-            if (traffic)
-            {
-                traffic->add(written);
-            }
-            if (error)
-            {
-                throw asio::system_error(error, "write local TCP stream");
-            }
-        }
+        co_await asio::async_read(from, asio::buffer(buffer.data(), size), asio::use_awaitable);
+        co_await asio::async_write(to, asio::buffer(buffer.data(), size), asio::use_awaitable);
     }
 }
 
 asio::awaitable<void> relay_tls(tcp::socket &left, tls_stream &right)
 {
-    return await_transfers(transfer_tls(left, right, nullptr, nullptr), transfer_tls(right, left, nullptr, nullptr));
-}
-
-asio::awaitable<void> relay_tls(tls_stream &left, tls_stream &right, TokenBucket *left_to_right_limiter,
-                                TokenBucket *right_to_left_limiter, TrafficCounter *left_to_right_traffic,
-                                TrafficCounter *right_to_left_traffic)
-{
-    return await_transfers(transfer_tls(left, right, left_to_right_limiter, left_to_right_traffic),
-                           transfer_tls(right, left, right_to_left_limiter, right_to_left_traffic));
+    return await_transfers(send_tls(left, right), receive_tls(right, left));
 }
 
 static asio::awaitable<void> send_udp_payloads(udp::socket &local_socket, udp::socket &transfer_socket,
@@ -448,10 +350,10 @@ asio::awaitable<void> relay_udp_connected(udp::socket &local_socket, udp::socket
 asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming)
 {
     const auto executor = co_await asio::this_coro::executor;
-    const auto [order, outgoing_error, incoming_error] = co_await asio::experimental::make_parallel_group(
-        asio::co_spawn(executor, std::move(outgoing), asio::deferred),
-        asio::co_spawn(executor, std::move(incoming), asio::deferred)
-    ).async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
+    const auto [order, outgoing_error, incoming_error] =
+        co_await asio::experimental::make_parallel_group(asio::co_spawn(executor, std::move(outgoing), asio::deferred),
+                                                         asio::co_spawn(executor, std::move(incoming), asio::deferred))
+            .async_wait(asio::experimental::wait_for_one_error(), asio::use_awaitable);
     // operator&& retains only the outgoing exception if both fail; that can hide the original I/O error.
     for (const auto index : order)
     {

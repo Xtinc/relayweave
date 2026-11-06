@@ -240,7 +240,8 @@ int main()
             auto eof = f.receive();
             f.pump();
             check(!eof.get(), "FIN did not become EOF");
-            auto after_fin = asio::co_spawn(f.caller, f.port->send(f.port->copy_payload(std::array<std::uint8_t, 1>{1})), asio::use_future);
+            auto after_fin = asio::co_spawn(
+                f.caller, f.port->send(lnk::PooledBuffer(f.port->pool, std::array<std::uint8_t, 1>{1})), asio::use_future);
             f.pump();
             expect_failure(after_fin, "stream sending has finished");
         }
@@ -265,7 +266,7 @@ int main()
                 const auto result = event.get();
                 if (i == 2)
                 {
-                    check(result.kind == lnk::EventKind::FlowError && result.stage == "send",
+                    check(result.command == CtrlCommand::FlowError && result.stage == "send",
                           "normal FIN hid the later sender error");
                 }
             }
@@ -281,10 +282,12 @@ int main()
                 }
             });
             f.pump();
-            auto handed_off = asio::co_spawn(f.caller, f.port->send(f.port->copy_payload(chunk)), asio::use_future);
+            auto handed_off = asio::co_spawn(
+                f.caller, f.port->send(lnk::PooledBuffer(f.port->pool, chunk)), asio::use_future);
             f.pump();
             handed_off.get(); // The sender now waits for window space on the data executor.
-            auto pending = asio::co_spawn(f.caller, f.port->send(f.port->copy_payload(chunk)), asio::use_future);
+            auto pending = asio::co_spawn(
+                f.caller, f.port->send(lnk::PooledBuffer(f.port->pool, chunk)), asio::use_future);
             f.pump();
             check(pending.wait_for(0s) != std::future_status::ready, "full Flow did not block next handoff");
             asio::post(f.caller, [port = f.port] { test_access::FlowStream_receive_completed_(*port).close(); });
@@ -310,15 +313,18 @@ int main()
         }
         {
             Fixture f;
-            auto payload = f.port->copy_payload(std::array<std::uint8_t, 3>{8, 9, 10});
+            lnk::PooledBuffer payload(f.port->pool, std::array<std::uint8_t, 3>{8, 9, 10});
             const auto storage = payload.data();
             auto sent = asio::co_spawn(f.caller, f.port->send(std::move(payload)), asio::use_future);
             f.pump();
             sent.get();
+            check(test_access::flow_buffered_bytes(*f.channel) == 384,
+                  "small payload charged an incorrect local budget");
             auto received = f.receive();
             f.pump();
             auto delivery = received.get();
             check(delivery && delivery->data() == storage, "stream endpoint copied its pooled payload");
+            check(delivery->size() == 3, "stream endpoint changed the payload length");
             auto stopped = asio::co_spawn(f.data, f.channel->stop(), asio::use_future);
             f.pump();
             stopped.get();

@@ -16,11 +16,11 @@ void require(bool condition, const char *message)
         throw std::runtime_error(message);
 }
 
-void require_deadline(TokenBucket::TimePoint actual, TokenBucket::TimePoint expected, const char *message)
+void require_deadline(std::optional<TokenBucket::TimePoint> actual, TokenBucket::TimePoint expected, const char *message)
 {
     // The duration calculation rounds fractional nanoseconds up. Long debts may
     // have tiny floating-point rounding differences, but must never wait less.
-    require(actual >= expected && actual - expected <= 1us, message);
+    require(actual && *actual >= expected && *actual - expected <= 1us, message);
 }
 
 void fast_path_and_debt()
@@ -28,7 +28,7 @@ void fast_path_and_debt()
     // Freeze refill ahead of the real clock, without sleeps or test-only APIs.
     const auto now = TokenBucket::Clock::now() + 1h;
     TokenBucket burst(1, 10);
-    require(burst.reserve(6, now) == now, "Initial burst unexpectedly waited");
+    require(!burst.reserve(6, now), "Initial burst unexpectedly waited");
     require(!burst.try_consume(5), "Insufficient tokens were accepted");
     require(burst.try_consume(4), "Rejected packet consumed the remaining tokens");
     require_deadline(burst.reserve(5, now), now + 5s, "Fast path charged bytes twice or lost consumed bytes");
@@ -36,7 +36,7 @@ void fast_path_and_debt()
     require_deadline(burst.reserve(11, now), now + 16s, "Large stream write lost preceding reservation debt");
 
     TokenBucket remaining(1, 10);
-    require(remaining.reserve(6, now) == now, "Initial stream burst was rejected");
+    require(!remaining.reserve(6, now), "Initial stream burst was rejected");
     require(!remaining.try_consume(5), "Insufficient stream burst was accepted");
     require_deadline(remaining.reserve(5, now), now + 1s, "Failed fast path consumed tokens before waiting");
 }
@@ -45,9 +45,9 @@ void refill_and_burst_cap()
 {
     const auto now = TokenBucket::Clock::now() + 1h;
     TokenBucket limiter(10, 10);
-    require(limiter.reserve(8, now) == now, "Initial reservation unexpectedly waited");
-    require(limiter.reserve(7, now + 500ms) == now + 500ms, "Elapsed time did not refill tokens");
-    require(limiter.reserve(10, now + 4s) == now + 4s, "Idle bucket did not refill to its burst");
+    require(!limiter.reserve(8, now), "Initial reservation unexpectedly waited");
+    require(!limiter.reserve(7, now + 500ms), "Elapsed time did not refill tokens");
+    require(!limiter.reserve(10, now + 4s), "Idle bucket did not refill to its burst");
     require_deadline(limiter.reserve(11, now + 8s), now + 8100ms, "Idle bucket accumulated beyond the burst cap");
 
     TokenBucket no_burst(1, 0);
@@ -61,32 +61,31 @@ void unlimited_and_empty()
     const auto now = TokenBucket::Clock::now() + 1h;
     const auto maximum = std::numeric_limits<std::size_t>::max();
     TokenBucket unlimited;
-    require(unlimited.try_consume(maximum) && unlimited.reserve(maximum, now) == now,
+    require(unlimited.try_consume(maximum) && !unlimited.reserve(maximum, now),
             "Disabled limiter rejected or delayed a transfer");
 
     TokenBucket limiter(1, 0);
     require_deadline(limiter.reserve(10, now), now + 10s, "Reservation did not establish debt");
-    require(limiter.try_consume(0) && limiter.reserve(0, now) == now,
+    require(limiter.try_consume(0) && !limiter.reserve(0, now),
             "Empty payload was delayed by existing debt");
     require_deadline(limiter.reserve(1, now), now + 11s, "Empty payload changed outstanding debt");
 }
 
-void asynchronous_consumption()
+void asynchronous_waiting()
 {
     asio::io_context io;
     TokenBucket burst_limiter(1, 10);
-    auto burst = asio::co_spawn(io, burst_limiter.consume(10), asio::use_future);
-    io.poll();
-    require(burst.wait_for(0s) == std::future_status::ready, "Available burst suspended consumption");
-    burst.get();
-    require(!burst_limiter.try_consume(10), "Async consumption did not deduct burst tokens");
+    require(!burst_limiter.reserve(10), "Available burst requested an async wait");
+    require(!burst_limiter.try_consume(10), "Reservation did not deduct burst tokens");
 
     // Repeated waits on the same bucket exercise its reusable timer.
     TokenBucket limiter(1000, 10);
     for (int index = 0; index < 2; ++index)
     {
         const auto started = TokenBucket::Clock::now();
-        auto result = asio::co_spawn(io, limiter.consume(30), asio::use_future);
+        const auto deadline = limiter.reserve(30);
+        require(deadline.has_value(), "Insufficient tokens did not produce a deadline");
+        auto result = asio::co_spawn(io, limiter.wait_until(*deadline), asio::use_future);
         io.restart();
         io.poll();
         require(result.wait_for(0s) != std::future_status::ready, "Insufficient tokens bypassed the wait");
@@ -97,7 +96,9 @@ void asynchronous_consumption()
     }
 
     asio::cancellation_signal cancellation;
-    auto cancelled = asio::co_spawn(io, limiter.consume(60000),
+    const auto deadline = limiter.reserve(60000);
+    require(deadline.has_value(), "Cancellation test did not reserve a wait");
+    auto cancelled = asio::co_spawn(io, limiter.wait_until(*deadline),
         asio::bind_cancellation_slot(cancellation.slot(), asio::use_future));
     io.restart();
     io.poll();
@@ -115,18 +116,10 @@ void asynchronous_consumption()
     }
     require(aborted, "Rate-limit wait did not propagate cancellation");
 
-    auto empty = asio::co_spawn(io, limiter.consume(0), asio::use_future);
-    io.restart();
-    io.poll();
-    require(empty.wait_for(0s) == std::future_status::ready, "Empty consumption waited on existing debt");
-    empty.get();
+    require(!limiter.reserve(0), "Empty reservation waited on existing debt");
 
     TokenBucket unlimited;
-    auto unrestricted = asio::co_spawn(io, unlimited.consume(std::numeric_limits<std::size_t>::max()), asio::use_future);
-    io.restart();
-    io.poll();
-    require(unrestricted.wait_for(0s) == std::future_status::ready, "Unlimited consumption suspended");
-    unrestricted.get();
+    require(!unlimited.reserve(std::numeric_limits<std::size_t>::max()), "Unlimited reservation requested a wait");
 }
 } // namespace
 
@@ -137,8 +130,8 @@ int main()
         fast_path_and_debt();
         refill_and_burst_cap();
         unlimited_and_empty();
-        asynchronous_consumption();
-        std::cout << "[PASS] TokenBucket reservations, consumption, reusable waits and cancellation\n";
+        asynchronous_waiting();
+        std::cout << "[PASS] TokenBucket reservations, reusable waits and cancellation\n";
         return 0;
     }
     catch (const std::exception &error)

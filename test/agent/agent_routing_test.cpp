@@ -167,6 +167,24 @@ int main()
             rejects([&] { load_agent_config(temporary); }, "Out of range Node budget accepted by parser");
         }
 
+        settings.erase("routing");
+        settings["relay"] = {{"udp_idle_timeout_ms", 250}};
+        write_settings();
+        const auto udp_settings = load_agent_config(temporary);
+        require(udp_settings.udp_idle_timeout == std::chrono::milliseconds(250),
+                "UDP idle configuration was not loaded");
+        for (const Json invalid : {Json(0), Json(-1), Json(1.5), Json("invalid")})
+        {
+            settings["relay"] = {{"udp_idle_timeout_ms", invalid}};
+            write_settings();
+            rejects([&] { load_agent_config(temporary); }, "Invalid UDP idle timeout was accepted");
+        }
+        settings.erase("relay");
+        write_settings();
+        const auto defaults = load_agent_config(temporary);
+        require(defaults.udp_idle_timeout == std::chrono::seconds(60),
+                "UDP lifecycle defaults changed");
+
         rejects([&] { AgentRouting invalid(io, 9); }, "Nine-node Agent budget accepted");
         rejects([&] { AgentRouting invalid(io, 0); }, "Zero-node Agent budget accepted");
         test_routing::Fixture eight(io, 8);

@@ -25,7 +25,7 @@ struct ControlNodeConfig
     std::size_t max_services_per_session = 16;
 };
 
-/** @brief Configure one TCP or TLS listener, setup deadlines, relay capacity, and service traffic limits. */
+/** @brief Configure the shared TCP data listener for TCP/TLS services, setup deadlines, capacity, and limits. */
 struct StreamNodeConfig
 {
     std::string address;
@@ -55,7 +55,6 @@ struct NodeConfig
     ControlNodeConfig control;
     ClusterConfig cluster;
     StreamNodeConfig tcp;
-    StreamNodeConfig tls;
     DatagramNodeConfig datagram;
     std::filesystem::path ca_file;
     std::filesystem::path server_ca_file;
@@ -103,11 +102,11 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
      * @brief Construct modules with four distinct execution domains without starting listeners.
      * @param control_io Single-threaded io_context owning control sessions, topology, and business
      * coordination.
-     * @param transfer_tcp_io Distinct single-threaded io_context owning Agent TCP/TLS sockets and copy tasks.
+     * @param transfer_tcp_io Distinct single-threaded io_context owning raw TCP carriers and copy tasks.
      * @param transfer_udp_io Distinct single-threaded io_context owning the shared Agent UDP listener and
      * bindings.
      * @param cluster_data_io Distinct single-threaded io_context owning FlowProtocol and NodeLink data state.
-     * @param ssl_context TLS server context borrowed for Agent TLS handshakes.
+     * @param ssl_context TLS server context borrowed for Agent control mTLS handshakes.
      * @param config Validated Node listener, cluster, capacity, bandwidth, and credential configuration.
      * @pre All four io_context instances are distinct and each is driven by a single thread.
      * @throws std::invalid_argument If execution domains overlap or cluster credentials are inconsistent.
@@ -134,9 +133,9 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 
   private:
     friend class ClusterMgr;
-    friend class ControlRouterSingle;
-    friend class ControlRouterMulti;
     friend class NodeSession;
+    friend class SingleSession;
+    friend class MultiSession;
 
     asio::awaitable<void> control_accept_loop();
     asio::awaitable<void> run_control_session(SessionId id, ControlSessionPtr session);
@@ -152,7 +151,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     /** @brief Route incoming business messages without creating remote control sessions. */
     void handle_cluster_relay(CtrlCommand command, CtrlMessage message);
     void handle_relay_peer(CtrlCommand command, const CtrlMessage &message);
-    void start_relay(std::shared_ptr<NodeSession> relay);
+    void start_relay(std::unique_ptr<NodeSession> relay);
     void invalidate_relays(std::string reason = {});
     /** @brief Drain control-owned tasks on control_io before transfer executors are stopped. */
     asio::awaitable<bool> stop_control();
@@ -178,8 +177,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
 
     RegistryMgr registry_;
     std::shared_ptr<RelayIdAllocator> relay_id_allocator_;
-    std::shared_ptr<TcpPipeline> tcp_pipeline_;
-    std::shared_ptr<TlsPipeline> tls_pipeline_;
+    std::shared_ptr<StreamPipeline> tcp_pipeline_;
     std::shared_ptr<DatagramMgr> datagram_mgr_;
     std::shared_ptr<ClusterMgr> cluster_mgr_;
     std::shared_ptr<NodeMetrics> metrics_;

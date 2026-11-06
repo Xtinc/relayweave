@@ -5,6 +5,21 @@
 
 using Clock = std::chrono::steady_clock;
 
+AgentSession::RelayEndpoint AgentSession::RelayEndpoint::from_params(const njson &p, RelayProtocol protocol)
+{
+    RelayEndpoint endpoint;
+    endpoint.address = config::required_string(p, "data_address", "relay endpoint");
+    endpoint.port = config::message_data_port(p);
+    endpoint.uuid = config::require_unsigned(p, "uuid", true);
+    endpoint.ticket = config::require_unsigned(p, "ticket", true);
+    endpoint.flow_id = config::optional_unsigned(p, "flow_id", true);
+    if (protocol == RelayProtocol::Udp)
+    {
+        endpoint.session_id = config::require_unsigned(p, "session_id", true);
+    }
+    return endpoint;
+}
+
 AgentSession::AgentSession(Forwarder &owner, std::uint64_t request, ServiceKey service, std::string destination,
                            Clock::time_point deadline)
     : owner(owner), request(request), service(std::move(service)), destination(std::move(destination)),
@@ -34,7 +49,7 @@ void AgentSession::fail(std::string cause)
         return;
     }
 
-    const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
+    const auto uuid = endpoint ? endpoint->uuid : 0;
     PROXY_ERROR_PRINT("Relay failed %s %s service=%s request_id=%llu uuid=%llu reason=%s",
                       relay_protocol_name(service.protocol).data(), producer() ? "producer" : "consumer",
                       service.service.c_str(), static_cast<unsigned long long>(request),
@@ -83,8 +98,7 @@ void AgentSession::handle(const CtrlMessage &message)
         return;
     }
 
-    if (!endpoint.empty() && p.contains("flow_id") &&
-        (!endpoint.contains("flow_id") || p.at("flow_id") != endpoint.at("flow_id")))
+    if (endpoint.has_value() && p.contains("flow_id") && (!endpoint->flow_id || p.at("flow_id") != *endpoint->flow_id))
     {
         return;
     }
@@ -97,25 +111,21 @@ void AgentSession::handle(const CtrlMessage &message)
         return;
     }
 
-    if (command == CtrlCommand::RelayOpened && endpoint.empty())
+    if (command == CtrlCommand::RelayOpened && !endpoint)
     {
-        endpoint = p;
+        endpoint = RelayEndpoint::from_params(p, service.protocol);
         changed.cancel();
     }
-    else if (command == CtrlCommand::RelayReady && !ready)
+    else if (command == CtrlCommand::RelayReady && !tunnel_ready())
     {
-        ready = true;
-        PROXY_INFO_PRINT("Relay [+] %s %s service=%s uuid=%llu", relay_protocol_name(service.protocol).data(),
-                         producer() ? "producer" : "consumer", service.service.c_str(),
-                         static_cast<unsigned long long>(config::require_unsigned(endpoint, "uuid", true)));
-        owner.relay_ready(*this);
+        phase = Phase::TunnelReady;
         changed.cancel();
     }
     else if (command == CtrlCommand::RelayError || command == CtrlCommand::RelayClosed)
     {
         auto cause = config::optional_string(p, "reason", "relay closed");
-        const bool completed = command == CtrlCommand::RelayClosed && ready && service.protocol != RelayProtocol::Udp &&
-                               cause == "stream complete";
+        const bool completed = command == CtrlCommand::RelayClosed && tunnel_ready() &&
+                               service.protocol != RelayProtocol::Udp && cause == "stream complete";
         if (p.contains("stage"))
         {
             cause = config::optional_string(p, "stage", "control") + ": " + cause;
@@ -125,7 +135,6 @@ void AgentSession::handle(const CtrlMessage &message)
         node_closed = true;
         if (completed)
         {
-            changed.cancel();
             return;
         }
 
@@ -190,6 +199,23 @@ asio::awaitable<void> AgentSession::run()
 
         stage = "attach";
         co_await attach();
+        if (service.protocol == RelayProtocol::Tls)
+        {
+            stage = "end-to-end TLS";
+            co_await establish_tls();
+        }
+        if (!reason.empty())
+        {
+            throw asio::system_error(asio::error::operation_aborted);
+        }
+        if (Clock::now() >= deadline)
+        {
+            throw std::runtime_error("relay establishment timed out");
+        }
+        phase = Phase::Ready;
+        PROXY_INFO_PRINT("Relay [+] %s %s service=%s uuid=%llu", relay_protocol_name(service.protocol).data(),
+                         producer() ? "producer" : "consumer", service.service.c_str(),
+                         static_cast<unsigned long long>(endpoint->uuid));
         stage = "transfer";
         if (service.protocol == RelayProtocol::Udp)
         {
@@ -200,10 +226,8 @@ asio::awaitable<void> AgentSession::run()
             }
             else
             {
-                co_await owner.receive_datagrams(*this);
+                co_await owner.relay_datagrams(*this);
             }
-
-            cancel("UDP forwarding ended");
         }
         else
         {
@@ -211,6 +235,8 @@ asio::awaitable<void> AgentSession::run()
             if (sockets.tls)
             {
                 co_await relay_tls(sockets.local, *sockets.tls);
+                stage = "TLS shutdown";
+                co_await finish_tls();
             }
             else
             {
@@ -221,14 +247,14 @@ asio::awaitable<void> AgentSession::run()
     catch (const std::exception &error)
     {
         auto cause = std::string(error.what());
-        if (!ready && Clock::now() >= deadline)
+        if (!ready() && Clock::now() >= deadline)
         {
             cause = "relay establishment deadline exceeded: " + cause;
         }
         fail(stage + ": " + cause);
     }
 
-    const auto uuid = endpoint.empty() ? 0 : config::require_unsigned(endpoint, "uuid", true);
+    const auto uuid = endpoint ? endpoint->uuid : 0;
     if (!reason.empty() && !node_closed && (submitted || producer()))
     {
         njson values{{"request_id", request}, {"reason", reason}};
@@ -236,11 +262,11 @@ asio::awaitable<void> AgentSession::run()
         {
             values["uuid"] = uuid;
         }
-        owner.send_control(
-            selection.server,
-            CtrlMessage(producer() && !ready ? CtrlCommand::RelayReject : CtrlCommand::RelayCancel, std::move(values)));
+        owner.send_control(selection.server, CtrlMessage(producer() && !tunnel_ready() ? CtrlCommand::RelayReject
+                                                                                       : CtrlCommand::RelayCancel,
+                                                         std::move(values)));
     }
-    if (ready)
+    if (ready())
     {
         PROXY_INFO_PRINT("Relay [x] %s %s service=%s uuid=%llu reason=%s", relay_protocol_name(service.protocol).data(),
                          producer() ? "producer" : "consumer", service.service.c_str(),
@@ -260,39 +286,20 @@ asio::awaitable<void> AgentSession::attach()
         throw asio::system_error(asio::error::operation_aborted);
     }
 
-    const auto host = config::required_string(endpoint, "data_address", "relay endpoint");
-    const auto port = config::message_data_port(endpoint);
-    const auto uuid = config::require_unsigned(endpoint, "uuid", true);
-    const auto ticket = config::require_unsigned(endpoint, "ticket", true);
-    auto attachment = RelayAttach::to_msg({producer() ? RelayAttach::Producer : RelayAttach::Consumer, uuid, ticket});
-    if (service.protocol == RelayProtocol::Tls)
-    {
-        if (endpoint.value("tls_framing", std::string{}) != tls_data_framing)
-        {
-            throw std::invalid_argument("Unsupported TLS data framing");
-        }
-        (*attachment.params)["tls_framing"] = std::string(tls_data_framing);
-    }
-    const auto frame = WireMessage::pack(std::move(attachment));
-    const auto remaining = [&](Clock::duration timeout) {
-        if (!reason.empty())
-        {
-            throw asio::system_error(asio::error::operation_aborted);
-        }
-        const auto budget = deadline - Clock::now();
-        if (budget <= Clock::duration::zero())
-        {
-            throw std::runtime_error("relay establishment timed out");
-        }
-        return std::min(budget, timeout);
-    };
+    const auto &host = endpoint->address;
+    const auto port = endpoint->port;
+    const auto uuid = endpoint->uuid;
+    const auto ticket = endpoint->ticket;
+    RelayAttach attachment{producer() ? RelayAttach::Producer : RelayAttach::Consumer, uuid, ticket, {}};
+    BytesBuf frame;
 
     if (service.protocol == RelayProtocol::Udp)
     {
+        frame = WireMessage::pack(RelayAttach::to_msg(attachment));
         auto &sockets = std::get<DatagramData>(data);
-        sockets.session_header = DatagramHeader::encode(config::require_unsigned(endpoint, "session_id", true));
+        sockets.session_header = DatagramHeader::encode(endpoint->session_id);
         sockets.maximum_payload =
-            endpoint.contains("flow_id") ? LnkFrameHeader::maximum_payload : DatagramHeader::maximum_user_payload;
+            endpoint->flow_id.has_value() ? LnkFrameHeader::maximum_payload : DatagramHeader::maximum_user_payload;
         if (target)
         {
             auto endpoints = co_await sockets.resolver.async_resolve(
@@ -321,36 +328,24 @@ asio::awaitable<void> AgentSession::attach()
     else
     {
         auto &sockets = std::get<StreamData>(data);
-        if (target)
+        if (target && service.protocol != RelayProtocol::Tls)
         {
-            auto endpoints = co_await sockets.resolver.async_resolve(
-                target->target_host, std::to_string(target->target_port),
-                asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
-            co_await asio::async_connect(sockets.local, endpoints,
-                                         asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
+            co_await connect_target();
         }
         auto endpoints = co_await sockets.resolver.async_resolve(
             host, std::to_string(port), asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
         co_await asio::async_connect(sockets.transfer, endpoints,
                                      asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
-        if (service.protocol == RelayProtocol::Tls)
+        attachment.connection_id.emplace();
+        co_await asio::async_read(sockets.transfer, asio::buffer(*attachment.connection_id),
+                                  asio::cancel_at(deadline, asio::use_awaitable));
+        if (!owner.send_control(selection.server, RelayAttach::to_msg(attachment)))
         {
-            sockets.tls.emplace(std::move(sockets.transfer), options.ssl_context);
-            configure_tls_client(*sockets.tls, host, options.server_name);
-            co_await sockets.tls->async_handshake(
-                asio::ssl::stream_base::client,
-                asio::cancel_after(remaining(options.handshake_timeout), asio::use_awaitable));
-            co_await asio::async_write(*sockets.tls, asio::buffer(frame),
-                                       asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
-        }
-        else
-        {
-            co_await asio::async_write(sockets.transfer, asio::buffer(frame),
-                                       asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
+            throw std::runtime_error("primary control unavailable for attachment");
         }
     }
 
-    while (!ready && reason.empty())
+    while (!tunnel_ready() && reason.empty())
     {
         if (Clock::now() >= deadline)
         {
@@ -360,14 +355,14 @@ asio::awaitable<void> AgentSession::attach()
         if (service.protocol == RelayProtocol::Udp)
         {
             auto &sockets = std::get<DatagramData>(data);
-            const auto sent = co_await sockets.transfer.async_send(
-                asio::buffer(frame), asio::cancel_after(remaining(options.connect_timeout), asio::use_awaitable));
+            const auto sent = co_await sockets.transfer.async_send(asio::buffer(frame),
+                                                                   asio::cancel_at(deadline, asio::use_awaitable));
             if (sent != frame.size())
             {
                 throw std::runtime_error("truncated relay.attach");
             }
             wakeup = std::min(deadline, Clock::now() + std::chrono::milliseconds(500));
-            if (ready || !reason.empty())
+            if (tunnel_ready() || !reason.empty())
             {
                 break;
             }
@@ -379,5 +374,85 @@ asio::awaitable<void> AgentSession::attach()
     if (!reason.empty())
     {
         throw asio::system_error(asio::error::operation_aborted);
+    }
+}
+
+Clock::duration AgentSession::remaining(Clock::duration timeout) const
+{
+    if (!reason.empty())
+    {
+        throw asio::system_error(asio::error::operation_aborted);
+    }
+    const auto budget = deadline - Clock::now();
+    if (budget <= Clock::duration::zero())
+    {
+        throw std::runtime_error("relay establishment timed out");
+    }
+    return std::min(budget, timeout);
+}
+
+asio::awaitable<void> AgentSession::connect_target()
+{
+    auto &sockets = std::get<StreamData>(data);
+    const auto timeout = owner.session_options().connect_timeout;
+    const auto endpoints =
+        co_await sockets.resolver.async_resolve(target->target_host, std::to_string(target->target_port),
+                                                asio::cancel_after(remaining(timeout), asio::use_awaitable));
+    co_await asio::async_connect(sockets.local, endpoints, asio::cancel_after(remaining(timeout), asio::use_awaitable));
+}
+
+asio::awaitable<void> AgentSession::establish_tls()
+{
+    auto &sockets = std::get<StreamData>(data);
+    const auto &options = owner.session_options();
+    sockets.tls.emplace(std::move(sockets.transfer), options.ssl_context);
+    auto &tls = *sockets.tls;
+    tls.next_layer().set_option(asio::ip::tcp::no_delay(true));
+    co_await tls.async_handshake(producer() ? asio::ssl::stream_base::server : asio::ssl::stream_base::client,
+                                 asio::cancel_after(remaining(options.handshake_timeout), asio::use_awaitable));
+    std::array<std::uint8_t, 4> header;
+    std::array<std::uint8_t, 1> confirmation{1};
+    if (producer())
+    {
+        co_await asio::async_read(tls, asio::buffer(header), asio::cancel_at(deadline, asio::use_awaitable));
+        const auto size = decode_tls_data_size(header);
+        if (size != service.service.size())
+        {
+            throw std::runtime_error("TLS service mismatch");
+        }
+        std::string requested(size, '\0');
+        co_await asio::async_read(tls, asio::buffer(requested), asio::cancel_at(deadline, asio::use_awaitable));
+        if (requested != service.service)
+        {
+            throw std::runtime_error("TLS service mismatch");
+        }
+        co_await connect_target();
+        co_await asio::async_write(tls, asio::buffer(confirmation), asio::cancel_at(deadline, asio::use_awaitable));
+    }
+    else
+    {
+        header = encode_tls_data_size(service.service.size());
+        const std::array<asio::const_buffer, 2> request{asio::buffer(header), asio::buffer(service.service)};
+        co_await asio::async_write(tls, request, asio::cancel_at(deadline, asio::use_awaitable));
+        co_await asio::async_read(tls, asio::buffer(confirmation), asio::cancel_at(deadline, asio::use_awaitable));
+        if (confirmation[0] != 1)
+        {
+            throw std::runtime_error("TLS service rejected");
+        }
+    }
+}
+
+asio::awaitable<void> AgentSession::finish_tls()
+{
+    auto &tls = *std::get<StreamData>(data).tls;
+    const auto finish_deadline = Clock::now() + owner.session_options().disconnect_timeout;
+    co_await tls.async_shutdown(asio::cancel_at(finish_deadline, asio::use_awaitable));
+    tls.next_layer().shutdown(asio::ip::tcp::socket::shutdown_send);
+    std::array<std::uint8_t, 1> tail;
+    const auto [error, size] = co_await tls.next_layer().async_read_some(
+        asio::buffer(tail), asio::cancel_at(finish_deadline, use_nothrow_awaitable));
+    if (error != asio::error::eof || size != 0 || SSL_pending(tls.native_handle()) != 0)
+    {
+        throw std::runtime_error("TLS carrier did not end cleanly");
     }
 }

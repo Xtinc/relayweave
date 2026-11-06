@@ -4,12 +4,17 @@
 #include "asio.hpp"
 #include "asio/ssl.hpp"
 #include "message.h"
+#include <array>
 #include <atomic>
 #include <optional>
 #include <span>
 #include <string_view>
 
-void set_current_thread_scheduler_policy();
+/**
+ * @brief Name the calling worker on Linux without changing its scheduling policy.
+ * @param name Null-terminated thread name of at most 15 bytes; ignored on other platforms.
+ */
+void set_current_thread_name(const char *name);
 
 template <class Socket> std::string socket_peer(const Socket &socket)
 {
@@ -41,22 +46,21 @@ class TokenBucket
     using TimePoint = Clock::time_point;
 
     TokenBucket(std::uint64_t bytes_per_second = 0, std::uint64_t burst_bytes = 0) noexcept;
-    TimePoint reserve(std::size_t bytes, TimePoint now);
+    // Reserve stream bytes synchronously; an empty result means no wait is needed.
+    std::optional<TimePoint> reserve(std::size_t bytes, TimePoint now = Clock::now());
     bool try_consume(std::size_t bytes);
-    // Stream consumers wait here; datagram consumers use try_consume to drop instead.
-    // All access stays on one executor, with at most one pending consume per bucket.
-    asio::awaitable<void> consume(std::size_t bytes);
+    // Wait for a reserved deadline. Datagrams use try_consume and drop on failure.
+    // All access stays on one executor, with at most one pending wait per bucket.
+    asio::awaitable<void> wait_until(TimePoint deadline);
 
   private:
-    bool try_consume_at(std::size_t bytes, TimePoint now);
     void refill(TimePoint now) noexcept;
     Clock::duration duration_for(double bytes) const noexcept;
 
     std::uint64_t rate_{};
     std::uint64_t burst_{};
-    bool initialised_{};
     double tokens_{};
-    TimePoint last_update_{};
+    TimePoint last_update_{Clock::now()};
     std::optional<asio::steady_timer> timer_;
 };
 
@@ -66,23 +70,16 @@ asio::awaitable<void> relay_tcp(asio::ip::tcp::socket &left, asio::ip::tcp::sock
                                 TrafficCounter *left_to_right_traffic = nullptr,
                                 TrafficCounter *right_to_left_traffic = nullptr);
 
-inline constexpr std::string_view tls_data_framing = "length32-fin-v1";
-inline constexpr std::size_t tls_data_maximum_payload = LnkFrameHeader::maximum_payload;
+/** @brief Bound endpoint TLS frames independently of NodeLink transport and fragmentation. */
+inline constexpr std::size_t tls_data_maximum_payload = 64 * 1024;
 
-asio::awaitable<std::size_t> read_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
-                                          std::span<std::uint8_t> buffer);
-asio::awaitable<void> write_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream,
-                                    std::span<const std::uint8_t> payload, TrafficCounter *traffic = nullptr);
-asio::awaitable<void> finish_tls_data(asio::ssl::stream<asio::ip::tcp::socket> &stream);
+/** @brief Decode and validate a TLS DATA length; zero denotes business FIN. */
+std::size_t decode_tls_data_size(std::span<const std::uint8_t, 4> header);
+
+/** @brief Encode an already bounded TLS DATA length; zero denotes business FIN. */
+std::array<std::uint8_t, 4> encode_tls_data_size(std::size_t size);
 
 asio::awaitable<void> relay_tls(asio::ip::tcp::socket &left, asio::ssl::stream<asio::ip::tcp::socket> &right);
-asio::awaitable<void> relay_tls(asio::ssl::stream<asio::ip::tcp::socket> &left,
-                                asio::ssl::stream<asio::ip::tcp::socket> &right,
-                                TokenBucket *left_to_right_limiter = nullptr,
-                                TokenBucket *right_to_left_limiter = nullptr,
-                                TrafficCounter *left_to_right_traffic = nullptr,
-                                TrafficCounter *right_to_left_traffic = nullptr);
-
 // Stream relays preserve the opposite direction after business EOF and propagate I/O failures.
 // Same executor: wait for both normal completions; on failure cancel and drain the sibling.
 asio::awaitable<void> await_transfers(asio::awaitable<void> outgoing, asio::awaitable<void> incoming);

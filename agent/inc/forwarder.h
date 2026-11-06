@@ -11,10 +11,10 @@
 class AgentSession;
 
 /**
- * @brief Own local forwards, business sessions, UDP source tracking, and retry tasks on transfer_io.
- * @details Borrows RelayAgent and the TLS context through shutdown. Owns all listeners and session
+ * @brief Own local forwards, business sessions, UDP associations, and idle expiry on transfer_io.
+ * @details Borrows RelayAgent through shutdown and owns its business RPK context. Owns all listeners and session
  * associations; AgentSession uses lifecycle notifications instead of modifying these containers.
- * async_stop() drains listeners, retries, and business tasks before releasing the transfer work guard.
+ * async_stop() drains listeners, idle expiry, and business tasks before releasing the transfer work guard.
  */
 class Forwarder
 {
@@ -23,26 +23,18 @@ class Forwarder
      * @brief Construct listeners and session settings without starting I/O.
      * @param agent Borrowed composition root used for cross-domain entrance selection.
      * @param executor Single-threaded transfer executor owning all forward and session state.
-     * @param ssl_context Borrowed TLS context, valid until business tasks drain.
-     * @param server_name Optional TLS server name override.
-     * @param handshake_timeout Maximum duration of one TLS handshake.
-     * @param connect_timeout Maximum duration of one resolve/connect operation.
-     * @param relay_open_timeout Total per-session establishment budget.
-     * @param services Local targets, owned by value.
-     * @param forwards Local listener descriptions, owned by value.
+     * @param ssl_context Existing control identity; its certificate and key are retained by the business context.
+     * @param config Settings and listener descriptions copied during construction.
      */
     Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ssl::context &ssl_context,
-              std::optional<std::string> server_name, std::chrono::steady_clock::duration handshake_timeout,
-              std::chrono::steady_clock::duration connect_timeout,
-              std::chrono::steady_clock::duration relay_open_timeout, std::vector<AgentServiceConfig> services,
-              std::vector<AgentForwardConfig> forwards);
+              const AgentConfig &config);
     /** @brief Immutable connection settings borrowed by sessions for their owner's lifetime. */
     struct SessionOptions
     {
         asio::ssl::context &ssl_context;
-        std::optional<std::string> server_name;
         std::chrono::steady_clock::duration handshake_timeout;
         std::chrono::steady_clock::duration connect_timeout;
+        std::chrono::steady_clock::duration disconnect_timeout;
     };
     /** @brief Read the business execution domain. @return Executor owning every session socket. */
     asio::any_io_executor executor() const
@@ -64,21 +56,16 @@ class Forwarder
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
                                                  std::chrono::steady_clock::time_point deadline);
     /**
-     * @brief Reset the associated UDP retry delay on transfer_io.
-     * @param relay Session that has received ready, borrowed during this notification.
-     */
-    void relay_ready(const AgentSession &relay);
-    /**
-     * @brief Unregister a drained session, release its UDP association, and consider retry on transfer_io.
+     * @brief Unregister a drained session and release its UDP association on transfer_io.
      * @param relay Session retained by its run task through this notification.
      */
-    void relay_finished(const AgentSession &relay);
+    void relay_finished(AgentSession &relay);
     /**
-     * @brief Return authenticated Node datagrams through the owned local UDP listener on transfer_io.
-     * @param relay Live consumer session, retained by its run task until this call finishes.
+     * @brief Send the cached first packet, then return Node datagrams through the local UDP listener.
+     * @param relay Attached, ready consumer with an owned forward and a cached first packet.
      * @return Completes on session cancellation or throws the original receive/send error.
      */
-    asio::awaitable<void> receive_datagrams(AgentSession &relay);
+    asio::awaitable<void> relay_datagrams(AgentSession &relay);
     /**
      * @brief Submit output through a weak control route; TLSChannel serializes its own executor.
      * @param route Entrance metadata with a weak TLS channel.
@@ -93,7 +80,7 @@ class Forwarder
      */
     void start();
     /**
-     * @brief Publish service availability and trigger eligible UDP forwards on transfer_io.
+     * @brief Publish service availability; a changed location cancels its old UDP associations.
      * @param service Service name and transport.
      * @param node Destination Node identity, independent of entrance connections.
      */
@@ -105,7 +92,7 @@ class Forwarder
      */
     void clear_service(const ServiceKey &service, std::string reason = "service unavailable");
     /**
-     * @brief Clear availability, cancel business sessions and wake UDP retries on transfer_io.
+     * @brief Clear availability and cancel business sessions on transfer_io.
      */
     void control_disconnected();
     /**
@@ -117,6 +104,7 @@ class Forwarder
      * @brief Match a business message or create its producer session on transfer_io.
      * @param route Primary control source and logical business Node.
      * @param message Owned message, matched by source, protocol, request and/or UUID.
+     * @pre AgentControl has validated that message parameters are an object before posting to transfer_io.
      */
     void relay_message(ServerRoute route, CtrlMessage message);
     /**
@@ -125,7 +113,7 @@ class Forwarder
      */
     void invalidate_relays(std::string reason);
     /**
-     * @brief Cancel listeners, retries and sessions, and await every owned task on transfer_io.
+     * @brief Cancel listeners, idle expiry and sessions, and await every owned task on transfer_io.
      * @return Completes after work guard release.
      */
     asio::awaitable<void> async_stop();
@@ -151,28 +139,28 @@ class Forwarder
     {
         DatagramForward(asio::any_io_executor executor, AgentForwardConfig config);
         asio::ip::udp::socket listener_socket;
-        asio::steady_timer retry_timer;
         AgentForwardConfig config;
-        std::optional<asio::ip::udp::endpoint> local_peer;
-        std::shared_ptr<AgentSession> relay;
-        std::chrono::steady_clock::duration retry_delay = std::chrono::milliseconds(500);
-        bool retry_scheduled = false;
+        std::map<asio::ip::udp::endpoint, std::uint64_t> clients;
     };
 
     asio::awaitable<void> accept_stream(StreamForward &forward);
     asio::awaitable<void> receive_local_datagrams(DatagramForwardId forward_id);
-    void open_datagram_forward(DatagramForwardId forward_id);
-    void schedule_datagram_retry(DatagramForwardId forward_id);
-    asio::awaitable<void> retry_datagram_forward(DatagramForwardId forward_id);
+    asio::awaitable<void> send_datagram(AgentSession &relay, std::span<const std::uint8_t> payload);
+    asio::awaitable<void> expire_datagrams();
     void start_relay(std::shared_ptr<AgentSession> relay);
     void spawn_task(asio::awaitable<void> task, std::string_view context);
     void finish_if_stopped();
     std::uint64_t allocate_request_id();
 
+    static constexpr std::size_t relay_capacity = 1000;
+    static constexpr std::size_t udp_opening_capacity = 100;
     RelayAgent &agent_;
     asio::executor_work_guard<asio::any_io_executor> transfer_work_;
+    asio::ssl::context business_context_{asio::ssl::context::tls};
     SessionOptions session_options_;
     std::chrono::steady_clock::duration relay_open_timeout_;
+    std::chrono::steady_clock::duration udp_idle_timeout_;
+    asio::steady_timer udp_idle_timer_;
     std::unordered_map<std::string, AgentServiceConfig> services_;
     std::vector<StreamForward> stream_forwards_;
     std::vector<DatagramForward> datagram_forwards_;

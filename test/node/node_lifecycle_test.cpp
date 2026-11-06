@@ -32,8 +32,6 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         config.control.port = 1;
         config.tcp.address = "127.0.0.1";
         config.tcp.port = 1;
-        config.tls.address = "127.0.0.1";
-        config.tls.port = 2;
         config.datagram.address = "127.0.0.1";
         config.datagram.port = 1;
 
@@ -62,8 +60,6 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         config.control.port = control_port;
         config.tcp.address = "invalid-address";
         config.tcp.port = unused_port(transfer_tcp_io);
-        config.tls.address = "127.0.0.1";
-        config.tls.port = 0;
         config.datagram.address = "127.0.0.1";
         config.datagram.port = config.tcp.port;
         auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,
@@ -99,8 +95,6 @@ void verify_server_start_lifecycle(asio::ssl::context &server_context)
         config.control.port = control_port;
         config.tcp.address = "127.0.0.1";
         config.tcp.port = transfer_port;
-        config.tls.address = "127.0.0.1";
-        config.tls.port = 0;
         config.datagram.address = "127.0.0.1";
         config.datagram.port = transfer_port;
         auto server = std::make_shared<RelayNode>(control_io, transfer_tcp_io, transfer_udp_io, cluster_data.io, server_context,

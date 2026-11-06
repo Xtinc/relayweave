@@ -93,9 +93,11 @@ asio::awaitable<std::shared_ptr<TLSChannel>> connect_control(asio::ssl::context 
     co_return channel;
 }
 
-asio::awaitable<CtrlMessage> receive_command(const std::shared_ptr<TLSChannel> &channel, std::string expected)
+asio::awaitable<CtrlMessage> receive_command(
+    const std::shared_ptr<TLSChannel> &channel, std::string expected,
+    std::chrono::steady_clock::duration timeout = std::chrono::steady_clock::duration::max())
 {
-    auto message = co_await channel->async_receive();
+    auto message = co_await channel->async_receive(timeout);
     require(message.command == expected, "Expected " + expected + ", received " + message.command);
     co_return message;
 }
@@ -309,22 +311,37 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
     require(co_await receive_datagram(producer_socket) == udp_datagram(producer_id, large_payload),
             "Maximum reverse single-node UDP datagram was changed or truncated");
 
-    consumer->send(CtrlMessage{"server.traffic", njson{{"request_id", 30U}}});
-    const auto traffic = co_await receive_command(consumer, "server.traffic.reported");
-    const auto &services = params_of(traffic).at("services");
-    require(services.size() == 2, "Traffic response did not report both registered services");
-    const auto find_service_stats = [&](const char *name) {
-        return std::ranges::find_if(
-            services, [name](const njson &entry) { return entry.at("service") == name; });
-    };
-    require(find_service_stats("tcp-session") != services.end(), "TCP service was missing from traffic response");
-    const auto stats = find_service_stats("udp-session");
-    require(stats != services.end(), "UDP service was missing from traffic response");
-    require(stats->at("protocol") == "udp", "UDP traffic response reported the wrong protocol");
-    require(stats->at("rx_bytes") == attach_shaped_payload.size() + large_payload.size(),
-            "UDP RX traffic included headers, invalid datagrams, or dropped payloads");
-    require(stats->at("tx_bytes") == tx_payload.size() + large_payload.size(),
-            "UDP TX payload bytes were counted incorrectly");
+    const auto expected_rx = attach_shaped_payload.size() + large_payload.size();
+    const auto expected_tx = tx_payload.size() + large_payload.size();
+    const auto accounting_deadline = std::chrono::steady_clock::now() + 1s;
+    for (;;)
+    {
+        // Receiving the packet is not a barrier for the transfer executor's
+        // send-completion accounting. Observe the exact totals through control.
+        consumer->send(CtrlMessage{"server.traffic", njson{{"request_id", 30U}}});
+        const auto traffic = co_await receive_command(
+            consumer, "server.traffic.reported", accounting_deadline - std::chrono::steady_clock::now());
+        const auto &services = params_of(traffic).at("services");
+        require(services.size() == 2, "Traffic response did not report both registered services");
+        const auto find_service_stats = [&](const char *name) {
+            return std::ranges::find_if(
+                services, [name](const njson &entry) { return entry.at("service") == name; });
+        };
+        require(find_service_stats("tcp-session") != services.end(), "TCP service was missing from traffic response");
+        const auto stats = find_service_stats("udp-session");
+        require(stats != services.end(), "UDP service was missing from traffic response");
+        require(stats->at("protocol") == "udp", "UDP traffic response reported the wrong protocol");
+        const auto rx = stats->at("rx_bytes").get<std::uint64_t>();
+        const auto tx = stats->at("tx_bytes").get<std::uint64_t>();
+        require(rx <= expected_rx && tx <= expected_tx,
+                "UDP traffic included headers, invalid datagrams, or duplicated payloads");
+        if (rx == expected_rx && tx == expected_tx)
+        {
+            break;
+        }
+        require(std::chrono::steady_clock::now() < accounting_deadline,
+                "UDP traffic did not reach the completed payload totals");
+    }
 
     asio::steady_timer sample_wait(co_await asio::this_coro::executor);
     sample_wait.expires_after(1100ms);
@@ -401,12 +418,13 @@ asio::awaitable<void> verify_routing(asio::ssl::context &producer_context, asio:
         udp_datagram(params_of(reopened).at("session_id").get<std::uint64_t>(), early_payload));
     const auto still_active = co_await receive_datagram(recovering_producer);
     require(still_active.size() == DatagramHeader::length + early_payload.size(), "UDP setup budget expired an active pair");
-    consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", new_uuid}, {"reason", "finished recovery check"}}});
+    consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", new_uuid}, {"reason", ""}}});
+    consumer->send(CtrlMessage{"relay.cancel", njson{{"uuid", new_uuid}, {"reason", "later cancellation"}}});
     const auto consumer_closed = co_await receive_command(consumer, "relay.closed");
     const auto producer_closed = co_await receive_command(late_producer, "relay.closed");
-    require(params_of(consumer_closed).at("reason") == "finished recovery check" &&
-            params_of(producer_closed).at("reason") == "finished recovery check",
-            "Active single-node cancellation lost its original reason");
+    require(params_of(consumer_closed).at("reason") == "" &&
+            params_of(producer_closed).at("reason") == "",
+            "Active cancellation replaced an empty first cause during cleanup");
 
     auto aborting_consumer = co_await connect_control(consumer_context, control_port);
     aborting_consumer->send(CtrlMessage{
@@ -450,8 +468,6 @@ int main()
         config.control.port = control_port;
         config.tcp.address = "127.0.0.1";
         config.tcp.port = tcp_port;
-        config.tls.address = "127.0.0.1";
-        config.tls.port = 0;
         config.datagram.address = "127.0.0.1";
         config.datagram.port = udp_port;
         config.tcp.max_relays = 1;
@@ -469,24 +485,25 @@ int main()
         auto result = asio::co_spawn(control_io,
                                      verify_routing(producer_context, consumer_context, control_port, udp_port),
                                      asio::use_future);
+        std::exception_ptr failure;
         try
         {
             result.get();
         }
         catch (...)
         {
-            control_io.stop();
-            transfer_tcp_io.stop();
-            transfer_udp_io.stop();
-            control_thread.join();
-            transfer_tcp_thread.join();
-            transfer_udp_thread.join();
-            throw;
+            failure = std::current_exception();
         }
+        // Keep all executors running until the Node has drained, even when a
+        // test assertion fails. Stopping contexts first strands owning handlers.
         server->stop();
         control_thread.join();
         transfer_tcp_thread.join();
         transfer_udp_thread.join();
+        if (failure)
+        {
+            std::rethrow_exception(failure);
+        }
 
         std::cout << "[PASS] UDP session routing, endpoint pinning, and cleanup\n";
         return 0;

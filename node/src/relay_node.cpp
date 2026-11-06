@@ -13,12 +13,9 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
       registry_(config_.control.max_connections, config_.control.max_services,
                 config_.control.max_services_per_session),
       relay_id_allocator_(std::make_shared<RelayIdAllocator>()),
-      tcp_pipeline_(std::make_shared<TcpPipeline>(
-          transfer_tcp_executor_, ssl_context_, relay_id_allocator_, config_.tcp.address, config_.tcp.port,
+      tcp_pipeline_(std::make_shared<StreamPipeline>(
+          transfer_tcp_executor_, relay_id_allocator_, config_.tcp.address, config_.tcp.port,
           config_.tcp.max_setup_connections, config_.tcp.max_relays, config_.tcp.setup_timeout, config_.tcp.traffic)),
-      tls_pipeline_(std::make_shared<TlsPipeline>(
-          transfer_tcp_executor_, ssl_context_, relay_id_allocator_, config_.tls.address, config_.tls.port,
-          config_.tls.max_setup_connections, config_.tls.max_relays, config_.tls.setup_timeout, config_.tls.traffic)),
       datagram_mgr_(std::make_shared<DatagramMgr>(
           transfer_udp_executor_, relay_id_allocator_,
           asio::ip::udp::endpoint(asio::ip::make_address(config_.datagram.address), config_.datagram.port),
@@ -54,9 +51,8 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
     nodelink_mgr_ =
         std::make_unique<NodeLinkMgr>(control_executor_, cluster_data_executor_, config_.cluster, config_.tcp.address,
                                       config_.datagram.address, *cluster_mgr_, *topology_);
-    control_ =
-        std::make_unique<NodeControl>(registry_, *cluster_mgr_, *topology_, *metrics_, relay_sessions_,
-                                      config_.cluster.node_id, config_.control.advertise_address, config_.control.port);
+    control_ = std::make_unique<NodeControl>(registry_, *cluster_mgr_, *topology_, *metrics_, relay_sessions_,
+                                             config_.cluster.node_id, config_.control.advertise_address);
 }
 
 RelayNode::~RelayNode() = default;
@@ -80,7 +76,6 @@ void RelayNode::start(std::function<void(std::string)> failure_handler)
     control_acceptor_.bind(endpoint);
     control_acceptor_.listen();
     tcp_pipeline_->start();
-    tls_pipeline_->start();
     datagram_mgr_->start();
     nodelink_mgr_->start();
     metrics_->start(nodelink_mgr_->protocol(), std::chrono::steady_clock::now());
@@ -93,10 +88,9 @@ void RelayNode::start(std::function<void(std::string)> failure_handler)
     metrics_->activate();
     rollback.dismiss();
 
-    PROXY_INFO_PRINT("Node listening control=%s:%u tcp=%s:%u tls=%s:%u udp=%s:%u", config_.control.address.c_str(),
+    PROXY_INFO_PRINT("Node listening control=%s:%u data=%s:%u udp=%s:%u", config_.control.address.c_str(),
                      static_cast<unsigned int>(config_.control.port), config_.tcp.address.c_str(),
-                     static_cast<unsigned int>(config_.tcp.port), config_.tls.address.c_str(),
-                     static_cast<unsigned int>(config_.tls.port), config_.datagram.address.c_str(),
+                     static_cast<unsigned int>(config_.tcp.port), config_.datagram.address.c_str(),
                      static_cast<unsigned int>(config_.datagram.port));
 }
 
@@ -117,11 +111,9 @@ bool RelayNode::stop()
         asio::post(transfer_tcp_executor_, asio::use_future([self] {
                        self->metrics_->stop_tcp();
                        self->tcp_pipeline_->stop();
-                       self->tls_pipeline_->stop();
                    }))
             .get();
-        tcp_pipeline_->wait_for_pending();
-        tls_pipeline_->wait_for_pending();
+        tcp_pipeline_->wait_for_setup_tasks();
 
         asio::post(transfer_udp_executor_, asio::use_future([self] {
                        self->metrics_->stop_udp();
@@ -290,12 +282,13 @@ void RelayNode::cluster_failed(std::string reason)
 
 void RelayNode::handle_cluster_message(CtrlCommand command, CtrlMessage message)
 {
-    if (ctrl_command_group(command) == CtrlCommand::Relay && ctrl_command_subgroup(command) != CtrlCommand::RelayPeer)
+    const auto group = ctrl_command_group(command);
+    const auto subgroup = ctrl_command_subgroup(command);
+    if (group == CtrlCommand::Relay && subgroup != CtrlCommand::RelayPeer)
     {
         handle_cluster_relay(command, std::move(message));
         return;
     }
-    const auto group = ctrl_command_group(command);
     if (group == CtrlCommand::Link || group == CtrlCommand::Flow)
     {
         if (state_.load() == State::Running || command != CtrlCommand::FlowOpen)
@@ -304,7 +297,7 @@ void RelayNode::handle_cluster_message(CtrlCommand command, CtrlMessage message)
         }
         return;
     }
-    if (ctrl_command_subgroup(command) == CtrlCommand::RelayPeer)
+    if (subgroup == CtrlCommand::RelayPeer)
     {
         if (state_.load() == State::Running)
         {
@@ -326,10 +319,16 @@ void RelayNode::handle_cluster_message(CtrlCommand command, CtrlMessage message)
     case CtrlCommand::TopologyReport:
         topology_->update_report(config::message_params(message));
         break;
-    case CtrlCommand::ClusterError:
-        nodelink_mgr_->control_failed(config::message_params(message).value("reason", "cluster control failed"));
-        invalidate_relays("cluster control failed");
+    case CtrlCommand::ClusterError: {
+        auto reason = config::message_params(message).value("reason", "");
+        if (reason.empty())
+        {
+            reason = "cluster control failed";
+        }
+        nodelink_mgr_->control_failed(reason);
+        invalidate_relays(reason);
         break;
+    }
     default:
         control_->handle_cluster(command, std::move(message));
         break;
@@ -343,6 +342,7 @@ void RelayNode::handle_control_message(SessionId id, const ControlSessionPtr &se
     switch (command)
     {
     case CtrlCommand::RelayOpen:
+    case CtrlCommand::RelayAttach:
     case CtrlCommand::RelayReject:
     case CtrlCommand::RelayCancel:
         if (const auto target = config::optional_string(params, "node_id", config_.cluster.node_id);
@@ -386,7 +386,7 @@ RelayNode::SessionId RelayNode::allocate_session_id()
     return id;
 }
 
-void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
+void RelayNode::start_relay(std::unique_ptr<NodeSession> relay)
 {
     if (relay->is_multi() && static_cast<std::size_t>(std::ranges::count_if(relay_sessions_, &NodeSession::is_multi)) >=
                                  config_.control.max_connections)
@@ -394,25 +394,29 @@ void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
         throw std::runtime_error("relay path capacity reached");
     }
     const auto protocol = relay->protocol();
-    const auto capacity = protocol == RelayProtocol::Tcp   ? config_.tcp.max_relays
-                          : protocol == RelayProtocol::Tls ? config_.tls.max_relays
-                                                           : config_.datagram.max_relays;
-    const auto count = std::ranges::count_if(relay_sessions_,
-                                             [protocol](const auto &active) { return active->protocol() == protocol; });
+    const bool datagram = protocol == RelayProtocol::Udp;
+    const auto capacity = datagram ? config_.datagram.max_relays : config_.tcp.max_relays;
+    const auto count = std::ranges::count_if(relay_sessions_, [datagram](const auto &active) {
+        return (active->protocol() == RelayProtocol::Udp) == datagram;
+    });
     if (static_cast<std::size_t>(count) >= capacity)
     {
         throw std::runtime_error("relay capacity reached");
     }
-    relay_sessions_.push_back(relay);
-    ScopeGuard rollback([this, &relay]() noexcept { std::erase(relay_sessions_, relay); });
-    asio::co_spawn(control_executor_, relay->run(),
+    auto *session = relay.get();
+    relay_sessions_.push_back(std::move(relay));
+    ScopeGuard rollback([this, session]() noexcept {
+        std::erase_if(relay_sessions_, [session](const auto &owned) { return owned.get() == session; });
+    });
+    asio::co_spawn(control_executor_, session->run(),
                    asio::bind_cancellation_slot(
-                       relay->cancellation_slot(), [self = shared_from_this(), relay](std::exception_ptr error) {
+                       session->cancellation_slot(), [self = shared_from_this(), session](std::exception_ptr error) {
                            if (error)
                            {
                                PROXY_ERROR_PRINT("Relay task failed reason=%s", exception_description(error).c_str());
                            }
-                           std::erase(self->relay_sessions_, relay);
+                           std::erase_if(self->relay_sessions_,
+                                         [session](const auto &owned) { return owned.get() == session; });
                            if (self->relay_sessions_.empty())
                            {
                                self->relays_done_.cancel();
@@ -423,7 +427,27 @@ void RelayNode::start_relay(std::shared_ptr<NodeSession> relay)
 
 void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
 {
-    const auto &params = *message.params;
+    if (command == CtrlCommand::RelayAttach)
+    {
+        RelayAttach request{};
+        try
+        {
+            request = RelayAttach::from_msg(message);
+        }
+        catch (const std::invalid_argument &error)
+        {
+            PROXY_DEBUG_PRINT("Relay attach ignored reason=%s", error.what());
+            return;
+        }
+        for (const auto &relay : relay_sessions_)
+        {
+            if (relay->handle_attach(session, request))
+            {
+                return;
+            }
+        }
+        return;
+    }
     if (command != CtrlCommand::RelayOpen)
     {
         for (const auto &relay : relay_sessions_)
@@ -435,20 +459,21 @@ void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, cons
         }
         return;
     }
+    const auto &params = *message.params;
     const auto request = config::require_unsigned(params, "request_id");
     const auto service = config::message_service(params);
     const auto protocol = config::message_protocol(params);
     const bool multi = params.contains("path");
     try
     {
-        njson values{{"request_id", request}, {"service", service}, {"protocol", relay_protocol_name(protocol)}};
+        RelayRequest values{service, protocol, request};
         if (multi)
         {
-            values["path"] = params.at("path");
-            values["epoch"] = config::require_unsigned(params, "epoch", true);
-            const auto path = values.at("path").get<std::vector<std::string>>();
+            values.path = params.at("path").get<std::vector<std::string>>();
+            values.epoch = config::require_unsigned(params, "epoch", true);
+            const auto &path = values.path;
             if (!request || path.size() < 2 || path.front() != config_.cluster.node_id ||
-                values.at("epoch") != topology_->epoch())
+                values.epoch != topology_->epoch())
             {
                 throw std::invalid_argument("invalid path or stale epoch");
             }
@@ -459,7 +484,7 @@ void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, cons
                     return;
                 }
             }
-            start_relay(std::make_shared<NodeSession>(*this, session, std::move(values), true));
+            start_relay(std::make_unique<MultiSession>(*this, session, std::move(values), true));
         }
         else
         {
@@ -468,8 +493,8 @@ void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, cons
             {
                 throw std::runtime_error(!producer ? "service unavailable" : "service protocol mismatch");
             }
-            start_relay(
-                std::make_shared<NodeSession>(*this, session, producer->session, std::move(values), producer->traffic));
+            start_relay(std::make_unique<SingleSession>(*this, session, producer->session, std::move(values),
+                                                        producer->traffic));
         }
     }
     catch (const std::exception &error)
@@ -512,12 +537,19 @@ void RelayNode::handle_relay_peer(CtrlCommand command, const CtrlMessage &messag
         {
             throw std::runtime_error("flow unavailable or wrong endpoint");
         }
-        const auto service = registry_.find_service(config::message_service(params));
+        const auto service_name = config::message_service(params);
+        const auto service = registry_.find_service(service_name);
         if (!service || service->protocol != protocol)
         {
             throw std::runtime_error(!service ? "service unavailable" : "service protocol mismatch");
         }
-        start_relay(std::make_shared<NodeSession>(*this, service->session, params, false, service->traffic));
+        RelayRequest request{service_name, protocol};
+        request.epoch = epoch;
+        request.flow_id = id;
+        request.peer = source;
+        request.accessor = config::optional_string(params, "accessor", "");
+        start_relay(
+            std::make_unique<MultiSession>(*this, service->session, std::move(request), false, service->traffic));
     }
     catch (const std::exception &error)
     {
@@ -553,7 +585,8 @@ bool RelayNode::send_relay(const AgentPeer &route, CtrlMessage message)
 {
     auto &params = *message.params;
     params["node_id"] = config_.cluster.node_id;
-    if (message.type() == CtrlCommand::RelayOpened || message.type() == CtrlCommand::RelayOffer)
+    const auto command = message.type();
+    if (command == CtrlCommand::RelayOpened || command == CtrlCommand::RelayOffer)
     {
         params["data_address"] = config_.control.advertise_address;
     }
@@ -580,18 +613,21 @@ void RelayNode::handle_cluster_relay(CtrlCommand command, CtrlMessage message)
     {
     case CtrlCommand::RelayOpen:
     case CtrlCommand::RelayCancel:
+    case CtrlCommand::RelayAttach:
     case CtrlCommand::RelayReject:
         if (state_.load() == State::Running || command != CtrlCommand::RelayOpen)
         {
             handle_relay(command, AgentPeer{source, id, config::optional_string(params, "accessor", "")}, message);
         }
         return;
-    case CtrlCommand::RelayDetach:
+    case CtrlCommand::RelayDetach: {
+        const AgentPeer peer{source, id, {}};
         for (const auto &relay : relay_sessions_)
         {
-            relay->control_disconnected(AgentPeer{source, id, {}});
+            relay->control_disconnected(peer);
         }
         return;
+    }
     case CtrlCommand::RelayOpened:
     case CtrlCommand::RelayReady:
     case CtrlCommand::RelayClosed:

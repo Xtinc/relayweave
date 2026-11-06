@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(relayweave VERSION 1.0.6 LANGUAGES CXX)
+project(relayweave VERSION 1.0.7 LANGUAGES CXX)
 
 if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2/include/asio.hpp"
     OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/CMakeLists.txt"
@@ -56,7 +56,14 @@ if(WIN32 AND NOT DEFINED OPENSSL_ROOT_DIR)
     set(OPENSSL_ROOT_DIR "D:/Program Files/OpenSSL-Win64")
 endif()
 find_package(Threads REQUIRED)
-find_package(OpenSSL REQUIRED)
+find_package(OpenSSL 3.2 REQUIRED)
+include(CheckCXXSymbolExists)
+set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
+check_cxx_symbol_exists(SSL_CTX_set1_client_cert_type "openssl/ssl.h" RELAYWEAVE_HAS_RPK)
+unset(CMAKE_REQUIRED_LIBRARIES)
+if(NOT RELAYWEAVE_HAS_RPK)
+    message(FATAL_ERROR "OpenSSL must be built with raw public key (RPK) support")
+endif()
 
 add_library(asio INTERFACE)
 target_include_directories(asio INTERFACE "${CMAKE_SOURCE_DIR}/vendor/asio-1.38.2/include")

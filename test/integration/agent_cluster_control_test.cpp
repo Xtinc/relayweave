@@ -1,6 +1,8 @@
+#include "stream_attach.h"
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
+#include "forwarder.h"
 #include "relay_node.h"
 #include "node_session.h"
 #include "xfr_channel.h"
@@ -22,7 +24,8 @@ TEST_MEMBER(RelayNode, registry_)
 TEST_MEMBER(RelayNode, relay_sessions_)
 TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(AgentControl, service_locations_)
-TEST_MEMBER(RelayAgent, connections_)
+TEST_MEMBER(RelayAgent, connection_)
+TEST_MEMBER(RelayAgent, forwarder_)
 
 namespace
 {
@@ -106,8 +109,6 @@ NodeConfig server_config(std::string node_id, ClusterConfig::Role role, std::uin
     config.tcp.address = "127.0.0.1";
     config.tcp.port = transfer_port;
     config.tcp.setup_timeout = 1s;
-    config.tls.address = "127.0.0.1";
-    config.tls.port = unused_port(port_io, used);
     config.datagram.address = "127.0.0.1";
     config.datagram.port = datagram_port;
     config.channel = channel_config();
@@ -207,8 +208,8 @@ asio::awaitable<void> verify_entries(RelayAgent &consumer, const std::vector<std
 
 asio::awaitable<void> verify_primary_reconnect(RelayAgent &consumer, std::vector<tcp::socket> &clients)
 {
-    const auto &connections = test_access::RelayAgent_connections_(consumer);
-    const auto original = connections.primary()->route().channel;
+    const auto &connection = test_access::RelayAgent_connection_(consumer);
+    const auto original = connection.route().channel;
     original.lock()->disconnect();
     for (auto &client : clients)
     {
@@ -220,7 +221,7 @@ asio::awaitable<void> verify_primary_reconnect(RelayAgent &consumer, std::vector
     }
     clients.clear();
     const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (!connections.primary()->ready() || !original.expired())
+    while (!connection.ready() || !original.expired())
     {
         require(std::chrono::steady_clock::now() < deadline, "Primary did not reconnect after disconnection");
         asio::steady_timer timer(co_await asio::this_coro::executor, 10ms);
@@ -304,21 +305,21 @@ asio::awaitable<void> verify_unavailable(RelayAgent &consumer, const std::vector
     require(locations.at({"late-udp", RelayProtocol::Udp}).node.empty(), "Offline UDP service became available");
 }
 
-asio::awaitable<void> verify_late_udp(const std::shared_ptr<RelayNode> &node, std::uint16_t forward_port)
+asio::awaitable<void> verify_late_udp(RelayAgent &agent, std::uint16_t forward_port)
 {
     const auto executor = co_await asio::this_coro::executor;
     const auto deadline = std::chrono::steady_clock::now() + 8s;
     for (;;)
     {
-        const auto &sessions = test_access::RelayNode_relay_sessions_(*node);
-        if (std::ranges::any_of(sessions, [](const auto &session) {
-                const auto report = session->status_report();
-                return report && report->at("service") == "late-udp";
-            }))
+        const auto &locations = test_access::AgentControl_service_locations_(test_access::RelayAgent_control_(agent));
+        const auto location = locations.find({"late-udp", RelayProtocol::Udp});
+        if (location != locations.end() && !location->second.node.empty())
         {
+            co_await asio::co_spawn(test_access::RelayAgent_forwarder_(agent)->executor(),
+                []() -> asio::awaitable<void> { co_return; }, asio::use_awaitable);
             break;
         }
-        require(std::chrono::steady_clock::now() < deadline, "Late UDP producer did not establish proactively");
+        require(std::chrono::steady_clock::now() < deadline, "Late UDP producer was not discovered");
         asio::steady_timer timer(executor, 20ms);
         co_await timer.async_wait(asio::use_awaitable);
     }
@@ -340,15 +341,15 @@ asio::awaitable<std::shared_ptr<TLSChannel>> connect_control(asio::ssl::context 
     co_return channel;
 }
 
-asio::awaitable<tcp::socket> attach_stream(const njson &endpoint, int role)
+asio::awaitable<tcp::socket> attach_stream(const std::shared_ptr<TLSChannel> &control, const njson &endpoint, int role)
 {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
     co_await socket.async_connect({asio::ip::make_address(endpoint.at("data_address").get<std::string>()),
                                   config::message_data_port(endpoint)}, asio::use_awaitable);
-    const auto frame = WireMessage::pack(RelayAttach::to_msg({role,
-        endpoint.at("uuid").get<std::uint64_t>(), endpoint.at("ticket").get<std::uint64_t>()}));
-    co_await asio::async_write(socket, asio::buffer(frame), asio::use_awaitable);
+    co_await attach_stream_control(socket, control, {role,
+        endpoint.at("uuid").get<std::uint64_t>(), endpoint.at("ticket").get<std::uint64_t>()},
+        endpoint.at("node_id").get<std::string>());
     co_return socket;
 }
 
@@ -370,11 +371,10 @@ asio::awaitable<void> verify_attach_wait(asio::ssl::context &context, std::uint1
         const auto offer = co_await producer->async_receive(2s);
         require(opened.type() == CtrlCommand::RelayOpened && offer.type() == CtrlCommand::RelayOffer,
                 "Delayed attach did not get endpoints");
-        auto consumer_data = co_await attach_stream(*opened.params, RelayAttach::Consumer);
+        auto consumer_data = co_await attach_stream(consumer, *opened.params, RelayAttach::Consumer);
         if (request == 1)
         {
             const std::string payload = "delayed-peer";
-            co_await asio::async_write(consumer_data, asio::buffer(payload), asio::use_awaitable);
             bool waiting = false;
             try
             {
@@ -386,10 +386,11 @@ asio::awaitable<void> verify_attach_wait(asio::ssl::context &context, std::uint1
                           error.code() == asio::error::operation_aborted;
             }
             require(waiting, "Relay became ready or failed before its producer attached");
-            auto producer_data = co_await attach_stream(*offer.params, RelayAttach::Producer);
+            auto producer_data = co_await attach_stream(producer, *offer.params, RelayAttach::Producer);
             require((co_await consumer->async_receive(1s)).type() == CtrlCommand::RelayReady &&
                     (co_await producer->async_receive(1s)).type() == CtrlCommand::RelayReady,
                     "Delayed second attach did not wake both sides");
+            co_await asio::async_write(consumer_data, asio::buffer(payload), asio::use_awaitable);
             std::string received(payload.size(), '\0');
             co_await asio::async_read(producer_data, asio::buffer(received), asio::cancel_after(1s, asio::use_awaitable));
             require(received == payload, "Data did not cross the delayed relay");
@@ -508,16 +509,16 @@ int main()
             nodes.back()->start();
         });
         asio::co_spawn(control_io, verify_entries(*agents.back(), nodes, forwards, clients), asio::use_future).get();
-        asio::co_spawn(control_io, verify_late_udp(nodes[9], udp_forward), asio::use_future).get();
+        asio::co_spawn(control_io, verify_late_udp(*agents.back(), udp_forward), asio::use_future).get();
         asio::co_spawn(control_io, verify_primary_reconnect(*agents.back(), clients), asio::use_future).get();
         asio::co_spawn(control_io, verify_entries(*agents.back(), nodes, forwards, clients), asio::use_future).get();
-        asio::co_spawn(control_io, verify_late_udp(nodes[9], udp_forward), asio::use_future).get();
+        asio::co_spawn(control_io, verify_late_udp(*agents.back(), udp_forward), asio::use_future).get();
         agents.back()->stop();
         asio::co_spawn(control_io, wait_empty(nodes), asio::use_future).get();
         asio::co_spawn(control_io, verify_detach(client_context, primary_port, nodes), asio::use_future).get();
         asio::co_spawn(control_io, verify_attach_wait(client_context, primary_port, entry_ports[0], nodes),
                        asio::use_future).get();
-        std::cout << "[PASS] Late producer/Node recovery, proactive UDP, delayed attach, timeout and cancellation\n";
+        std::cout << "[PASS] Late producer/Node recovery, one-shot UDP setup, delayed attach, timeout and cancellation\n";
         std::cout << "[PASS] Ten entrances share one Agent control; disconnection closes old business and reconnect establishes new business\n";
         return 0;
     }

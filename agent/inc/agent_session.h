@@ -41,6 +41,22 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
         std::optional<asio::ip::udp::socket> target;
         DatagramHeader::Buffer session_header{};
         std::size_t maximum_payload = DatagramHeader::maximum_user_payload;
+        asio::ip::udp::endpoint local_peer;
+        std::optional<BytesBuf> first_packet;
+        std::chrono::steady_clock::time_point last_activity;
+    };
+
+    /** @brief Retain the parsed Node attachment on transfer_io; Flow identity is absent for single-node relays. */
+    struct RelayEndpoint
+    {
+        /** @brief Parse and validate an attachment before installing it in a session. */
+        static RelayEndpoint from_params(const njson &params, RelayProtocol protocol);
+        std::uint64_t uuid = 0;
+        std::uint64_t ticket = 0;
+        std::string address;
+        std::uint16_t port = 0;
+        std::uint64_t session_id = 0;
+        std::optional<std::uint64_t> flow_id;
     };
 
     bool producer() const
@@ -52,6 +68,17 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
     void fail(std::string cause);
     void close_io();
     asio::awaitable<void> attach();
+    /** @brief Authenticate the peer and confirm the service before touching the TLS Producer target. */
+    asio::awaitable<void> establish_tls();
+    /** @brief Complete TLS shutdown and carrier EOF on transfer_io within one disconnect deadline. */
+    asio::awaitable<void> finish_tls();
+    /** @brief Connect the Producer local TCP target within the original setup deadline. */
+    asio::awaitable<void> connect_target();
+    /** @brief Limit one setup operation to its remaining absolute establishment budget. */
+    std::chrono::steady_clock::duration remaining(std::chrono::steady_clock::duration timeout) const;
+    enum class Phase { Opening, TunnelReady, Ready };
+    bool ready() const { return phase == Phase::Ready; }
+    bool tunnel_ready() const { return phase >= Phase::TunnelReady; }
 
     Forwarder &owner;
     std::uint64_t request;
@@ -59,13 +86,13 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
     std::string destination;
     std::chrono::steady_clock::time_point deadline;
     RelaySelection selection;
-    njson endpoint;
+    std::optional<RelayEndpoint> endpoint;
     std::optional<std::size_t> forward;
     std::optional<AgentServiceConfig> target;
     using Data = std::variant<StreamData, DatagramData>;
     Data data;
     asio::steady_timer changed;
-    bool ready = false;
+    Phase phase = Phase::Opening;
     bool node_closed = false;
     std::string reason;
 };

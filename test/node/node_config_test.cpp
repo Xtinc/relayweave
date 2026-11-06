@@ -37,14 +37,6 @@ void verify_server_config()
     require(modern.tcp.traffic.rx_bytes_per_second == 1001 && modern.tcp.traffic.rx_burst_bytes == 1002 &&
                 modern.tcp.traffic.tx_bytes_per_second == 1003 && modern.tcp.traffic.tx_burst_bytes == 1004,
             "Modern server TCP traffic limits were not parsed");
-    require(modern.tls.address == "127.0.0.1" && modern.tls.port == 18446,
-            "TLS data listener was not parsed");
-    require(modern.tls.max_setup_connections == 8 && modern.tls.max_relays == 10 &&
-                modern.tls.setup_timeout == 1800ms,
-            "TLS data limits were not parsed");
-    require(modern.tls.traffic.rx_bytes_per_second == 3001 && modern.tls.traffic.rx_burst_bytes == 3002 &&
-                modern.tls.traffic.tx_bytes_per_second == 3003 && modern.tls.traffic.tx_burst_bytes == 3004,
-            "TLS data traffic limits were not parsed independently");
     require(modern.datagram.address == "127.0.0.1" && modern.datagram.port == 18445,
             "UDP listener was not parsed");
     require(modern.datagram.max_relays == 11 && modern.datagram.setup_timeout == 2500ms,
@@ -139,13 +131,13 @@ void verify_server_config()
         candidate["bandwidth_mbps"] = invalid;
         require_rejected(candidate, "invalid bandwidth_mbps");
     }
-    for (const auto *object : {"bandwidth_mbps", "control", "cluster", "tcp", "tls", "udp", "certificate"})
+    for (const auto *object : {"bandwidth_mbps", "control", "cluster", "tcp", "udp", "certificate"})
     {
         auto candidate = baseline;
         candidate.erase(object);
         require_rejected(std::move(candidate), std::string("missing ") + object);
     }
-    for (const auto *object : {"control", "tcp", "tls", "udp"})
+    for (const auto *object : {"control", "tcp", "udp"})
     {
         for (const auto *field : {"address", "port"})
         {
@@ -236,13 +228,13 @@ void verify_server_config()
         candidate["log"]["debug_enable"] = "yes";
         require_rejected(std::move(candidate), "non-boolean log.debug_enable");
     }
-    for (const auto *object : {"tcp", "tls", "udp"})
+    for (const auto *object : {"tcp", "udp"})
     {
         auto candidate = baseline;
         candidate[object].erase("max_relays");
         require_rejected(std::move(candidate), std::string("missing ") + object + ".max_relays");
     }
-    for (const auto *field : {"listen", "data_listen", "tls_data", "udp_listen", "pipe"})
+    for (const auto *field : {"listen", "data_listen", "tls", "tls_data", "udp_listen", "pipe"})
     {
         auto candidate = baseline;
         candidate[field] = njson::object();

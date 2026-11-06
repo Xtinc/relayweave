@@ -7,6 +7,7 @@
 using namespace std::chrono_literals;
 using tcp = asio::ip::tcp;
 using udp = asio::ip::udp;
+TEST_MEMBER(LnkChannel, accepting_)
 
 void require(bool condition, const char *reason)
 {
@@ -56,7 +57,7 @@ void integration()
     {
         auto config = make_test_node_config();
         const auto address = "127.0.0." + std::to_string(i + 1);
-        config.control.address = config.control.advertise_address = config.tcp.address = config.tls.address =
+        config.control.address = config.control.advertise_address = config.tcp.address =
             config.datagram.address = address;
         config.cluster = {i == 0 ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave,
                           i == 0   ? "master"
@@ -81,7 +82,7 @@ void integration()
     try
     {
         auto scenario = [&]() -> asio::awaitable<void> {
-            LinkResult warm;
+            test_node::LinkResult warm;
             for (int tries = 0; tries < 100; ++tries)
             {
                 warm = co_await test_node::ensure_link(nodes[0], "a", "b", RelayProtocol::Tcp);
@@ -102,7 +103,7 @@ void integration()
             require(!denied && denied.stage == "ensure", "slave was allowed to coordinate");
             for (auto transport : {RelayProtocol::Tcp, RelayProtocol::Udp})
             {
-                asio::experimental::channel<void(asio::error_code, LinkResult)> results(control, 2);
+                asio::experimental::channel<void(asio::error_code, test_node::LinkResult)> results(control, 2);
                 auto call = [&]() -> asio::awaitable<void> {
                     auto link = co_await test_node::ensure_link(nodes[0], "master", "a", transport);
                     results.try_send(asio::error_code{}, std::move(link));
@@ -168,7 +169,7 @@ void integration()
         nodes[0] = std::make_shared<RelayNode>(control, transfer, datagram, data, ssl, configurations[0]);
         nodes[0]->start();
         auto new_epoch = [&]() -> asio::awaitable<void> {
-            LinkResult result;
+            test_node::LinkResult result;
             for (int tries = 0; tries < 350; ++tries)
             {
                 result = co_await test_node::ensure_link(nodes[0], "master", "a", RelayProtocol::Tcp);
@@ -184,7 +185,7 @@ void integration()
             bad.cluster.tcp_port = tcp_port(data);
             nodes[2] = std::make_shared<RelayNode>(control, transfer, datagram, data, ssl, bad);
             nodes[2]->start();
-            LinkResult mismatch;
+            test_node::LinkResult mismatch;
             for (int tries = 0; tries < 100; ++tries)
             {
                 mismatch = co_await test_node::ensure_link(nodes[0], "master", "b", RelayProtocol::Tcp);
@@ -420,14 +421,14 @@ void data_failures()
             auto udp_received = co_await port->receive();
             require(std::ranges::equal(udp_received.bytes(), valid_payload),
                     "malformed maximum-size UDP frame entered the flow");
-            require(udp_received.allocation_size() == valid_payload.size(),
+            require(udp_received.size() == valid_payload.size(),
                     "small UDP payload retained a maximum-size receive block");
             for (const auto length : {std::size_t{0}, std::size_t{64}, std::size_t{512}, LnkFrameHeader::maximum_payload})
             {
                 const BytesBuf expected(length, 0x7b);
                 co_await send_payload(expected);
                 auto received = co_await port->receive();
-                require(std::ranges::equal(received.bytes(), expected) && received.allocation_size() == length,
+                require(std::ranges::equal(received.bytes(), expected) && received.size() == length,
                         "UDP payload changed or was not allocated at its actual length");
                 require(std::ranges::equal(udp_received.bytes(), valid_payload),
                         "reusing the UDP receive array overwrote an earlier delivery");
@@ -709,6 +710,38 @@ void data_failures()
     tcp::acceptor rollback_probe(io, {asio::ip::address_v4::loopback(), rollback_port});
 }
 
+// A bootstrap task owns its socket; stop only borrows it through the pending index.
+void pending_accept_ownership()
+{
+    asio::io_context io(1);
+    const auto tp = tcp_port(io);
+    const auto up = udp_port(io);
+    auto module = std::make_shared<FlowProtocol>(io.get_executor(), io.get_executor(), "pending", "127.0.0.1", tp,
+                                               "127.0.0.1", up);
+    module->links().start();
+    module->activate();
+    tcp::socket peer(io);
+    const auto scenario = [&]() -> asio::awaitable<void> {
+        co_await peer.async_connect({asio::ip::address_v4::loopback(), tp}, asio::use_awaitable);
+        auto &pending = test_access::LnkChannel_accepting_(module->links());
+        const auto deadline = std::chrono::steady_clock::now() + 1s;
+        while (pending.empty() && std::chrono::steady_clock::now() < deadline)
+        {
+            co_await pause(1ms);
+        }
+        const bool indexed = pending.size() == 1;
+        const bool stopped = co_await module->stop();
+        require(indexed, "unauthenticated socket was not indexed");
+        require(stopped && pending.empty(), "bootstrap shutdown retained a borrowed socket");
+    };
+    auto result = asio::co_spawn(io, scenario(), asio::use_future);
+    io.run();
+    result.get();
+    const std::weak_ptr<FlowProtocol> lifetime = module;
+    module.reset();
+    require(lifetime.expired() && io.stopped(), "bootstrap task retained its protocol after stop");
+}
+
 // A delayed activation must not revive data tasks after shutdown has completed.
 void delayed_activation()
 {
@@ -800,6 +833,7 @@ int main()
     {
         integration();
         data_failures();
+        pending_accept_ownership();
         delayed_activation();
         concurrent_stop();
         notification_overflow();

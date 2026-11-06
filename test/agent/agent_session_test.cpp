@@ -1,3 +1,4 @@
+#include "test_data.h"
 #include "agent_session.h"
 #include "forwarder.h"
 #include <array>
@@ -10,7 +11,7 @@ TEST_MEMBER(AgentSession, target)
 TEST_MEMBER(AgentSession, selection)
 TEST_MEMBER(AgentSession, endpoint)
 TEST_MEMBER(AgentSession, data)
-TEST_MEMBER(AgentSession, ready)
+TEST_MEMBER(AgentSession, phase)
 TEST_MEMBER(AgentSession, node_closed)
 TEST_MEMBER(AgentSession, reason)
 TEST_MEMBER(AgentSession, deadline)
@@ -26,8 +27,9 @@ struct AgentSessionTestAccess
         auto session = std::make_shared<AgentSession>(owner, 7, ServiceKey{"drain-test", RelayProtocol::Tcp},
                                                      std::string{}, std::chrono::steady_clock::now() + std::chrono::seconds(2));
         test_access::AgentSession_target(*session) = AgentServiceConfig{"drain-test", "127.0.0.1", target_port};
-        test_access::AgentSession_endpoint(*session) = njson{{"data_address", "127.0.0.1"}, {"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
-                                 {"flow_id", std::uint64_t{3}}, {"data_port", entry_port}};
+        test_access::AgentSession_handle(*session, CtrlMessage(CtrlCommand::RelayOpened,
+            njson{{"data_address", "127.0.0.1"}, {"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
+                  {"flow_id", std::uint64_t{3}}, {"data_port", entry_port}}));
         return session;
     }
 
@@ -52,8 +54,8 @@ struct AgentSessionTestAccess
                     auto session = std::make_shared<AgentSession>(
                         owner, 7, ServiceKey{"close-test", protocol}, std::string{},
                         std::chrono::steady_clock::now() + std::chrono::seconds(2));
-                    test_access::AgentSession_endpoint(*session) = njson{{"uuid", std::uint64_t{1}}};
-                    test_access::AgentSession_ready(*session) = true;
+                    test_access::AgentSession_endpoint(*session).emplace().uuid = 1;
+                    test_access::AgentSession_phase(*session) = std::remove_reference_t<decltype(test_access::AgentSession_phase(*session))>::Ready;
                     if (protocol == RelayProtocol::Udp)
                     {
                         std::get<1>(test_access::AgentSession_data(*session)).transfer.open(asio::ip::udp::v4());
@@ -105,14 +107,23 @@ struct AgentSessionTestAccess
         }
     }
 
-    static asio::awaitable<void> expired_endpoint(Forwarder &owner)
+    static void validate_endpoint(Forwarder &owner)
     {
-        auto session = producer(owner, 1, 0);
-        test_access::AgentSession_deadline(*session) = std::chrono::steady_clock::now();
-        co_await session->run();
-        if (test_access::AgentSession_reason(*session).find("data_port is outside the valid range") == std::string::npos)
+        auto session = std::make_shared<AgentSession>(owner, 7, ServiceKey{"endpoint-test", RelayProtocol::Tcp},
+                                                     std::string{}, std::chrono::steady_clock::now());
+        bool rejected = false;
+        try
         {
-            throw std::runtime_error("Expired establishment deadline hid the original attachment failure");
+            test_access::AgentSession_handle(*session, CtrlMessage(CtrlCommand::RelayOpened,
+                njson{{"data_address", "127.0.0.1"}, {"uuid", 1U}, {"ticket", 2U}, {"data_port", 0U}}));
+        }
+        catch (const std::invalid_argument &error)
+        {
+            rejected = std::string_view(error.what()) == "data_port is outside the valid range";
+        }
+        if (!rejected || test_access::AgentSession_endpoint(*session))
+        {
+            throw std::runtime_error("Invalid attachment changed endpoint state or hid its original error");
         }
     }
 
@@ -141,30 +152,38 @@ enum class End
 {
     Normal,
     LateNodeClose,
+    SlowGreeting,
     Reset,
     Cancel,
     CancelEmpty,
 };
 
 asio::awaitable<void> exchange(AgentSession &session, tcp::acceptor &target, tcp::acceptor &entry, End end,
-                               const bool &session_finished)
+                               const bool &session_finished, const std::shared_ptr<TLSChannel> &control)
 {
     auto application = co_await target.async_accept(asio::cancel_after(1s, asio::use_awaitable));
     auto node = co_await entry.async_accept(asio::cancel_after(1s, asio::use_awaitable));
-    auto attach = WireMessage::pack(RelayAttach::to_msg({RelayAttach::Producer, 1, 2}));
-    BytesBuf received_attach(attach.size());
-    co_await asio::async_read(node, asio::buffer(received_attach), asio::cancel_after(1s, asio::use_awaitable));
-    if (received_attach != attach)
+    if (end == End::SlowGreeting)
     {
-        throw std::runtime_error("Agent data attachment changed");
+        asio::steady_timer greeting(co_await asio::this_coro::executor, 1200ms);
+        co_await greeting.async_wait(asio::use_awaitable);
+    }
+    RelayAttach::ConnectionId id{};
+    id[0] = 13;
+    co_await asio::async_write(node, asio::buffer(id), asio::use_awaitable);
+    const auto attachment = RelayAttach::from_msg(co_await control->async_receive(1s));
+    if (!attachment.connection_id || *attachment.connection_id != id || attachment.role != RelayAttach::Producer ||
+        attachment.uuid != 1 || attachment.ticket != 2)
+    {
+        throw std::runtime_error("Agent control attachment changed");
     }
     AgentSessionTestAccess::ready(session);
 
-    if (end == End::Normal || end == End::LateNodeClose)
+    if (end == End::Normal || end == End::LateNodeClose || end == End::SlowGreeting)
     {
         const std::array<std::uint8_t, 3> payload{1, 2, 3};
         co_await asio::async_write(node, asio::buffer(payload), asio::use_awaitable);
-        if (end == End::Normal)
+        if (end != End::LateNodeClose)
         {
             AgentSessionTestAccess::closed(session);
         }
@@ -224,31 +243,48 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
                                asio::ssl::context &ssl, End end)
 {
     auto agent = std::make_shared<RelayAgent>(control, transfer, ssl, AgentConfig{});
-    auto owner = std::make_unique<Forwarder>(*agent, transfer.get_executor(), ssl, std::nullopt,
-                                            1s, 1s, 2s, std::vector<AgentServiceConfig>{},
-                                            std::vector<AgentForwardConfig>{});
+    AgentConfig config;
+    config.channel.handshake_timeout = 1s;
+    config.connect_timeout = 1s;
+    config.relay_open_timeout = 2s;
+    auto owner = std::make_unique<Forwarder>(*agent, transfer.get_executor(), ssl, config);
     owner->start();
     if (end == End::Normal)
     {
         AgentSessionTestAccess::validate_close_messages(*owner);
-        co_await AgentSessionTestAccess::expired_endpoint(*owner);
+        AgentSessionTestAccess::validate_endpoint(*owner);
     }
     tcp::acceptor target(transfer, {asio::ip::address_v4::loopback(), 0});
     tcp::acceptor entry(transfer, {asio::ip::address_v4::loopback(), 0});
     auto session = AgentSessionTestAccess::producer(*owner, target.local_endpoint().port(), entry.local_endpoint().port());
+    asio::ssl::context server_ssl(asio::ssl::context::tls);
+    const auto files = test_data::directory();
+    server_ssl.use_certificate_chain_file((files / "tls_channel_test_server.pem").string());
+    server_ssl.use_private_key_file((files / "tls_channel_test_server.key").string(), asio::ssl::context::pem);
+    server_ssl.load_verify_file((files / "tls_channel_test_client_ca.pem").string());
+    tcp::acceptor control_listener(transfer, {asio::ip::address_v4::loopback(), 0});
+    tcp::socket control_socket(transfer);
+    co_await control_socket.async_connect(control_listener.local_endpoint(), asio::use_awaitable);
+    auto peer = std::make_shared<TLSChannel>(co_await control_listener.async_accept(asio::use_awaitable),
+                                           server_ssl, TLSChannelRole::S);
+    auto channel = std::make_shared<TLSChannel>(std::move(control_socket), ssl, TLSChannelRole::C);
+    co_await await_transfers(peer->start({}), channel->start("localhost"));
+    test_access::AgentSession_selection(*session).server = ServerRoute{channel, "test-node"};
     bool session_finished = false;
     const auto run_session = [&]() -> asio::awaitable<void> {
         co_await session->run();
         session_finished = true;
     };
-    co_await await_transfers(run_session(), exchange(*session, target, entry, end, session_finished));
-    if (end != End::Normal && end != End::LateNodeClose)
+    co_await await_transfers(run_session(), exchange(*session, target, entry, end, session_finished, peer));
+    if (end != End::Normal && end != End::LateNodeClose && end != End::SlowGreeting)
     {
         session->cancel("late cancellation");
     }
     const auto expected_reason = end == End::Cancel ? "test stop" : (end == End::CancelEmpty ? "relay cancelled" : "");
     AgentSessionTestAccess::verify(*session, expected_reason, end == End::Reset);
     co_await owner->async_stop();
+    co_await channel->async_disconnect();
+    co_await peer->async_disconnect();
 }
 
 } // namespace
@@ -258,7 +294,11 @@ int main()
     try
     {
         asio::ssl::context ssl(asio::ssl::context::tls_client);
-        for (const auto end : {End::Normal, End::LateNodeClose, End::Reset, End::Cancel, End::CancelEmpty})
+        const auto files = test_data::directory();
+        ssl.use_certificate_chain_file((files / "tls_channel_test_client.pem").string());
+        ssl.use_private_key_file((files / "tls_channel_test_client.key").string(), asio::ssl::context::pem);
+        ssl.load_verify_file((files / "tls_channel_test_ca.pem").string());
+        for (const auto end : {End::Normal, End::LateNodeClose, End::SlowGreeting, End::Reset, End::Cancel, End::CancelEmpty})
         {
             asio::io_context control(1);
             asio::io_context transfer(1);

@@ -5,7 +5,7 @@
 | 文件 / 可执行目标 | 测量问题 | 关键指标 |
 |---|---|---|
 | `tcp_relay_benchmark.cpp` / `benchmark_tcp_relay` | TCP relay 相对直连的转发成本；1400 B / 32 KiB 块 | 双向业务吞吐、块/秒、CPU 时间；直连使用相同生成与校验逻辑 |
-| `tls_relay_benchmark.cpp` / `benchmark_tls_relay` | TLS 1.2 / 1.3 的 TLS↔TLS 与 TCP↔TLS relay 成本 | 双向业务吞吐、CPU 时间；握手单独计时，记录协商版本和密码套件 |
+| `tls_relay_benchmark.cpp` / `benchmark_tls_relay` | TLS 1.3 双向 RPK 的 Agent TCP↔TLS relay 成本 | 双向业务吞吐、CPU 时间；握手单独计时，记录协商版本和密码套件 |
 | `udp_relay_benchmark.cpp` / `benchmark_udp_relay` | UDP relay 的往返成本与持续双向发包能力；1400 B 业务报文 | RTT p50/p95/p99、发包/转发 pps、业务吞吐、各方向接收量、丢包率、乱序数 |
 | `flow_benchmark.cpp` / `benchmark_flow` | Flow 复用与多跳转发的开销 | 终点吞吐、每流发送等待 p50/p95/p99、CPU、RSS、各节点缓存与载荷池占用 |
 | `congestion_benchmark.cpp` / `benchmark_congestion` | 带宽降低、恢复与单流暂停时的信用流控及背压能力 | 稳态吞吐、收敛时间、超额字节、公平性、健康流进展、缓存上限与排空 |
@@ -79,7 +79,7 @@ CLI 的 Mbps 是每方向聚合目标，0 表示不限速；双向实验的汇�
 收敛定义为至少 500 ms 的滑动窗口连续三次进入目标 ±10%，包含约 0.7 秒的统计观察下限。后半阶段吞吐用于稳态比较；未达到目标保留原始结果，不等同于功能失败。`phases.csv` 另存正向超额字节、阶段净超额字节、Jain 公平指数（1 表示等份）及健康流最低/最高吞吐，`flows.csv` 的等待分位数为直方图微秒上界。
 
 流控的数学模型、固定容量参数、节点 20 ms 批次与各场景扫描结论统一见
-[RelayNode 的逐跳信用、流控与容量设计](../docs/RelayNode设计.md#5-逐跳信用流控与容量)。
+[RelayWeave 逐跳信用流控机制](../docs/RelayWeave设计.md#54-逐跳信用流控机制-hop-by-hop-credit-flow-control)。
 精确期限、即时刷新及多 Flow 批次隔离由 `lnk_flow_control` 回归验证；
 本目录的普通 Flow、拥塞与网络基准用于测量吞吐、等待和实际内存。
 

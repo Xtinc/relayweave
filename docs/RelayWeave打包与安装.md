@@ -1,5 +1,8 @@
 # RelayWeave 打包与安装
 
+端到端 TLS 需要支持 RPK 的 OpenSSL **3.2 或更高版本**，编译与部署运行库均须满足。此次数据接入协议要求所有 Node/Agent 统一升级，不兼容旧版。Node 删除独立 `tls` 数据配置，TCP/TLS 共用原 `tcp` 端口、容量和限速；升级前删除 Node 配置中的 `tls` 段。Agent 凭据不变，双方对应 service/forward 的 `protocol: "tls"` 即启用端到端加密。
+
+
 本文集中说明 RelayWeave 的 CMake/CPack Debian 打包、版本和架构命名、文件布局、systemd 服务生命周期、安装、升级、卸载和排错。系统原理见 [RelayWeave 设计](RelayWeave设计.md)，证书生成和信任关系见 [证书制作与部署](证书制作与部署.md)。
 
 ## 1. 包与版本
@@ -45,7 +48,7 @@ Dashboard 是纯 Python 包，架构固定为 `all`。构建时只复制源码�
 
 - CMake 3.21；
 - 支持 C++20 的编译器；
-- OpenSSL headers 和 libraries；
+- 支持 RPK 的 OpenSSL 3.2+ headers 和 libraries；
 - pthread；
 - Debian 打包工具，包括 `dpkg-shlibdeps`；
 - Bash，用于项目包装脚本。

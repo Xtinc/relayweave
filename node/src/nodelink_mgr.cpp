@@ -6,31 +6,16 @@
 #include <utility>
 using namespace std::chrono_literals;
 
-static_assert(NodeLinkMgr::max_flow_nodes <= std::numeric_limits<std::uint8_t>::digits);
-
-static CtrlCommand event_command(lnk::EventKind kind)
+namespace
 {
-    switch (kind)
-    {
-    case lnk::EventKind::LinkPrepared:
-        return CtrlCommand::LinkPrepared;
-    case lnk::EventKind::LinkReady:
-        return CtrlCommand::LinkReady;
-    case lnk::EventKind::LinkError:
-        return CtrlCommand::LinkError;
-    case lnk::EventKind::LinkClosed:
-        return CtrlCommand::LinkClosed;
-    case lnk::EventKind::FlowPrepared:
-        return CtrlCommand::FlowPrepared;
-    case lnk::EventKind::FlowCommitted:
-        return CtrlCommand::FlowCommitted;
-    case lnk::EventKind::FlowError:
-        return CtrlCommand::FlowError;
-    case lnk::EventKind::FlowClosed:
-        return CtrlCommand::FlowClosed;
-    }
-    throw std::logic_error("unknown protocol event");
-}
+constexpr auto link_setup_timeout = 10s;
+constexpr auto flow_setup_timeout = 10s;
+constexpr auto flow_close_timeout = 10s;
+constexpr auto remote_open_timeout = 30s;
+constexpr auto max_flow_ttl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(flow_setup_timeout).count();
+} // namespace
+
+static_assert(NodeLinkMgr::max_flow_nodes <= std::numeric_limits<std::uint8_t>::digits);
 
 static bool valid_flow_path(const std::vector<std::string> &path)
 {
@@ -49,14 +34,50 @@ static bool valid_flow_path(const std::vector<std::string> &path)
     return true;
 }
 
+njson NodeLinkMgr::LinkParams::to_params(std::string_view node) const
+{
+    njson p{{"id", id},
+            {"epoch", epoch},
+            {"master", master},
+            {"left", left},
+            {"right", right},
+            {"transport", relay_protocol_name(transport)},
+            {"token", token},
+            {"left_address", left_address},
+            {"right_address", right_address},
+            {"tcp_port", tcp_port},
+            {"udp_port", udp_port}};
+    if (!node.empty())
+    {
+        p["peer"] = node == left ? right : left;
+        p["peer_address"] = node == left ? right_address : left_address;
+    }
+    return p;
+}
+
+njson NodeLinkMgr::FlowParams::identity_params() const
+{
+    return {{"epoch", epoch}, {"master", master}, {"flow_id", id}, {"request_id", request_id}};
+}
+
+njson NodeLinkMgr::FlowParams::to_params() const
+{
+    auto p = identity_params();
+    p["path"] = path;
+    p["addresses"] = addresses;
+    p["links"] = links;
+    p["transport"] = relay_protocol_name(transport);
+    return p;
+}
+
 NodeLinkMgr::NodeLinkMgr(asio::any_io_executor control, asio::any_io_executor data, ClusterConfig config,
                          std::string tcp_address, std::string udp_address, ClusterMgr &cluster, Topology &topology)
     : control_(control), config_(std::move(config)), cluster_(cluster), topology_(topology),
       protocol_(std::make_shared<FlowProtocol>(data, control, config_.node_id, std::move(tcp_address), config_.tcp_port,
                                                std::move(udp_address), config_.udp_port)),
-      done_(control)
+      events_done_(control)
 {
-    done_.expires_at(Clock::time_point::max());
+    events_done_.expires_at(Clock::time_point::max());
 }
 
 void NodeLinkMgr::start()
@@ -81,7 +102,7 @@ void NodeLinkMgr::activate()
                 PROXY_ERROR_PRINT("Node data notifications: %s", exception_description(error).c_str());
             }
             events_running_ = false;
-            done_.cancel();
+            events_done_.cancel();
         });
     });
 }
@@ -116,27 +137,26 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
             {
                 continue;
             }
-            const auto type = event_command(event.kind);
-            switch (type)
+            switch (event.command)
             {
             case CtrlCommand::LinkPrepared:
             case CtrlCommand::LinkReady:
             case CtrlCommand::LinkError:
             case CtrlCommand::LinkClosed: {
                 const auto id = event.id;
-                const auto endpoint = link_endpoints_.find(id);
-                if (endpoint == link_endpoints_.end() || endpoint->second.at("epoch") != event.epoch)
+                const auto endpoint = local_links_.find(id);
+                if (endpoint == local_links_.end() || endpoint->second.epoch != event.epoch)
                 {
                     continue;
                 }
-                auto params = endpoint->second;
+                auto params = endpoint->second.to_params(config_.node_id);
                 params["stage"] = std::move(event.stage);
                 params["reason"] = std::move(event.reason);
                 params.erase("token");
-                cluster_.send(std::string(topology_.master_id()), CtrlMessage(type, std::move(params)));
-                if (type == CtrlCommand::LinkError || type == CtrlCommand::LinkClosed)
+                cluster_.send(std::string(topology_.master_id()), CtrlMessage(event.command, std::move(params)));
+                if (event.command == CtrlCommand::LinkError || event.command == CtrlCommand::LinkClosed)
                 {
-                    link_endpoints_.erase(endpoint);
+                    local_links_.erase(endpoint);
                 }
                 break;
             }
@@ -145,26 +165,26 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
             case CtrlCommand::FlowError:
             case CtrlCommand::FlowClosed: {
                 const auto id = event.id;
-                const auto endpoint = flow_endpoints_.find(id);
-                if (endpoint == flow_endpoints_.end() || endpoint->second.at("epoch") != event.epoch)
+                const auto endpoint = local_flows_.find(id);
+                if (endpoint == local_flows_.end() || endpoint->second.params.epoch != event.epoch)
                 {
                     continue;
                 }
-                auto params = endpoint->second;
+                if (event.command == CtrlCommand::FlowCommitted)
+                {
+                    endpoint->second.committed = true;
+                }
+                if (event.command == CtrlCommand::FlowError || event.command == CtrlCommand::FlowClosed)
+                {
+                    notify_flow_closed(id, event.reason);
+                }
+                auto params = endpoint->second.params.identity_params();
                 params["stage"] = std::move(event.stage);
                 params["reason"] = std::move(event.reason);
-                if (type == CtrlCommand::FlowCommitted)
+                cluster_.send(std::string(topology_.master_id()), CtrlMessage(event.command, std::move(params)));
+                if (event.command == CtrlCommand::FlowError || event.command == CtrlCommand::FlowClosed)
                 {
-                    endpoint->second["committed"] = true;
-                }
-                if (type == CtrlCommand::FlowError || type == CtrlCommand::FlowClosed)
-                {
-                    flow_closed(id, params.value("reason", "flow closed"));
-                }
-                cluster_.send(std::string(topology_.master_id()), CtrlMessage(type, std::move(params)));
-                if (type == CtrlCommand::FlowError || type == CtrlCommand::FlowClosed)
-                {
-                    flow_endpoints_.erase(endpoint);
+                    local_flows_.erase(endpoint);
                 }
                 break;
             }
@@ -188,21 +208,19 @@ asio::awaitable<void> NodeLinkMgr::receive_events()
 asio::awaitable<void> NodeLinkMgr::shutdown()
 {
     running_ = false;
-    fail_remote_flows("node stopping");
-    while (!flow_requests_.empty())
+    fail_waiters("node stopping");
+    while (!paths_.empty())
     {
-        finish_flow(flow_requests_.begin()->second, "stop", "node stopping");
+        auto path = paths_.begin()->second;
+        close_path(path, "stop", "node stopping");
+        release_path(path, "node stopping");
     }
-    while (!closing_flows_.empty())
+    while (!shared_links_.empty())
     {
-        released(closing_flows_.begin()->second, "node stopping");
+        finish_link(shared_links_.begin()->second, "stop", "node stopping");
     }
-    while (!link_requests_.empty())
-    {
-        finish_link(link_requests_.begin()->second, "stop", "node stopping");
-    }
-    flow_endpoints_.clear();
-    link_endpoints_.clear();
+    local_flows_.clear();
+    local_links_.clear();
     const bool data_ok = co_await asio::co_spawn(protocol_->executor(), protocol_->stop(), asio::use_awaitable);
     stop_ok_ = data_ok && stop_ok_;
 }
@@ -211,135 +229,124 @@ asio::awaitable<bool> NodeLinkMgr::stop()
 {
     co_await asio::this_coro::reset_cancellation_state(asio::disable_cancellation());
     co_await shutdown();
-    while (events_running_ || flow_tasks_ != 0)
+    while (events_running_)
     {
-        co_await done_.async_wait(use_nothrow_awaitable);
+        co_await events_done_.async_wait(use_nothrow_awaitable);
     }
     co_return stop_ok_;
 }
 
-NodeLinkMgr::LinkRequest::LinkRequest(asio::any_io_executor executor, njson values)
-    : params(std::move(values)), timeout(executor), completed_event(executor)
+NodeLinkMgr::SharedLink::SharedLink(asio::any_io_executor executor, LinkParams values)
+    : params(std::move(values)), timeout(executor)
 {
 }
 
-NodeLinkMgr::LinkKey NodeLinkMgr::link_key(const njson &p)
-{
-    return {p.at("left").get<std::string>(), p.at("right").get<std::string>(),
-            parse_relay_protocol(p.at("transport").get_ref<const std::string &>())};
-}
-
-asio::awaitable<LinkResult> NodeLinkMgr::ensure_link(std::string left, std::string right, RelayProtocol transport)
+std::shared_ptr<NodeLinkMgr::SharedLink> NodeLinkMgr::start_link(std::string left, std::string right,
+                                                                 RelayProtocol transport)
 {
     if (!running_)
     {
-        co_return LinkResult{0, "ensure", "node links stopping or not started"};
+        throw std::runtime_error("node links stopping or not started");
     }
     if (!topology_.is_master())
     {
-        co_return LinkResult{0, "ensure", "only master can ensure node links"};
+        throw std::runtime_error("only master can ensure node links");
     }
-    if (left == right || transport == RelayProtocol::Tls)
-    {
-        co_return LinkResult{0, "ensure", "requires distinct nodes and tcp/udp transport"};
-    }
-
-    const auto &members = topology_.members();
-    if (!topology_.epoch() || !members.contains(left) || !members.contains(right))
-    {
-        co_return LinkResult{0, "ensure", "node is offline or membership unavailable"};
-    }
-
     if (right < left)
     {
         std::swap(left, right);
     }
 
-    njson params{{"left", left}, {"right", right}, {"transport", relay_protocol_name(transport)}};
     const LinkKey pair{left, right, transport};
-    std::shared_ptr<LinkRequest> request;
-    if (auto found = link_requests_.find(pair); found != link_requests_.end())
+    if (auto found = shared_links_.find(pair); found != shared_links_.end())
     {
-        request = found->second;
+        return found->second;
     }
-    else
+    if (shared_links_.size() >= 1000)
     {
-        if (link_requests_.size() >= 1000)
+        throw std::runtime_error("node link capacity exceeded");
+    }
+    const auto &members = topology_.members();
+    LinkParams params;
+    params.id = generate_random_id();
+    params.epoch = topology_.epoch();
+    params.master = topology_.master_id();
+    params.left = left;
+    params.right = right;
+    params.transport = transport;
+    params.token = std::to_string(generate_random_id()) + ":" + std::to_string(generate_random_id());
+    params.left_address = members.at(left);
+    params.right_address = members.at(right);
+    params.tcp_port = config_.tcp_port;
+    params.udp_port = config_.udp_port;
+    const auto request = std::make_shared<SharedLink>(control_, std::move(params));
+    shared_links_.emplace(pair, request);
+    request->timeout.expires_after(link_setup_timeout);
+    request->timeout.async_wait([this, request](asio::error_code error) {
+        if (!error)
         {
-            co_return LinkResult{0, "ensure", "node link capacity exceeded"};
+            finish_link(request, "timeout", "node link establishment exceeded 10 seconds");
         }
-        auto id = generate_random_id();
-        params["id"] = id;
-        params["epoch"] = topology_.epoch();
-        params["master"] = std::string(topology_.master_id());
-        params["token"] = std::to_string(generate_random_id()) + ":" + std::to_string(generate_random_id());
-        params["left_address"] = members.at(left);
-        params["right_address"] = members.at(right);
-        params["tcp_port"] = config_.tcp_port;
-        params["udp_port"] = config_.udp_port;
-        request = std::make_shared<LinkRequest>(control_, params);
-        link_requests_.emplace(pair, request);
-        request->timeout.expires_after(10s);
-        request->timeout.async_wait([this, request](asio::error_code error) {
-            if (!error)
-            {
-                finish_link(request, "timeout", "node link establishment exceeded 10 seconds");
-            }
-        });
-        for (auto &node : {left, right})
+    });
+    for (auto &node : {left, right})
+    {
+        auto prepare = request->params.to_params(node);
+        if (cluster_.send(node, CtrlMessage(CtrlCommand::LinkPrepare, std::move(prepare))) !=
+            ClusterMgr::SendResult::Submitted)
         {
-            auto prepare = params;
-            const auto &peer = node == left ? right : left;
-            prepare["peer"] = peer;
-            prepare["peer_address"] = members.at(peer);
-            if (cluster_.send(node, CtrlMessage(CtrlCommand::LinkPrepare, std::move(prepare))) !=
-                ClusterMgr::SendResult::Submitted)
-            {
-                finish_link(request, "control", "cluster control submission failed");
-                break;
-            }
+            finish_link(request, "control", "cluster control submission failed");
+            break;
         }
     }
-    if (request->completed)
-    {
-        co_return request->result;
-    }
-
-    co_await request->completed_event.wait();
-    if (!request->completed)
-    {
-        co_return LinkResult{0, "ensure", "ensure cancelled"};
-    }
-    co_return request->result;
+    return request;
 }
 
-bool NodeLinkMgr::send_both(const LinkRequest &request, CtrlCommand command)
+bool NodeLinkMgr::send_both(const SharedLink &request, CtrlCommand command)
 {
-    return cluster_.send(request.params.at("left"), CtrlMessage(command, request.params)) ==
-               ClusterMgr::SendResult::Submitted &&
-           cluster_.send(request.params.at("right"), CtrlMessage(command, request.params)) ==
+    auto params = request.params.to_params();
+    return cluster_.send(request.params.left, CtrlMessage(command, params)) == ClusterMgr::SendResult::Submitted &&
+           cluster_.send(request.params.right, CtrlMessage(command, std::move(params))) ==
                ClusterMgr::SendResult::Submitted;
 }
 
-void NodeLinkMgr::finish_link(std::shared_ptr<LinkRequest> request, std::string stage, std::string reason)
+void NodeLinkMgr::finish_link(std::shared_ptr<SharedLink> request, std::string stage, std::string reason)
 {
     if (request->completed && reason.empty())
     {
         return;
     }
     request->completed = true;
-    request->result = {request->params.at("id").get<std::uint64_t>(), std::move(stage), std::move(reason)};
+    request->stage = std::move(stage);
+    request->reason = std::move(reason);
     request->timeout.cancel();
-    if (!request->result)
+    if (!request->reason.empty())
     {
         send_both(*request, CtrlCommand::LinkClose);
-        auto found = link_requests_.find(link_key(request->params));
-        if (found != link_requests_.end() && found->second == request)
+        auto found = shared_links_.find({request->params.left, request->params.right, request->params.transport});
+        if (found != shared_links_.end() && found->second == request)
         {
-            link_requests_.erase(found);
+            shared_links_.erase(found);
         }
     }
-    request->completed_event.notify_all();
+    for (const auto &[id, path] : paths_)
+    {
+        if (path->phase != PathPhase::Linking)
+        {
+            continue;
+        }
+        const auto edge = std::ranges::find(path->params.links, request->params.id);
+        if (edge == path->params.links.end())
+        {
+            continue;
+        }
+        if (!request->reason.empty())
+        {
+            close_path(path, "links", request->stage + ": " + request->reason);
+            continue;
+        }
+        path->acknowledged |= static_cast<std::uint8_t>(1u << std::distance(path->params.links.begin(), edge));
+        prepare_path(path);
+    }
 }
 
 void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
@@ -356,130 +363,14 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
         }
         if (type == CtrlCommand::LinkPrepare || type == CtrlCommand::LinkConnect || type == CtrlCommand::LinkClose)
         {
-            if (source != topology_.master_id())
+            if (source == topology_.master_id())
             {
-                return;
-            }
-            if (type == CtrlCommand::LinkPrepare)
-            {
-                if (link_endpoints_.contains(id))
-                {
-                    return;
-                }
-                const auto left = p.at("left").get<std::string>();
-                const auto right = p.at("right").get<std::string>();
-                const auto peer = p.at("peer").get<std::string>();
-                if (!(left < right) || (config_.node_id != left && config_.node_id != right) ||
-                    peer != (config_.node_id == left ? right : left) || !topology_.members().contains(peer) ||
-                    p.at("peer_address") != topology_.members().at(peer))
-                {
-                    return;
-                }
-                const auto transport = parse_relay_protocol(p.at("transport").get<std::string>());
-                if (transport == RelayProtocol::Tls || p.at("token").get<std::string>().empty())
-                {
-                    return;
-                }
-                if (p.at("tcp_port") != config_.tcp_port || p.at("udp_port") != config_.udp_port)
-                {
-                    auto values = p;
-                    values["stage"] = "prepare";
-                    values["reason"] = "cluster data ports differ between nodes";
-                    cluster_.send(source, CtrlMessage(CtrlCommand::LinkError, values));
-                    return;
-                }
-                if (link_endpoints_.size() >= 1000)
-                {
-                    throw std::runtime_error("node link capacity exceeded");
-                }
-                link_endpoints_[id] = p;
-                asio::post(protocol_->executor(),
-                           [data = protocol_,
-                            spec = lnk::LinkSpec{id, epoch, transport, peer, p.at("peer_address").get<std::string>(),
-                                                 p.at("token").get<std::string>(), config_.tcp_port, config_.udp_port,
-                                                 config_.node_id == left}]() mutable {
-                               data->links().prepare(std::move(spec));
-                           });
-            }
-            else
-            {
-                auto found = link_endpoints_.find(id);
-                if (found == link_endpoints_.end())
-                {
-                    if (type == CtrlCommand::LinkClose)
-                    {
-                        cluster_.send(source, CtrlMessage(CtrlCommand::LinkClosed, p));
-                    }
-                    return;
-                }
-                const auto &authorized = found->second;
-                if (p.at("token") != authorized.at("token") || p.at("left") != authorized.at("left") ||
-                    p.at("right") != authorized.at("right") || p.at("transport") != authorized.at("transport"))
-                {
-                    return;
-                }
-                if (type == CtrlCommand::LinkConnect)
-                {
-                    asio::post(protocol_->executor(), [data = protocol_, id] { data->links().connect(id); });
-                }
-                else if (type == CtrlCommand::LinkClose)
-                {
-                    asio::post(protocol_->executor(), [data = protocol_, id] { data->links().close(id); });
-                }
-            }
-            return;
-        }
-
-        if (!topology_.is_master())
-        {
-            return;
-        }
-
-        auto found = link_requests_.find(link_key(p));
-        if (found == link_requests_.end())
-        {
-            return;
-        }
-
-        auto request = found->second;
-        if (request->params.at("id") != id ||
-            (source != p.at("left").get<std::string>() && source != p.at("right").get<std::string>()))
-        {
-            return;
-        }
-
-        const bool from_left = source == p.at("left").get<std::string>();
-        const std::uint8_t bit = from_left ? 1 : 2;
-        if (type == CtrlCommand::LinkError || type == CtrlCommand::LinkClosed)
-        {
-            auto reason = p.value("reason", "");
-            finish_link(request, p.value("stage", "remote"), reason.empty() ? "node link closed" : std::move(reason));
-        }
-        else if (!request->completed && type == CtrlCommand::LinkPrepared)
-        {
-            if (!(request->prepared & bit))
-            {
-                request->prepared |= bit;
-                if (request->prepared == 3)
-                {
-                    if (!send_both(*request, CtrlCommand::LinkConnect))
-                    {
-                        finish_link(request, "control", "cluster control submission failed");
-                    }
-                }
+                handle_link_command(type, p, id, epoch, source);
             }
         }
-        else if (!request->completed && type == CtrlCommand::LinkReady)
+        else if (topology_.is_master())
         {
-            if (!(request->prepared & bit))
-            {
-                return;
-            }
-            request->ready |= bit;
-            if (request->ready == 3)
-            {
-                finish_link(request, "ready", {});
-            }
+            handle_link_reply(type, p, id, source);
         }
     }
     catch (const std::exception &e)
@@ -488,9 +379,144 @@ void NodeLinkMgr::handle_link(CtrlCommand type, CtrlMessage message)
     }
 }
 
+void NodeLinkMgr::handle_link_command(CtrlCommand type, const njson &p, std::uint64_t id,
+                                      std::uint64_t epoch, const std::string &source)
+{
+    if (type == CtrlCommand::LinkPrepare)
+    {
+        if (local_links_.contains(id))
+        {
+            return;
+        }
+        auto left = p.at("left").get<std::string>();
+        auto right = p.at("right").get<std::string>();
+        auto peer = p.at("peer").get<std::string>();
+        if (!(left < right) || (config_.node_id != left && config_.node_id != right) ||
+            peer != (config_.node_id == left ? right : left) || !topology_.members().contains(peer) ||
+            p.at("peer_address") != topology_.members().at(peer))
+        {
+            return;
+        }
+        const auto transport = parse_relay_protocol(p.at("transport").get<std::string>());
+        auto token = p.at("token").get<std::string>();
+        if (transport == RelayProtocol::Tls || token.empty())
+        {
+            return;
+        }
+        if (p.at("tcp_port") != config_.tcp_port || p.at("udp_port") != config_.udp_port)
+        {
+            auto values = p;
+            values["stage"] = "prepare";
+            values["reason"] = "cluster data ports differ between nodes";
+            cluster_.send(source, CtrlMessage(CtrlCommand::LinkError, values));
+            return;
+        }
+        if (local_links_.size() >= 1000)
+        {
+            throw std::runtime_error("node link capacity exceeded");
+        }
+        lnk::LinkSpec spec{id,
+                           epoch,
+                           transport,
+                           std::move(peer),
+                           p.at("peer_address").get<std::string>(),
+                           token,
+                           config_.tcp_port,
+                           config_.udp_port,
+                           config_.node_id == left};
+        local_links_.emplace(
+            id, LinkParams{id, epoch, std::string(topology_.master_id()), std::move(left), std::move(right),
+                           transport, std::move(token), p.at("left_address").get<std::string>(),
+                           p.at("right_address").get<std::string>(), config_.tcp_port, config_.udp_port});
+        asio::post(protocol_->executor(), [data = protocol_, spec = std::move(spec)]() mutable {
+            data->links().prepare(std::move(spec));
+        });
+    }
+    else
+    {
+        auto found = local_links_.find(id);
+        if (found == local_links_.end())
+        {
+            if (type == CtrlCommand::LinkClose)
+            {
+                cluster_.send(source, CtrlMessage(CtrlCommand::LinkClosed, p));
+            }
+            return;
+        }
+        const auto &authorized = found->second;
+        if (p.at("token") != authorized.token || p.at("left") != authorized.left ||
+            p.at("right") != authorized.right || p.at("transport") != relay_protocol_name(authorized.transport))
+        {
+            return;
+        }
+        if (type == CtrlCommand::LinkConnect)
+        {
+            asio::post(protocol_->executor(), [data = protocol_, id] { data->links().connect(id); });
+        }
+        else
+        {
+            asio::post(protocol_->executor(), [data = protocol_, id] { data->links().close(id); });
+        }
+    }
+}
+
+void NodeLinkMgr::handle_link_reply(CtrlCommand type, const njson &p, std::uint64_t id,
+                                    const std::string &source)
+{
+    auto found = shared_links_.find({p.at("left").get<std::string>(), p.at("right").get<std::string>(),
+                                     parse_relay_protocol(p.at("transport").get<std::string>())});
+    if (found == shared_links_.end())
+    {
+        return;
+    }
+
+    auto request = found->second;
+    if (request->params.id != id ||
+        (source != request->params.left && source != request->params.right))
+    {
+        return;
+    }
+
+    if (type == CtrlCommand::LinkError || type == CtrlCommand::LinkClosed)
+    {
+        auto reason = p.value("reason", "");
+        finish_link(request, p.value("stage", "remote"), reason.empty() ? "node link closed" : std::move(reason));
+        return;
+    }
+    if (request->completed)
+    {
+        return;
+    }
+    const std::uint8_t bit = source == request->params.left ? 1 : 2;
+    if (type == CtrlCommand::LinkPrepared)
+    {
+        if (request->prepared & bit)
+        {
+            return;
+        }
+        request->prepared |= bit;
+        if (request->prepared == 3 && !send_both(*request, CtrlCommand::LinkConnect))
+        {
+            finish_link(request, "control", "cluster control submission failed");
+        }
+    }
+    else if (type == CtrlCommand::LinkReady)
+    {
+        if (!(request->prepared & bit))
+        {
+            return;
+        }
+        request->ready |= bit;
+        if (request->ready == 3)
+        {
+            finish_link(request, "ready", {});
+        }
+    }
+}
+
 void NodeLinkMgr::members_changed()
 {
-    for (auto &[id, request] : remote_flows_)
+    for (auto &[id, request] : pending_opens_)
     {
         if (request->result.epoch != topology_.epoch())
         {
@@ -503,14 +529,12 @@ void NodeLinkMgr::members_changed()
     {
         return;
     }
-    const auto valid_link = [this](const njson &p) {
-        return p.at("epoch") == topology_.epoch() && p.at("master").get<std::string>() == topology_.master_id() &&
-               topology_.members().contains(p.at("left").get<std::string>()) &&
-               topology_.members().contains(p.at("right").get<std::string>()) &&
-               p.at("left_address") == topology_.members().at(p.at("left").get<std::string>()) &&
-               p.at("right_address") == topology_.members().at(p.at("right").get<std::string>());
+    const auto valid_link = [this](const LinkParams &p) {
+        return p.epoch == topology_.epoch() && p.master == topology_.master_id() &&
+               topology_.members().contains(p.left) && topology_.members().contains(p.right) &&
+               p.left_address == topology_.members().at(p.left) && p.right_address == topology_.members().at(p.right);
     };
-    for (auto it = link_endpoints_.begin(); it != link_endpoints_.end();)
+    for (auto it = local_links_.begin(); it != local_links_.end();)
     {
         if (valid_link(it->second))
         {
@@ -519,9 +543,16 @@ void NodeLinkMgr::members_changed()
         }
         auto id = it->first;
         asio::post(protocol_->executor(), [data = protocol_, id] { data->links().close(id); });
-        it = link_endpoints_.erase(it);
+        it = local_links_.erase(it);
     }
-    for (auto it = link_requests_.begin(); it != link_requests_.end();)
+    for (const auto &[id, path] : paths_)
+    {
+        if (!valid_flow(path->params))
+        {
+            close_path(path, "membership", "flow path membership changed");
+        }
+    }
+    for (auto it = shared_links_.begin(); it != shared_links_.end();)
     {
         auto request = (it++)->second;
         if (!valid_link(request->params))
@@ -530,44 +561,36 @@ void NodeLinkMgr::members_changed()
         }
     }
 
-    for (auto it = flow_requests_.begin(); it != flow_requests_.end();)
+    for (auto it = local_flows_.begin(); it != local_flows_.end();)
     {
-        auto request = (it++)->second;
-        if (!valid_flow(request->params))
-        {
-            finish_flow(std::move(request), "membership", "flow path membership changed");
-        }
-    }
-    for (auto it = flow_endpoints_.begin(); it != flow_endpoints_.end();)
-    {
-        if (valid_flow(it->second))
+        if (valid_flow(it->second.params))
         {
             ++it;
             continue;
         }
         const auto id = it->first;
-        flow_closed(id, "flow path membership changed");
+        notify_flow_closed(id, "flow path membership changed");
         asio::post(protocol_->executor(), [this, id] { protocol_->close_flow(id, "flow path membership changed"); });
-        it = flow_endpoints_.erase(it);
+        it = local_flows_.erase(it);
     }
 }
 
-NodeLinkMgr::FlowRequest::FlowRequest(asio::any_io_executor executor, njson values)
-    : params(std::move(values)), timeout(executor), completed_event(executor), released_event(executor)
+NodeLinkMgr::MasterPath::MasterPath(asio::any_io_executor executor, FlowParams values)
+    : params(std::move(values)), timeout(executor), opened(executor), released(executor)
 {
-    result.epoch = params.at("epoch").get<std::uint64_t>();
-    result.id = params.at("flow_id").get<std::uint64_t>();
+    result.epoch = params.epoch;
+    result.id = params.id;
     result.stage = "links";
 }
 
-bool NodeLinkMgr::valid_flow(const njson &p) const
+bool NodeLinkMgr::valid_flow(const FlowParams &p) const
 {
-    if (p.at("epoch") != topology_.epoch() || p.at("master").get<std::string>() != topology_.master_id())
+    if (p.epoch != topology_.epoch() || p.master != topology_.master_id())
     {
         return false;
     }
-    const auto nodes = p.at("path").get<std::vector<std::string>>();
-    const auto addresses = p.at("addresses").get<std::vector<std::string>>();
+    const auto &nodes = p.path;
+    const auto &addresses = p.addresses;
     if (!valid_flow_path(nodes) || addresses.size() != nodes.size())
     {
         return false;
@@ -583,13 +606,13 @@ bool NodeLinkMgr::valid_flow(const njson &p) const
     return true;
 }
 
-void NodeLinkMgr::arm_flow_timeout(const std::shared_ptr<FlowRequest> &r)
+void NodeLinkMgr::arm_path_timeout(const std::shared_ptr<MasterPath> &r)
 {
-    r->timeout.expires_after(10s);
+    r->timeout.expires_after(flow_setup_timeout);
     r->timeout.async_wait([this, r](asio::error_code error) {
-        if (!error && !r->completed && Clock::now() >= r->timeout.expiry())
+        if (!error && r->phase < PathPhase::Active && Clock::now() >= r->timeout.expiry())
         {
-            finish_flow(r, r->result.stage, "flow establishment deadline expired");
+            close_path(r, r->result.stage, "flow establishment deadline expired");
         }
     });
 }
@@ -601,22 +624,74 @@ asio::awaitable<FlowResult> NodeLinkMgr::open_flow(std::vector<std::string> path
     }
     if (!topology_.is_master())
     {
-        co_return co_await request_flow(std::move(path), transport);
+        if (path.size() < 2 || path.front() != config_.node_id || transport == RelayProtocol::Tls ||
+            !topology_.epoch() || pending_opens_.size() >= lnk::max_flow_count)
+        {
+            co_return FlowResult{0, 0, "open", "requires a current ingress and tcp/udp flow"};
+        }
+        auto id = generate_random_id();
+        while (pending_opens_.contains(id) || local_flows_.contains(id))
+        {
+            id = generate_random_id();
+        }
+        const auto epoch = topology_.epoch();
+        PendingOpen request(control_);
+        request.result = {epoch, id, "open", "flow result pending"};
+        const auto submitted =
+            cluster_.send(std::string(topology_.master_id()),
+                          CtrlMessage(CtrlCommand::FlowOpen, njson{{"epoch", epoch},
+                                                                   {"flow_id", id},
+                                                                   {"path", std::move(path)},
+                                                                   {"transport", relay_protocol_name(transport)}}));
+        if (submitted != ClusterMgr::SendResult::Submitted)
+        {
+            co_return FlowResult{epoch, id, "open", "cluster control submission failed"};
+        }
+        pending_opens_.emplace(id, &request);
+        bool accepted = false;
+        ScopeGuard cleanup([this, id, epoch, &accepted] {
+            pending_opens_.erase(id);
+            if (!accepted)
+            {
+                cluster_.send(std::string(topology_.master_id()),
+                              CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}}));
+            }
+        });
+        if (!co_await asio::co_spawn(control_, request.completed.wait(),
+                                    asio::cancel_after(remote_open_timeout, asio::use_awaitable)))
+        {
+            throw asio::system_error(asio::error::operation_aborted);
+        }
+        accepted = static_cast<bool>(request.result);
+        co_return request.result;
     }
-    std::shared_ptr<FlowRequest> request;
+    std::shared_ptr<MasterPath> request;
     try
     {
-        request = create_flow(std::move(path), transport);
+        request = create_path(std::move(path), transport);
     }
     catch (const std::exception &error)
     {
         co_return FlowResult{0, 0, "open", error.what()};
     }
-    co_return co_await establish_flow(std::move(request));
+    try
+    {
+        start_path(request);
+        if (!co_await request->opened.wait())
+        {
+            throw asio::system_error(asio::error::operation_aborted);
+        }
+    }
+    catch (...)
+    {
+        close_path(request, request->result.stage, "flow open interrupted");
+        throw;
+    }
+    co_return request->result;
 }
 
-std::shared_ptr<NodeLinkMgr::FlowRequest> NodeLinkMgr::create_flow(std::vector<std::string> path,
-                                                                   RelayProtocol transport, std::uint64_t requested_id)
+std::shared_ptr<NodeLinkMgr::MasterPath> NodeLinkMgr::create_path(std::vector<std::string> path,
+                                                                  RelayProtocol transport, std::uint64_t requested_id)
 {
     if (transport == RelayProtocol::Tls || !valid_flow_path(path))
     {
@@ -633,118 +708,108 @@ std::shared_ptr<NodeLinkMgr::FlowRequest> NodeLinkMgr::create_flow(std::vector<s
         }
         addresses.push_back(member->second);
     }
-    if (!topology_.epoch() || flow_requests_.size() + closing_flows_.size() >= lnk::max_flow_count)
+    if (!topology_.epoch() || paths_.size() >= lnk::max_flow_count)
     {
         throw std::runtime_error("membership unavailable or flow capacity exceeded");
     }
     const auto id = requested_id ? requested_id : generate_random_id();
-    if (flow_requests_.contains(id) || closing_flows_.contains(id))
+    if (paths_.contains(id))
     {
         throw std::runtime_error("flow identity already exists");
     }
-    njson p{{"epoch", topology_.epoch()},
-            {"master", std::string(topology_.master_id())},
-            {"flow_id", id},
-            {"request_id", generate_random_id()},
-            {"path", path},
-            {"addresses", addresses},
-            {"transport", relay_protocol_name(transport)},
-            {"links", std::vector<std::uint64_t>(path.size() - 1)}};
-    auto r = std::make_shared<FlowRequest>(control_, std::move(p));
-    flow_requests_.emplace(id, r);
-    arm_flow_timeout(r);
+    FlowParams params;
+    params.epoch = topology_.epoch();
+    params.master = topology_.master_id();
+    params.id = id;
+    params.request_id = generate_random_id();
+    params.links.resize(path.size() - 1);
+    params.path = std::move(path);
+    params.addresses = std::move(addresses);
+    params.transport = transport;
+    auto r = std::make_shared<MasterPath>(control_, std::move(params));
+    paths_.emplace(id, r);
+    arm_path_timeout(r);
     return r;
 }
 
-asio::awaitable<FlowResult> NodeLinkMgr::establish_flow(std::shared_ptr<FlowRequest> r)
+void NodeLinkMgr::start_path(const std::shared_ptr<MasterPath> &request)
 {
-    const auto path = r->params.at("path").get<std::vector<std::string>>();
-    const auto transport = parse_relay_protocol(r->params.at("transport").get<std::string>());
-    /** @brief Own one adjacent-Link establishment result for the control-side parallel path setup. */
-    struct Edge
-    {
-        std::size_t index;
-        LinkResult result;
-    };
-    auto edges = std::make_shared<asio::experimental::channel<void(asio::error_code, Edge)>>(control_, path.size() - 1);
-    for (std::size_t i = 0; i + 1 < path.size(); ++i)
-    {
-        asio::co_spawn(control_, ensure_link(path[i], path[i + 1], transport),
-                       [edges, i](std::exception_ptr error, LinkResult result) {
-                           if (error)
-                           {
-                               result = {0, "links", exception_description(error)};
-                           }
-                           edges->try_send(asio::error_code{}, Edge{i, std::move(result)});
-                       });
-    }
     try
     {
-        for (std::size_t count = 0; count + 1 < path.size(); ++count)
+        const auto &path = request->params.path;
+        for (std::size_t i = 0; i + 1 < path.size(); ++i)
         {
-            auto edge = co_await edges->async_receive(asio::use_awaitable);
-            if (!edge.result && !r->completed)
+            const auto link = start_link(path[i], path[i + 1], request->params.transport);
+            request->params.links[i] = link->params.id;
+            if (!link->completed)
             {
-                finish_flow(r, "links", edge.result.stage + ": " + edge.result.reason);
+                continue;
             }
-            if (!r->completed)
+            if (!link->reason.empty())
             {
-                r->params["links"][edge.index] = edge.result.id;
+                close_path(request, "links", link->stage + ": " + link->reason);
+                return;
             }
+            request->acknowledged |= static_cast<std::uint8_t>(1u << i);
         }
     }
-    catch (...)
+    catch (const std::exception &error)
     {
-        if (!r->completed)
-        {
-            finish_flow(r, "links", "flow open interrupted");
-        }
-        throw;
+        close_path(request, "links", std::string("ensure: ") + error.what());
+        return;
     }
-
-    if (r->completed)
-    {
-        co_return r->result;
-    }
-
-    if (!running_ || !valid_flow(r->params))
-    {
-        finish_flow(r, "membership", "path membership changed");
-        co_return r->result;
-    }
-
-    r->result.stage = "prepare";
-    arm_flow_timeout(r);
-    if (!send_all(*r, CtrlCommand::FlowPrepare))
-    {
-        finish_flow(r, "control", "cluster control submission failed");
-    }
-    co_await r->completed_event.wait();
-
-    if (!r->completed)
-    {
-        finish_flow(r, "open", "flow open cancelled");
-    }
-    co_return r->result;
+    prepare_path(request);
 }
 
-bool NodeLinkMgr::send_all(const FlowRequest &r, CtrlCommand command)
+void NodeLinkMgr::prepare_path(const std::shared_ptr<MasterPath> &request)
 {
-    auto p = r.params;
+    const auto all = static_cast<std::uint8_t>((1u << request->params.links.size()) - 1);
+    if (request->acknowledged != all)
+    {
+        return;
+    }
+    request->phase = PathPhase::Preparing;
+    request->acknowledged = 0;
+    request->result.stage = "prepare";
+    arm_path_timeout(request);
+    if (!send_all(*request, CtrlCommand::FlowPrepare))
+    {
+        close_path(request, "control", "cluster control submission failed");
+    }
+}
+
+void NodeLinkMgr::finish_open(const std::shared_ptr<MasterPath> &request)
+{
+    request->opened.notify_all();
+    if (request->reply_to.empty())
+    {
+        return;
+    }
+    auto target = std::exchange(request->reply_to, {});
+    const auto &result = request->result;
+    cluster_.send(std::move(target), CtrlMessage(CtrlCommand::FlowOpened, njson{{"epoch", result.epoch},
+                                                                                {"flow_id", result.id},
+                                                                                {"stage", result.stage},
+                                                                                {"reason", result.reason}}));
+}
+
+bool NodeLinkMgr::send_all(const MasterPath &r, CtrlCommand command)
+{
+    auto p = command == CtrlCommand::FlowPrepare ? r.params.to_params() : r.params.identity_params();
     if (command == CtrlCommand::FlowPrepare)
     {
         p["ttl_ms"] = std::uint64_t(std::clamp<std::int64_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(r.timeout.expiry() - Clock::now()).count(), 1,
-            10000));
+            max_flow_ttl_ms));
     }
     if (command == CtrlCommand::FlowClose)
     {
         p["stage"] = r.result.stage;
         p["reason"] = r.result.reason;
     }
-    for (const auto &node : p.at("path"))
+    for (const auto &node : r.params.path)
     {
-        if (cluster_.send(node.get<std::string>(), CtrlMessage(command, p)) != ClusterMgr::SendResult::Submitted)
+        if (cluster_.send(node, CtrlMessage(command, p)) != ClusterMgr::SendResult::Submitted)
         {
             return false;
         }
@@ -752,56 +817,55 @@ bool NodeLinkMgr::send_all(const FlowRequest &r, CtrlCommand command)
     return true;
 }
 
-void NodeLinkMgr::finish_flow(std::shared_ptr<FlowRequest> r, std::string stage, std::string reason)
+void NodeLinkMgr::close_path(std::shared_ptr<MasterPath> r, std::string stage, std::string reason)
 {
-    if (r->completed && reason.empty())
+    if (r->phase >= PathPhase::Closing)
     {
         return;
     }
-    r->completed = true;
+    r->phase = PathPhase::Closing;
+    r->acknowledged = 0;
     r->result.stage = std::move(stage);
     r->result.reason = std::move(reason);
-    r->timeout.cancel();
-    if (!r->result)
-    {
-        flow_requests_.erase(r->result.id);
-        closing_flows_.emplace(r->result.id, r);
-        r->timeout.expires_after(10s);
-        r->timeout.async_wait([this, r](asio::error_code error) {
-            if (!error && !r->released)
-            {
-                released(r, "flow close acknowledgements exceeded 10 seconds");
-            }
-        });
-        send_all(*r, CtrlCommand::FlowClose);
-    }
-    r->completed_event.notify_all();
+    r->timeout.expires_after(flow_close_timeout);
+    r->timeout.async_wait([this, r](asio::error_code error) {
+        if (!error && r->phase == PathPhase::Closing)
+        {
+            release_path(r, "flow close acknowledgements exceeded 10 seconds");
+        }
+    });
+    send_all(*r, CtrlCommand::FlowClose);
+    finish_open(r);
 }
 
-void NodeLinkMgr::released(std::shared_ptr<FlowRequest> r, std::string error)
+void NodeLinkMgr::release_path(std::shared_ptr<MasterPath> r, std::string error)
 {
-    r->released = true;
+    if (r->phase == PathPhase::Released)
+    {
+        return;
+    }
+    r->phase = PathPhase::Released;
     r->close_error = std::move(error);
     r->timeout.cancel();
-    closing_flows_.erase(r->result.id);
-    r->released_event.notify_all();
+    paths_.erase(r->result.id);
+    r->released.notify_all();
 }
 
 void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
 {
-    switch (type)
-    {
-    case CtrlCommand::FlowOpen:
-    case CtrlCommand::FlowOpened:
-    case CtrlCommand::FlowCloseRequest:
-        handle_flow_request(type, std::move(message));
-        return;
-    default:
-        break;
-    }
-
     try
     {
+        switch (type)
+        {
+        case CtrlCommand::FlowOpen:
+        case CtrlCommand::FlowOpened:
+        case CtrlCommand::FlowCloseRequest:
+            handle_flow_request(type, std::move(message));
+            return;
+        default:
+            break;
+        }
+
         const auto &p = config::message_params(message);
         const auto id = config::require_unsigned(p, "flow_id", true);
         const auto epoch = config::require_unsigned(p, "epoch", true);
@@ -812,163 +876,14 @@ void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
         }
         if (type == CtrlCommand::FlowPrepare || type == CtrlCommand::FlowCommit || type == CtrlCommand::FlowClose)
         {
-            if (source != topology_.master_id())
+            if (source == topology_.master_id())
             {
-                return;
-            }
-            const auto reject = [&](std::string reason) {
-                auto error = p;
-                error["stage"] = "prepare";
-                error["reason"] = std::move(reason);
-                cluster_.send(source, CtrlMessage(CtrlCommand::FlowError, std::move(error)));
-            };
-            if (type == CtrlCommand::FlowPrepare)
-            {
-                const auto path = p.at("path").get<std::vector<std::string>>();
-                const auto edge_ids = p.at("links").get<std::vector<std::uint64_t>>();
-                const auto ttl = config::require_unsigned(p, "ttl_ms", true);
-                config::require_unsigned(p, "request_id", true);
-                if (!valid_flow(p) || std::ranges::find(path, config_.node_id) == path.end() || ttl > 10000 ||
-                    edge_ids.size() + 1 != path.size() || std::ranges::find(edge_ids, 0) != edge_ids.end() ||
-                    parse_relay_protocol(p.at("transport").get<std::string>()) == RelayProtocol::Tls)
-                {
-                    reject("invalid flow path or identity");
-                    return;
-                }
-                if (auto it = flow_endpoints_.find(id); it != flow_endpoints_.end())
-                {
-                    if (it->second.at("request_id") != p.at("request_id") || it->second.at("path") != p.at("path") ||
-                        it->second.at("links") != p.at("links") || it->second.at("transport") != p.at("transport"))
-                    {
-                        reject("conflicting flow prepare");
-                        return;
-                    }
-                }
-                else
-                {
-                    if (flow_endpoints_.size() >= lnk::max_flow_count)
-                    {
-                        reject("flow endpoint capacity exceeded");
-                        return;
-                    }
-                    flow_endpoints_.emplace(id, p);
-                }
-                const auto index = std::size_t(std::ranges::find(path, config_.node_id) - path.begin());
-                lnk::FlowSpec spec{id, epoch, parse_relay_protocol(p.at("transport").get<std::string>())};
-                spec.prepare_timeout = std::chrono::milliseconds(ttl);
-                if (index)
-                {
-                    spec.previous = edge_ids[index - 1];
-                    spec.previous_peer = path[index - 1];
-                }
-                if (index + 1 < path.size())
-                {
-                    spec.next = edge_ids[index];
-                    spec.next_peer = path[index + 1];
-                }
-                asio::post(protocol_->executor(), [data = protocol_, spec = std::move(spec)]() mutable {
-                    try
-                    {
-                        data->prepare_flow(std::move(spec));
-                    }
-                    catch (const std::exception &e)
-                    {
-                        PROXY_ERROR_PRINT("NodeFlow prepare rejected: %s", e.what());
-                    }
-                });
-            }
-            else
-            {
-                auto it = flow_endpoints_.find(id);
-                if (it == flow_endpoints_.end())
-                {
-                    if (type == CtrlCommand::FlowClose)
-                    {
-                        cluster_.send(source, CtrlMessage(CtrlCommand::FlowClosed, p));
-                    }
-                    return;
-                }
-                for (const auto *field : {"request_id", "path", "links", "transport", "addresses"})
-                {
-                    if (p.at(field) != it->second.at(field))
-                    {
-                        return;
-                    }
-                }
-                asio::post(protocol_->executor(), [this, id, type, reason = p.value("reason", "")] {
-                    if (type == CtrlCommand::FlowCommit)
-                    {
-                        protocol_->commit_flow(id);
-                    }
-                    else
-                    {
-                        protocol_->close_flow(id, reason);
-                    }
-                });
-            }
-            return;
-        }
-        if (!topology_.is_master())
-        {
-            return;
-        }
-        auto it = flow_requests_.find(id);
-        auto closing = closing_flows_.find(id);
-        if (it == flow_requests_.end() && closing == closing_flows_.end())
-        {
-            return;
-        }
-        auto r = it != flow_requests_.end() ? it->second : closing->second;
-        if (p.at("request_id") != r->params.at("request_id") || p.at("path") != r->params.at("path") ||
-            p.at("links") != r->params.at("links") || p.at("transport") != r->params.at("transport"))
-        {
-            return;
-        }
-        const auto path = r->params.at("path").get<std::vector<std::string>>();
-        const auto node = std::ranges::find(path, source);
-        if (node == path.end())
-        {
-            return;
-        }
-        const auto bit = static_cast<std::uint8_t>(1u << std::distance(path.begin(), node));
-        const auto all = static_cast<std::uint8_t>((1u << path.size()) - 1);
-        if (closing != closing_flows_.end())
-        {
-            if (type == CtrlCommand::FlowClosed)
-            {
-                r->closed |= bit;
-                if (r->closed == all)
-                {
-                    released(r);
-                }
-            }
-            return;
-        }
-        if (type == CtrlCommand::FlowError || type == CtrlCommand::FlowClosed)
-        {
-            finish_flow(r, p.value("stage", "remote"),
-                        p.value("reason", "flow closed").empty() ? "flow closed" : p.value("reason", "remote error"));
-        }
-        else if (!r->completed && type == CtrlCommand::FlowPrepared && r->result.stage == "prepare")
-        {
-            r->prepared |= bit;
-            if (r->prepared == all)
-            {
-                r->result.stage = "commit";
-                if (!send_all(*r, CtrlCommand::FlowCommit))
-                {
-                    finish_flow(r, "control", "cluster control submission failed");
-                }
+                handle_flow_command(type, p, id, epoch, source);
             }
         }
-        else if (!r->completed && type == CtrlCommand::FlowCommitted && r->result.stage == "commit" &&
-                 (r->prepared & bit))
+        else if (topology_.is_master())
         {
-            r->committed |= bit;
-            if (r->committed == all)
-            {
-                finish_flow(r, "ready", {});
-            }
+            handle_flow_reply(type, p, id, epoch, source);
         }
     }
     catch (const std::exception &e)
@@ -977,42 +892,199 @@ void NodeLinkMgr::handle_flow(CtrlCommand type, CtrlMessage message)
     }
 }
 
+void NodeLinkMgr::handle_flow_command(CtrlCommand type, const njson &p, std::uint64_t id,
+                                      std::uint64_t epoch, const std::string &source)
+{
+    if (type == CtrlCommand::FlowPrepare)
+    {
+        FlowParams params{epoch,
+                          std::string(topology_.master_id()),
+                          id,
+                          config::require_unsigned(p, "request_id", true),
+                          p.at("path").get<std::vector<std::string>>(),
+                          p.at("addresses").get<std::vector<std::string>>(),
+                          p.at("links").get<std::vector<std::uint64_t>>(),
+                          parse_relay_protocol(p.at("transport").get<std::string>())};
+        const auto reject = [&](std::string reason) {
+            auto error = params.identity_params();
+            error["stage"] = "prepare";
+            error["reason"] = std::move(reason);
+            cluster_.send(source, CtrlMessage(CtrlCommand::FlowError, std::move(error)));
+        };
+        const auto &path = params.path;
+        const auto &edge_ids = params.links;
+        const auto node = std::ranges::find(path, config_.node_id);
+        const auto ttl = config::require_unsigned(p, "ttl_ms", true);
+        if (!valid_flow(params) || node == path.end() ||
+            ttl > std::uint64_t(max_flow_ttl_ms) ||
+            edge_ids.size() + 1 != path.size() || std::ranges::find(edge_ids, 0) != edge_ids.end() ||
+            params.transport == RelayProtocol::Tls)
+        {
+            reject("invalid flow path or identity");
+            return;
+        }
+        if (auto it = local_flows_.find(id); it != local_flows_.end())
+        {
+            if (it->second.params != params)
+            {
+                reject("conflicting flow prepare");
+                return;
+            }
+        }
+        else if (local_flows_.size() >= lnk::max_flow_count)
+        {
+            reject("flow endpoint capacity exceeded");
+            return;
+        }
+        const auto index = std::size_t(node - path.begin());
+        lnk::FlowSpec spec{id, epoch, params.transport};
+        spec.prepare_timeout = std::chrono::milliseconds(ttl);
+        if (index)
+        {
+            spec.previous = edge_ids[index - 1];
+            spec.previous_peer = path[index - 1];
+        }
+        if (index + 1 < path.size())
+        {
+            spec.next = edge_ids[index];
+            spec.next_peer = path[index + 1];
+        }
+        local_flows_.try_emplace(id, LocalFlow{std::move(params)});
+        asio::post(protocol_->executor(), [data = protocol_, spec = std::move(spec)]() mutable {
+            try
+            {
+                data->prepare_flow(std::move(spec));
+            }
+            catch (const std::exception &e)
+            {
+                PROXY_ERROR_PRINT("NodeFlow prepare rejected: %s", e.what());
+            }
+        });
+    }
+    else
+    {
+        const auto request_id = config::require_unsigned(p, "request_id", true);
+        auto it = local_flows_.find(id);
+        if (it == local_flows_.end())
+        {
+            if (type == CtrlCommand::FlowClose)
+            {
+                cluster_.send(source, CtrlMessage(CtrlCommand::FlowClosed,
+                                                  njson{{"master", std::string(topology_.master_id())},
+                                                        {"epoch", epoch},
+                                                        {"flow_id", id},
+                                                        {"request_id", request_id}}));
+            }
+            return;
+        }
+        const auto &authorized = it->second.params;
+        if (authorized.epoch != epoch || authorized.request_id != request_id)
+        {
+            return;
+        }
+        asio::post(protocol_->executor(), [this, id, type, reason = p.value("reason", "")] {
+            if (type == CtrlCommand::FlowCommit)
+            {
+                protocol_->commit_flow(id);
+            }
+            else
+            {
+                protocol_->close_flow(id, reason);
+            }
+        });
+    }
+}
+
+void NodeLinkMgr::handle_flow_reply(CtrlCommand type, const njson &p, std::uint64_t id,
+                                    std::uint64_t epoch, const std::string &source)
+{
+    auto it = paths_.find(id);
+    if (it == paths_.end())
+    {
+        return;
+    }
+    auto r = it->second;
+    if (r->params.epoch != epoch || config::require_unsigned(p, "request_id", true) != r->params.request_id)
+    {
+        return;
+    }
+    const auto &path = r->params.path;
+    const auto node = std::ranges::find(path, source);
+    if (node == path.end())
+    {
+        return;
+    }
+    const auto bit = static_cast<std::uint8_t>(1u << std::distance(path.begin(), node));
+    const auto all = static_cast<std::uint8_t>((1u << path.size()) - 1);
+    if (r->phase == PathPhase::Closing)
+    {
+        if (type == CtrlCommand::FlowClosed)
+        {
+            r->acknowledged |= bit;
+            if (r->acknowledged == all)
+            {
+                release_path(r);
+            }
+        }
+        return;
+    }
+    if (type == CtrlCommand::FlowError || type == CtrlCommand::FlowClosed)
+    {
+        auto reason = p.value("reason", "remote error");
+        close_path(r, p.value("stage", "remote"), reason.empty() ? "flow closed" : std::move(reason));
+    }
+    else if (r->phase == PathPhase::Preparing && type == CtrlCommand::FlowPrepared)
+    {
+        r->acknowledged |= bit;
+        if (r->acknowledged == all)
+        {
+            r->phase = PathPhase::Committing;
+            r->acknowledged = 0;
+            r->result.stage = "commit";
+            if (!send_all(*r, CtrlCommand::FlowCommit))
+            {
+                close_path(r, "control", "cluster control submission failed");
+            }
+        }
+    }
+    else if (r->phase == PathPhase::Committing && type == CtrlCommand::FlowCommitted)
+    {
+        r->acknowledged |= bit;
+        if (r->acknowledged == all)
+        {
+            r->phase = PathPhase::Active;
+            r->result.stage = "ready";
+            r->timeout.cancel();
+            finish_open(r);
+        }
+    }
+}
+
 asio::awaitable<void> NodeLinkMgr::close_flow(std::uint64_t epoch, std::uint64_t id)
 {
     if (!topology_.is_master())
     {
-        if (cluster_.send(std::string(topology_.master_id()),
-                          CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}})) !=
-            ClusterMgr::SendResult::Submitted)
+        const auto submitted = cluster_.send(
+            std::string(topology_.master_id()),
+            CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}}));
+        if (submitted != ClusterMgr::SendResult::Submitted)
         {
-            co_return;
+            throw std::runtime_error("flow close request submission failed (cluster send status=" +
+                                     std::to_string(static_cast<int>(submitted)) + ")");
         }
-        co_await asio::co_spawn(control_, wait_flow_closed(epoch, id), asio::cancel_after(10s, asio::use_awaitable));
+        co_await asio::co_spawn(control_, wait_flow_closed(epoch, id),
+                                asio::cancel_after(flow_close_timeout, asio::use_awaitable));
         co_return;
     }
 
-    std::shared_ptr<FlowRequest> r;
-    if (auto it = flow_requests_.find(id); it != flow_requests_.end())
-    {
-        r = it->second;
-    }
-    else if (auto it = closing_flows_.find(id); it != closing_flows_.end())
-    {
-        r = it->second;
-    }
-    if (!r || r->result.epoch != epoch)
+    const auto it = paths_.find(id);
+    if (it == paths_.end() || it->second->params.epoch != epoch)
     {
         co_return;
     }
-    if (!r->completed || r->result)
-    {
-        finish_flow(r, "close", "closed by caller");
-    }
-    if (!r->released)
-    {
-        co_await r->released_event.wait();
-    }
-    if (!r->released)
+    auto r = it->second;
+    close_path(r, "close", "closed by caller");
+    if (!co_await r->released.wait())
     {
         throw std::runtime_error("flow close cancelled");
     }
@@ -1024,44 +1096,22 @@ asio::awaitable<void> NodeLinkMgr::close_flow(std::uint64_t epoch, std::uint64_t
 
 asio::awaitable<std::string> NodeLinkMgr::wait_flow_closed(std::uint64_t epoch, std::uint64_t id)
 {
-    if (!topology_.is_master())
-    {
-        const auto endpoint = flow_endpoints_.find(id);
-        if (endpoint == flow_endpoints_.end() || endpoint->second.at("epoch") != epoch)
-        {
-            co_return "flow closed";
-        }
-        auto [it, inserted] = flow_watches_.try_emplace(id);
-        if (inserted)
-        {
-            it->second = std::make_shared<FlowWatch>(control_);
-        }
-        auto watch = it->second;
-        if (!co_await watch->closed.wait())
-        {
-            throw asio::system_error(asio::error::operation_aborted);
-        }
-        co_return watch->reason;
-    }
-
-    std::shared_ptr<FlowRequest> request;
-    if (const auto it = flow_requests_.find(id); it != flow_requests_.end())
-    {
-        request = it->second;
-    }
-    else if (const auto it = closing_flows_.find(id); it != closing_flows_.end())
-    {
-        request = it->second;
-    }
-    if (!request || request->result.epoch != epoch)
+    const auto endpoint = local_flows_.find(id);
+    if (endpoint == local_flows_.end() || endpoint->second.params.epoch != epoch)
     {
         co_return "flow closed";
     }
-    if (!co_await request->released_event.wait())
+    auto watch = endpoint->second.closure;
+    if (!watch)
+    {
+        watch = std::make_shared<CloseNotice>(control_);
+        endpoint->second.closure = watch;
+    }
+    if (!co_await watch->closed.wait())
     {
         throw asio::system_error(asio::error::operation_aborted);
     }
-    co_return request->result.reason.empty() ? "flow closed" : request->result.reason;
+    co_return watch->reason;
 }
 
 void NodeLinkMgr::control_failed(std::string reason)
@@ -1070,7 +1120,13 @@ void NodeLinkMgr::control_failed(std::string reason)
     {
         return;
     }
-    for (auto it = link_requests_.begin(); it != link_requests_.end();)
+    while (!paths_.empty())
+    {
+        auto path = paths_.begin()->second;
+        close_path(path, "control", reason);
+        release_path(path, reason);
+    }
+    for (auto it = shared_links_.begin(); it != shared_links_.end();)
     {
         auto request = (it++)->second;
         if (!request->completed)
@@ -1078,16 +1134,8 @@ void NodeLinkMgr::control_failed(std::string reason)
             finish_link(request, "control", reason);
         }
     }
-    while (!flow_requests_.empty())
-    {
-        finish_flow(flow_requests_.begin()->second, "control", reason);
-    }
-    while (!closing_flows_.empty())
-    {
-        released(closing_flows_.begin()->second, reason);
-    }
-    fail_remote_flows(reason);
-    flow_endpoints_.clear();
+    fail_waiters(reason);
+    local_flows_.clear();
     asio::post(protocol_->executor(),
                [data = protocol_, reason = std::move(reason)] { data->invalidate_flows(reason); });
 }

@@ -19,21 +19,13 @@ struct FlowSpec
     std::chrono::milliseconds prepare_timeout{10000};
 };
 
-enum class EventKind
-{
-    LinkPrepared,
-    LinkReady,
-    LinkError,
-    LinkClosed,
-    FlowPrepared,
-    FlowCommitted,
-    FlowError,
-    FlowClosed
-};
-
+/**
+ * @brief Own a Link or Flow notification transferred from the data executor to the control executor.
+ * @details Use the corresponding CtrlCommand directly; convert the payload to CtrlMessage on the control executor.
+ */
 struct ProtocolEvent
 {
-    EventKind kind;
+    CtrlCommand command;
     std::uint64_t epoch;
     std::uint64_t id;
     std::string stage;
@@ -46,7 +38,8 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
 {
   public:
     static constexpr std::size_t maximum_chunk_size = LnkFrameHeader::maximum_payload;
-    PooledBuffer copy_payload(std::span<const std::uint8_t> data);
+    /** @brief Retain the shared, thread-safe allocator used by payloads across executors. */
+    const std::shared_ptr<std::pmr::memory_resource> pool;
     asio::awaitable<void> send(PooledBuffer data);
     asio::awaitable<void> finish_send();
     asio::awaitable<std::optional<PooledBuffer>> receive();
@@ -63,7 +56,7 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
     // An engaged value is DATA (including empty DATA); nullopt is an ordered FIN.
     using Queue = asio::experimental::concurrent_channel<void(asio::error_code, std::optional<PooledBuffer>)>;
     FlowStream(asio::any_io_executor transfer, asio::any_io_executor data, std::weak_ptr<FlowProtocol> protocol,
-               std::uint64_t id, bool reverse, std::shared_ptr<std::pmr::synchronized_pool_resource> pool);
+               std::uint64_t id, bool reverse, std::shared_ptr<std::pmr::synchronized_pool_resource> payload_pool);
     const std::uint64_t id_;
     const bool reverse_;
     Queue send_queue_;
@@ -76,7 +69,6 @@ class FlowStream : public std::enable_shared_from_this<FlowStream>
     bool send_finished_ = false;
     std::string reason_;
     std::weak_ptr<FlowProtocol> protocol_;
-    const std::shared_ptr<std::pmr::synchronized_pool_resource> pool_;
 };
 
 // Datagram endpoints never wait for queue capacity and never acknowledge delivery.
@@ -264,7 +256,8 @@ class FlowProtocol : public std::enable_shared_from_this<FlowProtocol>
     void receive(const lnk::NodeLink &source, lnk::Frame frame);
     void written(lnk::Frame frame);
     void link_flows_closed(std::uint64_t id);
-    void notify_flow(const std::shared_ptr<lnk::FlowState> &flow, lnk::EventKind kind, std::string stage,
+    /** @brief Queue a Flow acknowledgement or failure from the data executor to the control executor. */
+    void notify_flow(const std::shared_ptr<lnk::FlowState> &flow, CtrlCommand command, std::string stage,
                      std::string reason = {});
     void fail_flow(std::shared_ptr<lnk::FlowState> flow, std::string stage, std::string reason);
 

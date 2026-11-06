@@ -2,6 +2,8 @@
 
 #include "benchmark.h"
 #include "xfr_channel.h"
+#include <algorithm>
+#include <array>
 #include <asio/experimental/awaitable_operators.hpp>
 #include <cstring>
 #include <future>
@@ -37,12 +39,19 @@ asio::awaitable<void> send(Stream &stream, std::size_t chunks, std::size_t size,
         for (unsigned i = 0; i < 8; ++i)
             data[i] = static_cast<std::uint8_t>(sequence >> (i * 8));
         if constexpr (std::is_same_v<Stream, TLS>)
-            co_await write_tls_data(stream, data);
+        {
+            const auto header = encode_tls_data_size(data.size());
+            const std::array<asio::const_buffer, 2> buffers{asio::buffer(header), asio::buffer(data)};
+            co_await asio::async_write(stream, buffers, asio::use_awaitable);
+        }
         else
             co_await asio::async_write(stream, asio::buffer(data), asio::use_awaitable);
     }
     if constexpr (std::is_same_v<Stream, TLS>)
-        co_await finish_tls_data(stream);
+    {
+        const std::array<std::uint8_t, 4> fin{};
+        co_await asio::async_write(stream, asio::buffer(fin), asio::use_awaitable);
+    }
     else
         stream.shutdown(tcp::socket::shutdown_send);
 }
@@ -59,10 +68,19 @@ asio::awaitable<void> receive(Stream &stream, std::size_t chunks, std::size_t si
     {
         std::size_t received;
         if constexpr (std::is_same_v<Stream, TLS>)
-            received = co_await read_tls_data(stream, data);
+        {
+            std::array<std::uint8_t, 4> header{};
+            co_await asio::async_read(stream, asio::buffer(header), asio::use_awaitable);
+            received = decode_tls_data_size(header);
+            if (received != 0)
+            {
+                co_await asio::async_read(stream, asio::buffer(data.data(), received), asio::use_awaitable);
+            }
+        }
         else
         {
-            const auto [error, size] = co_await stream.async_read_some(asio::buffer(data), asio::as_tuple(asio::use_awaitable));
+            const auto [error, size] =
+                co_await stream.async_read_some(asio::buffer(data), asio::as_tuple(asio::use_awaitable));
             if (error && error != asio::error::eof)
                 throw asio::system_error(error);
             received = size;

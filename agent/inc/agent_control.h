@@ -7,14 +7,13 @@
 
 struct AgentConfig;
 class AgentRouting;
-class NodeConnectionMgr;
 class NodeConnection;
 class Forwarder;
 
 /**
  * @brief Own service discovery, path selection and primary business control dispatch.
  * @details All methods and mutable state require control_io, except construction/start before workers.
- * Borrows configuration, NodeConnectionMgr, AgentRouting, and Forwarder from RelayAgent. The owner
+ * Borrows configuration, NodeConnection, AgentRouting, and Forwarder from RelayAgent. The owner
  * drains control producers before Forwarder and joins workers before destroying either module.
  * Queued transfer notifications borrow Forwarder until transfer shutdown drains them.
  */
@@ -26,13 +25,12 @@ class AgentControl
      * @param control_executor Single-threaded control execution domain.
      * @param transfer_executor Forwarder execution domain for posted notifications.
      * @param config Borrowed immutable configuration, valid through shutdown.
-     * @param connections Borrowed primary connection owner, valid through all connection notifications and selections.
+     * @param connection Borrowed primary connection owner, valid through all connection notifications and selections.
      * @param routing Borrowed route state, valid through shutdown.
      * @param forwarder Borrowed transfer owner, drained by RelayAgent after all control producers exit.
      */
     AgentControl(asio::any_io_executor control_executor, asio::any_io_executor transfer_executor,
-                 const AgentConfig &config, NodeConnectionMgr &connections, AgentRouting &routing,
-                 Forwarder &forwarder);
+                 const AgentConfig &config, NodeConnection &connection, AgentRouting &routing, Forwarder &forwarder);
     /** @brief Start optional discovery maintenance once after the owner starts the primary connection. */
     void start();
     /** @brief Cancel discovery maintenance on control_io. */
@@ -89,9 +87,9 @@ class AgentControl
     const AgentConfig &config_;
     AgentRouting &routing_;
     Forwarder &forwarder_;
-    NodeConnectionMgr &connections_;
+    NodeConnection &connection_;
     asio::steady_timer discovery_timer_;
-    /** @brief Preserve discovery correlation and the destination endpoint independently of connections. */
+    /** @brief Preserve discovery correlation and the destination endpoint independently of the primary connection. */
     struct ServiceLocation
     {
         std::uint64_t request = 0;

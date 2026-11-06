@@ -103,7 +103,7 @@ void validate_snapshot_link(const njson &link, std::string_view location)
     static_cast<void>(optional_age(link, "age_ms", location));
     static_cast<void>(parse_quality(link.at("quality")));
 }
-}
+} // namespace
 
 void Topology::validate_snapshot(const njson &params, std::string_view location)
 {
@@ -376,15 +376,15 @@ void Topology::send_report()
     for (const auto &metric : probes_.metrics())
     {
         const auto &assessment = metric.assessment;
-        const auto &long_ema = assessment.scales.back();
+        const auto &probe_metrics = assessment.metrics;
         const auto age =
             assessment.last_success_age == ICMP::Duration::max()
                 ? std::optional<std::chrono::milliseconds>{}
                 : std::optional(std::chrono::duration_cast<std::chrono::milliseconds>(assessment.last_success_age));
         links.push_back(njson{{"destination", metric.node_id},
-                              {"rtt_ms", nullable(long_ema.rtt_ms)},
-                              {"jitter_ms", nullable(long_ema.jitter_ms)},
-                              {"loss_rate", long_ema.loss_rate},
+                              {"rtt_ms", nullable(probe_metrics.rtt_ms)},
+                              {"jitter_ms", nullable(probe_metrics.jitter_ms)},
+                              {"loss_rate", probe_metrics.loss_rate},
                               {"transmitted", metric.transmitted},
                               {"received", assessment.total_received},
                               {"completed", assessment.total_completed},

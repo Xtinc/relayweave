@@ -1,5 +1,6 @@
 add_library(relayweave_proxy_lib
     src/proxy_server.cpp
+    src/socks5_udp.cpp
 )
 target_link_libraries(relayweave_proxy_lib PUBLIC relayweave_protocol)
 target_include_directories(relayweave_proxy_lib PUBLIC inc)

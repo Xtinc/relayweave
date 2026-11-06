@@ -8,22 +8,6 @@
 #include <map>
 #include <tuple>
 
-/** @brief Describe a Link transaction; success requires a nonzero ID and an empty reason. */
-struct LinkResult
-{
-    std::uint64_t id = 0;
-    std::string stage;
-    std::string reason;
-    /**
-     * @brief Return whether Link establishment succeeded.
-     * @return True when the transaction has a usable nonzero identity and no failure reason.
-     */
-    explicit operator bool() const noexcept
-    {
-        return reason.empty() && id != 0;
-    }
-};
-
 /** @brief Describe a Flow transaction by epoch, ID, failing stage, and diagnostic reason. */
 struct FlowResult
 {
@@ -83,30 +67,23 @@ class NodeLinkMgr
      */
     void control_failed(std::string reason);
     /**
-     * @brief Ensure or reuse an adjacent TCP/UDP Link on the master and await both endpoints.
-     * @param left ID of one adjacent Node; endpoint order is normalized for Link reuse.
-     * @param right ID of the other adjacent Node.
-     * @param transport NodeLink transport: TCP or UDP; TLS uses TCP on inter-Node links.
-     * @return Established Link ID on success, or a failing stage and reason without a usable ID.
-     * @pre Called on control_io; only the cluster master can establish or reuse adjacent Links.
-     * @details A fresh outer attempt uses new IDs and credentials, including after earlier failures.
-     */
-    asio::awaitable<LinkResult> ensure_link(std::string left, std::string right, RelayProtocol transport);
-    /**
      * @brief Commit a TCP/UDP path locally on the master or through a bounded remote request.
      * @param path Ordered, loop-free Node IDs from ingress to egress, containing two to eight members.
      * @param transport NodeLink transport: TCP or UDP; TLS uses TCP on inter-Node links.
      * @return Committed Flow epoch and ID on success, or a failing stage and reason.
      * @pre Called on control_io; a slave request must originate at path.front().
-     * @details Cancellation of establishment propagates through its owned transaction cleanup.
+     * @details Work begins when awaited. Remote replies have a 30-second bound; cancellation revokes the
+     * pending reply registration and requests remote cleanup. On the master, cancellation closes only this path;
+     * shared Links remain manager-owned. Link and Flow messages advance the transaction and publish its result.
      */
     asio::awaitable<FlowResult> open_flow(std::vector<std::string> path, RelayProtocol transport);
     /**
-     * @brief Request Flow closure and await bounded release confirmation without closing shared Links.
+     * @brief Request closure; await path acknowledgements on the master, local invalidation elsewhere.
      * @param epoch Cluster membership epoch that authorizes this Flow.
      * @param id Flow ID to close within the supplied epoch.
      * @pre Called on control_io with the Flow's authorized epoch and ID.
-     * @throws std::exception If release confirmation fails, times out, or is cancelled.
+     * @throws std::exception If request submission or release confirmation fails, times out, or is cancelled.
+     * @details Non-master success confirms local invalidation, not full path release. Neither branch joins business I/O.
      */
     asio::awaitable<void> close_flow(std::uint64_t epoch, std::uint64_t id);
     /**
@@ -117,14 +94,15 @@ class NodeLinkMgr
      * @param transport NodeLink transport: TCP or UDP; TLS uses TCP on inter-Node links.
      * @return True only for a committed local egress matching all supplied authorization fields.
      */
-    bool egress_ready(std::uint64_t epoch, std::uint64_t id, const std::string &ingress,
-                      RelayProtocol transport) const;
+    bool egress_ready(std::uint64_t epoch, std::uint64_t id, const std::string &ingress, RelayProtocol transport) const;
     /**
-     * @brief Await Flow invalidation and return its close reason.
+     * @brief Observe local Flow invalidation on every Node, including the master; never initiates closure.
      * @param epoch Cluster membership epoch that authorizes this Flow.
      * @param id Flow ID to watch within the supplied epoch.
-     * @return Reason for Flow closure, or an immediate diagnostic if the epoch or Flow is already invalid.
+     * @return Local closure reason, or "flow closed" if no local Flow matches the epoch and ID.
      * @pre Called on control_io; cancelling this wait does not close a healthy Flow.
+     * @details Does not wait for path release or join business I/O. NodeSession drains its transfer task
+     * separately; close_flow() waits for path release on the master.
      */
     asio::awaitable<std::string> wait_flow_closed(std::uint64_t epoch, std::uint64_t id);
     /**
@@ -145,73 +123,151 @@ class NodeLinkMgr
 
   private:
     using Clock = std::chrono::steady_clock;
-    /** @brief Retain Link parameters and acknowledgements; bit 0 is left and bit 1 is right. */
-    struct LinkRequest
+    /** @brief Retain shared Link authorization on control_io; peer fields are derived per endpoint. */
+    struct LinkParams
+    {
+        /** @brief Encode Link parameters, deriving peer fields when addressing an endpoint. */
+        njson to_params(std::string_view node = {}) const;
+        std::uint64_t id = 0;
+        std::uint64_t epoch = 0;
+        std::string master;
+        std::string left;
+        std::string right;
+        RelayProtocol transport = RelayProtocol::Tcp;
+        std::string token;
+        std::string left_address;
+        std::string right_address;
+        std::uint16_t tcp_port = 0;
+        std::uint16_t udp_port = 0;
+    };
+    /** @brief Retain validated path parameters without a JSON runtime mirror. */
+    struct FlowParams
+    {
+        /** @brief Encode complete Prepare parameters; its deadline is supplied by the transaction. */
+        njson to_params() const;
+        /** @brief Encode the identity shared by later phases and acknowledgements. */
+        njson identity_params() const;
+        bool operator==(const FlowParams &) const = default;
+        std::uint64_t epoch = 0;
+        std::string master;
+        std::uint64_t id = 0;
+        std::uint64_t request_id = 0;
+        std::vector<std::string> path;
+        std::vector<std::string> addresses;
+        std::vector<std::uint64_t> links;
+        RelayProtocol transport = RelayProtocol::Tcp;
+    };
+    /** @brief Share a local invalidation notification with suspended observers after authorization removal. */
+    struct CloseNotice
+    {
+        explicit CloseNotice(asio::any_io_executor executor) : closed(executor)
+        {
+        }
+        std::string reason;
+        AsyncEvent closed;
+    };
+    /** @brief Own this node's Flow authorization, including transit nodes; observers retain only closure. */
+    struct LocalFlow
+    {
+        FlowParams params;
+        bool committed = false;
+        std::shared_ptr<CloseNotice> closure;
+    };
+    /** @brief Keep a reusable master Link record; bit 0 is left and bit 1 is right. */
+    struct SharedLink
     {
         /** @brief Retain validated Link parameters and construct deadline and completion state on control_io. */
-        LinkRequest(asio::any_io_executor executor, njson params);
-        njson params;
-        LinkResult result;
+        SharedLink(asio::any_io_executor executor, LinkParams params);
+        LinkParams params;
+        std::string stage;
+        std::string reason;
         asio::steady_timer timeout;
-        AsyncEvent completed_event;
         std::uint8_t prepared = 0;
         std::uint8_t ready = 0;
         bool completed = false;
     };
-    bool send_both(const LinkRequest &request, CtrlCommand command);
-    void finish_link(std::shared_ptr<LinkRequest> request, std::string stage, std::string reason);
+    /**
+     * @brief Get or start a reusable Link synchronously on control_io; stopping or non-master calls throw.
+     * @pre The caller supplies distinct current members and TCP/UDP from a validated path.
+     */
+    std::shared_ptr<SharedLink> start_link(std::string left, std::string right, RelayProtocol transport);
+    bool send_both(const SharedLink &request, CtrlCommand command);
+    void finish_link(std::shared_ptr<SharedLink> request, std::string stage, std::string reason);
     using LinkKey = std::tuple<std::string, std::string, RelayProtocol>;
-    static LinkKey link_key(const njson &params);
-    /** @brief Retain a master path transaction; acknowledgement bit i denotes path node i. */
-    struct FlowRequest
+    enum class PathPhase
+    {
+        Linking,
+        Preparing,
+        Committing,
+        Active,
+        Closing,
+        Released
+    };
+    /**
+     * @brief Own one master path through message-driven establishment and close coordination on control_io.
+     * @details acknowledged tracks ready edges in Linking, then node acknowledgements in later phases.
+     * reply_to is empty for local opens and is consumed once when publishing a remote open result.
+     */
+    struct MasterPath
     {
         /** @brief Retain path parameters and construct setup and release waiters on control_io. */
-        FlowRequest(asio::any_io_executor executor, njson params);
-        njson params;
+        MasterPath(asio::any_io_executor executor, FlowParams params);
+        FlowParams params;
         FlowResult result;
         asio::steady_timer timeout;
-        AsyncEvent completed_event;
-        AsyncEvent released_event;
-        std::uint8_t prepared = 0;
-        std::uint8_t committed = 0;
-        std::uint8_t closed = 0;
-        bool completed = false;
-        bool released = false;
+        AsyncEvent opened;
+        AsyncEvent released;
+        PathPhase phase = PathPhase::Linking;
+        std::uint8_t acknowledged = 0;
         std::string close_error;
+        std::string reply_to;
     };
-    /** @brief Hold a remote ingress request until the master's result or a bounded timeout. */
-    struct RemoteFlow
+    /**
+     * @brief Hold one remote request in open_flow() until reply, cancellation or timeout on control_io.
+     * @details pending_opens_ borrows its address; scope cleanup removes the entry before destruction.
+     */
+    struct PendingOpen
     {
         /** @brief Initialize the remote result event on control_io. */
-        explicit RemoteFlow(asio::any_io_executor executor) : completed(executor) {}
+        explicit PendingOpen(asio::any_io_executor executor) : completed(executor)
+        {
+        }
         FlowResult result;
         AsyncEvent completed;
     };
-    /** @brief Retain a one-shot Flow close notification and its diagnostic reason. */
-    struct FlowWatch
-    {
-        /** @brief Initialize the one-shot closure event on control_io. */
-        explicit FlowWatch(asio::any_io_executor executor) : closed(executor) {}
-        std::string reason;
-        AsyncEvent closed;
-    };
-    std::shared_ptr<FlowRequest> create_flow(std::vector<std::string> path, RelayProtocol transport,
-                                             std::uint64_t requested_id = 0);
-    asio::awaitable<FlowResult> establish_flow(std::shared_ptr<FlowRequest> request);
-    /** @brief Await the master's shared FlowRequest result on control_io with a 30-second bound. */
-    asio::awaitable<FlowResult> request_flow(std::vector<std::string> path, RelayProtocol transport);
-    asio::awaitable<void> reply_flow(std::shared_ptr<FlowRequest> request, std::string target);
+    std::shared_ptr<MasterPath> create_path(std::vector<std::string> path, RelayProtocol transport,
+                                            std::uint64_t requested_id = 0);
+    /** @brief Start or reuse all adjacent Links on control_io without waiting or launching edge tasks. */
+    void start_path(const std::shared_ptr<MasterPath> &request);
+    /**
+     * @brief Enter Preparing once every edge is ready; reuse the acknowledgement bitmap on control_io.
+     * @pre The caller owns a Linking transaction; invalidation closes it before publishing Link results.
+     */
+    void prepare_path(const std::shared_ptr<MasterPath> &request);
+    /** @brief Publish the open result to local waiters and consume any remote reply target on control_io. */
+    void finish_open(const std::shared_ptr<MasterPath> &request);
     /** @brief Reserve remote requests synchronously before a subsequent cancellation can arrive. */
     void handle_flow_request(CtrlCommand command, CtrlMessage message);
-    void flow_closed(std::uint64_t id, std::string reason);
-    void fail_remote_flows(const std::string &reason);
-    void arm_flow_timeout(const std::shared_ptr<FlowRequest> &request);
-    bool send_all(const FlowRequest &request, CtrlCommand command);
-    void finish_flow(std::shared_ptr<FlowRequest> request, std::string stage, std::string reason);
-    void released(std::shared_ptr<FlowRequest> request, std::string error = {});
-    bool valid_flow(const njson &params) const;
+    void notify_flow_closed(std::uint64_t id, std::string reason);
+    void fail_waiters(const std::string &reason);
+    void arm_path_timeout(const std::shared_ptr<MasterPath> &request);
+    bool send_all(const MasterPath &request, CtrlCommand command);
+    void close_path(std::shared_ptr<MasterPath> request, std::string stage, std::string reason);
+    void release_path(std::shared_ptr<MasterPath> request, std::string error = {});
+    bool valid_flow(const FlowParams &params) const;
     void handle_link(CtrlCommand command, CtrlMessage message);
+    /** @brief Apply authenticated master commands to local Link authorizations on control_io. */
+    void handle_link_command(CtrlCommand command, const njson &params, std::uint64_t id, std::uint64_t epoch,
+                             const std::string &source);
+    /** @brief Collect authenticated endpoint replies for a master-owned shared Link on control_io. */
+    void handle_link_reply(CtrlCommand command, const njson &params, std::uint64_t id, const std::string &source);
     void handle_flow(CtrlCommand command, CtrlMessage message);
+    /** @brief Apply authenticated master commands to local Flow authorizations on control_io. */
+    void handle_flow_command(CtrlCommand command, const njson &params, std::uint64_t id, std::uint64_t epoch,
+                             const std::string &source);
+    /** @brief Advance a master-owned path from authenticated endpoint replies on control_io. */
+    void handle_flow_reply(CtrlCommand command, const njson &params, std::uint64_t id, std::uint64_t epoch,
+                           const std::string &source);
     /** @brief Receive data-domain events on control_io; notification loss terminates the data service. */
     asio::awaitable<void> receive_events();
     /** @brief Stop requests and await data tasks on control_io before cluster control disconnects. */
@@ -221,15 +277,14 @@ class NodeLinkMgr
     ClusterMgr &cluster_;
     Topology &topology_;
     std::shared_ptr<FlowProtocol> protocol_;
-    std::map<LinkKey, std::shared_ptr<LinkRequest>> link_requests_;
-    std::map<std::uint64_t, njson> link_endpoints_;
-    std::map<std::uint64_t, std::shared_ptr<FlowRequest>> flow_requests_;
-    std::map<std::uint64_t, njson> flow_endpoints_;
-    std::map<std::uint64_t, std::shared_ptr<FlowRequest>> closing_flows_;
-    std::map<std::uint64_t, std::shared_ptr<RemoteFlow>> remote_flows_;
-    std::map<std::uint64_t, std::shared_ptr<FlowWatch>> flow_watches_;
-    std::size_t flow_tasks_ = 0;
-    asio::steady_timer done_;
+    // Master-wide coordination. Closing paths remain in paths_ until acknowledgement or timeout.
+    std::map<LinkKey, std::shared_ptr<SharedLink>> shared_links_;
+    std::map<std::uint64_t, std::shared_ptr<MasterPath>> paths_;
+    // This node's authorizations, including transit Flows. Observers retain only CloseNotice.
+    std::map<std::uint64_t, LinkParams> local_links_;
+    std::map<std::uint64_t, LocalFlow> local_flows_;
+    std::map<std::uint64_t, PendingOpen *> pending_opens_;
+    asio::steady_timer events_done_;
     bool stop_ok_ = true;
     bool running_ = false;
     bool events_running_ = false;

@@ -49,20 +49,8 @@ inline void prepare(std::shared_ptr<FlowProtocol> protocol, const njson& p)
 inline asio::awaitable<CtrlMessage> event(std::shared_ptr<FlowProtocol> protocol)
 {
     auto event = co_await protocol->receive_event();
-    CtrlCommand command;
-    switch (event.kind)
-    {
-    case lnk::EventKind::LinkPrepared: command = CtrlCommand::LinkPrepared; break;
-    case lnk::EventKind::LinkReady: command = CtrlCommand::LinkReady; break;
-    case lnk::EventKind::LinkError: command = CtrlCommand::LinkError; break;
-    case lnk::EventKind::LinkClosed: command = CtrlCommand::LinkClosed; break;
-    case lnk::EventKind::FlowPrepared: command = CtrlCommand::FlowPrepared; break;
-    case lnk::EventKind::FlowCommitted: command = CtrlCommand::FlowCommitted; break;
-    case lnk::EventKind::FlowError: command = CtrlCommand::FlowError; break;
-    case lnk::EventKind::FlowClosed: command = CtrlCommand::FlowClosed; break;
-    }
-    co_return CtrlMessage(command, njson{{"epoch", event.epoch}, {"id", event.id}, {"flow_id", event.id},
-                                         {"stage", event.stage}, {"reason", event.reason}});
+    co_return CtrlMessage(event.command, njson{{"epoch", event.epoch}, {"id", event.id}, {"flow_id", event.id},
+                                               {"stage", event.stage}, {"reason", event.reason}});
 }
 
 // Fixtures cross once to retrieve/bind a synthetic endpoint; all actual traffic uses production ports.
@@ -122,7 +110,7 @@ inline asio::awaitable<bool> send_data(std::shared_ptr<FlowProtocol> channel, st
     {
         co_await asio::co_spawn((*stream)->executor(),
             [stream = *stream, payload = std::move(payload)]() -> asio::awaitable<void> {
-                co_await stream->send(stream->copy_payload(payload));
+                co_await stream->send(lnk::PooledBuffer(stream->pool, payload));
             }, asio::use_awaitable);
         co_return true;
     }

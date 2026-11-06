@@ -251,10 +251,15 @@ class Benchmark
             for (;;)
             {
                 auto event = co_await node->receive_event();
-                if (event.kind == lnk::EventKind::LinkReady) ++ready_;
-                if (!stopping_ && (event.kind == lnk::EventKind::LinkError || event.kind == lnk::EventKind::FlowError ||
-                                   event.kind == lnk::EventKind::LinkClosed || event.kind == lnk::EventKind::FlowClosed))
+                if (event.command == CtrlCommand::LinkReady)
+                {
+                    ++ready_;
+                }
+                if (!stopping_ && (event.command == CtrlCommand::LinkError || event.command == CtrlCommand::FlowError ||
+                                   event.command == CtrlCommand::LinkClosed || event.command == CtrlCommand::FlowClosed))
+                {
                     errors_.push_back(event.stage + ": " + event.reason);
+                }
             }
         }
         catch (const asio::system_error &error)
@@ -372,7 +377,7 @@ class Benchmark
             const std::uint64_t id = index;
             std::memcpy(pattern.data() + 8, &id, sizeof(id));
             const auto began = Clock::now();
-            co_await pair.source->send(pair.source->copy_payload(pattern));
+            co_await pair.source->send(lnk::PooledBuffer(pair.source->pool, pattern));
             const auto now = Clock::now();
             pair.sent += options_.chunk;
             ++sequence;
@@ -416,12 +421,15 @@ class Benchmark
                 const auto requested = rate(Clock::now());
                 if (previous_rate != requested)
                 {
-                    // Only replace a test sink's bucket after its prior consume has completed.
+                    // Only replace a test sink's bucket after its prior wait has completed.
                     // Production has no live rate-change API; this models downstream speed changes.
                     limiter = TokenBucket(static_cast<std::uint64_t>(requested) * 125000 / options_.flows, 0);
                     previous_rate = requested;
                 }
-                co_await limiter.consume(payload->size());
+                if (const auto deadline = limiter.reserve(payload->size()))
+                {
+                    co_await limiter.wait_until(*deadline);
+                }
             }
             const auto bytes = payload->size();
             payload.reset();

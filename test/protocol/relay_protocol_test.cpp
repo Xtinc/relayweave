@@ -85,8 +85,7 @@ void test_control_commands()
              CommandCase{CtrlCommand::ServerIdentified, "server.identified", CtrlCommand::Server, CtrlCommand::Server},
              CommandCase{CtrlCommand::ServerStatusQuery, "server.status.query", CtrlCommand::Server, CtrlCommand::Server},
              CommandCase{CtrlCommand::ServerTrafficReported, "server.traffic.reported", CtrlCommand::Server, CtrlCommand::Server},
-             CommandCase{CtrlCommand::ServiceListed, "service.listed", CtrlCommand::Service, CtrlCommand::Service},
-             CommandCase{CtrlCommand::NodeLocated, "node.located", CtrlCommand::Node, CtrlCommand::Node}})
+             CommandCase{CtrlCommand::ServiceListed, "service.listed", CtrlCommand::Service, CtrlCommand::Service}})
     {
         const auto message = unpack_message(WireMessage::pack(CtrlMessage{command}));
         require(message.command == name && message.type() == command, "Control command wire mapping is inconsistent");
@@ -223,6 +222,22 @@ void test_attach_validation()
                             njson{{"role", RelayAttach::Producer}, {"uuid", uuid}, {"ticket", uint64_t{0}}}});
         },
         "Zero ticket was accepted");
+
+    RelayAttach stream{RelayAttach::Producer, uuid, ticket, RelayAttach::ConnectionId{}};
+    for (std::size_t i = 0; i < stream.connection_id->size(); ++i)
+    {
+        (*stream.connection_id)[i] = static_cast<std::uint8_t>(i * 7);
+    }
+    const auto encoded = RelayAttach::to_msg(stream);
+    require(RelayAttach::from_msg(encoded).connection_id == stream.connection_id,
+            "Connection ID failed its exact-byte round trip");
+    for (const auto &invalid : {njson(1), njson(""), njson(std::string(63, '0')),
+                               njson(std::string(65, '0')), njson(std::string(64, 'g'))})
+    {
+        auto bad = encoded;
+        (*bad.params)["connection_id"] = invalid;
+        require_throws([&] { RelayAttach::from_msg(bad); }, "Malformed connection ID accepted");
+    }
 
     auto extended_params = valid_params;
     extended_params["future_field"] = true;
