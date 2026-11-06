@@ -1,31 +1,5 @@
-cmake_minimum_required(VERSION 3.21)
+cmake_minimum_required(VERSION 3.24)
 project(relayweave VERSION 1.0.7 LANGUAGES CXX)
-
-if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2/include/asio.hpp"
-    OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/CMakeLists.txt"
-    OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/include/nlohmann/json.hpp")
-    find_package(Git REQUIRED)
-    file(MAKE_DIRECTORY "${PROJECT_SOURCE_DIR}/vendor")
-endif()
-
-if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2/include/asio.hpp")
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" clone --depth 1 --branch asio-1-38-2
-            https://github.com/chriskohlhoff/asio.git
-            "${PROJECT_SOURCE_DIR}/vendor/asio-1.38.2"
-        COMMAND_ERROR_IS_FATAL ANY
-    )
-endif()
-
-if(NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/CMakeLists.txt"
-    OR NOT EXISTS "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0/include/nlohmann/json.hpp")
-    execute_process(
-        COMMAND "${GIT_EXECUTABLE}" clone --depth 1 --branch v3.12.0
-            https://github.com/nlohmann/json.git
-            "${PROJECT_SOURCE_DIR}/vendor/json-3.12.0"
-        COMMAND_ERROR_IS_FATAL ANY
-    )
-endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -52,21 +26,24 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     add_link_options(-static-libstdc++ -static-libgcc)
 endif()
 
-if(WIN32 AND NOT DEFINED OPENSSL_ROOT_DIR)
-    set(OPENSSL_ROOT_DIR "D:/Program Files/OpenSSL-Win64")
-endif()
 find_package(Threads REQUIRED)
-find_package(OpenSSL 3.2 REQUIRED)
-include(CheckCXXSymbolExists)
-set(CMAKE_REQUIRED_LIBRARIES OpenSSL::SSL OpenSSL::Crypto)
-check_cxx_symbol_exists(SSL_CTX_set1_client_cert_type "openssl/ssl.h" RELAYWEAVE_HAS_RPK)
-unset(CMAKE_REQUIRED_LIBRARIES)
-if(NOT RELAYWEAVE_HAS_RPK)
-    message(FATAL_ERROR "OpenSSL must be built with raw public key (RPK) support")
-endif()
+set(OPENSSL_USE_STATIC_LIBS TRUE)
+find_package(OpenSSL 3.2 REQUIRED COMPONENTS SSL Crypto)
+
+include(FetchContent)
+FetchContent_Declare(asio
+    URL https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-38-2.tar.gz
+    URL_HASH SHA256=9f2648fa483e58a6bf848d970ee0ea650ca19ed7769dfa520ed4f7b8d27af1db
+)
+FetchContent_Declare(nlohmann_json
+    URL https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz
+    URL_HASH SHA256=4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187
+)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_MakeAvailable(asio nlohmann_json)
 
 add_library(asio INTERFACE)
-target_include_directories(asio INTERFACE "${CMAKE_SOURCE_DIR}/vendor/asio-1.38.2/include")
+target_include_directories(asio INTERFACE "${asio_SOURCE_DIR}/include")
 target_compile_definitions(asio INTERFACE $<$<CXX_COMPILER_ID:MSVC>:_WIN32_WINNT=0x0601>)
 target_link_libraries(asio INTERFACE Threads::Threads)
 
@@ -95,9 +72,6 @@ if(ENABLE_IO_URING)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(STATUS "Asio backend: epoll (ENABLE_IO_URING=OFF)")
 endif()
-
-set(JSON_BuildTests OFF CACHE INTERNAL "")
-add_subdirectory(vendor/json-3.12.0)
 
 add_subdirectory(protocol)
 add_subdirectory(route)

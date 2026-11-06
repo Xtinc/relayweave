@@ -38,7 +38,7 @@ UDP Consumer 按双向业务空闲超时回收关联（默认 60 秒），所有
 共享通道、路径事务、数据热路径和生命周期统一见 [RelayWeave 设计](docs/RelayWeave设计.md)。
 TLS 业务由两端 Agent 使用 TLS 1.3 双向 RPK 认证与加密，复用已有共享客户端凭据；Node 只转发密文。
 TCP/TLS 共用 Node 的 `tcp` 数据端口、容量及限速，接入授权经现有控制 mTLS 完成；不再配置独立 `tls` 数据入口。
-编译与 Agent 运行库需要支持 RPK 的 OpenSSL 3.2+，Node/Agent 须统一升级。
+编译需要支持 RPK 的 OpenSSL 3.2+ 静态库；程序静态链接 OpenSSL，运行时无需系统 libssl/libcrypto，Node/Agent 须统一升级。
 多节点 TCP/TLS 使用逐跳双向信用窗口，拥塞时等待；UDP 满队列丢包而不关闭健康 Flow。
 固定窗口、预算和流控算法见 [逐跳信用流控机制](docs/RelayWeave设计.md#54-逐跳信用流控机制-hop-by-hop-credit-flow-control)；
 TCP 共享发送队列按流标签交错插入，算法、接口与实现见 [近似公平队列调度算法](docs/RelayWeave设计.md#55-近似公平队列调度算法-fairqueue)。

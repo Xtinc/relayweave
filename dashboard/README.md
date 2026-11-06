@@ -296,7 +296,7 @@ cpack --config build/CPackConfig.cmake -G DEB -D CPACK_COMPONENTS_ALL=dashboard
 
 采集连接和 TLS 握手超时均默认为 5 秒，示例省略对应字段。证书用于采集连接的 mTLS 认证，即使连接同机 Node 也需要保留。
 
-Dashboard 复用与 Node、Agent 相同的部署脚本。证书输入目录采用 Agent 的命名：`server-ca.pem`、`client-ca.pem`、`shared-client.pem`、`shared-client.key`。其中 `client-ca.pem` 仅用于部署前验证客户端证书，不会安装。可使用现有 Agent 证书目录，或按相同命名准备专用客户端证书。
+Dashboard 复用与 Node、Agent 相同的部署脚本。证书输入目录采用 Agent 的命名：`server-ca.pem`、`client-ca.pem`、`shared-client.pem`、`shared-client.key`。其中 `client-ca.pem` 仅用于部署前验证客户端证书，不会安装。若使用新的三文件 `client.tar.gz`，解压后还需由签发端单独提供 `client-ca.pem` 公钥证书，供此旧部署接口验证；不要复制含 CA 私钥的离线备份包。也可按上述四个文件名准备专用客户端证书。
 
 先校验，再安装配置和证书并启动：
 
@@ -312,7 +312,7 @@ curl http://127.0.0.1:5000/api/health
 
 工具检查客户端证书信任链和私钥匹配，将配置原样安装到 `/etc/relayweave/dashboard.json`，将证书安装到独立的 `/etc/relayweave/dashboard-certs/`。配置中的证书路径须与示例一致，使用 `shared-client.pem` / `shared-client.key`；工具不会重写 JSON。目录为 `root:relayweave-dashboard`、`0750`，私钥和配置为 `0640`，看板用户可以读取，无需修改 Agent 的证书权限。
 
-覆盖前备份到 `/var/backups/relayweave/dashboard-<UTC时间>-<pid>/`。不带启停参数时仅安装文件；`--start` 启用并启动服务，`--restart` 仅重启已运行的服务。源码中可用 `bash scripts/provision_relayweave.sh dashboard ...` 调用相同流程。`--dry-run` 不修改文件或服务，也不检查安装后的权限和采集连接。
+覆盖前备份到 `/var/backups/relayweave/dashboard-<UTC时间>-<随机后缀>/`。不带启停参数时仅安装文件；`--start` 启用并启动服务，`--restart` 仅重启已运行的服务。源码中可用 `bash scripts/provision_relayweave.sh dashboard ...` 调用相同流程。`--dry-run` 不修改文件或服务，也不检查安装后的权限和采集连接。
 
 服务始终使用单进程 Waitress，HTTP 监听地址固定为 `127.0.0.1`，默认端口 `5000`。不需要开放服务器的公网 5000 端口。`/api/health` 的 HTTP 200 表示 HTTP 服务可用，JSON 的 `ok` 才表示集群采集正常；入口 Node 暂时离线时，页面继续可用，采集客户端会自动重连。
 

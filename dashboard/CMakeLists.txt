@@ -12,7 +12,5 @@ install(FILES "${PROJECT_SOURCE_DIR}/packaging/dashboard/relayweave-dashboard.se
     DESTINATION lib/systemd/system COMPONENT dashboard)
 install(FILES dashboard.example.json
     DESTINATION etc/relayweave RENAME dashboard.json COMPONENT dashboard)
-install(FILES README.md requirements.txt
-    DESTINATION usr/share/doc/relayweave-dashboard COMPONENT dashboard)
 install(PROGRAMS "${PROJECT_SOURCE_DIR}/scripts/provision_relayweave.sh"
     DESTINATION usr/sbin RENAME relayweave-provision-dashboard COMPONENT dashboard)

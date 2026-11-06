@@ -19,7 +19,6 @@ class DebianControlFilesTest(unittest.TestCase):
             source = work / 'source'
             build = work / 'build'
             shutil.copytree(ROOT / 'packaging', source / 'packaging')
-            shutil.copytree(ROOT / 'docs', source / 'docs')
             shutil.copytree(ROOT / 'cmake', source / 'cmake')
             shutil.copytree(ROOT / 'dashboard', source / 'dashboard',
                             ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
@@ -39,7 +38,7 @@ class DebianControlFilesTest(unittest.TestCase):
             # Exercise the real packaging rules with a tiny payload instead of
             # compiling C++. No packages or services are installed on the host.
             (source / 'payload').write_text('test payload\n')
-            (source / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.21)
+            (source / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.24)
 project(relayweave VERSION 1.0.4 LANGUAGES NONE)
 foreach(component IN ITEMS agent node proxy dashboard)
     install(FILES payload DESTINATION usr/share/relayweave COMPONENT ${component})
@@ -59,6 +58,9 @@ include(cmake/Packaging.cmake)
             for component in components:
                 with self.subTest(component=component):
                     package, = (build / 'packages').glob(f'relayweave-{component}_*.deb')
+                    contents = subprocess.check_output(['dpkg-deb', '--contents', str(package)], text=True)
+                    self.assertNotIn('/usr/share/doc/', contents)
+                    self.assertNotIn('requirements.txt', contents)
                     extracted = work / component
                     subprocess.run(['dpkg-deb', '--control', str(package), str(extracted)],
                                    check=True, capture_output=True, timeout=10)

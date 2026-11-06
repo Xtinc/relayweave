@@ -30,7 +30,7 @@ set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION ON)
 set(CPACK_DEBIAN_AGENT_PACKAGE_NAME "relayweave-agent")
 set(CPACK_DEBIAN_AGENT_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_AGENT_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_AGENT_PACKAGE_DEPENDS "systemd, openssl (>= 3.2)")
+set(CPACK_DEBIAN_AGENT_PACKAGE_DEPENDS "systemd, openssl")
 set(CPACK_DEBIAN_AGENT_PACKAGE_DESCRIPTION
     "RelayWeave agent for publishing services and forwarding local TCP, TLS, and UDP traffic.")
 
@@ -72,14 +72,6 @@ foreach(component IN ITEMS agent node proxy dashboard)
         list(APPEND control_files "${control_output}")
     endforeach()
     set(CPACK_DEBIAN_${component_upper}_PACKAGE_CONTROL_EXTRA "${control_files}")
-
-    install(FILES
-        "${PROJECT_SOURCE_DIR}/docs/RelayWeave设计.md"
-        "${PROJECT_SOURCE_DIR}/docs/RelayWeave打包与安装.md"
-        "${PROJECT_SOURCE_DIR}/docs/证书制作与部署.md"
-        DESTINATION "usr/share/doc/relayweave-${component}"
-        COMPONENT ${component}
-    )
 endforeach()
 
 include(CPack)

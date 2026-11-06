@@ -1,6 +1,6 @@
 # RelayWeave 打包与安装
 
-端到端 TLS 需要支持 RPK 的 OpenSSL **3.2 或更高版本**，编译与部署运行库均须满足。此次数据接入协议要求所有 Node/Agent 统一升级，不兼容旧版。Node 删除独立 `tls` 数据配置，TCP/TLS 共用原 `tcp` 端口、容量和限速；升级前删除 Node 配置中的 `tls` 段。Agent 凭据不变，双方对应 service/forward 的 `protocol: "tls"` 即启用端到端加密。
+端到端 TLS 编译需要支持 RPK 的 OpenSSL **3.2 或更高版本**静态库，程序运行时不依赖系统 libssl/libcrypto。此次数据接入协议要求所有 Node/Agent 统一升级，不兼容旧版。Node 删除独立 `tls` 数据配置，TCP/TLS 共用原 `tcp` 端口、容量和限速；升级前删除 Node 配置中的 `tls` 段。Agent 凭据不变，双方对应 service/forward 的 `protocol: "tls"` 即启用端到端加密。
 
 
 本文集中说明 RelayWeave 的 CMake/CPack Debian 打包、版本和架构命名、文件布局、systemd 服务生命周期、安装、升级、卸载和排错。系统原理见 [RelayWeave 设计](RelayWeave设计.md)，证书生成和信任关系见 [证书制作与部署](证书制作与部署.md)。
@@ -36,7 +36,7 @@ relayweave-proxy_1.0.0-1_arm64.deb
 版本来源只有两处：
 
 - upstream version 在顶层 [`CMakeLists.txt`](../CMakeLists.txt) 的 `project(relayweave VERSION ...)` 中维护；
-- Debian revision 使用 CMake cache 变量 `RELAYWEAVE_PACKAGE_RELEASE`，默认值为 `2`。
+- Debian revision 使用 CMake cache 变量 `RELAYWEAVE_PACKAGE_RELEASE`，默认值为 `3`。
 
 应用输出的版本、CMake project version 和包的 upstream version 来自同一 `PROJECT_VERSION`。只修改 Debian 构建或维护脚本而应用版本不变时，可以递增 revision，例如从 `1.0.0-1` 变为 `1.0.0-2`。
 
@@ -46,9 +46,9 @@ Dashboard 是纯 Python 包，架构固定为 `all`。构建时只复制源码�
 
 最低要求：
 
-- CMake 3.21；
+- CMake 3.24；
 - 支持 C++20 的编译器；
-- 支持 RPK 的 OpenSSL 3.2+ headers 和 libraries；
+- 支持 RPK 的 OpenSSL 3.2+ headers 和静态 libraries；
 - pthread；
 - Debian 打包工具，包括 `dpkg-shlibdeps`；
 - Bash，用于项目包装脚本。
@@ -60,7 +60,13 @@ sudo apt update
 sudo apt install build-essential cmake libssl-dev dpkg-dev
 ```
 
-Linux 上 GCC 的 `libstdc++` 和 `libgcc` 被静态链接，glibc、OpenSSL 等系统库仍按动态依赖处理。CPack 启用 `dpkg-shlibdeps` 自动计算三个包的共享库依赖，并显式依赖 `systemd`。
+Asio 1.38.2 和 JSON 3.12.0 由 FetchContent 下载源码压缩包并解压到构建目录。离线构建可通过 `FETCHCONTENT_SOURCE_DIR_ASIO` 和 `FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON` 指定已有源码目录。
+
+OpenSSL 使用静态链接；可通过 `-DOPENSSL_ROOT_DIR=/path/to/openssl` 指定安装目录，该目录必须提供静态库。RPK 接口从 OpenSSL 3.2 开始提供，CMake 直接要求最低版本 3.2，低于该版本时终止配置，不再额外检查符号。
+
+`scripts/build_deb.sh` 每次配置时重新查找 OpenSSL 库，避免旧构建目录缓存的 `.so` 路径导致继续动态链接。Deb 对 `openssl` 命令行工具不设置版本要求；程序的 OpenSSL 最低版本约束只在编译时检查。
+
+Linux 上 GCC 的 `libstdc++` 和 `libgcc` 也被静态链接，glibc 等其他系统库仍按动态依赖处理。CPack 启用 `dpkg-shlibdeps` 自动计算三个包的共享库依赖，并显式依赖 `systemd`。Agent/Node 包保留 `openssl` 命令行工具依赖，供证书部署脚本使用，无需部署 OpenSSL 3.2+ 共享库。
 
 ## 3. 生成 Deb 包
 
@@ -125,8 +131,7 @@ Git 对 `packaging/` 文件统一要求 LF 换行；CMake 还会把 `conffiles`�
 | 证书目录 | `/etc/relayweave/certs/` | `/etc/relayweave/certs/` | 不需要 |
 | 部署工具 | `/usr/sbin/relayweave-provision-agent` | `/usr/sbin/relayweave-provision-node` | `/usr/sbin/relayweave-provision-proxy` |
 
-四个组件包均在 `/usr/share/doc/relayweave-<role>/` 安装设计、打包与安装、证书部署文档；Dashboard
-另包含其 README。route 模块静态链接到 Node 和 Agent，不单独打包；测试、诊断程序及测试证书不安装。
+四个组件包只安装运行文件和部署工具，不安装仓库中的文档、README 或 requirements.txt。文档从源码仓库查阅。route 模块静态链接到 Node 和 Agent，不单独打包；测试、诊断程序及测试证书不安装。
 
 Node 的 UDP 建立超时使用 `udp.setup_timeout_ms`，默认 10000 毫秒；旧 `udp.service_wait_timeout_ms` 已删除，升级已有配置时需要移除旧字段。服务离线仅在 Agent 本地等待，不分配 Node 资源。
 
@@ -153,47 +158,48 @@ sudo apt install ./build-package/packages/relayweave-proxy_1.0.0-1_arm64.deb
 3. enable 对应服务，使其在以后开机时启动；
 4. 不立即启动服务，避免使用尚未修改的示例地址和缺失证书启动。
 
-随后准备主机专用配置和由证书生成脚本输出的部署目录。先执行只读验证：
+随后编辑当前角色的 `/etc/relayweave/node.json` 或 `/etc/relayweave/agent.json`，将签发端生成的本机证书压缩包传到目标机器。完整流程是：安装 Deb → 编辑配置 → 安装证书 → 手工启动服务。
 
 ```console
-relayweave-provision-node \
-  --cert-dir /secure/relayweave/nodes/master-1 \
-  --config /secure/relayweave/config/master-1.json \
-  --verify-host proxy.example.com \
-  --dry-run
-
-relayweave-provision-agent \
-  --cert-dir /secure/relayweave/agent \
-  --config /secure/relayweave/config/agent.json \
-  --dry-run
-
-relayweave-provision-proxy \
-  --config /secure/relayweave/config/proxy.json \
-  --dry-run
+# 无参数进入证书安装/更新/卸载菜单，只运行当前主机所需角色。
+sudo relayweave-provision-node
+sudo relayweave-provision-agent
 ```
 
-验证通过后安装文件并首次启动，只执行当前主机实际安装的角色：
+命令方式同样支持首次安装和更新：
+
+```console
+relayweave-provision-node --install-certs ./node-master-1.tar.gz --dry-run
+sudo relayweave-provision-node --install-certs ./node-master-1.tar.gz
+sudo systemctl start relayweave-node
+
+relayweave-provision-agent --install-certs ./client.tar.gz --dry-run
+sudo relayweave-provision-agent --install-certs ./client.tar.gz
+sudo systemctl start relayweave-agent
+```
+
+更新后需要加载新证书时手工执行 `systemctl restart relayweave-node` 或 `relayweave-agent`。证书流程不调用 systemd，不覆盖配置；`--remove-certs` 备份并卸载当前角色证书，也不改变服务状态。Node 只安装四个证书文件，Agent 只安装三个；具体内容和生成方法见 [证书制作与部署](证书制作与部署.md)。Node/Agent 同机且共用证书目录时，卸载一方保留另一方使用的 Server CA。`--cert-dir DEST` 可指定目标目录，配置中的路径须与之对应。
+
+覆盖或卸载前备份到 `/var/backups/relayweave/<role>-<UTC时间>-<随机后缀>/`；写入失败时尝试恢复。`--dry-run` 验证文件但不修改目标或服务，无需 root。
+
+原有完整部署接口继续保留：
 
 ```console
 sudo relayweave-provision-node \
-  --cert-dir /secure/relayweave/nodes/master-1 \
+  --cert-dir /secure/relayweave/node-certificates \
   --config /secure/relayweave/config/master-1.json \
-  --verify-host proxy.example.com \
-  --start
+  --verify-host proxy.example.com --start
 
 sudo relayweave-provision-agent \
-  --cert-dir /secure/relayweave/agent \
-  --config /secure/relayweave/config/agent.json \
-  --start
+  --cert-dir /secure/relayweave/client-certificates \
+  --config /secure/relayweave/config/agent.json --start
 
-sudo relayweave-provision-proxy \
-  --config /secure/relayweave/config/proxy.json \
-  --start
+sudo relayweave-provision-proxy --config /secure/relayweave/config/proxy.json --start
 ```
 
-Dashboard 也使用同一工具：`relayweave-provision-dashboard --cert-dir DIR --config FILE [--dry-run] [--start|--restart]`。证书输入与 Agent 相同，安装到独立的 `/etc/relayweave/dashboard-certs/`，私钥设置为看板专用组可读；详见 [Dashboard 部署说明](../dashboard/README.md#独立服务部署)。
+这里的 Node/Agent 证书目录来自对应压缩包的解压结果；Agent 若额外提供 `client-ca.pem` 则做签发链验证，但不安装该文件。完整部署接口默认不改变服务状态；只有显式的 `--start` 执行 `systemctl enable --now`，`--restart` 执行 `systemctl try-restart`。`--verify-host` 仅适用于 Node，可重复指定。
 
-工具按固定路径安装配置和证书，覆盖前把已有文件保存到 `/var/backups/relayweave/<role>-<UTC时间>-<pid>/`。Proxy 不使用证书，因此其部署命令不接受 `--cert-dir`。默认不改变服务状态；`--start` 执行 `systemctl enable --now`，`--restart` 执行 `systemctl try-restart`。Node 的 `--verify-host` 可以重复指定，Agent、Proxy 和 Dashboard 不接受该选项。
+Proxy 和 Dashboard 的接口保持原样。Proxy 不需要证书；Dashboard 仍使用 `relayweave-provision-dashboard --cert-dir DIR --config FILE [--dry-run] [--start|--restart]`，输入需包含 Client CA 公钥证书以验证客户端签发链，安装到独立的 `/etc/relayweave/dashboard-certs/`；详见 [Dashboard 部署说明](../dashboard/README.md#独立服务部署)。
 
 检查状态和日志：
 
