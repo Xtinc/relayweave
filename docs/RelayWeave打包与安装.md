@@ -275,6 +275,25 @@ Node 配置需要将旧 `cluster.port` 改为必填 `cluster.control_port`，并
 新的部署工具使用同版本 `relayweave-node --check-cluster-config FILE` 验证这些字段。
 Node 升级时先停止服务、安装新包、迁移配置，再使用部署工具 `--start`；保留的 conffile 不会自动迁移。
 
+### 6.1 协议与配置迁移边界
+
+软件包可以分别安装，但跨进程协议变更仍须按下表协调部署；包安装完成也不表示运行中的进程已加载新程序。
+
+| 变更 | 协调升级范围 | 迁移与检查 |
+|---|---|---|
+| 删除节点定位命令与 `service.located.port` | 使用这些旧字段的 Agent 与 Node | 旧 Agent 若强制读取 port，不能继续配套使用；没有旧命令兼容分支。 |
+| Flow 事务精简 | Master 与全部 Slave | Prepare 传完整授权，后续只传事务身份及诊断；须同步升级，不能以 Agent 仍可连接作为集群兼容证明。 |
+| 端到端 TLS 与控制绑定 | 全部 Node 与 Agent | 删除 Node 的 `tls` 段，统一使用 `tcp` 端口、容量和限速；流式接入改为读取 32 字节编号后经控制 mTLS 提交 attach。旧数据 TLS、数据 socket 票据和 `tls_framing` 协商均已移除，无明文回退。 |
+| 质量格式与集群端口 | Node、Agent、Dashboard 及对应配置 | 按本节迁移 quality、routing 和 cluster 端口字段；conffile 保留不自动转换内容。 |
+
+端到端 TLS 的两端继续使用同一套共享客户端证书与私钥，只需将对应 service/forward 的 protocol 设为 tls。无需给 Producer 另签 serverAuth 证书；若轮换了共享私钥，互联双方必须同时更新，详见 [端到端公钥与凭据轮换](证书制作与部署.md#26-端到端公钥与凭据轮换)。
+
+OpenSSL 部署以第 2 节当前链接方式为准：默认静态链接时构建机需要支持 RPK 的 3.2+ 开发库，运行机无需同版本共享库；选择动态链接时运行机须提供匹配的库。历史改造记录中的运行库依赖不替代当前打包规则。
+
+多跳准备失败的诊断 stage 已由早期 attach/bridge 收敛为 prepare；按旧 stage 字面值分类的日志工具需同步调整。会话内部的控制器删除、数据任务合并和所有权调整没有另加兼容协议。
+
+### 6.2 升级核验与回退
+
 升级后检查：
 
 ```console

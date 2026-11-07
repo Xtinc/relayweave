@@ -27,7 +27,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 find_package(Threads REQUIRED)
-option(OPENSSL_USE_STATIC_LIBS "Link OpenSSL statically" ON)
+option(OPENSSL_USE_STATIC_LIBS "Link OpenSSL statically" OFF)
 find_package(OpenSSL 3.2 REQUIRED COMPONENTS SSL Crypto)
 if(OPENSSL_USE_STATIC_LIBS)
     find_package(ZLIB REQUIRED)

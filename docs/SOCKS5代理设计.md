@@ -11,7 +11,7 @@ BIND、用户名密码及 GSSAPI 认证尚未实现，不将当前实现称为�
 请求中的地址和端口描述客户端的 UDP 来源，不是业务目标；不知道来源时可以填写全零。
 代理回复一个独立 UDP 接收地址和动态端口，客户端随后向该端点发送 SOCKS5 UDP 报文。
 
-`ProxyServer` 持有活动 `ProxySession`；UDP Session 按值持有唯一 `Socks5UdpAssociation`。
+`ProxyServer` 通过 `unique_ptr` 独占活动 `ProxySession`；UDP Session 按值持有唯一 `Socks5UdpAssociation`。
 关联借用所属 Session 的 TCP socket，直接持有客户端接收 socket、IPv4/IPv6 出口 socket、
 UDP resolver 和两个有界 LRU 缓存。所有状态都在 Proxy 的单线程执行器访问，不增加锁或 strand。
 IPv6 出口不可用时仍提供 IPv4 UDP 转发。
@@ -19,6 +19,10 @@ IPv6 出口不可用时仍提供 IPv4 UDP 转发。
 `run()` 使用独立的 TCP 生命周期、客户端收包、IPv4/IPv6 目标收包协程链。
 任何链结束后取消并等待其他链完成，Session 才能被移除；TCP EOF 和 Proxy stop 都关闭 UDP socket
 并取消解析任务。TCP 半关闭写方向同样结束关联。UDP 空闲不会单独解除仍存活的 TCP 关联。
+
+会话根任务及完成处理器借用会话地址，取消只请求结束，不立即删除容器项或释放容量；所有并行收发
+汇合后，完成处理器才记录结果并移除会话。启动失败回滚容器登记，不额外引入共享会话所有权。
+跨模块所有权和排空约束见 [设计文档附录 C](RelayWeave设计.md#附录-c-会话工程约束与所有权审计-engineering-invariants)。
 
 ## UDP 报文与隔离
 
@@ -53,6 +57,13 @@ RSV(2) | FRAG(1) | ATYP(1) | 地址(可变) | 端口(2) | 载荷
 超过容量时淘汰最近最少使用条目。每个 UDP 关联占用一个 `max_connections` 名额，
 与 HTTP、TCP CONNECT 共用容量限制。解析超时沿用 `connect_timeout_ms`。
 
+这里的目标缓存 TTL 只控制目标授权与解析结果，不是 UDP 关联的空闲期限。普通 RelayAgent UDP forward
+的首包缓存、固定 100 个建立并发和 60 秒 idle 属于另一条接入路径，不套用于 SOCKS5 UDP ASSOCIATE；
+本关联始终受 TCP 控制连接寿命及 Proxy 容量约束。
+
+UDP 收发协程仍在循环外复用约 64 KiB 缓冲，存在每个活动任务的常驻内存成本，不是逐包分配。
+容量估算须同时计入会话、缓存、收发任务和 socket 缓冲，不能只按 `udp_max_targets` 推算总内存。
+
 ## 使用方式
 
 启动 `relayweave-proxy proxy.json` 后，客户端连接配置中的 SOCKS5 TCP 入口，选择无认证方法并发送
@@ -67,3 +78,7 @@ UDP ASSOCIATE。客户端读取成功回复中的 BND.ADDR/BND.PORT，再直接�
 `socks5_udp` 测试通过真实 TCP/UDP socket 验证 IPv4/IPv6 入口、跨地址族转发、域名、空载荷和最大报文，
 以及非法头、分片丢弃、来源端口固定、多关联隔离、回复来源检查、缓存容量/过期、TCP 关闭和 Proxy stop。
 `proxy` 保留 HTTP、CONNECT、SOCKS5 TCP、超时和停止回归；原先拒绝 UDP ASSOCIATE 的断言改为拒绝 BIND。
+
+所有权调整后的历史集成回归还覆盖 Proxy 停机、并行任务退出及容量释放；范围与日期见
+[设计文档的实施验证记录](RelayWeave设计.md#e1-分阶段验收与关键覆盖)。这些是既有测试和历史结果说明，
+本次文档归并未重新运行网络测试。软件包与服务管理见 [RelayWeave 打包与安装](RelayWeave打包与安装.md)。

@@ -2,6 +2,15 @@
 
 本文档是 RelayWeave 项目的系统架构与工程技术设计规范，全面阐述 RelayWeave 的网络拓扑、执行域并发模型、控制面与路径事务、路由与质量评估模型、数据面与逐跳信用流控、双 CA 零信任安全体系、端到端业务时序、资源消耗模型以及控制协议规范。
 
+工程约束与所有权审计集中于附录 C，后续演进与已知边界集中于附录 D，历次验证与性能测量集中于附录 E。正文描述最终机制；历史数据保留各自的日期、环境及适用范围，不作为当前版本的性能承诺。
+
+| 文档 | 职责范围 |
+|---|---|
+| **本文** | 系统原理、协议、执行域、生命周期、工程取舍与验证依据。 |
+| **[证书制作与部署](证书制作与部署.md)** | 证书签发与压缩包制作、文件部署、凭据轮换及认证排障。 |
+| **[RelayWeave 打包与安装](RelayWeave打包与安装.md)** | 软件构建与打包、依赖、协议升级、安装和服务管理。 |
+| **[SOCKS5 代理](SOCKS5代理设计.md)** | SOCKS5 能力、TCP/UDP 关联、隔离与容量配置。 |
+
 ---
 
 ## 1. 系统上下文与架构总览
@@ -191,7 +200,7 @@ flowchart TD
     Protocol --> Flows["FlowState / PMR 载荷池"]
     Root --> Pipelines["StreamPipeline / DatagramMgr"]
     Root --> Sessions["NodeSessionList：unique_ptr NodeSession"]
-    Sessions --> Mode["按值 Single / Multi：仅模式差异数据"]
+    Sessions --> Mode["SingleSession / MultiSession：具体会话与差异状态"]
     Sessions --> DataTask["shared_ptr SessionTransfer：单次启动的数据生命周期"]
     DataTask -. "RelayTransport& 借用" .-> Pipelines
 ```
@@ -206,7 +215,7 @@ Node 通过普通 `RelayRequest` 将已解析的业务构造参数传入 NodeSes
 
 NodeSession 由 Node 会话容器独占持有，根协程完成处理器只借用会话地址；具体会话的 run 排空控制子协程、数据任务与 Flow 后才从容器删除它。代理的 ProxySession 使用同样的独占模型。NodeLink 待认证 socket 由握手协程的 unique_ptr 独占，accepting_ 只是停机时用于关闭 socket 的借用索引；握手结束先撤销索引，再销毁或移交 socket。远端 Flow 请求直接保存在 open_flow 的非 Master 分支协程帧中，pending_opens_ 仅登记其地址，退出等待时先撤销登记。
 
-AgentSession 保留共享所有权：除会话主协程之外，共享 UDP 监听任务还会独立等待向该会话发送数据，主协程可能先移除注册表。Flow 端口与协议双向关系则是「协议状态强持有端口、端口弱引用协议」，跨域投递只临时持有它们。排队载荷只延长 PMR 资源寿命，不延长整个协议或 Node 寿命。更完整的持有者、释放时点及审计依据见《会话数据任务改造计划》的“全量共享所有权复核”。
+AgentSession 保留共享所有权：除会话主协程之外，共享 UDP 监听任务还会独立等待向该会话发送数据，主协程可能先移除注册表。Flow 端口与协议双向关系则是「协议状态强持有端口、端口弱引用协议」，跨域投递只临时持有它们。排队载荷只延长 PMR 资源寿命，不延长整个协议或 Node 寿命。完整的持有者、释放时点及审计依据见附录 C.2。
 
 #### 配对状态与跨域准备
 
@@ -234,7 +243,7 @@ classDiagram
 
 安装、准备与激活事件的等待沿用会话原始绝对建立期限，重复消息不刷新期限。超时、控制断线或 peer/Flow 关闭使 NodeSession 退出阶段等待，随后关闭路径在数据域发出取消信号，能中断授权等待、greeting 等待、Flow 绑定或转发 I/O。数据任务不借用 NodeSession；管理器以引用、FlowProtocol 以可空指针借用，Node 保证先排空会话再停止它们。晚到的完成与停止处理保留任务自身，且不访问这两个借用资源。资源清理和 run() 返回后，由唯一的标准 co_spawn 完成处理器在控制域确认 Stopped，任务入口前取消也会收到确认；不使用手工完成闩锁或额外结束事件。NodeSession 在根任务的统一收尾路径禁用取消并等待完成，才能释放业务实例；不再维护独立的 binding_roles_/bindings_done_。异常通过通道原生 `std::exception_ptr` 完成参数传递，由 use_awaitable 自动抛出；管理器准备接口仍为 `awaitable<void>`。SessionTransfer 的 prepared/activate/transfer 是直接返回 wait 的普通函数，真正的阶段等待只保留一层业务协程；继续通知在该协程被等待后才发送，避免创建等待对象时产生激活或转发副作用。安装凭据由 installed 直接接收，stop 仍独立负责取消与排空。Node 将接入、绑定与 peer 就绪协调统一记为 `prepare` 阶段，独立的 Flow、控制断线等诊断阶段继续保留。
 
-单跳和多跳每个端点的数据生命周期均只有一个启动点。控制面仍需接收必要的阶段确认，跨线程通知并未消失；改造消除的是分散的跨域协程调用、attach 完成回调和控制面绑定任务记账。实际逐包转发不经过这些阶段通道。详细设计和验证记录见 [会话数据任务改造计划](会话数据任务改造计划.md)。
+单跳和多跳每个端点的数据生命周期均只有一个启动点。控制面仍需接收必要的阶段确认，跨线程通知并未消失；改造消除的是分散的跨域协程调用、attach 完成回调和控制面绑定任务记账。实际逐包转发不经过这些阶段通道。状态归属与验收依据分别见附录 C.1、E.1。
 
 ---
 
@@ -328,6 +337,10 @@ Consumer UDP 会话的建立中、运行中和关闭中状态均占用 Agent 原
 - **多等待者安全挂起**：内部维护挂起协程队列，支持任意数量的协程并发执行 `co_await event.wait()`。
 - **一次性广播通知语义**：调用 `event.notify_all()` 唤醒全部等待协程，后续 `wait()` 立即返回成功；等待被取消时返回 `false`。
 - **无锁化设计**：完全与所在执行器的事件循环协同工作，消除了传统多线程条件变量的互斥锁竞争。
+
+其语义是**同执行域的一次性广播锁存器**：先通知后等待仍成功，重复通知幂等，取消只影响相应等待者。事件必须覆盖全部等待操作的寿命；不得将其用于逐包确认、重复脉冲或跨线程直接访问。
+
+真正挂起的等待者各持有一个容量为 1 的原生 Asio channel。私有 `ChannelTraits` 将其后备容器配置为 `std::list`，避免当前 Asio 与标准库组合下空 `deque` 的额外分配；通知值使用内嵌首值，不为此创建链表节点。广播完成后释放等待者 vector 的容量，恢复与独立取消仍遵循原生 channel 调度，不同步调用等待协程。独立取消使用 `std::erase` 注销，单次为 `O(W)`，大量分别取消仍可能累计 `O(W²)`；相关取舍和同条件测量见附录 E.4。
 
 
 ## 3. 控制面：集群编排与路径事务
@@ -565,7 +578,7 @@ flowchart LR
 
 #### 3.5.2 TLSChannel 心跳与断线重连状态机
 
-- **心跳机制**：双向周期性发送 `heartbeat.ping` 控制帧（默认间隔 5s），对端必须立即回复 `heartbeat.pong`。
+- **心跳机制**：双向周期性发送 `ping` 控制帧（默认间隔 5s），对端必须立即回复 `pong`。
 - **失联判定**：当持续未收到心跳响应的时间达到 `heartbeat_timeout_ms`（默认 20s）时，`TLSChannel` 主动切断 TCP 连接，触发物理 Socket `close()` 并向拥有者抛出断线异常。
 
 
@@ -1212,7 +1225,7 @@ RelayWeave 确立了**两条互不相交的根信任链**：
 
 ---
 
-### 6.1.3 Agent 端到端身份与信任边界
+#### 6.1.3 Agent 端到端身份与信任边界
 
 Forwarder 拥有独立业务 TLS context，复用原控制凭据，并严格固定对端 RPK 为本地证书公钥。只接受 TLS 1.3 与双向 RPK，关闭会话恢复及 0-RTT；NodeConnection 的 CA、有效期及名称校验不变。需要支持 RPK 的 OpenSSL 3.2 或更高版本。
 
@@ -1258,19 +1271,28 @@ sequenceDiagram
     N->>D: install_pair：相同 uuid、不同 ticket
     N->>P: relay.offer（data_port, uuid, ticket）
     N->>C: relay.opened（request_id, data_port, uuid, ticket）
-    P->>T: 连接目标服务
+    opt TCP 业务
+        P->>T: 连接目标服务
+    end
     C->>D: 数据 TCP 读取编号，控制 mTLS relay.attach
     P->>D: 数据 TCP 读取编号，控制 mTLS relay.attach
     D->>D: 验证并配对
     N->>C: relay.ready
     N->>P: relay.ready
+    opt TLS 业务
+        C->>P: 经 Node 进行 TLS 1.3 双向 RPK 握手
+        C->>P: 加密服务名确认请求
+        P->>T: 认证和服务核对成功后连接目标
+        P-->>C: 加密成功确认
+    end
     C->>D: 双向业务数据
     D-->>C: 反向数据
     D->>P: 双向业务数据
     P-->>D: 反向数据
     P->>T: 双向业务数据
     T-->>P: 反向数据
-    C->>D: TCP EOF（TLS 使用零长度业务帧）
+    Note over C,P: TLS 业务 FIN 由 Agent 加解密，双向排空后交换 close_notify
+    C->>D: 载体 TCP EOF（TLS 在完整关闭后发送）
     D->>P: 对向写半关闭
     P->>T: shutdown send
     T-->>C: 经 Producer 和 Node 返回剩余响应
@@ -1308,7 +1330,7 @@ sequenceDiagram
     participant P as Producer Agent
     participant Target as Target
     C->>Ingress: relay.open（path, service, protocol, request_id）
-    Ingress->>M: flow.prepare（远程请求携带 flow_id 与 path）
+    Ingress->>M: flow.open（远程请求携带 flow_id、path 与 transport）
     par Master 协调路径安装
         M->>Ingress: flow.prepare
         M->>Relay: flow.prepare
@@ -1323,13 +1345,15 @@ sequenceDiagram
     Ingress->>M: flow.committed
     Relay->>M: flow.committed
     Egress->>M: flow.committed
-    M-->>Ingress: open_flow 成功
+    M-->>Ingress: flow.opened（open_flow 成功）
+    Ingress->>Egress: relay.peer.open（集群单播：epoch, flow_id, service）
     Ingress->>Ingress: install_endpoint（分配 Ingress uuid/ticket）
     Ingress->>C: relay.opened（data_port, uuid, ticket）
-    Ingress->>Egress: relay.peer.open（集群单播：epoch, flow_id, service）
     Egress->>Egress: install_endpoint（分配 Egress uuid/ticket）
     Egress->>P: relay.offer（data_port, uuid, ticket）
-    P->>Target: 连接真实服务
+    opt TCP 业务
+        P->>Target: 连接真实服务
+    end
     C->>Ingress: 数据 TCP 读取编号，控制 mTLS relay.attach
     Ingress->>Ingress: bind_stream_flow（首端挂接 FlowStream）
     P->>Egress: 数据 TCP 读取编号，控制 mTLS relay.attach
@@ -1340,6 +1364,11 @@ sequenceDiagram
     Ingress->>Egress: relay.peer.ready（集群单播）
     Egress->>Egress: activate() 激活本地端点
     Egress->>P: relay.ready
+    opt TLS 业务
+        C->>P: 经 Flow 进行双向 RPK 握手与加密服务名请求
+        P->>Target: 认证和服务核对成功后连接目标
+        P-->>C: 加密成功确认
+    end
     C->>Ingress: 业务数据流
     Ingress->>Relay: 经 NodeLink：二进制 Data / Fin + FairQueue 调度
     Relay->>Egress: 逐跳信用流控中继
@@ -1348,13 +1377,14 @@ sequenceDiagram
     Target-->>C: 反向业务数据沿原路回传
     Egress-->>Relay: 消费后反向发送 Credit 帧返还信用
     Relay-->>Ingress: 逐跳返还发送信用
-    C->>Ingress: 写半关闭（EOF）
+    Note over C,P: TLS 业务双向排空及 close_notify 完成后，才发送载体 EOF
+    C->>Ingress: 载体写半关闭（EOF）
     Ingress->>Egress: 跨节点传递 Flow Fin 帧
     Egress->>P: 对向写半关闭
     P->>Target: shutdown send
     Target-->>C: 剩余响应回传完毕并发送 Fin
-    Ingress->>M: 业务结束触发 flow.close
-    par Master 广播释放 Flow
+    Ingress->>M: 业务结束，peer Finished 协调及数据任务排空后 flow.close.request
+    par Master 向路径节点逐一提交释放
         M->>Ingress: flow.close
         M->>Relay: flow.close
         M->>Egress: flow.close
@@ -1377,11 +1407,11 @@ sequenceDiagram
    - Node-3 唤醒 Producer Agent 发送 `relay.offer` 并等待其连接数据端口发送 `RelayAttach`。
    - Node-3 将 Producer Socket 挂载到 Flow 的尾部端点（`bind_stream_flow`），向 Node-1 回复单播 `relay.peer.attached`。
 4. **入口激活与全双工数据流转**：
-   - Node-1 收到尾端接入后，通知 Consumer Agent 连接其数据端口并完成 `RelayAttach` 认证。
-   - Node-1 挂接首端 `FlowStream`，向 Node-3 发送 `relay.peer.ready`，向 Consumer 发送 `relay.ready`。
-   - 数据进入 `FlowStream`，被切分为定长二进制帧，通过逐跳信用流控（`Credit`）和 `FairQueue` 调度在跨节点物理 `NodeLink` 上穿梭传输。
+   - Node-1 返回 `relay.opened` 后，Consumer 即可完成本端接入；本端准备与尾端 `relay.peer.attached` 可并行推进，不等待尾端才通知 Consumer。
+   - Node-1 同时满足本端 Prepared 与尾端准备条件后激活首端 `FlowStream`，向 Node-3 发送 `relay.peer.ready`，向 Consumer 发送 `relay.ready`；Node-3 再激活尾端并通知 Producer。
+   - TCP 直接复制，TLS 先由两端 Agent 完成 RPK 握手、服务核对和目标连接。数据进入 `FlowStream`，使用定长二进制帧头，通过逐跳信用流控（`Credit`）和 `FairQueue` 在跨节点物理 `NodeLink` 上传输。
 5. **双向半关闭与事务销毁**：
-   - 业务完成时，EOF 转化为 `LnkFrType::Fin` 二进制帧沿路径流动。双向数据均完成刷写后，Ingress 节点向 Master 发送 `flow.close`，Master 释放整条路径并回收资源。
+   - 业务完成时，载体 EOF 转化为 `LnkFrType::Fin` 二进制帧沿路径流动；TLS 的业务 FIN 和 close_notify 仅由 Agent 处理。双向数据刷写、peer Finished 协调及数据任务排空后，Ingress 通过 `flow.close.request` 请求 Master 释放路径；Master 向各路径节点提交 `flow.close` 并收集确认。
 
 ---
 
@@ -1646,7 +1676,7 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 
 #### 9.3.1 核心度量指标 (NodeMetrics)
 
-`NodeMetrics` 组件在运行时持续收集以下维度的原子度量指标，可通过控制信令 `server.status_query` 或 Dashboard 实时拉取：
+`NodeMetrics` 组件在运行时持续收集以下维度的原子度量指标，可通过控制信令 `server.status.query` 或 Dashboard 实时拉取：
 - **流量统计**：累计转发字节数（`forwarded_bytes`）、各服务实时瞬时收发速率（Rx/Tx Bps）。
 - **会话状态**：当前并发活跃会话数（`active_relays`）、累计已完成会话数、累计异常终止数。
 - **队列深度**：物理 NodeLink 的发送积压帧数（`writes.size()`）、信用挂起帧数（`pending_frames.size()`）。
@@ -1686,10 +1716,10 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 
 | 十六进制数值 | 枚举标识符 (`CtrlCommand`) | 传输层字符串名称 (`command`) | 作用域与核心功能 |
 |---|---|---|---|
-| `0x09000000` | `Heartbeat` | `"heartbeat"` | 心跳组基准 |
-| `0x09000001` | `Ping` | `"heartbeat.ping"` | TLSChannel 双向心跳探测帧 |
-| `0x09000002` | `Pong` | `"heartbeat.pong"` | TLSChannel 心跳应答帧 |
-| `0x01000000` | `Relay` | `"relay"` | 业务中继组基准 |
+| `0x09000000` | `Heartbeat` | — | 心跳组分类基准，不作为独立命令传输 |
+| `0x09000001` | `Ping` | `"ping"` | TLSChannel 双向心跳探测帧 |
+| `0x09000002` | `Pong` | `"pong"` | TLSChannel 心跳应答帧 |
+| `0x01000000` | `Relay` | — | 业务中继组分类基准，不作为独立命令传输 |
 | `0x01000001` | `RelayAttach` | `"relay.attach"` | 流式控制授权绑定 / UDP 数据接入 |
 | `0x01000002` | `RelayOpen` | `"relay.open"` | Consumer Agent 向 Ingress Node 发起开通业务 |
 | `0x01000003` | `RelayOpened` | `"relay.opened"` | Ingress Node 向 Consumer Agent 返回已开通 |
@@ -1700,11 +1730,11 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 | `0x01000008` | `RelayClosed` | `"relay.closed"` | 会话正常关闭报文 |
 | `0x01000009` | `RelayError` | `"relay.error"` | 会话异常错误通知 |
 | `0x0100000A` | `RelayDetach` | `"relay.detach"` | 会话解绑通知 |
-| `0x01010001` | `RelayPeerOpen` | `"relay_peer.open"` | Ingress Node 向 Egress Node 发起的集群单播首末协商 |
-| `0x01010002` | `RelayPeerAttached` | `"relay_peer.attached"` | Egress 节点通知数据端口已接入 |
-| `0x01010003` | `RelayPeerReady` | `"relay_peer.ready"` | Egress 节点通知首端 Flow 端点已挂载就绪 |
-| `0x01010004` | `RelayPeerFinished` | `"relay_peer.finished"` | 首末端数据刷写结束通知 |
-| `0x01010005` | `RelayPeerClose` | `"relay_peer.close"` | 首末端强制关闭通知 |
+| `0x01010001` | `RelayPeerOpen` | `"relay.peer.open"` | Ingress Node 向 Egress Node 发起的集群单播首末协商 |
+| `0x01010002` | `RelayPeerAttached` | `"relay.peer.attached"` | Egress 节点通知数据端口已接入 |
+| `0x01010003` | `RelayPeerReady` | `"relay.peer.ready"` | Ingress 节点通知首端已准备并激活，允许尾端推进 |
+| `0x01010004` | `RelayPeerFinished` | `"relay.peer.finished"` | 首末端数据刷写结束通知 |
+| `0x01010005` | `RelayPeerClose` | `"relay.peer.close"` | 首末端强制关闭通知 |
 | `0x02000001` | `LinkPrepare` | `"link.prepare"` | Master 指令：准备相邻 NodeLink |
 | `0x02000002` | `LinkPrepared` | `"link.prepared"` | 节点回复：NodeLink 准备就绪 |
 | `0x02000003` | `LinkConnect` | `"link.connect"` | Master 指令：发起物理 NodeLink 连接 |
@@ -1712,13 +1742,18 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 | `0x02000005` | `LinkError` | `"link.error"` | 物理 NodeLink 异常报错 |
 | `0x02000006` | `LinkClose` | `"link.close"` | 关闭物理 NodeLink |
 | `0x02000007` | `LinkClosed` | `"link.closed"` | 物理 NodeLink 已关闭 |
+| `0x02000008` | `LinkAttach` | `"link.attach"` | NodeLink 数据连接关联请求 |
+| `0x02000009` | `LinkAttached` | `"link.attached"` | NodeLink 数据连接关联确认 |
 | `0x03000001` | `FlowPrepare` | `"flow.prepare"` | Master 事务阶段一：下发全路径 Flow 预留 |
 | `0x03000002` | `FlowPrepared` | `"flow.prepared"` | 节点回复事务阶段一完成 |
-| `0x03000003` | `FlowCommit` | `"flow.commit"` | Master 事务阶段二：广播全路径 Flow 激活 |
+| `0x03000003` | `FlowCommit` | `"flow.commit"` | Master 事务阶段二：向路径节点逐一提交激活 |
 | `0x03000004` | `FlowCommitted` | `"flow.committed"` | 节点回复事务阶段二完成 |
 | `0x03000005` | `FlowError` | `"flow.error"` | Flow 事务执行失败 |
-| `0x03000006` | `FlowClose` | `"flow.close"` | Master 或端点发起 Flow 全路径销毁 |
+| `0x03000006` | `FlowClose` | `"flow.close"` | Master 向路径节点提交 Flow 销毁 |
 | `0x03000007` | `FlowClosed` | `"flow.closed"` | Flow 销毁确认 |
+| `0x03000008` | `FlowOpen` | `"flow.open"` | 非 Master 入口请求 Master 建立路径 |
+| `0x03000009` | `FlowOpened` | `"flow.opened"` | Master 返回远端建立结果 |
+| `0x0300000A` | `FlowCloseRequest` | `"flow.close.request"` | 非 Master 入口请求 Master 释放路径 |
 | `0x04000001` | `ClusterJoin` | `"cluster.join"` | Slave 向 Master 申请加入集群 |
 | `0x04000002` | `ClusterJoined` | `"cluster.joined"` | Master 接纳加入并下发最新 Epoch |
 | `0x04000003` | `ClusterError` | `"cluster.error"` | 集群身份或版本异常 |
@@ -1726,13 +1761,23 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 | `0x05000002` | `TopologyReport` | `"topology.report"` | 节点向 Master 上报链路探测度量 |
 | `0x05000003` | `TopologyQuery` | `"topology.query"` | Agent/Dashboard 查询集群拓扑快照 |
 | `0x05000004` | `TopologySnapshot`| `"topology.snapshot"` | Master 返回全局拓扑图与质量矩阵 |
-| `0x06000006` | `ServerStatusQuery`| `"server.status_query"`| 状态监控查询 |
-| `0x06000007` | `ServerStatusReport`| `"server.status_report"`| 状态监控回复 |
+| `0x06000001` | `ServerIdentify` | `"server.identify"` | 控制连接身份请求 |
+| `0x06000002` | `ServerIdentified` | `"server.identified"` | 控制连接身份确认 |
+| `0x06000003` | `ServerLoad` | `"server.load"` | 节点负载查询 |
+| `0x06000004` | `ServerLoaded` | `"server.loaded"` | 节点负载回复 |
+| `0x06000005` | `ServerCluster` | `"server.cluster"` | 集群状态查询 |
+| `0x06000006` | `ServerStatusQuery` | `"server.status.query"` | 集群状态查询转送 |
+| `0x06000007` | `ServerStatusReport` | `"server.status.report"` | 集群状态上报 |
+| `0x06000008` | `ServerStatusReported` | `"server.status.reported"` | 集群状态回复 |
+| `0x06000009` | `ServerTraffic` | `"server.traffic"` | 流量统计查询 |
+| `0x0600000A` | `ServerTrafficReported` | `"server.traffic.reported"` | 流量统计回复 |
 | `0x07000001` | `ServiceRegister` | `"service.register"` | Producer Agent 向 Node 注册服务 |
 | `0x07000002` | `ServiceOk` | `"service.ok"` | 服务注册成功回复 |
 | `0x07000003` | `ServiceError` | `"service.error"` | 服务注册失败回复 |
 | `0x07000004` | `ServiceLookup` | `"service.lookup"` | Consumer Agent 查询服务位置 |
 | `0x07000005` | `ServiceLocated` | `"service.located"` | 返回服务所在的宿主 Node 信息 |
+| `0x07000006` | `ServiceList` | `"service.list"` | 服务列表查询 |
+| `0x07000007` | `ServiceListed` | `"service.listed"` | 服务列表回复 |
 
 ---
 
@@ -1794,41 +1839,41 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 
 #### A.2.2 RelayPeer 首末业务协调消息 (Node <-> Node 集群单播)
 
-##### 1. `relay_peer.open` (Ingress Node -> Egress Node)
+以下示例为 Master 转送后的接收视角：`target` 已由集群路由移除，`source` 由认证连接写入，不接受业务请求自行声明来源。
+
+##### 1. `relay.peer.open` (Ingress Node -> Egress Node)
 ```json
 {
-  "command": "relay_peer.open",
+  "command": "relay.peer.open",
   "params": {
-    "target_node": "node-3",
-    "from_node": "node-1",
+    "source": "node-1",
     "epoch": 42,
     "flow_id": 5001,
     "service": "prod-ssh",
-    "protocol": "tcp"
+    "protocol": "tcp",
+    "accessor": "198.51.100.20:50000"
   }
 }
 ```
 
-##### 2. `relay_peer.attached` (Egress Node -> Ingress Node)
+##### 2. `relay.peer.attached` (Egress Node -> Ingress Node)
 ```json
 {
-  "command": "relay_peer.attached",
+  "command": "relay.peer.attached",
   "params": {
-    "target_node": "node-1",
-    "from_node": "node-3",
+    "source": "node-3",
     "epoch": 42,
     "flow_id": 5001
   }
 }
 ```
 
-##### 3. `relay_peer.ready` (Ingress Node -> Egress Node)
+##### 3. `relay.peer.ready` (Ingress Node -> Egress Node)
 ```json
 {
-  "command": "relay_peer.ready",
+  "command": "relay.peer.ready",
   "params": {
-    "target_node": "node-3",
-    "from_node": "node-1",
+    "source": "node-1",
     "epoch": 42,
     "flow_id": 5001
   }
@@ -1973,3 +2018,357 @@ Commit、Close 和以上回复均不携带 path、addresses、links、transport�
 | **`agent/inc/node_connection.h`**<br>`agent/src/node_connection.cpp` | `NodeConnection` | `control_io` | 直接拥有唯一主控连接、重连与停止排空。 |
 | **`agent/inc/forwarder.h`**<br>`agent/src/forwarder.cpp` | `Forwarder` | `transfer_io` | 本地端口监听器（TCP/UDP）与 `AgentSession` 管理中心。 |
 | **`agent/inc/agent_session.h`**<br>`agent/src/agent_session.cpp` | `AgentSession` | `transfer_io` | 客户端业务连接会话，执行本地 Socket 与远端 Node 数据端口桥接。 |
+
+
+## 附录 C. 会话工程约束与所有权审计 (Engineering Invariants)
+
+本附录汇总会话数据任务改造、全量共享所有权复核及异常边界审视的最终结论。机制分别由第 2、3、5、8 章展开；此处明确重构时必须保持的状态归属、异步寿命和清理责任。
+
+### C.1 状态归属与控制生命周期
+
+一次中继业务包含三个不同的观察维度：**业务进度、数据任务寿命、协议资源状态**。三者分别由各自执行域内的唯一持有者维护，不能通过一组跨域布尔值相互替代。
+
+| 状态或数据 | 持有者与有效范围 | 工程约束 |
+|---|---|---|
+| 公共身份、service、protocol、request_id、deadline | `NodeSession`，`control_io` | 构造后按值持有；整个建立流程使用同一绝对期限。构造参数移交后不保留 JSON 镜像，不在整体 move 后继续读取原请求。 |
+| 双端 Agent 与 `AttachPair` | `SingleSession` | 单节点的两种角色可以属于同一 Agent；凭据不是 socket 的所有者。 |
+| 本端 Agent、`AttachInfo`、path、peer、epoch/flow_id | `MultiSession` | ingress 成功取得 Flow 身份后先记录，再检查取消和 epoch，确保退出时有释放依据；egress 不争夺路径关闭责任。 |
+| `Progress` | `NodeSession` | Opening / PeerOpened / AgentNotified / Ready 记录已经到达的业务里程碑；部分通知提交后失败仍需按该历史进度收尾。 |
+| `close_reason_` 与诊断 stage | `NodeSession` | 原因存在即表示进入结束流程，允许空字符串；首次原因不被后续取消错误覆盖。Ready 与正在关闭可以同时成立。 |
+| Created / Running / Stopping / Stopped | `SessionTransfer` 控制侧 | 表示唯一数据任务的寿命，不表示 Agent 已就绪；停止请求与真实完成分开。 |
+| Installed / Prepared / Activated / Finished / Stopped | 数据任务阶段通道 | 是按序交付的完成确认；Installed 返回凭据，Stopped 由原生任务完成处理器确认。 |
+| pair、socket、UUID、UDP bindings、Flow 端口 | 具体传输执行域 | 数据任务管理业务寿命，管理器维护查找和容量；Finished 后仍保留端点，直到控制流程明确停止。 |
+| 计费对象 | 会话 → `SessionTransfer::Setup` → pair | 启动和准备时逐步移交；准备后任务不再额外保留同一份共享计费引用。 |
+| 临时地址、报文、角色与通知结果 | 实际使用它的同步片段或协程帧 | 跨 await 使用的地址必须拥有字符串内容，不将借用的 `string_view` 留到来源失效后；只供单阶段使用的值不提升为成员镜像。 |
+
+控制流程由 `SingleSession::run()`、`MultiSession::run()` 各自完整表达。基类保存真正公共的状态与操作，不通过控制器回指、模式 variant 或逐阶段虚钩子调度生命周期。SessionTransfer 只借用传输资源契约，不回调 NodeSession。
+
+```mermaid
+flowchart TD
+    Start["具体会话 run：保存原始期限与业务身份"] --> Install["启动一次数据任务，等待 Installed"]
+    Install --> Notify["通知 Agent，等待 Prepared"]
+    Notify --> Peer["多节点：peer 准备屏障"]
+    Peer --> Activate["提交继续通知，等待 Activated"]
+    Activate --> Ready["检查停止与期限，提交 relay.ready"]
+    Ready --> Transfer["提交继续通知，等待 Finished"]
+    Transfer --> Finish["多节点：有限期等待 peer Finished"]
+    Finish --> Cleanup["屏蔽取消，停止并等待数据任务"]
+    Cleanup --> Release["ingress 释放 Flow，根任务完成后移除会话"]
+    Error["超时 / 控制失效 / peer close / Flow 失效"] --> Cleanup
+```
+
+图中数据阶段遵循统一顺序，关闭通知仍按模式处理：Single 先排空数据任务再通知 Agent；Multi 先汇合建立/转发与 Flow 监视两支，按进度通知本端 Agent 和必要的 PeerClose，再停止数据任务，最后由 ingress 释放 Flow。peer 发起关闭时保留来源标记，避免回送 PeerClose。未安装数据任务或未取得 Flow 是正常失败路径，按实际存在的资源收尾。
+
+阶段接口保持惰性：创建 activate/transfer 的 awaitable 不发送继续通知，实际等待时才推进。停止时由根控制任务屏蔽取消，数据任务在自己的清理段屏蔽取消；不能用取消请求代替 Stopped 确认，也不能在关闭中的会话退出前归还容量。
+
+### C.2 独占、借用与共享所有权
+
+所有权判断依据是**谁在独立等待、容器何时移除、最后一次访问何时结束**。默认按值或独占持有；只有容器之外确有独立存活窗口时才共享持有。
+
+#### C.2.1 独占对象与借用索引
+
+| 对象 | 唯一所有者 | 删除或撤销时点 |
+|---|---|---|
+| `NodeSession` | RelayNode 的 `unique_ptr` 会话容器 | 具体 run 排空控制子协程、数据任务与 Flow 后，由根任务完成处理器移除；取消时不提前删除。 |
+| `ProxySession` | ProxyServer 的 `unique_ptr` 会话容器 | 会话的并行收发已汇合，完成处理器完成日志与清理后删除；SOCKS5 UDP 关联按值属于该会话。 |
+| `ClusterSession` / `LocalParticipant` | ClusterRoom 的参与者容器 | 远端 reader 排空 TLS 后通知 room 移除；room 停止须等待所有远端参与者退出。 |
+| NodeLink 待认证 socket | 握手协程的 `unique_ptr` | `accepting_` 仅是停机关闭用的借用索引；握手退出先撤销索引，再销毁或移交 socket。 |
+| `PendingOpen` | 非 Master `open_flow` 的协程帧 | `pending_opens_` 只登记地址；应答、取消、超时及停机均在帧销毁前撤销登记。 |
+
+启动失败须回滚已登记的容器项。借用索引不能延长对象寿命，也不能在异步任务尚未退出时先销毁其所属执行器服务。
+
+#### C.2.2 保留共享持有的实际理由
+
+| 对象 | 独立持有者与必要性 | 结束条件及防止循环的边界 |
+|---|---|---|
+| RelayNode | 应用、监听根任务、控制会话及完成处理 | stop 排空业务与控制任务，应用继续排空执行器；子组件不以强引用回指根对象。RelayAgent 按值构造，任务借用，停止后同样排空执行器。 |
+| StreamPipeline / DatagramMgr | Node 与监听、TCP 接入任务 | stop 关闭 I/O 后尾部完成处理仍可待运行；TCP 另等待 setup_tasks。保留共享以覆盖尾部处理。 |
+| RelayIdAllocator | Node 与 TCP/UDP 管理器 | 最后一个管理器释放，无反向持有。 |
+| NodeMetrics / ClusterMgr | 根组件、计时器、探针与延后故障通知 | 停止请求不代表已投递处理消失；取消探针、排空集群循环和会话，晚到处理只访问自身有效状态。 |
+| SessionTransfer | 会话、原生完成处理器、晚到停止投递 | stop 等待完成；晚到处理仅访问自身信号/通道，不访问借用的管理器或协议。 |
+| RelayPair / PendingConnection | 查找表与挂起的 prepare/run/bind/setup | 移除查找项后在途操作仍需持有；关闭取消 I/O 并唤醒等待，最后一项操作退出后释放。Pair 不持有任务或管理器。 |
+| ServiceTraffic | 注册表、活动 pair、正在发送的本地 UDP 报文 | 服务注销不删除仍在使用的统计；最后一次业务访问后释放，无会话回指。 |
+| AgentSession | Forwarder 注册表、会话主任务、共享 UDP 监听中的独立发送 | 主任务可先撤销注册；监听发送另持有会话到发送完成。Forwarder 析构前排空全部任务。 |
+| TLSChannel | 会话任务、内部收发/关闭任务及跨域投递 | disconnect 排空后释放；Agent 路由、控制注册表等弱引用 channel，避免强引用循环。 |
+| FlowProtocol | NodeLinkMgr、协议后台任务、跨域命令与通知等待 | stop 汇合协议任务；FlowStream / FlowDatagram 弱引用协议，端口及导出载荷可比协议活得更久。 |
+| NodeLink / FlowState | 路由表、建立/转发任务及尚未写出的 Frame | 关闭先清表并取消或丢弃队列；Frame.owner 仅用于 Link 写入，Flow 自有队列不保留 owner，Flow 不持有 NodeLink。 |
+| Flow 端口 / UDP 接收队列 | pair、FlowState、跨域关闭投递及端口操作 | 绑定前 UDP 即可收包，Flow 关闭后在途端口操作仍须安全返回；接收队列无协议或 Flow 回指。 |
+| PMR 载荷池 | 协议、端口与 PooledBuffer deleter | 只共享分配资源，每个载荷独占内存块；最后一块归还后释放池，不反向持有协议。 |
+| SharedLink / MasterPath / CloseNotice | 事务索引、定时器及建立/释放/观察等待者 | 撤销索引前发布相应结果；晚到定时处理释放记录，事务不强持有管理器。共享 Link 的旧独立等待事件已删除。 |
+
+SessionTransfer 通过 `RelayTransport&` 借用管理器，通过可空 `FlowProtocol*` 借用多节点协议服务。Node 的关闭顺序保证先停止并等待会话，再停止这些资源。远端读写子协程借用 `RemotePair&`，父 run 持有 pair 并汇合两个方向后才返回。不能把共享 UDP 监听器跨 await 的会话句柄改成引用，也不能让导出载荷仅借用协议内存池。
+
+### C.3 通知语义与期限边界
+
+一次性完成、可重复唤醒、跨域消息与取消请求有不同的语义。统一接口之前应先确认是否锁存、是否可合并、是否携带结果以及是否要求逐次确认。
+
+| 类别 | 典型成员或操作 | 保留的语义 |
+|---|---|---|
+| 组件退出广播 | AgentControl.discovery_done_、NodeConnection.stopped_event_、Forwarder.stopped_event_、Topology.finished_、ClusterMgr.loop_done_、FlowProtocol.tasks_done_ | 全部相关任务退出后一次性完成；不是发现结果、单次重连或停止请求。 |
+| 路径建立与释放 | MasterPath.opened / released、PendingOpen.completed | 建立结果与全路径释放是独立完成点；结果本身仍由阶段、原因和事务记录表达。 |
+| 本地授权失效 | LocalFlow.CloseNotice.closed | Master 与其他 Node 一致观察本地失效；观察取消不关闭 Flow，不影响其他观察者。 |
+| 接入及 UDP 配对寿命 | RelayPair.attached、PendingConnection.announced、DatagramMgr.LocalPair.finished | 接入成功或关闭都可触发唤醒，恢复后仍检查实际资源；TCP greeting 完成不等于业务绑定成功。 |
+| 原生通道关闭广播 | TLSChannel.run_done_channel_ | 表示真实 run 完成，与 close_channel_ 的停止请求分开。 |
+| 计数变化提示 | RelayNode 会话/控制任务排空、ClusterRoom.changed_、NodeLinkMgr.events_done_ | 唤醒后复查计数或运行谓词；不以注册表为空代替任务退出。 |
+| 有实际期限的重复唤醒 | MultiSession.changed_、AgentSession.changed、发现及拓扑定时器 | 接收新阶段或取消后复查谓词；建立与 Finished 各有固定期限，重复通知不续期。 |
+| 数据热路径脉冲 | NodeLink.writable、FlowStream.send_space_ | 队列或信用变化可多次发生且允许合并；永久置位事件会造成忙循环。 |
+| 跨域逐块确认 | FlowStream.receive_completed_ | 每次下游写出对应一次信用返还，不能合并或丢弃。 |
+| 有界跨域业务消息 | SessionTransfer.events_ / proceed_ / authorizations_、FlowProtocol.events_ | 保留顺序、容量及错误交付；阶段通知不参与逐包转发。 |
+| 取消信号 | cancellation_signal | 只请求中断，不能证明资源已经回收。 |
+| 外部线程等待建立任务 | StreamPipeline.setup_tasks_ 的 atomic.wait/notify_all | 等待尚未退出的 setup 任务，不能阻塞运行这些任务的数据线程。 |
+
+`unbound_.size()` 表示当前仍可认领的 socket 数，用于建立准入；`setup_tasks_` 表示尚未退出的建立任务数，用于跨执行域排空。绑定成功立即移除 unbound 项，而 setup 清理稍后结束，这两个数允许暂时不同，不能合并。
+
+期限按资源寿命分别定义：业务建立总预算、DNS/TCP 连接上限、实际 TLS 握手上限、未绑定 socket 期限、Link/Flow 事务期限、控制心跳、Consumer UDP idle 及双向传输完成后的收尾期限。单方向 FIN 后仍有反向业务时不进入收尾计时；正常 TCP/TLS 传输不套用建立期限或任意总时长限制。
+
+### C.4 异常、取消与资源回滚
+
+异常只在拥有相应恢复或收尾责任的边界转换。内部同步片段已保证的不变量不重复验证；外部输入、跨 await 失效窗口、身份关联与容量约束继续在各自消费处校验。
+
+| 边界 | 处理责任 |
+|---|---|
+| Agent 控制入口与 Forwarder | 控制入口验证 params 对象；Offer 解析失败回复 Reject，匹配会话处理失败调用 fail，立即取消并排空。不把非法端点异常放出 transfer 线程；request_id 要求无符号整数，浮点同值不能匹配。 |
+| RelayNode / 具体 NodeSession | 入口解析 attach 一次，会话核对真实 AgentPeer、角色、UUID、ticket 和期限；授权冲突取消相应会话。根任务保留原始首因并统一收尾，完成处理器只报告逃逸异常及移除会话。 |
+| SessionTransfer | 暂存原异常，禁用取消，在数据域关闭 pair 后原样交付；stop 只负责排空。清理中存在 await，不能以普通析构代替。 |
+| StreamPipeline | greeting 任务独立清理 pending；转发错误直接传播，远端路径尽力提交 RESET，RESET 提交失败不覆盖原始异常。prepare/run 持有 pair 跨挂起，不能用无持有的直接返回缩短其寿命。 |
+| DatagramMgr 安装 | 单一回滚范围覆盖 pair、bindings 和 UUID；后续插入分配失败时全部撤销，不留下已归还 UUID 的残余 pair。 |
+| NodeLinkMgr | 格式错误在 Link/Flow 信封入口隔离；有效远端身份下的开流失败才能回送关联应答。保留事务身份、认证来源、阶段、迟到确认与过期定时器检查。 |
+| 集群批量失效 | 先以 membership/control 原因关闭路径，再结束共享 Link；延后故障通知避免遍历期间重入清空容器。ClusterError 的同一具体原因传给管理器与会话，后续错误不覆盖首因。 |
+| FlowProtocol / LnkChannel | TCP/共享任务错误交给所属失败边界，UDP 非法输入隔离为当前报文失败；FlowDatagram 分配失败丢当前报文。发送挂起后重新查表并核对 epoch，避免访问已删除 Link。 |
+
+身份、角色、ticket 和数据域期限各自约束不同事实：控制授权回答“谁有权绑定”，数据域复核回答“此刻这个 socket 和配对是否仍有效”。UDP 的来源绑定依赖实际收到的报文，不能照搬流式纯控制授权。
+
+信用更新先忽略不大于旧上限的 CREDIT。已建立的 `sent_bytes <= send_limit` 不变量使“新上限大于旧上限但小于已发送量”的重复分支无意义；初始窗口、超额窗口、累计计数溢出及重复信用的校验仍保留。
+
+
+## 附录 D. 后续演进与已知边界 (Evolution & Open Issues)
+
+本附录保留原审视、复审与改进计划的问题编号，并按后续实施结果归并。状态以 2026-11-06 已记录的最终实现为基准；未实施目标不写入正文的现有能力，历史源码行号不作为长期索引。
+
+### D.1 改进项与实施状态
+
+| 编号 / 批次 | 改进项 | 最终状态与设计落点 |
+|---|---|---|
+| 01 / A | 删除无生产调用的协议、字段和切片能力 | 已完成。NodeLookup / NodeLocated / NodeError、service.located.port 及无用途缓冲接口已删除；只为测试存在的能力不构成保留理由。 |
+| 02 / A | 合并单主控连接管理 | 已完成。RelayAgent 按值持有唯一 NodeConnection，重连与排空集中于连接对象；见 2.2。 |
+| 03 / B | 合并 Stream/Datagram 配对管理 | 已完成。RelayPair / LocalRelayPair / RemoteRelayPair 复用共同寿命；具体传输资源留在管理器私有派生类；见 2.1。 |
+| 04 / B 及后续会话改造 | 减少连续跨域协程链 | 已完成。最终采用一次启动的 SessionTransfer、有界阶段通道及完整 Single/Multi run；早期单跳 4 次、多跳 5 次调用仅是中间版本数据。 |
+| 05 / C | 内部状态强类型化 | 已完成。LinkParams、FlowParams、RelayRequest、RelayEndpoint 在边界解析，核心推进不保存 JSON 镜像。 |
+| 06 / C | Flow 后续事务载荷精简 | 已完成。Prepare 保留完整路径，后续仅传身份与诊断；Link 后续消息仍传完整双端参数，因频率低而保留；见 3.4、附录 A。 |
+| 07 / D | 广播收敛与集群消息预算 | 第一批完成：TopologyQuery 定向、广播排除认证来源、成员表本机应用。查询合并、消息预算与准入仍暂缓；见 D.2。 |
+| 08 / D | 会话分派索引与准入计数 | 未实施。RelayNode、Forwarder、ClusterRoom 仍有全表扫描；见 D.2。 |
+| 09 / E | 缓冲与复制优化 | 已完成并继续简化。最终 TCP/TLS 入口复用 32 KiB 读取缓冲，按实长复制入池；中间的 truncate/capacity/memory_charge 已再删除；见 5.6。 |
+| 10 / A | 拓扑快照 Master 授权 | 已完成。校验认证 source 等于当前 Master，继续校验 requester/session 和快照结构；见 3.2。 |
+| 11 / F | 普通 Agent UDP 多客户端隔离 | 已完成。完整 endpoint 索引、按需建流与首包缓存；不使用预建池；见 2.2。 |
+| 12 / F、H | UDP 回收及有限收尾 | Agent UDP 双向 idle、多跳 Finished 和 TLS 收尾期限已完成；直接接入 Node 的通用 UDP idle 独立保留。 |
+| 13 / A | 线程调度与命名 | 已完成。移除 Linux SCHED_RR 与 Windows ABOVE_NORMAL 的自动提升，仅保留职责线程名；不新增未经测量的调优配置。 |
+| 14 / G | primary 控制闪断与业务解耦 | 未实施。Agent 控制断开仍取消关联业务，Node 仍广播 RelayDetach；见 D.2。 |
+| 15 / H | Agent 端到端 TLS 与统一流式接入 | 已完成。控制 mTLS、编号绑定、统一 TCP 管道、TLS 1.3 双向 RPK；多跳 Node 不再解密业务；见第 6、7 章。 |
+
+原 A/B/C/E 批次的删除与合并不能因后续新功能再恢复冗余包装。后续变更按范围清晰的小批实施，代码、必要测试、CMake、样例与当前文档同步更新；性能结论依赖可比较测量，安全和生命周期结论依赖身份、错误及回收验证。
+
+### D.2 未完成项的范围与验收
+
+#### D.2.1 集群消息预算、查询收敛与分派索引
+
+**Master 出站队列满后停止是保留的失败策略。** 默认 `channel.max_queued_messages = 100`，本地 Master 的 send/broadcast 提交失败会触发 `master control outbound queue full`，由所有者执行停机。尚未实施的是正常业务突发的预算与准入，不能通过无限扩容、取消队列或静默丢弃关键事务消息替代。
+
+控制消息经过三条不同路径：Master 本地提交先进入 outbound_channel_；Slave 入站在认证后直接由 ClusterRoom 路由，消耗目标 TLSChannel 写队列；TopologyMembers 由 room 直接发布。减少广播不能直接等同于降低 Master 本地出站队列高水位。
+
+后续实施要求如下：
+
+1. **先测量消息预算**：记录队列高水位、消息数量/字节数及建流、失败回滚和关闭突发；分别覆盖共享 Link 已存在与冷启动建链。
+2. **再收敛服务发现**：服务未命中时仍会广播，Consumer 沿用 5 秒发现周期。按实际重复率评估在途查询合并，明确有界等待者、过期、会话断开及关联规则；没有一致性目录时不能改成任意节点单播。
+3. **按预算控制准入和推进**：给关闭、失败回滚及必要通知留出容量，保持提交顺序与有界等待；主动压满时仍验证所有者收到失败并停机。
+4. **独立推进索引与计数**：RelayNode 按 Agent 请求、端点、peer Flow 身份分派并维护协议/多跳计数；Forwarder 的 UUID 索引允许同一 Agent 双角色；ClusterRoom 索引已加入 node_id，同时保留未加入连接的准入和排空。关闭未排空仍占额，所有失败路径同步撤销索引。
+
+单条分派扫描为 `O(N)`，不能笼统称作 `O(N²)`。索引优化验收应在扩大并发后比较分派与准入耗时，覆盖重复/冲突请求、迟到消息、同 Agent 双角色、取消范围和关闭中容量。
+
+#### D.2.2 primary 闪断恢复与 UDP 通用回收
+
+primary 恢复需先定义短暂失联宽限期、控制身份重绑定、服务归属和业务终态同步，再联动 Agent/Node。建立中的请求与已 Ready 的业务分开处理；仅删除 Agent 的 cancel 调用不能建立恢复语义。验收目标是在数据路径、epoch 和授权仍有效时容忍短暂控制断线，超期或验证失败则有界清理；不承诺 Master 重启后旧 Flow 存活。
+
+普通 Agent Consumer UDP 已通过双向 idle 和既有 cancel 链路回收 Node 配对与 Flow。直接接入 Node 且长期不取消的其他客户端尚无通用 idle，DatagramMgr 的本地会话仍等待 finished。此项独立评估，不能把 Agent 的 60 秒 idle 套用于 SOCKS5 仍存活的 TCP 关联，或误写成 Node 的全局能力。
+
+#### D.2.3 UDP 大缓冲与内存测量
+
+UDP 发送/接收任务仍有约 64 KiB 的协程内数组，涉及公共 UDP 复制、Agent、DatagramMgr 和 SOCKS5 UDP。它们均在循环外复用，不是每包分配，也不会作为小包的完整池块排队；但每个存活任务确实有常驻成本。后续优化应同时测量协程帧、载荷、队列、池缓存及内核缓冲，不能仅将数组搬到堆上便宣称总内存降低。
+
+### D.3 复审核验发现的处置
+
+| 编号 | 发现 | 最终处置或剩余边界 |
+|---|---|---|
+| 0.1 / 广播来源 | 文档和测试声称排除来源，实际 deliver 缺少过滤 | 2026-11-02 成对修复来源排除与成员表本机应用。撤回旧完成声明；显式自单播保留，过滤依据认证来源，不信任消息自报 source。 |
+| 0.2 / Agent 异常 | 非法端点可能击穿 transfer 线程并缺少清理信令 | 已修复；非法 Offer 拒绝，匹配会话异常触发 fail/cancel，测试要求在 500 ms 内观察清理信令，不能靠原 30 秒建立超时掩盖。 |
+| 0.3 / 初始化与短读 | move 后读取构造参数；64 字节小包占用 32 KiB 池块 | 已修复构造依赖和移交顺序，短读改为按实际长度入池；64 字节载荷按现有分档占用 384 字节窗口。 |
+| N1 | 广播为每个参与者深拷贝完整 JSON | 仍保留，约为 `O(N × 报文大小)` 的控制域开销；并入 07，评估最后一份移动或不可变共享的收益及复杂度。 |
+| N2 | 单播目标不存在时静默丢弃 | 仍保留，事务可能等待原绝对期限才失败；后续评估按命令记录诊断，不在本次引入回执协议。 |
+| N3 | 状态查询自回送防护不一致 | 随统一广播来源排除删除多余自来源判断；服务查询无需新增同类特判。 |
+| N4 | room 停机等待没有独立显式期限 | 依赖各 TLSChannel disconnect_timeout 和 reader 完成回调移除参与者；属于隐含边界观察项，不直接认定为无限泄漏。 |
+| N5 | 成员发布为 `O(N)` 消息乘 `O(N)` 全量表 | 仍保留，成员频繁变化时总字节量约 `O(N²)`；与每次少一次回送的收益分开测量。 |
+
+2026-11-02 复审时“多跳 TLS 为明文”“Finished 无限等待”“保留 ControlRouter”的结论属于当时基线，已被 H 批次与后续会话改造替代。保留问题来源不等于恢复旧状态。
+
+### D.4 TLS 改造后的简化建议跟踪
+
+| 编号 | 审查主题 | 最终状态与取舍 |
+|---|---|---|
+| J1 | pending socket 通过 cancel/wait_read 间接表示认领 | 未实施显式 claimed 事件。现有机制还监测未绑定 socket 的断开、提前发送与到期；若替换通知方式，须同时保留这些清理能力及 greeting 完成后才允许移动 socket 的顺序。 |
+| J2 | 待绑定表与建立任务计数看似重复 | 已改名为 unbound_ / setup_tasks_ 并明确准入与排空差别，见 C.3；两者不能合并。 |
+| J3 | TLS DATA/FIN 与服务确认有相似长度封装 | 尚未抽取统一帧协程，也未迁移到 Agent 目录。当前只共用同步长度编解码；是否抽取以实际重复和协程层级收益判断。 |
+| J4 | attach 重复 UUID 检查 | 当时重复层次已清理；控制器随后删除，最终由具体会话统一验证身份、UUID、角色、ticket 和期限，数据域仍复核资源。 |
+| J5 | attach 异常在会话遍历内静默吞掉 | 已在 RelayNode 入口解析一次并记录格式错误，经专用接口传递强类型请求。 |
+| J6 | RelayProtocol 同时表示服务协议与链路传输 | 保留现有枚举和本地 UDP/非 UDP 归一化；远端声明的 TLS Link 仍拒绝。未新增 flow_transport 映射函数。 |
+| J7 | 建流容量仍按全表扫描 | 与 08 合流，未实施额外计数器。 |
+| J8 | bindings_done_ 用 timer 表示绑定任务归零 | 随 SessionTransfer 删除逐 attach 任务、位图和该等待对象，原替换建议失去对象，不再单独待办。 |
+| J9 | Agent attach 协程职责较多 | 保留观察，触及该流程时再决定拆分；TLS 目标连接必须晚于认证，UDP 重发与 Ready 等待受同一建立期限约束。 |
+| J10 | TLS 关闭四步串联 | 已提取 finish_tls，共用固定收尾 deadline；close_notify、载体半关闭、EOF 和 SSL 缓冲校验保留，见 2.2。 |
+
+控制 mTLS、32 字节连接编号、数据域提交复核、Agent RPK、加密服务确认、业务 FIN 与载体关闭分别保护不同的边界。流程精简以减少重复表示和实现为目标，不因层次相邻就合并其认证或完整性责任。
+
+
+## 附录 E. 实施验证与性能测量 (Validation & Measurements)
+
+本附录归并 2026-10-29 至 2026-11-06 的改造验证记录。**下列构建、测试次数与性能数据均为历史实测，不代表本次文档整理重新执行了相应检查。** 同一项目在不同阶段新增了测试，52 项与 53 项的总数不可直接比较；相关子集通过也不等同于全量、跨平台或服务部署验收。
+
+### E.1 分阶段验收与关键覆盖
+
+早期 A–F 使用项目 CMake 入口、`build-stage-a`，Debug 为 `-O0 -g0`；后续会话改造使用当时的 `build`。各次记录保留原有测试期限，没有以生产重试或无限队列掩盖失败。
+
+| 日期 / 阶段 | 验证范围与实际结果 | 关键覆盖或限制 |
+|---|---|---|
+| 2026-10-29 / A | Node、Agent、Proxy 构建；28 项相关 CTest 通过 | 闲置协议删除、主控连接生命周期、Master 快照来源拒绝；工作线程为 SCHED_OTHER、优先级 0；PooledBuffer / Frame 实测 32 / 80 字节。 |
+| 2026-10-29 / B 最终追加验收 | 提交 e40d271；17 项相关回归首轮通过，162.30 秒；三个重点用例各连续 20 次通过，共 668.40 秒 | udp_session_routing 每次 4.43–4.47 秒，relay_integration 4.50–4.59 秒，relay_paths 24.36–24.53 秒；77 次执行均通过，早期无堆栈偶发失败仍未定位。 |
+| 2026-10-30 / C | 三个生产目标构建；22 项相关回归通过，164.49 秒；简洁性复查后另 9 项通过，118.00 秒 | 2/3/8 节点事务、精简格式、重复/冲突 Prepare、错误身份/来源/阶段、未知 Commit/Close、迟到确认和真实回滚。 |
+| 2026-10-30 / E | 14 项相关回归最终通过；后续缓冲精简另行增量验证 | 所有权、按实长计费、三跳双向空/1/257 字节 DATA、信用、FIN、限速取消；性能数据属于中间实现，见 E.3。 |
+| 2026-10-31 / F | 三个生产目标构建；13 项相关回归通过 | 首包与空首包、建立期丢弃、100 建立并发和共享容量、多监听器/单多节点隔离、入出站 idle 续期、迟到 Ready、真实两端 Agent 与 Node 配对排空。未测吞吐或集群总预算。 |
+| 2026-11-02 / D 广播修复 | 改前重编译复现 Generic broadcast was echoed back to its source；改后 13 项回归通过 | cluster_integration 1/1，20.49 秒；Node 组 7/7，52.29 秒；端到端组 5/5，28.07 秒。验证认证来源、Master 自单播/广播、单节点成员初始化、加入退出及 Master 重启。 |
+| 2026-11-03 / H | 全量 52 项累计 51 通过、1 ICMP 跳过；TLS 基准 128 次、单轮完整性冒烟通过 | 双向 RPK、错钥/缺钥/X.509 回退拒绝、共享 TCP/TLS 容量、控制绑定、延迟绑定、跨主控、真实单/三节点 TLS、大响应半关闭和停止。旧 agent_cluster_control 在 Ready 前发业务，调整测试顺序后单独通过；不称作首轮全通过。 |
+| 2026-11-03 至 04 / SessionTransfer | 完整 53 项中 52 通过、1 ICMP 跳过；初版 113.49 秒，多态接入后 112.82 秒 | 两个真实执行线程与 socket；每角色 1000 次重放、冲突接入、绑定原始错误、入口前取消、准备超时、延迟激活/转发、UDP 激活前丢弃及资源/计费回收。多态接入后 session_transfer、udp_session_routing 各连续 20 次通过。 |
+| 2026-11-04 / 共享所有权审计 | 完整 53 项中 52 通过、1 ICMP 跳过，110.07 秒 | 未认证 Link 停机索引清空、协议弱引用释放、远端应答/取消/迟到通知、导出载荷晚于协议析构、计费移交及独占会话排空。 |
+| 2026-11-04 / 控制职责收拢 | 完整构建；UDP 连续 40 次通过，178.07 秒；最终全量 52 通过、1 ICMP 跳过，114.41 秒 | 取消首因、启动前取消、会话析构及暂存计费释放；定位并修正测试异常路径的执行器销毁顺序和异步 UDP 统计断言。 |
+| 2026-11-04 / UDP 安装回滚 | 分配失败注入通过；最终全量 52 通过、1 ICMP 跳过，111.86 秒 | 逐项注入 C++ 分配失败，确认 pair、bindings、UUID 回收且容量槽可再用；边界报文夹具补足接收缓冲后未新增 RcvbufErrors。 |
+| 2026-11-04 / AsyncEvent | 全部目标构建；完整回归 52 通过、1 ICMP 跳过 | 原生广播、迟到等待、独立取消及通知/取消胜出顺序；独立探针验证通知后容量释放。未做分配失败注入。 |
+| 2026-11-05 / 路径事务统一推进 | 全量 52 通过、1 ICMP 跳过，116.49 秒；删除旧 Link 等待能力后全量 115.24 秒 | 所有边并行启动、反序/重复 Ready、共享 Link 的单路径取消、立即失败、迟到消息不恢复、远端成功/失败各一次应答、membership/control 首因和实际事务清空。 |
+| 2026-11-05 / 通知类型统一 | 全量 52 通过、1 ICMP 跳过，116.02 秒 | ProtocolEvent 直接使用 CtrlCommand；未启用的 flow/congestion 基准入口另行通过独立编译语法检查，不等同于运行基准。 |
+| 2026-11-06 / 本地观察与关闭契约 | 六项重点回归通过，67.98 秒；最终全量 52 通过、1 ICMP 跳过，120.33 秒 | 本地失效先于路径释放、Master/Slave 多观察者、观察取消隔离、关闭提交失败、实际 10 秒上限与停机通知；node_shutdown 端口冲突后连续 20 次及全量复测通过。 |
+| 2026-11-06 / 最终协议审视 | 三项协议回归通过，21.56 秒；完整构建及全量 52 通过、1 ICMP 跳过、0 失败，130.23 秒 | 包括低于已发送量的旧 CREDIT；保持格式、额度、期限、队列和任务排空语义。 |
+
+原始覆盖主要由现有测试承担：公共协议组含 pooled_buffer、relay_protocol、relay_pair、token_bucket、async_event、tls_channel_mtls、tls_rpk、tcp/tls/udp_relay、lnk_flow_receive/control 和 lnk_channel_flows；会话与集群组含 agent_session、forwarder、forwarder_messages、node_connection、session_transfer、node_relay_capacity、node_links、node_flows、node_shutdown、cluster_integration、udp_session_routing；完整路径组含 relay_integration、udp_relay_integration、relay_paths、agent_cluster、agent_cluster_control 和 proxy_relay_integration。测试入口与分组维护在 [测试目录](../test/README.md)。
+
+后续重构继续遵循以下验收边界：真实 Agent 的端到端 TLS 不能由直接连 Node 的载体测试代替；控制绑定成功不能代替 RPK、服务确认和完整关闭校验；Flow 观察完成不能代替数据任务排空。计时器回归应驱动到实际条件满足，并使用独立测试保护期限，固定执行器轮次不能证明期限已触发。
+
+### E.2 控制消息字节数与数量边界
+
+#### E.2.1 Flow 事务载荷精简
+
+2026-10-30，以生产发送及数据事件路径捕获的 2/3/8 节点事务为基础，补回旧字段重建对照，统一由 WireMessage::pack 编码。下表为固定节点名、地址、身份和诊断字符串下的 **CBOR 字节数，不含 4 字节长度头**，不是吞吐测量。
+
+| 报文 | 2 节点：原 → 新 | 3 节点：原 → 新 | 8 节点：原 → 新 |
+|---|---:|---:|---:|
+| FlowPrepare | 216 → 216 | 242 → 242 | 372 → 372 |
+| FlowPrepared | 239 → 143 | 265 → 143 | 395 → 143 |
+| FlowCommit | 205 → 119 | 231 → 119 | 361 → 119 |
+| FlowCommitted | 239 → 143 | 265 → 143 | 395 → 143 |
+| FlowClose | 240 → 154 | 266 → 154 | 396 → 154 |
+| FlowClosed | 246 → 139 | 272 → 139 | 402 → 139 |
+| FlowError（Prepare 冲突） | 253 → 157 | 279 → 157 | 409 → 157 |
+
+只有 Prepare 随路径增长；其余阶段仍受身份及诊断字符串长度影响。后续阶段删除 path/addresses/links、ttl_ms 回传和 committed 线上字段，并不减少协议阶段数。未知 Commit 忽略；未知 Close 仅在当前 Master 来源及完整身份通过后确认，不创建状态或历史缓存。
+
+#### E.2.2 广播收敛与建流阶段数量
+
+2026-11-02 广播修复后的消息数量由路由规则推导。N 为含 Master 的已加入节点总数；每跳完整 CtrlMessage 计一次，不计心跳、握手和分片，不是队列高水位实测。
+
+| 场景 | 修改前 | 修改后 |
+|---|---:|---:|
+| Slave 一次拓扑查询及回复 | N + 1 | 2；10 节点时为 11 → 2 |
+| Master 本地拓扑查询 | 0 | 0 |
+| Slave 普通广播 | N 次跨节点传输，含回送 | N − 1 次 |
+| Master 普通广播 | N − 1 次跨节点传输及一次本机派发 | 跨节点数不变，省去本机派发 |
+| 成员表一次发布 | N − 1 次跨节点传输，本机依赖回送 | 网络数量不变，本机显式定向应用 |
+
+每条新邻接 Link 的 Prepare/Prepared/Connect/Ready 各双端一条，共 8 条阶段消息；P 节点 Flow 的 Prepare/Prepared、Commit/Committed、Close/Closed 共 6P 条。复用已有 Link 不支付前者；远端入口另有 Open/Opened/CloseRequest，流式每端另有一次 control attach。此口径包含本机提交，不等于跨节点传输次数或瞬时排队量，也不含全部 Agent/peer 协调。消息预算与过载准入仍未完成压测验收。
+
+### E.3 缓冲优化的中间版本对照
+
+2026-10-30 的 E 批次曾采用 TCP 直接读入 32 KiB 池块、短读后保留分配容量的实现。当时控制域到传输域的 B 批次投递次数也仅为中间状态：单跳 5 → 4，多跳每端 6 → 5，协议域绑定 1 次不变。普通继承后的 TCP LocalPair/RemotePair 为 696/616 字节，UDP 为 688/560 字节，均较原实现增加 8 字节；没有据此宣称吞吐改善。
+
+**以下缓冲数据仅适用于当时 E 批次实现。** 后续已改成复用堆读取缓冲并按实际长度复制入池，再删除截短接口；H 又取消 Node 的 TLS 解帧。下表不能用于估算当前入口的吞吐或尺寸。保留它是为说明“减少入口复制”与“短读持有大池块”的取舍，防止重复采用已放弃的优化。
+
+当时实验使用 GNU 14.2.0、Debug（-O0 -g0）、本机回环单线程、基线 90c319f；不计 TLS 握手和 Flow 安装，终点本地消费以隔离入口开销。小包为 2048 次 64 B 顺序交互；大流量及慢端为 256 × 65467 B，慢端用生产 TokenBucket 限为 8 MiB/s。前后交替各三次取中位数，窗口与 RSS 每 1 ms 采样。
+
+| 对象 | 修改前 → 当时 E 实现（字节） |
+|---|---:|
+| TCP read_remote_pair 实际协程分配 | 65760 → 336 |
+| TLS read_remote_pair 实际协程分配 | 65728 → 304 |
+| PooledBuffer | 32 → 40 |
+| Frame | 80 → 88，仍在 128 字节管理预算内 |
+
+“池申请”为载荷调用次数，“上游申请”为标准池向 new_delete_resource 申请的次数，含元数据。“持有峰值”为在用载荷请求字节与入口协程分配之和，不含池缓存、其他协程、TLS 或内核内存。删除的复制仅统计入口数组到池的 memcpy。
+
+| 场景 | 池申请次数（前 → 后） | 上游申请次数（前 → 后） | 删除的入口复制字节 | 持有峰值 KiB（前 → 后） |
+|---|---:|---:|---:|---:|
+| TCP 64 B 小包 | 2048 → 2049 | 6 → 6 | 131072 | 64.3 → 64.3 |
+| TCP 连续大流量 | 298 → 529 | 12 → 6 | 16759552 | 424.2 → 352.3 |
+| TCP 慢接收端 | 352 → 529 | 10 → 6 | 16759552 | 436.2 → 352.3 |
+| TLS 64 B 小包 | 2048 → 2048 | 6 → 6 | 131072 | 64.2 → 0.4 |
+| TLS 连续大流量 | 256 → 256 | 6 → 6 | 16759552 | 128.1 → 128.2 |
+| TLS 慢接收端 | 256 → 256 | 6 → 6 | 16759552 | 447.8 → 383.9 |
+
+| 场景 | 吞吐 Mbit/s（前 → 后） | RSS KiB（前 → 后） | 窗口采样峰值字节（前 → 后） | 池上游保留 KiB（前 → 后） |
+|---|---:|---:|---:|---:|
+| TCP 64 B 小包 | 6.32 → 6.51 | 10848 → 10848 | 384 → 32896 | 2.4 → 481.5 |
+| TCP 连续大流量 | 224.08 → 211.83 | 11600 → 11216 | 295552 → 296064 | 1742.1 → 481.5 |
+| TCP 慢接收端 | 51.73 → 48.04 | 11536 → 11216 | 312320 → 296192 | 1681.9 → 481.5 |
+| TLS 64 B 小包 | 4.41 → 4.74 | 12352 → 12416 | 384 → 384 | 2.4 → 2.4 |
+| TLS 连续大流量 | 207.56 → 199.92 | 12576 → 12640 | 128 → 128 | 961.5 → 961.5 |
+| TLS 慢接收端 | 51.94 → 48.57 | 12896 → 12912 | 262784 → 262784 | 961.5 → 961.5 |
+
+TCP 从约 64 KiB 分块改为 32 KiB 后申请与交接增多，大流量 Debug 吞吐约下降 5.5%；小包池保留量由约 2.4 KiB 升至 481.5 KiB，不能隐藏在协程帧收益中。所有对照验证字节完整，窗口采样未超过 320 KiB 加 FIN 的 128 字节，停止后在用载荷和窗口归零；节点级池保留高水位缓存不等于载荷泄漏。
+
+当时另有单节点 TLS 的 1024 次、三轮中位数对照：TCP↔TLS 在 TLS 1.2 下为 1930.20 → 1826.56 Mbit/s、TLS 1.3 下为 1797.11 → 1819.12；现已删除的 TLS↔TLS 路径分别为 1113.65 → 1133.93、1102.22 → 1097.38。方向与版本均有波动，不证明消除复制必然提升吞吐。三节点十 Flow 的不限速及 100 → 10 → 100 Mbit/s 背压检查仅验证底层发送接收相等与排空，不含 Agent 接入。
+
+最终选择按实际长度入池后，64 字节小包恢复为 384 字节窗口占额；PooledBuffer/Frame 恢复 32/80 字节，移除 truncate/capacity/memory_charge。该最终选择没有重跑同条件吞吐对照。历史原始数据曾位于 `build-stage-a/benchmark/results/stage-e/`，不保证该本机目录随仓库保存。
+
+### E.4 AsyncEvent 同条件微基准与实现取舍
+
+2026-11-04 的最终复评采用 AArch64、GCC/libstdc++、C++20、`-O2 -DNDEBUG`、vendored Asio 1.38.2、单 io_context(1)。基线保存修改前完整实现，生产优化版直接包含仓库头文件；共享 channel.close 原型同样消除默认容器空分配，避免不对等比较。
+
+各组预热后计时五次取中位数，计时关闭分配计数；分配统计另跑三次取中位数。完整轮次包含创建、协程登记、通知/取消、恢复、销毁和公共脚手架，**不是单次 notify_all 的耗时或应用吞吐**。
+
+| 广播完整轮次 | 优化前 | 生产两项优化后 | 同容器优化的共享 channel.close 原型 |
+|---|---:|---:|---:|
+| 1 等待者 | 1.96 µs | 1.88 µs | 1.86 µs |
+| 8 等待者 | 9.85 µs | 9.61 µs | 9.20 µs |
+| 64 等待者 | 83.94 µs | 77.88 µs | 72.79 µs |
+| 512 等待者 | 0.924 ms | 0.712 ms | 0.642 ms |
+
+| 独立取消完整轮次 | 优化前 | 生产两项优化后 | 同容器优化的共享 channel.close 原型 |
+|---|---:|---:|---:|
+| 1 等待者 | 2.05 µs | 1.99 µs | 1.96 µs |
+| 512 等待者 | 1.390 ms | 1.029 ms | 1.318 ms |
+
+| 广播完整轮次分配请求 | 优化前 | 生产两项优化后 | 同容器优化的共享 channel.close 原型 |
+|---|---:|---:|---:|
+| 1 等待者 | 6 次 / 1408 字节 | 4 次 / 840 字节 | 3 次 / 832 字节 |
+| 512 等待者 | 3593 次 / 962120 字节 | 2569 次 / 638600 字节 | 2559 次 / 540480 字节 |
+
+已通知快路约为 53 → 52 ns，预热后均未观测到新堆分配请求。生产事件本体仍为 88 字节、构造零堆分配；真正挂起的每个等待者减少两次空容器分配。通知后存活事件原先在 1/512 等待者下保留 8/4096 字节 vector 容量，优化后归零。单等待者 notify_all 本身约为 0.257 → 0.265 µs，释放容量只是把工作从析构移到通知阶段，不保证单次通知更快。
+
+共享 channel 原型的结论亦需保留修正：默认 deque 原型本体 232 字节、另两次申请 568 字节，约 800 字节常驻估算只适用于旧原型；配置相同容器后本体为 176 字节、预热构造零堆分配。此时单等待者完整成本接近，高扇出广播仍有简化空间，不能再以旧常驻开销否定该方案。原生 cancel_by_key 和生产版 std::erase 都可能在大量分别取消时累计 `O(W²)`，成本发生阶段不同；尚无应用采样证明这些一次性通知限制稳态吞吐，因此保留当前两项局部优化。
+
+生产与候选均验证广播、幂等、迟到等待、独立取消、先通知后取消及同执行器内先提交取消后通知的胜出语义。没有采用改变剩余通知顺序的下标交换注销，也未引入自定义 awaiter 或通用通知框架。SharedLink 的旧完成事件随后删除，原来对其高扇出的优化建议不再构成生产需求。
+
+复现文件曾位于 `/tmp/relayweave_async_event_after_bench.cpp`、`/tmp/relayweave_async_event_after_measure.py`、`/tmp/relayweave_async_event_after_timing_median.csv`、`/tmp/relayweave_async_event_after_allocations_median.csv` 和 `/tmp/relayweave_async_event_retention.cpp`；回归日志曾位于 `/tmp/relayweave_async_event_ctest.log`。这些是当时环境的临时证据路径，不是仓库交付物。
+
+### E.5 历史异常、已定位原因与证据范围
+
+1. **早期 B 批次偶发失败**：udp_session_routing 段错误、relay_paths 等待取消、relay_integration 总超时/心跳超时均曾出现；调试和最终重复验收未再复现，但原始无堆栈案例没有已确认根因，不能因后续通过标为已修复。
+2. **2026-11-04 UDP 测试异常路径**：第 18 次重复取得 core，发现失败清理先停执行器，使持有 Node 的处理器在 control_io 析构期间释放 NodeMetrics，访问已析构的 UDP 定时器服务。修正为成功/失败都先 server->stop，再等待线程退出；第 37 次正常暴露原始断言：UDP TX payload bytes were counted incorrectly。客户端收到数据与服务端发送完成计数跨执行域无先后保证，改为同一绝对期限内观察精确计数，超预期立即失败，未增加固定 sleep，也未修改生产统计时机。最终连续 40 次通过，仅解释此次有堆栈复现。
+3. **并行 UDP 边界报文接收超时**：记录到一次内核 RcvbufErrors，与多组约 64 KiB 报文排队相符；测试夹具按四个最大报文配置接收缓冲，并补充服务/方向/报文类别诊断。最终完整回归无新增该计数，生产 UDP 缓冲与尾丢弃语义保持原样。
+4. **监听端口冲突**：E 批次 relay_paths 与 2026-11-06 node_shutdown 曾因 bind: Address already in use 失败，后续原样复测通过；未增加生产监听重试或延长测试期限，不能据此认定端口竞争根因已消除。
+5. **2026-11-06 并行 relay_paths 超时**：首次等 relay.error 触发测试端 4 秒接收上限；单独复跑及与 cluster_integration 原组合并行两轮通过，根因未确认，原失败保留，不改生产或测试期限。
+6. **环境与夹具问题**：缺少原始 ICMP socket 权限时 probe_integration 按规则跳过；测试夹具漏填监听地址曾导致 Node 构造失败，补齐后相关用例重建复验通过。跳过不能计为协议探测通过，修正夹具后的累计成功不能改写成首次全绿。
+
+会话异常证据曾位于 `/tmp/relayweave_udp_debug/backtrace_full.txt`、`clean_37.log` 及 `/tmp/relayweave_session_refactor_*` 日志；2026-11-06 的构建、首轮失败、复测与最终完整回归曾位于 `/tmp/relayweave-nodelink-review/`，最终协议记录为 `protocol-audit-build.log`、`protocol-audit-core-tests.log`、`protocol-audit-full-ctest.log`。临时文件未作为长期依赖；复核时以源码符号、现有测试和可重新执行的构建为准。
