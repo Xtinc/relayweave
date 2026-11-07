@@ -445,7 +445,8 @@ void NodeLinkMgr::handle_link_command(CtrlCommand type, const njson &p, std::uin
         }
         const auto &authorized = found->second;
         if (p.at("token") != authorized.token || p.at("left") != authorized.left ||
-            p.at("right") != authorized.right || p.at("transport") != relay_protocol_name(authorized.transport))
+            p.at("right") != authorized.right ||
+            p.at("transport") != std::string(relay_protocol_name(authorized.transport)))
         {
             return;
         }

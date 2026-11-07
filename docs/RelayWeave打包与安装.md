@@ -1,6 +1,6 @@
 # RelayWeave 打包与安装
 
-端到端 TLS 编译需要支持 RPK 的 OpenSSL **3.2 或更高版本**静态库，程序运行时不依赖系统 libssl/libcrypto。此次数据接入协议要求所有 Node/Agent 统一升级，不兼容旧版。Node 删除独立 `tls` 数据配置，TCP/TLS 共用原 `tcp` 端口、容量和限速；升级前删除 Node 配置中的 `tls` 段。Agent 凭据不变，双方对应 service/forward 的 `protocol: "tls"` 即启用端到端加密。
+端到端 TLS 编译需要支持 RPK 的 OpenSSL **3.2 或更高版本**，默认静态链接，程序运行时不依赖系统 libssl/libcrypto；可通过 `OPENSSL_USE_STATIC_LIBS=OFF` 改用动态库。此次数据接入协议要求所有 Node/Agent 统一升级，不兼容旧版。Node 删除独立 `tls` 数据配置，TCP/TLS 共用原 `tcp` 端口、容量和限速；升级前删除 Node 配置中的 `tls` 段。Agent 凭据不变，双方对应 service/forward 的 `protocol: "tls"` 即启用端到端加密。
 
 
 本文集中说明 RelayWeave 的 CMake/CPack Debian 打包、版本和架构命名、文件布局、systemd 服务生命周期、安装、升级、卸载和排错。系统原理见 [RelayWeave 设计](RelayWeave设计.md)，证书生成和信任关系见 [证书制作与部署](证书制作与部署.md)。
@@ -48,7 +48,8 @@ Dashboard 是纯 Python 包，架构固定为 `all`。构建时只复制源码�
 
 - CMake 3.24；
 - 支持 C++20 的编译器；
-- 支持 RPK 的 OpenSSL 3.2+ headers 和静态 libraries；
+- 支持 RPK 的 OpenSSL 3.2+ headers 和 libraries（默认需要静态库）；
+- 静态链接 OpenSSL 时需要 zlib/zstd 开发库，其中 zstd 须提供 CMake package 配置和静态库；
 - pthread；
 - Debian 打包工具，包括 `dpkg-shlibdeps`；
 - Bash，用于项目包装脚本。
@@ -57,16 +58,22 @@ Debian/Ubuntu 可以安装：
 
 ```console
 sudo apt update
-sudo apt install build-essential cmake libssl-dev dpkg-dev
+sudo apt install build-essential cmake libssl-dev zlib1g-dev libzstd-dev dpkg-dev
 ```
 
-Asio 1.38.2 和 JSON 3.12.0 由 FetchContent 下载源码压缩包并解压到构建目录。离线构建可通过 `FETCHCONTENT_SOURCE_DIR_ASIO` 和 `FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON` 指定已有源码目录。
+Asio 1.38.2 和 JSON 3.12.0 优先使用本地 `vendor/asio-1.38.2` 和 `vendor/json-3.12.0`，缺失时由 FetchContent 下载源码压缩包并解压到构建目录。也可通过 `FETCHCONTENT_SOURCE_DIR_ASIO` 和 `FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON` 指定已有源码目录。
 
-OpenSSL 使用静态链接；可通过 `-DOPENSSL_ROOT_DIR=/path/to/openssl` 指定安装目录，该目录必须提供静态库。RPK 接口从 OpenSSL 3.2 开始提供，CMake 直接要求最低版本 3.2，低于该版本时终止配置，不再额外检查符号。
+OpenSSL 默认使用静态链接；可通过 `-DOPENSSL_ROOT_DIR=/path/to/openssl` 指定安装目录，该目录默认必须提供静态库。静态模式使用 `find_package(ZLIB REQUIRED)` 和 `find_package(zstd CONFIG REQUIRED)` 查找压缩依赖，链接 `ZLIB::ZLIB` 和 `zstd::libzstd_static`。配置时传入 `-DOPENSSL_USE_STATIC_LIBS=OFF` 可使用 OpenSSL 动态库，此时不额外查找和链接 zlib/zstd，运行环境须提供匹配的 OpenSSL 共享库。RPK 接口从 OpenSSL 3.2 开始提供，CMake 直接要求最低版本 3.2，低于该版本时终止配置，不再额外检查符号。
+
+在已有构建目录切换 OpenSSL 链接方式时，需清除已缓存的库路径，例如：
+
+```console
+cmake -S . -B build -UOPENSSL_SSL_LIBRARY -UOPENSSL_CRYPTO_LIBRARY -DOPENSSL_USE_STATIC_LIBS=OFF
+```
 
 `scripts/build_deb.sh` 每次配置时重新查找 OpenSSL 库，避免旧构建目录缓存的 `.so` 路径导致继续动态链接。Deb 对 `openssl` 命令行工具不设置版本要求；程序的 OpenSSL 最低版本约束只在编译时检查。
 
-Linux 上 GCC 的 `libstdc++` 和 `libgcc` 也被静态链接，glibc 等其他系统库仍按动态依赖处理。CPack 启用 `dpkg-shlibdeps` 自动计算三个包的共享库依赖，并显式依赖 `systemd`。Agent/Node 包保留 `openssl` 命令行工具依赖，供证书部署脚本使用，无需部署 OpenSSL 3.2+ 共享库。
+Linux 上 GCC 的 `libstdc++` 和 `libgcc` 也被静态链接，glibc 等其他系统库仍按动态依赖处理。CPack 启用 `dpkg-shlibdeps` 自动计算三个包的共享库依赖，并显式依赖 `systemd`。Agent/Node 包保留 `openssl` 命令行工具依赖，供证书部署脚本使用；默认静态模式无需部署 OpenSSL 3.2+ 共享库。
 
 ## 3. 生成 Deb 包
 

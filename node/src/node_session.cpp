@@ -480,7 +480,7 @@ bool MultiSession::handle(CtrlCommand command, const AgentPeer &session, const C
     if (opening)
     {
         if (params.at("path") != path_ || params.at("epoch") != epoch_ || params.at("service") != service_ ||
-            params.at("protocol") != relay_protocol_name(protocol_))
+            params.at("protocol") != std::string(relay_protocol_name(protocol_)))
         {
             throw std::invalid_argument("relay request conflicts with existing request");
         }

@@ -27,18 +27,34 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif()
 
 find_package(Threads REQUIRED)
-set(OPENSSL_USE_STATIC_LIBS TRUE)
+option(OPENSSL_USE_STATIC_LIBS "Link OpenSSL statically" ON)
 find_package(OpenSSL 3.2 REQUIRED COMPONENTS SSL Crypto)
+if(OPENSSL_USE_STATIC_LIBS)
+    find_package(ZLIB REQUIRED)
+    find_package(zstd CONFIG REQUIRED)
+endif()
 
 include(FetchContent)
-FetchContent_Declare(asio
-    URL https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-38-2.tar.gz
-    URL_HASH SHA256=9f2648fa483e58a6bf848d970ee0ea650ca19ed7769dfa520ed4f7b8d27af1db
-)
-FetchContent_Declare(nlohmann_json
-    URL https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz
-    URL_HASH SHA256=4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187
-)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/asio-1.38.2/include/asio.hpp")
+    message(STATUS "Using vendored Asio 1.38.2")
+    FetchContent_Declare(asio SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/asio-1.38.2")
+else()
+    FetchContent_Declare(asio
+        URL https://github.com/chriskohlhoff/asio/archive/refs/tags/asio-1-38-2.tar.gz
+        URL_HASH SHA256=9f2648fa483e58a6bf848d970ee0ea650ca19ed7769dfa520ed4f7b8d27af1db
+    )
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/json-3.12.0/CMakeLists.txt" AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/vendor/json-3.12.0/include/nlohmann/json.hpp")
+    message(STATUS "Using vendored nlohmann_json 3.12.0")
+    FetchContent_Declare(nlohmann_json SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/vendor/json-3.12.0")
+else()
+    FetchContent_Declare(nlohmann_json
+        URL https://github.com/nlohmann/json/archive/refs/tags/v3.12.0.tar.gz
+        URL_HASH SHA256=4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187
+    )
+endif()
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_MakeAvailable(asio nlohmann_json)
 
