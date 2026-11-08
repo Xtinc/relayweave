@@ -13,7 +13,6 @@ if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
 fi
 
 cmake -S "$source_dir" -B "$build_dir" \
-    -UOPENSSL_SSL_LIBRARY -UOPENSSL_CRYPTO_LIBRARY \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_FLAGS="--param=ggc-min-expand=20 --param=ggc-min-heapsize=65536" \
     -DBUILD_TESTING=OFF \

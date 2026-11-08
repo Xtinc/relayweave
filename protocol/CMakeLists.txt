@@ -12,7 +12,4 @@ target_link_libraries(relayweave_protocol PUBLIC
     OpenSSL::SSL
     OpenSSL::Crypto
 )
-if(OPENSSL_USE_STATIC_LIBS)
-    target_link_libraries(relayweave_protocol PUBLIC ZLIB::ZLIB zstd::libzstd_static)
-endif()
 target_include_directories(relayweave_protocol PUBLIC inc)

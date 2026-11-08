@@ -48,8 +48,8 @@ Dashboard 是纯 Python 包，架构固定为 `all`。构建时只复制源码�
 
 - CMake 3.24；
 - 支持 C++20 的编译器；
-- 支持 RPK 的 OpenSSL 3.2+ headers 和 libraries（默认需要静态库）；
-- 静态链接 OpenSSL 时需要 zlib/zstd 开发库，其中 zstd 须提供 CMake package 配置和静态库；
+- 静态模式需要 `vendor/openssl-<版本>/` 源码目录中的 OpenSSL 3.2+ 稳定版本，以及 C 编译器、Perl 5 和 Make，目前支持 Unix/Linux/macOS 本机构建；
+- 动态模式需要系统提供 OpenSSL 3.2+ 开发头文件和共享库，无需 vendor OpenSSL 源码及其构建工具；
 - pthread；
 - Debian 打包工具，包括 `dpkg-shlibdeps`；
 - Bash，用于项目包装脚本。
@@ -58,20 +58,34 @@ Debian/Ubuntu 可以安装：
 
 ```console
 sudo apt update
-sudo apt install build-essential cmake libssl-dev zlib1g-dev libzstd-dev dpkg-dev
+sudo apt install build-essential cmake perl dpkg-dev
 ```
 
 Asio 1.38.2 和 JSON 3.12.0 优先使用本地 `vendor/asio-1.38.2` 和 `vendor/json-3.12.0`，缺失时由 FetchContent 下载源码压缩包并解压到构建目录。也可通过 `FETCHCONTENT_SOURCE_DIR_ASIO` 和 `FETCHCONTENT_SOURCE_DIR_NLOHMANN_JSON` 指定已有源码目录。
 
-OpenSSL 默认使用静态链接；可通过 `-DOPENSSL_ROOT_DIR=/path/to/openssl` 指定安装目录，该目录默认必须提供静态库。静态模式使用 `find_package(ZLIB REQUIRED)` 和 `find_package(zstd CONFIG REQUIRED)` 查找压缩依赖，链接 `ZLIB::ZLIB` 和 `zstd::libzstd_static`。配置时传入 `-DOPENSSL_USE_STATIC_LIBS=OFF` 可使用 OpenSSL 动态库，此时不额外查找和链接 zlib/zstd，运行环境须提供匹配的 OpenSSL 共享库。RPK 接口从 OpenSSL 3.2 开始提供，CMake 直接要求最低版本 3.2，低于该版本时终止配置，不再额外检查符号。
+OpenSSL 来源由 `OPENSSL_USE_STATIC_LIBS` 决定：
 
-在已有构建目录切换 OpenSSL 链接方式时，需清除已缓存的库路径，例如：
+- `ON`（默认）：从 vendor 源码构建静态库，选取版本最高、至少为 3.2 的稳定版本；缺失、版本过旧或构建失败时直接报错，不回退系统库，也不使用 `OPENSSL_ROOT_DIR` 或缓存的系统库路径。目前 vendor 自动构建仅支持 Unix 本机构建。
+- `OFF`：直接使用系统 OpenSSL 共享库，通过 `find_package(OpenSSL 3.2 REQUIRED COMPONENTS SSL Crypto)` 检查头文件和库；跳过 vendor 源码及其构建工具检查，不构建自有动态库。系统版本不足时配置失败。可用 `-DOPENSSL_ROOT_DIR=/path/to/openssl` 指定已安装的 OpenSSL 前缀。Debian/Ubuntu 动态构建还需安装版本满足要求的 `libssl-dev`。
+
+OpenSSL 源码没有 `CMakeLists.txt`，项目通过 CMake `ExternalProject_Add` 在构建阶段执行 Perl `Configure`、Make 和 `install_sw`。直接使用 `vendor/openssl-3.5.9/` 中已有的源码，运行：
 
 ```console
-cmake -S . -B build -UOPENSSL_SSL_LIBRARY -UOPENSSL_CRYPTO_LIBRARY -DOPENSSL_USE_STATIC_LIBS=OFF
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --parallel 2
 ```
 
-`scripts/build_deb.sh` 每次配置时重新查找 OpenSSL 库，避免旧构建目录缓存的 `.so` 路径导致继续动态链接。Deb 对 `openssl` 命令行工具不设置版本要求；程序的 OpenSSL 最低版本约束只在编译时检查。
+源码目录保持干净，不能包含已经在源码树内构建的 OpenSSL 配置。编译和安装产物位于 `build/_deps/openssl-3.5.9-static/`，不会覆盖系统 OpenSSL，也不需要 sudo 或在线下载；项目不处理源码压缩包。OpenSSL 的并行数默认是 `1`，可在配置时通过 `-DRELAYWEAVE_OPENSSL_BUILD_JOBS=2` 调整；它独立于外层 CMake 的并行数。vendor 构建关闭测试、命令行程序、动态模块和压缩支持，保留项目所需的 TLS/RPK 功能。
+
+vendor 静态构建固定包含 `no-zlib no-zstd no-brotli`，不查找或链接这些压缩库，也不需要安装它们的开发包。动态模式链接系统 libssl/libcrypto，压缩库依赖由系统共享库处理，项目无需显式链接。部署动态版本时，运行环境必须提供匹配的 OpenSSL 3.2+ 共享库。RPK 接口从 OpenSSL 3.2 开始提供，最低版本要求为 3.2。
+
+在已有构建目录切换 OpenSSL 链接方式时，直接重新配置即可：
+
+```console
+cmake -S . -B build -DOPENSSL_USE_STATIC_LIBS=OFF
+```
+
+动态模式配置时会重新查找系统 OpenSSL 头文件和库，避免沿用旧缓存的静态库路径；切换方式无需手动清理缓存。Deb 中的 `openssl` 命令行工具供证书部署脚本使用，与程序链接的 libssl/libcrypto 分开，不设置相同的版本要求。
 
 Linux 上 GCC 的 `libstdc++` 和 `libgcc` 也被静态链接，glibc 等其他系统库仍按动态依赖处理。CPack 启用 `dpkg-shlibdeps` 自动计算三个包的共享库依赖，并显式依赖 `systemd`。Agent/Node 包保留 `openssl` 命令行工具依赖，供证书部署脚本使用；默认静态模式无需部署 OpenSSL 3.2+ 共享库。
 
@@ -288,7 +302,7 @@ Node 升级时先停止服务、安装新包、迁移配置，再使用部署工
 
 端到端 TLS 的两端继续使用同一套共享客户端证书与私钥，只需将对应 service/forward 的 protocol 设为 tls。无需给 Producer 另签 serverAuth 证书；若轮换了共享私钥，互联双方必须同时更新，详见 [端到端公钥与凭据轮换](证书制作与部署.md#26-端到端公钥与凭据轮换)。
 
-OpenSSL 部署以第 2 节当前链接方式为准：默认静态链接时构建机需要支持 RPK 的 3.2+ 开发库，运行机无需同版本共享库；选择动态链接时运行机须提供匹配的库。历史改造记录中的运行库依赖不替代当前打包规则。
+OpenSSL 部署以第 2 节当前链接方式为准：默认静态链接时从 vendor 中已有的 OpenSSL 3.2+ 源码构建，运行机无需同版本共享库；选择动态链接时构建机和运行机须提供匹配的系统库。历史改造记录中的运行库依赖不替代当前打包规则。
 
 多跳准备失败的诊断 stage 已由早期 attach/bridge 收敛为 prepare；按旧 stage 字面值分类的日志工具需同步调整。会话内部的控制器删除、数据任务合并和所有权调整没有另加兼容协议。
 
