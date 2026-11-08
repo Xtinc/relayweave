@@ -352,7 +352,7 @@ void NodeControl::handle_topology_query(const njson &params)
 
 void NodeControl::handle_topology_snapshot(CtrlMessage message)
 {
-    if (message.params->at("source") != topology_.master_id())
+    if (message.params->at("source") != std::string(topology_.master_id()))
     {
         return;
     }
