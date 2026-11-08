@@ -48,11 +48,11 @@ Dashboard 是纯 Python 包，架构固定为 `all`。构建时只复制源码�
 
 - CMake 3.24；
 - 支持 C++20 的编译器；
-- 静态模式需要 `vendor/openssl-<版本>/` 源码目录中的 OpenSSL 3.2+ 稳定版本，以及 C 编译器、Perl 5 和 Make，目前支持 Unix/Linux/macOS 本机构建；
+- 静态模式需要 `vendor/openssl-<版本>/` 源码目录中的 OpenSSL 3.2+ 稳定版本，以及 C 编译器和 Perl 5；Unix/Linux/macOS 使用 Make，Windows MSVC 使用 NMake、原生 Windows Perl（如 Strawberry Perl）和 NASM；
 - 动态模式需要系统提供 OpenSSL 3.2+ 开发头文件和共享库，无需 vendor OpenSSL 源码及其构建工具；
-- pthread；
-- Debian 打包工具，包括 `dpkg-shlibdeps`；
-- Bash，用于项目包装脚本。
+- Unix 上需要 pthread；
+- 生成 Deb 包需要 Debian 打包工具，包括 `dpkg-shlibdeps`；
+- Bash，用于项目的 Linux 包装脚本。
 
 Debian/Ubuntu 可以安装：
 
@@ -65,7 +65,7 @@ Asio 1.38.2 和 JSON 3.12.0 优先使用本地 `vendor/asio-1.38.2` 和 `vendor/
 
 OpenSSL 来源由 `OPENSSL_USE_STATIC_LIBS` 决定：
 
-- `ON`（默认）：从 vendor 源码构建静态库，选取版本最高、至少为 3.2 的稳定版本；缺失、版本过旧或构建失败时直接报错，不回退系统库，也不使用 `OPENSSL_ROOT_DIR` 或缓存的系统库路径。目前 vendor 自动构建仅支持 Unix 本机构建。
+- `ON`（默认）：从 vendor 源码构建静态库，选取版本最高、至少为 3.2 的稳定版本；缺失、版本过旧或构建失败时直接报错，不回退系统库，也不使用 `OPENSSL_ROOT_DIR` 或缓存的系统库路径。支持 Unix 和 Windows MSVC 本机构建，不支持交叉编译。
 - `OFF`：直接使用系统 OpenSSL 共享库，通过 `find_package(OpenSSL 3.2 REQUIRED COMPONENTS SSL Crypto)` 检查头文件和库；跳过 vendor 源码及其构建工具检查，不构建自有动态库。系统版本不足时配置失败。可用 `-DOPENSSL_ROOT_DIR=/path/to/openssl` 指定已安装的 OpenSSL 前缀。Debian/Ubuntu 动态构建还需安装版本满足要求的 `libssl-dev`。
 
 OpenSSL 源码没有 `CMakeLists.txt`，项目通过 CMake `ExternalProject_Add` 在构建阶段执行 Perl `Configure`、Make 和 `install_sw`。直接使用 `vendor/openssl-3.5.9/` 中已有的源码，运行：
@@ -75,7 +75,17 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --parallel 2
 ```
 
-源码目录保持干净，不能包含已经在源码树内构建的 OpenSSL 配置。编译和安装产物位于 `build/_deps/openssl-3.5.9-static/`，不会覆盖系统 OpenSSL，也不需要 sudo 或在线下载；项目不处理源码压缩包。OpenSSL 的并行数默认是 `1`，可在配置时通过 `-DRELAYWEAVE_OPENSSL_BUILD_JOBS=2` 调整；它独立于外层 CMake 的并行数。vendor 构建关闭测试、命令行程序、动态模块和压缩支持，保留项目所需的 TLS/RPK 功能。
+源码目录保持干净，不能包含已经在源码树内构建的 OpenSSL 配置。编译和安装产物位于 `build/_deps/openssl-3.5.9-static/`，不会覆盖系统 OpenSSL，也不需要 sudo 或在线下载；项目不处理源码压缩包。Unix 上 OpenSSL 的并行数默认是 `1`，可在配置时通过 `-DRELAYWEAVE_OPENSSL_BUILD_JOBS=2` 调整；它独立于外层 CMake 的并行数，Windows NMake 使用串行构建。vendor 构建关闭测试、命令行程序、动态模块和压缩支持，保留项目所需的 TLS/RPK 功能。
+
+Windows x64 在 Visual Studio 2022 的 **Developer PowerShell / x64 Native Tools Command Prompt** 中运行，先将原生 Windows Perl 和 NASM 的目录加入当前终端的 `PATH`：
+
+```powershell
+cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64
+cmake --build build-win --config Release --parallel 4
+ctest --test-dir build-win -C Release --output-on-failure
+```
+
+配置和构建均须使用对应架构的 VS 开发环境，使 `cl`、`nmake`、Windows SDK 头文件和库可用；Git/MSYS 的 Perl 不能替代原生 Windows Perl。CMake 根据目标架构选择 `VC-WIN64A`、`VC-WIN32` 或 `VC-WIN64-ARM`，使用 NMake 编译，补齐 OpenSSL 静态链接所需的 Windows 系统库。Debug/Release 等配置的构建目录及安装目录分别位于 `build/<配置>/` 和 `install/<配置>/`，均在上述 OpenSSL 产物根目录内；单配置生成器未指定构建类型时，OpenSSL 使用 Release 目录。OpenSSL 的运行库选项跟随 `CMAKE_MSVC_RUNTIME_LIBRARY`，未设置时默认 Release 使用 `/MD`，Debug 使用 `/MDd`；如需静态 CRT，可按 CMake 标准设置该变量，显式设为空时不追加运行库选项。Windows 本机构建不生成 Deb 包。
 
 vendor 静态构建固定包含 `no-zlib no-zstd no-brotli`，不查找或链接这些压缩库，也不需要安装它们的开发包。动态模式链接系统 libssl/libcrypto，压缩库依赖由系统共享库处理，项目无需显式链接。部署动态版本时，运行环境必须提供匹配的 OpenSSL 3.2+ 共享库。RPK 接口从 OpenSSL 3.2 开始提供，最低版本要求为 3.2。
 

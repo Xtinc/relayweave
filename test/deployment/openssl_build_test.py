@@ -10,8 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@unittest.skipUnless(shutil.which('cmake') and os.name == 'posix',
-                     'CMake and a native Unix toolchain are required')
+@unittest.skipUnless(shutil.which('cmake'), 'CMake is required')
 class OpenSSLBuildTest(unittest.TestCase):
     def setUp(self):
         self.workspace = tempfile.TemporaryDirectory(prefix='relayweave-openssl-')
@@ -26,11 +25,13 @@ find_package(Threads REQUIRED)
 option(OPENSSL_USE_STATIC_LIBS "Link OpenSSL statically" ON)
 include(OpenSSL.cmake)
 relayweave_setup_openssl()
-get_target_property(crypto_path OpenSSL::Crypto IMPORTED_LOCATION)
+get_target_property(crypto_path OpenSSL::Crypto LOCATION)
 message(STATUS "Selected crypto: ${crypto_path}")
 if(TARGET relayweave_openssl)
     message(STATUS "Vendored build enabled")
 endif()
+file(GENERATE OUTPUT "${CMAKE_BINARY_DIR}/selected-$<CONFIG>.txt"
+    CONTENT "$<TARGET_FILE:OpenSSL::Crypto>\\n$<TARGET_PROPERTY:OpenSSL::Crypto,INTERFACE_INCLUDE_DIRECTORIES>\\n")
 ''')
 
     def vendor(self, version):
@@ -42,10 +43,18 @@ endif()
             f'MAJOR={major}\nMINOR={minor}\nPATCH={patch}\nPRE_RELEASE_TAG=\n')
 
     def configure(self, *options):
+        platform_options = (['-DCMAKE_BUILD_TYPE=Debug',
+                             '-DCMAKE_CONFIGURATION_TYPES=Debug;Release']
+                            if os.name == 'nt' else [])
         result = subprocess.run(
-            ['cmake', '-S', str(self.source), '-B', str(self.source / 'build'), *options],
+            ['cmake', '-S', str(self.source), '-B', str(self.source / 'build'),
+             *platform_options, *options],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         return result.returncode, result.stdout
+
+    def vendor_crypto_path(self, version='3.5.9'):
+        library = 'Debug/lib/libcrypto.lib' if os.name == 'nt' else 'lib/libcrypto.a'
+        return f'openssl-{version}-static/install/{library}'
 
     def system(self, version='3.5.9'):
         prefix = self.source / 'system-openssl'
@@ -55,7 +64,7 @@ endif()
         (include / 'ssl.h').touch()
         (include / 'opensslv.h').write_text(
             f'#define OPENSSL_VERSION_STR "{version}"\n')
-        suffix = '.dylib' if sys.platform == 'darwin' else '.so'
+        suffix = '.lib' if os.name == 'nt' else ('.dylib' if sys.platform == 'darwin' else '.so')
         for name in ('ssl', 'crypto'):
             for extension in ('.a', suffix):
                 (prefix / f'lib/lib{name}{extension}').touch()
@@ -68,7 +77,7 @@ endif()
         code, output = self.configure()
         self.assertEqual(code, 0, output)
         self.assertIn('Using vendored OpenSSL 3.5.9 (static)', output)
-        self.assertIn('openssl-3.5.9-static/install/lib/libcrypto.a', output)
+        self.assertIn(self.vendor_crypto_path(), output)
 
     def test_missing_vendor_fails_instead_of_using_system(self):
         code, output = self.configure()
@@ -89,14 +98,14 @@ endif()
                                       '-DOPENSSL_SSL_LIBRARY=/unused-system-openssl/libssl.so',
                                       '-DOPENSSL_CRYPTO_LIBRARY=/unused-system-openssl/libcrypto.so')
         self.assertEqual(code, 0, output)
-        self.assertIn('openssl-3.5.9-static/install/lib/libcrypto.a', output)
+        self.assertIn(self.vendor_crypto_path(), output)
 
     def test_system_and_compression_packages_are_not_looked_up(self):
         self.vendor('3.5.9')
         for name in ('OpenSSL', 'ZLIB', 'zstd'):
             (self.source / f'Find{name}.cmake').write_text(
                 'message(FATAL_ERROR "Unexpected system dependency lookup")\n')
-        code, output = self.configure(f'-DCMAKE_MODULE_PATH={self.source}',
+        code, output = self.configure(f'-DCMAKE_MODULE_PATH={self.source.as_posix()}',
                                       '-DCMAKE_DISABLE_FIND_PACKAGE_zstd=TRUE')
         self.assertEqual(code, 0, output)
 
@@ -127,7 +136,7 @@ endif()
                                       f'-DOPENSSL_ROOT_DIR={prefix}')
         self.assertEqual(code, 0, output)
         self.assertIn('Using system OpenSSL 3.2.8 (shared)', output)
-        self.assertIn(f'Selected crypto: {prefix}/lib/libcrypto{suffix}', output)
+        self.assertIn(f'Selected crypto: {prefix.as_posix()}/lib/libcrypto{suffix}', output)
         self.assertNotIn('Vendored build enabled', output)
 
     def test_dynamic_works_without_vendor(self):
@@ -153,7 +162,7 @@ endif()
                                       f'-DOPENSSL_SSL_LIBRARY={prefix}/lib/libssl.a',
                                       f'-DOPENSSL_CRYPTO_LIBRARY={prefix}/lib/libcrypto.a')
         self.assertEqual(code, 0, output)
-        self.assertIn(f'Selected crypto: {prefix}/lib/libcrypto{suffix}', output)
+        self.assertIn(f'Selected crypto: {prefix.as_posix()}/lib/libcrypto{suffix}', output)
 
     def test_switching_modes_in_same_build_directory(self):
         self.vendor('3.5.9')
@@ -163,11 +172,58 @@ endif()
                                           f'-DOPENSSL_ROOT_DIR={prefix}')
             self.assertEqual(code, 0, output)
             if static == 'ON':
-                self.assertIn('openssl-3.5.9-static/install/lib/libcrypto.a', output)
+                self.assertIn(self.vendor_crypto_path(), output)
                 self.assertIn('Vendored build enabled', output)
             else:
-                self.assertIn(f'Selected crypto: {prefix}/lib/libcrypto{suffix}', output)
+                self.assertIn(f'Selected crypto: {prefix.as_posix()}/lib/libcrypto{suffix}', output)
                 self.assertNotIn('Vendored build enabled', output)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows MSVC configuration test')
+    def test_windows_configurations_use_matching_headers_and_libraries(self):
+        self.vendor('3.5.9')
+        code, output = self.configure()
+        self.assertEqual(code, 0, output)
+        selected_files = list((self.source / 'build').glob('selected-*.txt'))
+        self.assertTrue(selected_files)
+        for selected in selected_files:
+            config = selected.stem.removeprefix('selected-')
+            library, include = selected.read_text().splitlines()
+            self.assertTrue(library.endswith(f'/install/{config}/lib/libcrypto.lib'), library)
+            self.assertTrue(include.endswith(f'/install/{config}/include'), include)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows MSVC configuration test')
+    def test_windows_single_config_without_build_type(self):
+        self.vendor('3.5.9')
+        # A stale CMAKE_CONFIGURATION_TYPES must not affect a single-config generator.
+        code, output = self.configure('-G', 'NMake Makefiles', '-DCMAKE_BUILD_TYPE=')
+        self.assertEqual(code, 0, output)
+        selected = (self.source / 'build/selected-.txt').read_text().splitlines()
+        self.assertTrue(selected[0].endswith('/install/Release/lib/libcrypto.lib'), selected)
+        self.assertTrue(selected[1].endswith('/install/Release/include'), selected)
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows MSVC configuration test')
+    def test_windows_runtime_library_is_propagated(self):
+        self.vendor('3.5.9')
+        for runtime, debug_flag, release_flag in (
+                ('MultiThreaded$<$<CONFIG:Debug>:Debug>DLL', '/MDd', '/MD'),
+                ('MultiThreaded$<$<CONFIG:Debug>:Debug>', '/MTd', '/MT'),
+                ('', '', '')):
+            code, output = self.configure(f'-DCMAKE_MSVC_RUNTIME_LIBRARY={runtime}')
+            self.assertEqual(code, 0, output)
+            commands = list((self.source / 'build/_deps').rglob('*-configure-*.cmake'))
+            self.assertTrue(commands)
+            for command in commands:
+                debug = command.stem.endswith('-Debug')
+                content = command.read_text()
+                flag = debug_flag if debug else release_flag
+                if flag:
+                    self.assertIn(f';{flag}', content)
+                else:
+                    for runtime_flag in ('/MD', '/MDd', '/MT', '/MTd'):
+                        self.assertNotIn(runtime_flag, content)
+                self.assertNotIn('CFLAGS=', content)
+                self.assertIn('--debug' if debug else '--release', content)
+                self.assertNotIn('-fPIC', content)
 
 
 if __name__ == '__main__':
