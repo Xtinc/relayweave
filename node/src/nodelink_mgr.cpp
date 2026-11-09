@@ -519,10 +519,10 @@ void NodeLinkMgr::members_changed()
 {
     for (auto &[id, request] : pending_opens_)
     {
-        if (request->result.epoch != topology_.epoch())
+        if (request.result.epoch != topology_.epoch())
         {
-            request->result.reason = "flow epoch changed";
-            request->completed.notify_all();
+            request.result.reason = "flow epoch changed";
+            request.completed.notify_all();
         }
     }
 
@@ -636,30 +636,36 @@ asio::awaitable<FlowResult> NodeLinkMgr::open_flow(std::vector<std::string> path
             id = generate_random_id();
         }
         const auto epoch = topology_.epoch();
-        PendingOpen request(control_);
-        request.result = {epoch, id, "open", "flow result pending"};
-        const auto submitted =
-            cluster_.send(std::string(topology_.master_id()),
-                          CtrlMessage(CtrlCommand::FlowOpen, njson{{"epoch", epoch},
-                                                                   {"flow_id", id},
-                                                                   {"path", std::move(path)},
-                                                                   {"transport", relay_protocol_name(transport)}}));
-        if (submitted != ClusterMgr::SendResult::Submitted)
-        {
-            co_return FlowResult{epoch, id, "open", "cluster control submission failed"};
-        }
-        pending_opens_.emplace(id, &request);
+        auto &request = pending_opens_.try_emplace(id, control_).first->second;
+        bool submitted = false;
         bool accepted = false;
-        ScopeGuard cleanup([this, id, epoch, &accepted] {
+        ScopeGuard cleanup([this, id, epoch, &submitted, &accepted] {
             pending_opens_.erase(id);
-            if (!accepted)
+            if (submitted && !accepted)
             {
                 cluster_.send(std::string(topology_.master_id()),
                               CtrlMessage(CtrlCommand::FlowCloseRequest, njson{{"epoch", epoch}, {"flow_id", id}}));
             }
         });
+        request.result = {epoch, id, "open", "flow result pending"};
+        const auto submission =
+            cluster_.send(std::string(topology_.master_id()),
+                          CtrlMessage(CtrlCommand::FlowOpen, njson{{"epoch", epoch},
+                                                                   {"flow_id", id},
+                                                                   {"path", std::move(path)},
+                                                                   {"transport", relay_protocol_name(transport)}}));
+        if (submission != ClusterMgr::SendResult::Submitted)
+        {
+            co_return FlowResult{epoch, id, "open", "cluster control submission failed"};
+        }
+        submitted = true;
         if (!co_await asio::co_spawn(control_, request.completed.wait(),
                                     asio::cancel_after(remote_open_timeout, asio::use_awaitable)))
+        {
+            throw asio::system_error(asio::error::operation_aborted);
+        }
+        const auto cancellation = co_await asio::this_coro::cancellation_state;
+        if (cancellation.cancelled() != asio::cancellation_type::none)
         {
             throw asio::system_error(asio::error::operation_aborted);
         }
@@ -1150,10 +1156,10 @@ void NodeLinkMgr::handle_flow_request(CtrlCommand command, CtrlMessage message)
     if (command == CtrlCommand::FlowOpened)
     {
         const auto it = pending_opens_.find(id);
-        if (source == topology_.master_id() && it != pending_opens_.end() && it->second->result.epoch == epoch)
+        if (source == topology_.master_id() && it != pending_opens_.end() && it->second.result.epoch == epoch)
         {
-            it->second->result = {epoch, id, p.at("stage").get<std::string>(), p.at("reason").get<std::string>()};
-            it->second->completed.notify_all();
+            it->second.result = {epoch, id, p.at("stage").get<std::string>(), p.at("reason").get<std::string>()};
+            it->second.completed.notify_all();
         }
         return;
     }
@@ -1220,8 +1226,8 @@ void NodeLinkMgr::fail_waiters(const std::string &reason)
 {
     for (auto &[id, request] : pending_opens_)
     {
-        request->result.reason = reason;
-        request->completed.notify_all();
+        request.result.reason = reason;
+        request.completed.notify_all();
     }
     for (const auto &[id, flow] : local_flows_)
     {

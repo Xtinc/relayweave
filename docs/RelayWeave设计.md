@@ -213,7 +213,7 @@ flowchart TD
 
 Node 通过普通 `RelayRequest` 将已解析的业务构造参数传入 NodeSession。NodeSession 基类保存公共身份、期限、进度和停止原因；两个具体类各自的 run 主持完整根控制生命周期，SingleSession、MultiSession 是 Node 独占持有的具体会话，自身保存差异状态并运行业务，不再持有模式 variant 或 Router 回指。Single 直接保存 AttachPair，Multi 直接保存 AttachInfo。数据阶段直接调用 SessionTransfer；JSON 只在输入、输出边界出现，不作为内部请求镜像。
 
-NodeSession 由 Node 会话容器独占持有，根协程完成处理器只借用会话地址；具体会话的 run 排空控制子协程、数据任务与 Flow 后才从容器删除它。代理的 ProxySession 使用同样的独占模型。NodeLink 待认证 socket 由握手协程的 unique_ptr 独占，accepting_ 只是停机时用于关闭 socket 的借用索引；握手结束先撤销索引，再销毁或移交 socket。远端 Flow 请求直接保存在 open_flow 的非 Master 分支协程帧中，pending_opens_ 仅登记其地址，退出等待时先撤销登记。
+NodeSession 由 Node 会话容器独占持有，根协程完成处理器只借用会话地址；具体会话的 run 排空控制子协程、数据任务与 Flow 后才从容器删除它。代理的 ProxySession 使用同样的独占模型。NodeLink 待认证 socket 由握手协程的 unique_ptr 独占，accepting_ 只是停机时用于关闭 socket 的借用索引；握手结束先撤销索引，再销毁或移交 socket。远端 Flow 请求由 NodeLinkMgr 的 pending_opens_ 按值持有，open_flow 的非 Master 分支只借用容器条目；应答和失效处理更新结果并唤醒等待，不提前删除，等待退出时由同一清理范围移除条目。
 
 AgentSession 保留共享所有权：除会话主协程之外，共享 UDP 监听任务还会独立等待向该会话发送数据，主协程可能先移除注册表。Flow 端口与协议双向关系则是「协议状态强持有端口、端口弱引用协议」，跨域投递只临时持有它们。排队载荷只延长 PMR 资源寿命，不延长整个协议或 Node 寿命。完整的持有者、释放时点及审计依据见附录 C.2。
 
@@ -530,9 +530,9 @@ NodeLinkMgr 在 control_io 用普通 `LinkParams`、`FlowParams` 保存已解析
 | paths_ / MasterPath | Master 整条路径从建立到关闭协调结束的唯一记录；Closing 仍占用容量及身份。 |
 | local_links_ | 当前 Node 的 Link 授权。 |
 | local_flows_ / LocalFlow | 当前 Node 的 Flow 授权，包括中间节点；按需关联一个 CloseNotice。 |
-| pending_opens_ / PendingOpen | 非 Master 入口等待建立应答的借用索引；请求状态由协程帧独占。 |
+| pending_opens_ / PendingOpen | 按值拥有非 Master 入口等待建立应答的请求；open_flow 等待退出后移除。 |
 
-open_flow 在控制域检查状态并按角色直接推进：非 Master 分支发送请求、以 30 秒上限等待应答，并在退出前注销 pending_opens_；未接受的请求同时发送远端关闭请求。Master 分支同步登记路径并启动或复用全部相邻 Link，随后只等待 opened；取消等待时关闭该路径，共享 Link 继续由管理器持有。构造 open_flow 的 awaitable 不读取运行状态或发起事务，实际工作在等待时开始。远端 FlowOpen 同样同步登记和启动路径，MasterPath.reply_to 保存回复目标；进入 Active 或提前 Closing 时统一发布结果并取走回复目标，保证每个远端请求只应答一次。没有独立远端应答任务或应答任务计数，events_done_ 仅等待通知接收任务退出。
+open_flow 在控制域检查状态并按角色直接推进：非 Master 分支先在 pending_opens_ 原位构造请求，再发送请求，以 30 秒上限等待应答，并在退出前移除条目；发送失败也撤销条目，只有已提交但未接受的请求才补发远端关闭请求。接受结果与结果已写入分开判断：等待返回后先检查取消状态，取消后即使成功应答先于等待恢复到达，仍请求远端清理。Master 分支同步登记路径并启动或复用全部相邻 Link，随后只等待 opened；取消等待时关闭该路径，共享 Link 继续由管理器持有。构造 open_flow 的 awaitable 不读取运行状态或发起事务，实际工作在等待时开始。远端 FlowOpen 同样同步登记和启动路径，MasterPath.reply_to 保存回复目标；进入 Active 或提前 Closing 时统一发布结果并取走回复目标，保证每个远端请求只应答一次。没有独立远端应答任务或应答任务计数，events_done_ 仅等待通知接收任务退出。
 
 MasterPath 阶段为 Linking → Preparing → Committing → Active → Closing → Released；建立失败从当前阶段直接进入 Closing。SharedLink 直接保存阶段、失败原因和完成标志，Link 身份只在 params.id 保存；生产代码不再提供单独的 Link 等待协程或完成广播事件。 共享 Link 的创建保留管理器存活、Master 角色和容量约束；路径入口已同步校验的端点、协议、epoch 和成员条件不再逐边重验。Linking 中 acknowledged 的位对应相邻边；Link 完成后在现有路径表中查找仍处于 Linking 的相关事务，直接记就绪位或关闭失败路径。所有边就绪后进入 Preparing 并清零位图，之后复用它记录各节点的 Prepare、Commit 或 Close 应答。 prepare_path 只接受调用方已确认的 Linking 事务：新建启动全程同步执行，Link 完成处理先筛选阶段，成员变化/控制失败在发布 Link 结果前已关闭路径，因此不再重复检查全局运行状态与成员快照。阶段决定接受哪种确认，诊断字符串 result.stage 不参与状态判断；没有每条边的等待协程、Edge 结果对象、聚合 channel 或完成回调。Link 完成的扫描只访问建立中的控制记录，每条路径最多七条边，不新增订阅表或反向索引。opened 通知建立结果，released 通知路径释放完成；重复关闭不刷新期限，迟到的 LinkReady、Prepare/Commit 确认均不推进 Closing。关闭超时归还身份并通过 close_error 通知主动关闭者。 成员变化或控制失败时先以原始原因结束路径，再结束相关共享 Link，避免即时链路结果传播覆盖 membership/control 首因。
 
@@ -2073,7 +2073,7 @@ flowchart TD
 | `ProxySession` | ProxyServer 的 `unique_ptr` 会话容器 | 会话的并行收发已汇合，完成处理器完成日志与清理后删除；SOCKS5 UDP 关联按值属于该会话。 |
 | `ClusterSession` / `LocalParticipant` | ClusterRoom 的参与者容器 | 远端 reader 排空 TLS 后通知 room 移除；room 停止须等待所有远端参与者退出。 |
 | NodeLink 待认证 socket | 握手协程的 `unique_ptr` | `accepting_` 仅是停机关闭用的借用索引；握手退出先撤销索引，再销毁或移交 socket。 |
-| `PendingOpen` | 非 Master `open_flow` 的协程帧 | `pending_opens_` 只登记地址；应答、取消、超时及停机均在帧销毁前撤销登记。 |
+| `PendingOpen` | NodeLinkMgr 的 `pending_opens_` 按值容器 | 非 Master `open_flow` 借用条目；应答或失效只更新并唤醒，发送失败或等待退出时移除，已提交但未接受的请求补发远端关闭。 |
 
 启动失败须回滚已登记的容器项。借用索引不能延长对象寿命，也不能在异步任务尚未退出时先销毁其所属执行器服务。
 

@@ -324,8 +324,18 @@ static void verify_flow_transactions()
     requester_config.node_id = names[1];
     NodeLinkMgr requester(control.get_executor(), data.get_executor(), std::move(requester_config),
                          "127.0.0.1", "127.0.0.1", cluster, requester_topology);
-    for (const bool cancel : {false, true})
+    enum class RemoteOpenResult
     {
+        Ready,
+        Cancelled,
+        CancelledWithReply,
+        Rejected
+    };
+    for (const auto outcome : {RemoteOpenResult::Ready, RemoteOpenResult::Cancelled,
+                               RemoteOpenResult::CancelledWithReply, RemoteOpenResult::Rejected})
+    {
+        const bool cancel = outcome == RemoteOpenResult::Cancelled || outcome == RemoteOpenResult::CancelledWithReply;
+        const bool rejected = outcome == RemoteOpenResult::Rejected;
         test_access::NodeLinkMgr_running_(requester) = false;
         auto opening = requester.open_flow({names[1], names[2]}, RelayProtocol::Tcp);
         require_flow(test_access::NodeLinkMgr_pending_opens_(requester).empty() && take().empty(),
@@ -342,37 +352,66 @@ static void verify_flow_transactions()
                      "pending remote request was not indexed");
         auto reply = *messages.front().params;
         reply["source"] = names.front();
-        reply["stage"] = "ready";
-        reply["reason"] = "";
+        reply["stage"] = rejected ? "prepare" : "ready";
+        reply["reason"] = rejected ? "remote preparation failed" : "";
         if (cancel)
         {
             cancellation.emit(asio::cancellation_type::all);
         }
-        else
+        if (outcome != RemoteOpenResult::Cancelled)
         {
             requester.handle(CtrlCommand::FlowOpened, CtrlMessage(CtrlCommand::FlowOpened, reply));
         }
+        require_flow(pending.wait_for(0s) != std::future_status::ready &&
+                         test_access::NodeLinkMgr_pending_opens_(requester).size() == 1,
+                     "notification removed a pending request before its wait drained");
         poll();
         require_flow(pending.wait_for(0s) == std::future_status::ready, "remote request did not finish");
         bool aborted = false;
         try
         {
-            require_flow(bool(pending.get()), "remote reply lost its result");
+            const auto result = pending.get();
+            require_flow(rejected ? !result && result.stage == "prepare" && result.reason == "remote preparation failed"
+                                  : bool(result),
+                         "remote reply lost its result");
         }
         catch (const asio::system_error &error)
         {
             aborted = error.code() == asio::error::operation_aborted;
         }
-        require_flow(aborted == cancel && test_access::NodeLinkMgr_pending_opens_(requester).empty(),
-                     "completed remote request retained a borrowed result");
+        require_flow(aborted == cancel, "cancelled remote request accepted a result before its wait resumed");
+        require_flow(test_access::NodeLinkMgr_pending_opens_(requester).empty(),
+                     "completed remote request retained its pending result");
         messages = take();
-        require_flow(cancel ? messages.size() == 1 && messages.front().type() == CtrlCommand::FlowCloseRequest
-                            : messages.empty(),
-                     "cancelled request did not release the remote Flow");
+        require_flow(cancel || rejected ? messages.size() == 1 && messages.front().type() == CtrlCommand::FlowCloseRequest
+                                        : messages.empty(),
+                     "unaccepted request did not release the remote Flow");
+        if (cancel || rejected)
+        {
+            require_flow(messages.front().params->at("epoch") == reply.at("epoch") &&
+                             messages.front().params->at("flow_id") == reply.at("flow_id"),
+                         "unaccepted request closed a different remote Flow");
+        }
         requester.handle(CtrlCommand::FlowOpened, CtrlMessage(CtrlCommand::FlowOpened, reply));
         require_flow(test_access::NodeLinkMgr_pending_opens_(requester).empty() && take().empty(),
                      "late reply revived a destroyed request");
     }
+    for (const auto failure : {ClusterMgr::SendResult::Stopped, ClusterMgr::SendResult::NotConnected})
+    {
+        test_access::ClusterMgr_running_(cluster) = failure != ClusterMgr::SendResult::Stopped;
+        test_access::ClusterMgr_config_(cluster).role = ClusterConfig::Role::Slave;
+        auto pending = asio::co_spawn(control, requester.open_flow({names[1], names[2]}, RelayProtocol::Tcp),
+                                      asio::use_future);
+        poll();
+        require_flow(pending.wait_for(0s) == std::future_status::ready,
+                     "failed open submission did not complete");
+        const auto result = pending.get();
+        require_flow(!result && result.stage == "open" && result.reason == "cluster control submission failed" &&
+                         test_access::NodeLinkMgr_pending_opens_(requester).empty() && take().empty(),
+                     "failed open submission retained state or requested remote cleanup");
+    }
+    test_access::ClusterMgr_config_(cluster).role = ClusterConfig::Role::Master;
+    test_access::ClusterMgr_running_(cluster) = true;
     auto &local = test_access::NodeLinkMgr_local_flows_(requester);
     constexpr std::uint64_t close_id = 4242;
     const auto epoch = topology.epoch();

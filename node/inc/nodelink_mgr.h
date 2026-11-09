@@ -223,8 +223,9 @@ class NodeLinkMgr
         std::string reply_to;
     };
     /**
-     * @brief Hold one remote request in open_flow() until reply, cancellation or timeout on control_io.
-     * @details pending_opens_ borrows its address; scope cleanup removes the entry before destruction.
+     * @brief Own one remote request in pending_opens_ until its open_flow() wait exits on control_io.
+     * @details Reply and failure handlers update and notify the entry without removing it.
+     * open_flow() borrows the entry; scope cleanup erases it and requests closure of any unaccepted submission.
      */
     struct PendingOpen
     {
@@ -283,7 +284,7 @@ class NodeLinkMgr
     // This node's authorizations, including transit Flows. Observers retain only CloseNotice.
     std::map<std::uint64_t, LinkParams> local_links_;
     std::map<std::uint64_t, LocalFlow> local_flows_;
-    std::map<std::uint64_t, PendingOpen *> pending_opens_;
+    std::map<std::uint64_t, PendingOpen> pending_opens_;
     asio::steady_timer events_done_;
     bool stop_ok_ = true;
     bool running_ = false;
