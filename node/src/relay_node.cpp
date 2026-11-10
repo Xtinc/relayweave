@@ -427,8 +427,9 @@ void RelayNode::start_relay(std::unique_ptr<NodeSession> relay)
 
 void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
 {
-    if (command == CtrlCommand::RelayAttach)
+    switch (command)
     {
+    case CtrlCommand::RelayAttach: {
         RelayAttach request{};
         try
         {
@@ -446,81 +447,98 @@ void RelayNode::handle_relay(CtrlCommand command, const AgentPeer &session, cons
                 return;
             }
         }
-        return;
+        break;
     }
-    if (command != CtrlCommand::RelayOpen)
-    {
+    case CtrlCommand::RelayCancel:
+    case CtrlCommand::RelayReject: {
+        const auto &params = *message.params;
+        const CancelRequest request{
+            config::optional_unsigned(params, "request_id"), config::optional_unsigned(params, "uuid", true),
+            config::optional_string(params, "reason",
+                                    command == CtrlCommand::RelayReject ? "producer rejected relay" : "relay cancelled")};
         for (const auto &relay : relay_sessions_)
         {
-            if (relay->handle(command, session, message))
+            if (relay->handle_cancel(command, session, request))
             {
                 return;
             }
         }
-        return;
+        break;
     }
-    const auto &params = *message.params;
-    const auto request = config::require_unsigned(params, "request_id");
-    const auto service = config::message_service(params);
-    const auto protocol = config::message_protocol(params);
-    const bool multi = params.contains("path");
-    try
-    {
-        RelayRequest values{service, protocol, request};
-        if (multi)
+    case CtrlCommand::RelayOpen: {
+        const auto &params = *message.params;
+        const auto request = config::require_unsigned(params, "request_id");
+        const auto service = config::message_service(params);
+        const auto protocol = config::message_protocol(params);
+        const bool multi = params.contains("path");
+        try
         {
-            values.path = params.at("path").get<std::vector<std::string>>();
-            values.epoch = config::require_unsigned(params, "epoch", true);
-            const auto &path = values.path;
-            if (!request || path.size() < 2 || path.front() != config_.cluster.node_id ||
-                values.epoch != topology_->epoch())
+            RelayRequest values{service, protocol, request};
+            if (multi)
             {
-                throw std::invalid_argument("invalid path or stale epoch");
-            }
-            for (const auto &relay : relay_sessions_)
-            {
-                if (relay->handle(command, session, message))
+                values.path = params.at("path").get<std::vector<std::string>>();
+                values.epoch = config::require_unsigned(params, "epoch", true);
+                values.uuid = config::optional_unsigned(params, "uuid", true);
+                const auto &path = values.path;
+                if (!request || path.size() < 2 || path.front() != config_.cluster.node_id ||
+                    values.epoch != topology_->epoch())
                 {
-                    return;
+                    throw std::invalid_argument("invalid path or stale epoch");
                 }
+                for (const auto &relay : relay_sessions_)
+                {
+                    if (relay->handle_open(session, values))
+                    {
+                        return;
+                    }
+                }
+                start_relay(std::make_unique<MultiSession>(*this, session, std::move(values), true));
             }
-            start_relay(std::make_unique<MultiSession>(*this, session, std::move(values), true));
-        }
-        else
-        {
-            const auto producer = registry_.find_service(service);
-            if (!producer || producer->protocol != protocol)
+            else
             {
-                throw std::runtime_error(!producer ? "service unavailable" : "service protocol mismatch");
+                const auto producer = registry_.find_service(service);
+                if (!producer || producer->protocol != protocol)
+                {
+                    throw std::runtime_error(!producer ? "service unavailable" : "service protocol mismatch");
+                }
+                start_relay(std::make_unique<SingleSession>(*this, session, producer->session, std::move(values),
+                                                            producer->traffic));
             }
-            start_relay(std::make_unique<SingleSession>(*this, session, producer->session, std::move(values),
-                                                        producer->traffic));
         }
-    }
-    catch (const std::exception &error)
-    {
-        njson values{{"request_id", request},
-                     {"service", service},
-                     {"protocol", relay_protocol_name(protocol)},
-                     {"reason", error.what()}};
-        if (multi)
+        catch (const std::exception &error)
         {
-            values["path"] = params.at("path");
-            values["stage"] = "validate";
+            njson values{{"request_id", request},
+                         {"service", service},
+                         {"protocol", relay_protocol_name(protocol)},
+                         {"reason", error.what()}};
+            if (multi)
+            {
+                values["path"] = params.at("path");
+                values["stage"] = "validate";
+            }
+            send_relay(session, CtrlMessage(CtrlCommand::RelayError, std::move(values)));
         }
-        send_relay(session, CtrlMessage(CtrlCommand::RelayError, std::move(values)));
+        break;
+    }
+    default:
+        break;
     }
 }
 
 void RelayNode::handle_relay_peer(CtrlCommand command, const CtrlMessage &message)
 {
     const auto &params = *message.params;
-    const auto epoch = config::require_unsigned(params, "epoch", true);
-    const auto id = config::require_unsigned(params, "flow_id", true);
-    const auto &source = params.at("source").get_ref<const std::string &>();
+    PeerEvent event{config::require_unsigned(params, "epoch", true),
+                    config::require_unsigned(params, "flow_id", true),
+                    params.at("source").get<std::string>()};
+    if (command == CtrlCommand::RelayPeerClose)
+    {
+        event.stage = config::optional_string(params, "stage", "control");
+        event.reason = config::optional_string(params, "reason", "peer closed");
+    }
     for (const auto &relay : relay_sessions_)
     {
-        if (relay->handle_peer(command, message))
+        if (relay->handle_peer(command, event))
         {
             return;
         }
@@ -532,7 +550,7 @@ void RelayNode::handle_relay_peer(CtrlCommand command, const CtrlMessage &messag
     try
     {
         const auto protocol = config::message_protocol(params);
-        if (!nodelink_mgr_->egress_ready(epoch, id, source,
+        if (!nodelink_mgr_->egress_ready(event.epoch, event.flow_id, event.source,
                                          protocol == RelayProtocol::Udp ? RelayProtocol::Udp : RelayProtocol::Tcp))
         {
             throw std::runtime_error("flow unavailable or wrong endpoint");
@@ -544,9 +562,9 @@ void RelayNode::handle_relay_peer(CtrlCommand command, const CtrlMessage &messag
             throw std::runtime_error(!service ? "service unavailable" : "service protocol mismatch");
         }
         RelayRequest request{service_name, protocol};
-        request.epoch = epoch;
-        request.flow_id = id;
-        request.peer = source;
+        request.epoch = event.epoch;
+        request.flow_id = event.flow_id;
+        request.peer = event.source;
         request.accessor = config::optional_string(params, "accessor", "");
         start_relay(
             std::make_unique<MultiSession>(*this, service->session, std::move(request), false, service->traffic));
@@ -554,9 +572,10 @@ void RelayNode::handle_relay_peer(CtrlCommand command, const CtrlMessage &messag
     catch (const std::exception &error)
     {
         PROXY_DEBUG_PRINT("Relay peer command=%s reason=%s", message.command.c_str(), error.what());
-        cluster_mgr_->send(
-            source, CtrlMessage(CtrlCommand::RelayPeerClose,
-                                njson{{"epoch", epoch}, {"flow_id", id}, {"stage", "bind"}, {"reason", error.what()}}));
+        cluster_mgr_->send(event.source,
+                           CtrlMessage(CtrlCommand::RelayPeerClose,
+                                       njson{{"epoch", event.epoch}, {"flow_id", event.flow_id},
+                                             {"stage", "bind"}, {"reason", error.what()}}));
     }
 }
 

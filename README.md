@@ -26,7 +26,7 @@ NodeSession 保存共同状态、取消和数据任务所有权；SingleSession�
 RelayNode 直接持有唯一 RegistryMgr 和 NodeSession 容器，负责全局业务创建、查找分派和停止排空；两个具体会话各自主持完整生命周期。
 NodeControl 借用注册表、拓扑和业务元数据，统一处理公共注册、查询与集群响应回送；NodeMetrics 拥有队列探针、流量采样和运行指标。
 两者统一声明和实现在 `node_control.h/.cpp` 中，保持各自的所有权和执行域。
-重复请求、peer 身份匹配、控制断线与 epoch 失效判断由 NodeSession 处理，RelayNode 只创建、分派并等待会话排空。
+RelayNode 在业务消息入口集中解析字段，以普通值类型交给 NodeSession；重复请求冲突、peer 身份匹配、控制断线与 epoch 失效判断仍由会话处理。
 master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
 Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
 RelayAgent 直接持有 AgentControl、NodeConnection、AgentRouting 和 Forwarder，配置保留在 relay_agent.h/.cpp。

@@ -211,7 +211,7 @@ flowchart TD
   - 跨域信令触发：使用 `asio::post(target_executor, ...)` 或 `asio::dispatch`。
   - 跨域流式数据传递：使用 Asio 实验性并发通道 `asio::experimental::concurrent_channel`，其内部实现保证了不同执行域之间线程安全的数据推送与非阻塞等待。
 
-Node 通过普通 `RelayRequest` 将已解析的业务构造参数传入 NodeSession。NodeSession 基类保存公共身份、期限、进度和停止原因；两个具体类各自的 run 主持完整根控制生命周期，SingleSession、MultiSession 是 Node 独占持有的具体会话，自身保存差异状态并运行业务，不再持有模式 variant 或 Router 回指。Single 直接保存 AttachPair，Multi 直接保存 AttachInfo。数据阶段直接调用 SessionTransfer；JSON 只在输入、输出边界出现，不作为内部请求镜像。
+RelayNode 在业务消息入口完成字段解析：`RelayRequest` 用于建立及 open 重试，`CancelRequest` 用于取消/拒绝，`PeerEvent` 用于 peer 事件，attach 沿用 `RelayAttach`。NodeSession 接收这些普通值类型，不再读取入站 JSON。NodeSession 基类保存公共身份、期限、进度和停止原因；两个具体类各自的 run 主持完整根控制生命周期，SingleSession、MultiSession 是 Node 独占持有的具体会话，自身保存差异状态并运行业务，不再持有模式 variant 或 Router 回指。Single 直接保存 AttachPair，Multi 直接保存 AttachInfo。数据阶段直接调用 SessionTransfer；JSON 只在输入、输出边界出现，不作为内部请求镜像。
 
 NodeSession 由 Node 会话容器独占持有，根协程完成处理器只借用会话地址；具体会话的 run 排空控制子协程、数据任务与 Flow 后才从容器删除它。代理的 ProxySession 使用同样的独占模型。NodeLink 待认证 socket 由握手协程的 unique_ptr 独占，accepting_ 只是停机时用于关闭 socket 的借用索引；握手结束先撤销索引，再销毁或移交 socket。远端 Flow 请求由 NodeLinkMgr 的 pending_opens_ 按值持有，open_flow 的非 Master 分支只借用容器条目；应答和失效处理更新结果并唤醒等待，不提前删除，等待退出时由同一清理范围移除条目。
 
@@ -363,8 +363,9 @@ flowchart TB
 
 - **Master 角色职责**：Master 节点维护唯一的 `ClusterRoom` 对象，集中管理所有已接入 Slave 节点的控制会话（`TLSChannel`）。
 - **Slave 接入与重连机制**：
-  - Slave 启动后，通过内置的 `ClusterMgr::Connector` 主动连接 Master 的集群控制端口（示例 18447）。
-  - 若连接中断，`Connector` 按固定 5 秒间隔自动重连，直至控制链路恢复。
+  - Slave 启动后，由 `ClusterMgr::slave_loop()` 直接完成解析、连接、mTLS 握手、加入及接收，主动连接 Master 的集群控制端口（示例 18447）。
+  - ClusterMgr 直接持有 resolver、待连接 socket、重试定时器和 joined 状态，统一使用管理器的 running 标志。当前 TLSChannel 由 slave_loop 的局部 shared_ptr 保持到排空，管理器仅保存弱引用供发送和停止使用。连接中断后先排空旧通道，再按固定 5 秒间隔重连；解析和 TCP 连接各有 5 秒上限，握手与断开期限继续使用 TLSChannel 配置。
+  - 停止时管理器直接取消解析、连接和重试等待，并请求当前 TLSChannel 断开；loop_done_ 确认整个循环及通道排空结束，停止早于循环入口也会得到完成确认。不再登记协程局部 Connector 或 ConnectOperations 的地址。
 - **结构化并发 Accept Loop**：Master 的 `accept_loop` 采用 C++20 协程并发接收传入连接。在接入新 Slave 连接后，先执行严格的 TLS 双向证书校验，并在加入 `ClusterRoom` 之前验证对端身份。
 
 #### 3.1.2 成员加入、Epoch 纪元与成员版本管理
@@ -425,6 +426,12 @@ flowchart TD
 ```
 
 每个具体会话只有 run() 一个控制侧收尾入口：Multi 使用同控制域的原生并行组监视 Flow 关闭，并在进入收尾前排空两支；数据任务停止确认后 ingress 才释放 Flow。Single 则停止数据任务后执行原有 Agent 关闭通知。Ready 里程碑保留历史进度，close_reason_ 的存在表示会话进入结束流程，同时保存首次原因（允许空字符串），不再另存停止布尔值；正常完成原因只在根任务收尾时生成。SessionTransfer 的共享持有仅用于其独立任务和晚到停止处理，两个具体类不另建共享会话所有者；取消信号通过根任务的原生并行组传播到阶段和定时器等待。
+
+`handle_open`、`handle_cancel`、`handle_attach`、`handle_peer` 只接收解析后的参数，继续检查真实 Agent 身份、角色、请求冲突与阶段。取消同时携带 request_id 与 UUID 时仍按任一键匹配，并保留会话容器的遍历次序；Single 不新增 open 去重。cancel/reject 的可选编号和原因、peer.close 的 stage/reason 在匹配前校验，非法 Agent 控制报文经现有异常路径关闭对应连接，非法集群报文由接收边界记录并隔离；该校验不依赖是否存在对应会话。省略原因使用原默认值，显式空原因保留。peer.open 在未命中已有会话后才解析创建所需字段，重复 open 仍可由现有身份直接消费；attach 的非法报文继续按原策略忽略。
+
+主控代转的请求在逻辑入口 Node 解析，异常走集群隔离路径；路由层只校验投递元数据，不重复解析业务字段，也不新增跨节点关闭 Agent 连接的协议。
+
+业务参数在组装时完成字段类型、范围校验及默认值补全。`optional` 只表达协议允许的缺省，不承载非法字段；原因和关闭阶段用已补默认值的普通字符串，会话函数无需再次解析或补缺省。
 
 #### 3.3.1 单节点会话编排
 
@@ -1422,7 +1429,7 @@ sequenceDiagram
 | **Agent 异常离线** | TCP RST 或 `TLSChannel` 心跳超时（20s）。 | Node 请求对应的 `NodeSession` 取消；数据任务关闭关联端点并排空，多节点完成必要的 peer/Flow 收尾；根控制任务返回后才移除会话。 |
 | **中继节点崩溃/离线** | Master 检测到 Slave 集群控制连接断开。 | 1. Master 将该节点从活跃列表中剔除，**递增成员版本 `version`**；<br>2. Master 向全网存活节点广播 `topology.members`；<br>3. 各节点收到新拓扑后，**立即作废所有包含离线节点或基于旧授权构建的 Flow**，数据通道丢弃旧帧并清理；<br>4. Agent 收到拓扑失效通知，在本地清空路由缓存，重新运行 Dijkstra 计算新的替代路径。 |
 | **慢客户端导致流控窗口耗尽** | 接收端停止返还信用，发送端 `sent_bytes == send_limit`。 | 发送端按信用与有界队列施加背压，等待对端消费后继续；建立期限只用于建立阶段，运行中的连接错误、显式取消或控制失联沿原清理链路释放 Flow。 |
-| **网络分区导致 Master 失联** | Slave 节点的 `ClusterMgr::Connector` 连续超时。 | Slave 节点停止接纳新的多节点 `relay.open` 请求（降级为仅支持单节点本地 Relay）；后台 Connector 启动固定 5 秒间隔自动重连；一旦重连成功并同步新成员列表，自动恢复全功能。 |
+| **网络分区导致 Master 失联** | Slave 节点的 `ClusterMgr::slave_loop()` 连续超时。 | Slave 节点停止接纳新的多节点 `relay.open` 请求（降级为仅支持单节点本地 Relay）；ClusterMgr 启动固定 5 秒间隔自动重连；一旦重连成功并同步新成员列表，自动恢复全功能。 |
 
 
 ## 8. 运行时生命周期与资源模型
@@ -2073,6 +2080,7 @@ flowchart TD
 | `ProxySession` | ProxyServer 的 `unique_ptr` 会话容器 | 会话的并行收发已汇合，完成处理器完成日志与清理后删除；SOCKS5 UDP 关联按值属于该会话。 |
 | `ClusterSession` / `LocalParticipant` | ClusterRoom 的参与者容器 | 远端 reader 排空 TLS 后通知 room 移除；room 停止须等待所有远端参与者退出。 |
 | NodeLink 待认证 socket | 握手协程的 `unique_ptr` | `accepting_` 仅是停机关闭用的借用索引；握手退出先撤销索引，再销毁或移交 socket。 |
+| Slave 解析、连接及重试资源 | ClusterMgr 的直接成员 | async_stop 取消原生操作与当前通道，并等待 loop_done_；发送仅在 joined 时提交，停止后不再重连。 |
 | `PendingOpen` | NodeLinkMgr 的 `pending_opens_` 按值容器 | 非 Master `open_flow` 借用条目；应答或失效只更新并唤醒，发送失败或等待退出时移除，已提交但未接受的请求补发远端关闭。 |
 
 启动失败须回滚已登记的容器项。借用索引不能延长对象寿命，也不能在异步任务尚未退出时先销毁其所属执行器服务。
@@ -2128,7 +2136,7 @@ SessionTransfer 通过 `RelayTransport&` 借用管理器，通过可空 `FlowPro
 | 边界 | 处理责任 |
 |---|---|
 | Agent 控制入口与 Forwarder | 控制入口验证 params 对象；Offer 解析失败回复 Reject，匹配会话处理失败调用 fail，立即取消并排空。不把非法端点异常放出 transfer 线程；request_id 要求无符号整数，浮点同值不能匹配。 |
-| RelayNode / 具体 NodeSession | 入口解析 attach 一次，会话核对真实 AgentPeer、角色、UUID、ticket 和期限；授权冲突取消相应会话。根任务保留原始首因并统一收尾，完成处理器只报告逃逸异常及移除会话。 |
+| RelayNode / 具体 NodeSession | 入口集中解析 open、cancel/reject、attach 和 peer 事件，会话接收普通值并核对真实 AgentPeer、角色、UUID、ticket、期限、冲突和阶段；授权冲突取消相应会话。根任务保留原始首因并统一收尾，完成处理器只报告逃逸异常及移除会话。 |
 | SessionTransfer | 暂存原异常，禁用取消，在数据域关闭 pair 后原样交付；stop 只负责排空。清理中存在 await，不能以普通析构代替。 |
 | StreamPipeline | greeting 任务独立清理 pending；转发错误直接传播，远端路径尽力提交 RESET，RESET 提交失败不覆盖原始异常。prepare/run 持有 pair 跨挂起，不能用无持有的直接返回缩短其寿命。 |
 | DatagramMgr 安装 | 单一回滚范围覆盖 pair、bindings 和 UUID；后续插入分配失败时全部撤销，不留下已归还 UUID 的残余 pair。 |

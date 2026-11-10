@@ -329,203 +329,11 @@ class ClusterMgr::LocalParticipant : public ClusterParticipant
     ClusterMgr &manager_;
 };
 
-/**
- * @brief Reconnect a slave to the master and receive cluster messages on control_io.
- * @details Owned by slave_loop for its complete run(). ClusterMgr borrows it for stop();
- * run() exposes temporary cancellation state only on this executor and clears it on exit.
- * Failed channels drain before retry, and control failure invalidates old Flow authorization.
- */
-class ClusterMgr::Connector
-{
-    using tcp = asio::ip::tcp;
-
-    /** @brief Hold resolver, socket, and retry timer for one Connector run() lifetime. */
-    struct ConnectOperations
-    {
-        /** @brief Construct all cancellable connection operations on control_io. */
-        explicit ConnectOperations(asio::any_io_executor executor)
-            : resolver(executor), socket(executor), retry(executor)
-        {
-        }
-
-        /** @brief Cancel resolution, connection, and retry waiting on their owning executor. */
-        void cancel()
-        {
-            resolver.cancel();
-            asio::error_code ignored;
-            socket.close(ignored);
-            retry.cancel();
-        }
-
-        tcp::resolver resolver;
-        tcp::socket socket;
-        asio::steady_timer retry;
-    };
-
-  public:
-    /** @brief Borrow manager, TLS context, and configuration for the slave loop's lifetime. */
-    Connector(asio::any_io_executor executor, asio::ssl::context &context, const ClusterConfig &config,
-              const TLSChannelConfig &channel_config, ClusterMgr &manager)
-        : executor_(executor), context_(context), config_(config), channel_config_(channel_config), manager_(manager)
-    {
-    }
-
-    /** @brief Submit to a joined TLS channel; return false while connecting or disconnected. */
-    bool send(CtrlMessage message)
-    {
-        if (auto channel = channel_.lock(); channel && joined_)
-        {
-            channel->send(std::move(message));
-            return true;
-        }
-        return false;
-    }
-
-    /** @brief Stop retries and cancel current operations and the active TLS channel. */
-    void stop()
-    {
-        running_ = false;
-        if (joined_)
-        {
-            PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=node stopping", config_.node_id.c_str(),
-                             config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
-        }
-        joined_ = false;
-        if (operations_)
-        {
-            operations_->cancel();
-        }
-        if (auto channel = channel_.lock())
-        {
-            channel->disconnect();
-        }
-    }
-
-    /** @brief Resolve, connect, join, and receive repeatedly, draining each channel before retry. */
-    asio::awaitable<void> run()
-    {
-        ConnectOperations operations(executor_);
-        operations_ = &operations;
-        ScopeGuard clear_operations([this]() noexcept { operations_ = nullptr; });
-        constexpr auto retry_interval = std::chrono::seconds(5);
-        while (running_)
-        {
-            {
-                std::shared_ptr<TLSChannel> channel;
-                try
-                {
-                    PROXY_DEBUG_PRINT("Cluster connecting -> %s:%u", config_.address.c_str(),
-                                      static_cast<unsigned int>(config_.control_port));
-                    auto endpoints = co_await operations.resolver.async_resolve(
-                        config_.address, std::to_string(config_.control_port),
-                        asio::cancel_after(std::chrono::seconds(5), asio::use_awaitable));
-                    if (!running_)
-                    {
-                        break;
-                    }
-
-                    co_await asio::async_connect(operations.socket, endpoints,
-                                                 asio::cancel_after(std::chrono::seconds(5), asio::use_awaitable));
-                    if (!running_)
-                    {
-                        break;
-                    }
-
-                    channel = std::make_shared<TLSChannel>(std::move(operations.socket), context_, TLSChannelRole::C,
-                                                           channel_config_);
-                    channel_ = channel;
-                    co_await channel->start(config_.address);
-                    channel->send(CtrlMessage{CtrlCommand::ClusterJoin, njson{{"node_id", config_.node_id},
-                                                                              {"address", config_.advertise_address}}});
-                    auto joined = co_await channel->async_receive(channel_config_.handshake_timeout);
-                    if (joined.type() == CtrlCommand::ClusterJoined)
-                    {
-                        joined_ = true;
-                        PROXY_INFO_PRINT("Cluster [+] node=%s peer=%s:%u", config_.node_id.c_str(),
-                                         config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
-                        while (running_)
-                        {
-                            manager_.receive(co_await channel->async_receive());
-                        }
-                    }
-                    else
-                    {
-                        if (joined.type() != CtrlCommand::ClusterError)
-                            throw std::invalid_argument("Expected cluster.joined or cluster.error");
-                        manager_.receive(std::move(joined));
-                    }
-                }
-                catch (const std::exception &exception)
-                {
-                    if (running_)
-                    {
-                        const auto *error = dynamic_cast<const asio::system_error *>(&exception);
-                        if (error && (error->code() == asio::experimental::error::channel_cancelled ||
-                                      error->code() == asio::experimental::error::channel_closed))
-                        {
-                            PROXY_DEBUG_PRINT("Cluster retry node=%s peer=%s:%u delay=5000ms", config_.node_id.c_str(),
-                                              config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
-                        }
-                        else
-                        {
-                            PROXY_ERROR_PRINT("Cluster failed node=%s peer=%s:%u reason=%s retry=5000ms",
-                                              config_.node_id.c_str(), config_.address.c_str(),
-                                              static_cast<unsigned int>(config_.control_port), exception.what());
-                        }
-                    }
-                    asio::error_code ignored;
-                    operations.socket.close(ignored);
-                }
-
-                if (joined_)
-                {
-                    PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=%s", config_.node_id.c_str(),
-                                     config_.address.c_str(), static_cast<unsigned int>(config_.control_port),
-                                     running_ ? "channel closed" : "node stopping");
-                    joined_ = false;
-                    if (running_)
-                    {
-                        manager_.receive(
-                            CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster control disconnected"}}});
-                    }
-                }
-                if (channel)
-                {
-                    co_await channel->async_disconnect();
-                }
-            }
-
-            if (!running_)
-            {
-                break;
-            }
-
-            operations.retry.expires_after(retry_interval);
-            auto [error] = co_await operations.retry.async_wait(use_nothrow_awaitable);
-            if (error)
-            {
-                break;
-            }
-        }
-    }
-
-  private:
-    asio::any_io_executor executor_;
-    asio::ssl::context &context_;
-    const ClusterConfig &config_;
-    const TLSChannelConfig &channel_config_;
-    ClusterMgr &manager_;
-    std::weak_ptr<TLSChannel> channel_;
-    ConnectOperations *operations_ = nullptr;
-    bool running_ = true;
-    bool joined_ = false;
-};
-
 ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::ssl::context &context,
                        ClusterConfig config, TLSChannelConfig channel, std::size_t max_connections)
     : server_(server), executor_(executor), context_(context), config_(std::move(config)), channel_config_(channel),
-      max_connections_(max_connections), acceptor_(executor), loop_done_(executor),
-      outbound_channel_(executor, channel.max_queued_messages)
+      max_connections_(max_connections), acceptor_(executor), resolver_(executor), connect_socket_(executor),
+      retry_timer_(executor), loop_done_(executor), outbound_channel_(executor, channel.max_queued_messages)
 {
     if (config_.node_id.empty() || config_.address.empty())
     {
@@ -620,10 +428,22 @@ asio::awaitable<bool> ClusterMgr::async_stop()
         }
         outbound_channel_.close();
     }
-
-    if (connector_)
+    else
     {
-        connector_->stop();
+        resolver_.cancel();
+        asio::error_code ignored;
+        connect_socket_.close(ignored);
+        retry_timer_.cancel();
+        if (joined_)
+        {
+            PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=node stopping", config_.node_id.c_str(),
+                             config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
+            joined_ = false;
+        }
+        if (auto channel = master_channel_.lock())
+        {
+            channel->disconnect();
+        }
     }
 
     co_await loop_done_.wait();
@@ -653,15 +473,108 @@ asio::awaitable<void> ClusterMgr::accept_loop()
 
 asio::awaitable<void> ClusterMgr::slave_loop()
 {
-    if (!running_)
+    constexpr auto retry_interval = std::chrono::seconds(5);
+    while (running_)
     {
-        co_return;
-    }
+        {
+            std::shared_ptr<TLSChannel> channel;
+            try
+            {
+                PROXY_DEBUG_PRINT("Cluster connecting -> %s:%u", config_.address.c_str(),
+                                  static_cast<unsigned int>(config_.control_port));
+                auto endpoints =
+                    co_await resolver_.async_resolve(config_.address, std::to_string(config_.control_port),
+                                                     asio::cancel_after(std::chrono::seconds(5), asio::use_awaitable));
+                if (!running_)
+                {
+                    break;
+                }
 
-    Connector connector(executor_, context_, config_, channel_config_, *this);
-    connector_ = &connector;
-    ScopeGuard clear_connector([this]() noexcept { connector_ = nullptr; });
-    co_await connector.run();
+                co_await asio::async_connect(connect_socket_, endpoints,
+                                             asio::cancel_after(std::chrono::seconds(5), asio::use_awaitable));
+                if (!running_)
+                {
+                    break;
+                }
+
+                channel = std::make_shared<TLSChannel>(std::move(connect_socket_), context_, TLSChannelRole::C,
+                                                       channel_config_);
+                master_channel_ = channel;
+                co_await channel->start(config_.address);
+                channel->send(CtrlMessage{CtrlCommand::ClusterJoin,
+                                          njson{{"node_id", config_.node_id}, {"address", config_.advertise_address}}});
+                auto joined = co_await channel->async_receive(channel_config_.handshake_timeout);
+                if (joined.type() == CtrlCommand::ClusterJoined)
+                {
+                    joined_ = true;
+                    PROXY_INFO_PRINT("Cluster [+] node=%s peer=%s:%u", config_.node_id.c_str(), config_.address.c_str(),
+                                     static_cast<unsigned int>(config_.control_port));
+                    while (running_)
+                    {
+                        receive(co_await channel->async_receive());
+                    }
+                }
+                else
+                {
+                    if (joined.type() != CtrlCommand::ClusterError)
+                    {
+                        throw std::invalid_argument("Expected cluster.joined or cluster.error");
+                    }
+                    receive(std::move(joined));
+                }
+            }
+            catch (const std::exception &exception)
+            {
+                if (running_)
+                {
+                    const auto *error = dynamic_cast<const asio::system_error *>(&exception);
+                    if (error && (error->code() == asio::experimental::error::channel_cancelled ||
+                                  error->code() == asio::experimental::error::channel_closed))
+                    {
+                        PROXY_DEBUG_PRINT("Cluster retry node=%s peer=%s:%u delay=5000ms", config_.node_id.c_str(),
+                                          config_.address.c_str(), static_cast<unsigned int>(config_.control_port));
+                    }
+                    else
+                    {
+                        PROXY_ERROR_PRINT("Cluster failed node=%s peer=%s:%u reason=%s retry=5000ms",
+                                          config_.node_id.c_str(), config_.address.c_str(),
+                                          static_cast<unsigned int>(config_.control_port), exception.what());
+                    }
+                }
+                asio::error_code ignored;
+                connect_socket_.close(ignored);
+            }
+
+            if (joined_)
+            {
+                PROXY_INFO_PRINT("Cluster [x] node=%s peer=%s:%u reason=%s", config_.node_id.c_str(),
+                                 config_.address.c_str(), static_cast<unsigned int>(config_.control_port),
+                                 running_ ? "channel closed" : "node stopping");
+                joined_ = false;
+                if (running_)
+                {
+                    receive(CtrlMessage{CtrlCommand::ClusterError, njson{{"reason", "cluster control disconnected"}}});
+                }
+            }
+            if (channel)
+            {
+                co_await channel->async_disconnect();
+            }
+            master_channel_.reset();
+        }
+
+        if (!running_)
+        {
+            break;
+        }
+
+        retry_timer_.expires_after(retry_interval);
+        auto [error] = co_await retry_timer_.async_wait(use_nothrow_awaitable);
+        if (error)
+        {
+            break;
+        }
+    }
 }
 
 asio::awaitable<void> ClusterMgr::accept_sessions(ClusterRoom &room)
@@ -772,8 +685,9 @@ ClusterMgr::SendResult ClusterMgr::send(std::string target, CtrlMessage message)
         fail("master control outbound queue full");
         return SendResult::QueueFull;
     }
-    if (connector_ && connector_->send(std::move(message)))
+    if (auto channel = master_channel_.lock(); channel && joined_)
     {
+        channel->send(std::move(message));
         return SendResult::Submitted;
     }
     return SendResult::NotConnected;

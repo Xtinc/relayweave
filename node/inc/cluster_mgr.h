@@ -34,8 +34,9 @@ struct ClusterConfig
 
 /**
  * @brief Own cluster control transport and route authenticated messages on control_io.
- * @details A master hosts a participant room; a slave reconnects through a Connector.
- * The RelayNode and TLS context are borrowed and must outlive all owned tasks.
+ * @details A master hosts a participant room; a slave directly owns resolution, connection,
+ * retry timing and joined-channel state. All operations require control_io. The RelayNode
+ * and TLS context are borrowed and must outlive all owned tasks.
  */
 class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
 {
@@ -90,9 +91,9 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
 
   private:
     class LocalParticipant;
-    class Connector;
 
     asio::awaitable<void> accept_loop();
+    /** @brief Resolve, connect, join and receive on control_io; drain each channel before retrying. */
     asio::awaitable<void> slave_loop();
     asio::awaitable<void> accept_sessions(ClusterRoom &room);
     asio::awaitable<void> deliver_messages(ClusterRoom &room);
@@ -107,12 +108,16 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
     TLSChannelConfig channel_config_;
     std::size_t max_connections_;
     tcp::acceptor acceptor_;
+    tcp::resolver resolver_;
+    tcp::socket connect_socket_;
+    asio::steady_timer retry_timer_;
     AsyncEvent loop_done_;
     std::exception_ptr drain_error_;
     message_channel outbound_channel_;
-    Connector *connector_ = nullptr;
+    std::weak_ptr<TLSChannel> master_channel_;
     std::uint64_t epoch_ = 0;
     bool running_ = false;
+    bool joined_ = false;
     bool started_ = false;
     bool stop_ok_ = true;
 };

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -81,7 +82,10 @@ struct AgentPeer
     std::string accessor;
 };
 
-/** @brief Carry parsed relay construction parameters on control_io; not retained alongside controller state. */
+/**
+ * @brief Carry parsed relay construction or open-retry parameters on control_io without a JSON mirror.
+ * @details An optional open-retry UUID, when present, is nonzero.
+ */
 struct RelayRequest
 {
     std::string service;
@@ -92,6 +96,32 @@ struct RelayRequest
     std::uint64_t flow_id = 0;
     std::string peer;
     std::string accessor;
+    std::optional<std::uint64_t> uuid;
+};
+
+/**
+ * @brief Carry an Agent cancellation or rejection parsed once at the control boundary; either identity may match.
+ * @details Optional identities represent omitted fields, never malformed values. A present UUID is nonzero;
+ * reason already includes the command-specific fallback when omitted.
+ */
+struct CancelRequest
+{
+    std::optional<std::uint64_t> request_id;
+    std::optional<std::uint64_t> uuid;
+    std::string reason;
+};
+
+/**
+ * @brief Carry an authenticated peer identity and parsed close diagnostics on control_io.
+ * @details Close stage and reason already include their fallbacks when omitted; other events leave them unused.
+ */
+struct PeerEvent
+{
+    std::uint64_t epoch = 0;
+    std::uint64_t flow_id = 0;
+    std::string source;
+    std::string stage;
+    std::string reason;
 };
 
 /** @brief Set service byte rates and burst sizes; a zero rate disables that direction's limit. */

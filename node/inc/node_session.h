@@ -170,14 +170,21 @@ class NodeSession
      */
     virtual void invalidate(std::uint64_t epoch, std::string reason) = 0;
     /**
-     * @brief Match and consume an Agent relay command on control_io.
-     * @param command RelayOpen retry, RelayCancel or RelayReject, subject to the concrete mode's rules.
+     * @brief Match a parsed Agent open retry on control_io; Single sessions do not consume retries.
      * @param session Authenticated identity of the original Agent control session.
-     * @param message Control message with parsed object parameters for identity and request validation.
-     * @return True if consumed, including ignored repeats; false if unmatched, closing or unsupported by this mode.
-     * @throws std::exception Malformed parameters or a conflicting repeated open request.
+     * @param request Parsed open fields, including the original request ID and optional nonzero endpoint UUID.
+     * @return True if consumed; false for an unrelated identity, closing session or unsupported mode.
+     * @throws std::invalid_argument If a matching retry conflicts with the established request.
      */
-    virtual bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message) = 0;
+    virtual bool handle_open(const AgentPeer &session, const RelayRequest &request);
+    /**
+     * @brief Match and consume a parsed Agent cancellation or rejection on control_io.
+     * @param command RelayCancel or RelayReject; the concrete session applies role and phase rules.
+     * @param session Authenticated identity of the original Agent control session.
+     * @param request Parsed optional identities and reason, with a nonzero UUID when present.
+     * @return True if consumed, including ignored rejections; false if unrelated or closing.
+     */
+    virtual bool handle_cancel(CtrlCommand command, const AgentPeer &session, const CancelRequest &request) = 0;
     /**
      * @brief Match an Agent attachment and validate its authorization on control_io.
      * @param session Authenticated identity of the original Agent control session.
@@ -189,11 +196,11 @@ class NodeSession
     /**
      * @brief Match and consume a peer-node relay notification on control_io.
      * @param command RelayPeer notification to process.
-     * @param message Object parameters with epoch, flow_id and authenticated source for identity matching.
+     * @param event Parsed epoch, flow ID, authenticated source and any close diagnostics.
      * @return True for a consumed peer identity, including repeats while closing; false for a mismatch
      * or a single-node session.
      */
-    virtual bool handle_peer(CtrlCommand command, const CtrlMessage &message);
+    virtual bool handle_peer(CtrlCommand command, const PeerEvent &event);
     /**
      * @brief Build a status entry for an active ready session on control_io.
      * @return Session JSON, or no value before Ready, while closing or after a local Agent route expires.
@@ -288,8 +295,8 @@ class SingleSession final : public NodeSession
     void control_disconnected(const AgentPeer &session) override;
     /** @copydoc NodeSession::invalidate */
     void invalidate(std::uint64_t epoch, std::string reason) override;
-    /** @copydoc NodeSession::handle */
-    bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message) override;
+    /** @copydoc NodeSession::handle_cancel */
+    bool handle_cancel(CtrlCommand command, const AgentPeer &session, const CancelRequest &request) override;
     /** @copydoc NodeSession::handle_attach */
     bool handle_attach(const AgentPeer &session, const RelayAttach &request) override;
     /** @copydoc NodeSession::status_report */
@@ -339,12 +346,14 @@ class MultiSession final : public NodeSession
     void control_disconnected(const AgentPeer &session) override;
     /** @copydoc NodeSession::invalidate */
     void invalidate(std::uint64_t epoch, std::string reason) override;
-    /** @copydoc NodeSession::handle */
-    bool handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message) override;
+    /** @copydoc NodeSession::handle_open */
+    bool handle_open(const AgentPeer &session, const RelayRequest &request) override;
+    /** @copydoc NodeSession::handle_cancel */
+    bool handle_cancel(CtrlCommand command, const AgentPeer &session, const CancelRequest &request) override;
     /** @copydoc NodeSession::handle_attach */
     bool handle_attach(const AgentPeer &session, const RelayAttach &request) override;
     /** @copydoc NodeSession::handle_peer */
-    bool handle_peer(CtrlCommand command, const CtrlMessage &message) override;
+    bool handle_peer(CtrlCommand command, const PeerEvent &event) override;
     /** @copydoc NodeSession::status_report */
     std::optional<njson> status_report() const override;
     /** @copydoc NodeSession::is_multi */

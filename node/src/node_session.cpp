@@ -53,7 +53,12 @@ asio::cancellation_slot NodeSession::cancellation_slot() noexcept
     return cancellation_.slot();
 }
 
-bool NodeSession::handle_peer(CtrlCommand, const CtrlMessage &)
+bool NodeSession::handle_open(const AgentPeer &, const RelayRequest &)
+{
+    return false;
+}
+
+bool NodeSession::handle_peer(CtrlCommand, const PeerEvent &)
 {
     return false;
 }
@@ -176,17 +181,14 @@ void SingleSession::invalidate(std::uint64_t, std::string reason)
     }
 }
 
-bool SingleSession::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
+bool SingleSession::handle_cancel(CtrlCommand command, const AgentPeer &session, const CancelRequest &request)
 {
-    if (close_reason_ || command == CtrlCommand::RelayOpen || (consumer_ != session && producer_ != session))
+    if (close_reason_ || (consumer_ != session && producer_ != session))
     {
         return false;
     }
-    const auto &params = *message.params;
-    const auto request = config::optional_unsigned(params, "request_id");
-    const auto attachment = config::optional_unsigned(params, "uuid", true);
-    const bool request_matches = request && request_id_ == *request && consumer_ == session;
-    if (!request_matches && !(attachment && uuid() == *attachment))
+    const bool request_matches = request.request_id && request_id_ == *request.request_id && consumer_ == session;
+    if (!request_matches && !(request.uuid && uuid() == *request.uuid))
     {
         return false;
     }
@@ -194,9 +196,7 @@ bool SingleSession::handle(CtrlCommand command, const AgentPeer &session, const 
     {
         return true;
     }
-    cancel("control",
-           config::optional_string(
-               params, "reason", command == CtrlCommand::RelayReject ? "producer rejected relay" : "relay cancelled"));
+    cancel("control", request.reason);
     return true;
 }
 
@@ -462,41 +462,43 @@ void MultiSession::invalidate(std::uint64_t epoch, std::string reason)
     }
 }
 
-bool MultiSession::handle(CtrlCommand command, const AgentPeer &session, const CtrlMessage &message)
+bool MultiSession::handle_open(const AgentPeer &session, const RelayRequest &request)
 {
-    const bool opening = command == CtrlCommand::RelayOpen;
-    if (close_reason_ || agent_ != session || (opening && !ingress_))
+    if (close_reason_ || agent_ != session || !ingress_)
     {
         return false;
     }
-    const auto &params = *message.params;
-    const auto request = config::optional_unsigned(params, "request_id");
-    const auto attachment = config::optional_unsigned(params, "uuid");
-    const bool request_matches = request && request_id_ == *request && ingress_;
-    if (!request_matches && !(attachment && uuid() && uuid() == *attachment))
+    if (request_id_ != request.request_id && !(request.uuid && uuid() == *request.uuid))
     {
         return false;
     }
-    if (opening)
+    if (request.path != path_ || request.epoch != epoch_ || request.service != service_ || request.protocol != protocol_)
     {
-        if (params.at("path") != path_ || params.at("epoch") != epoch_ || params.at("service") != service_ ||
-            params.at("protocol") != std::string(relay_protocol_name(protocol_)))
-        {
-            throw std::invalid_argument("relay request conflicts with existing request");
-        }
-        if (progress_ >= Progress::AgentNotified)
-        {
-            notify_agents();
-        }
-        return true;
+        throw std::invalid_argument("relay request conflicts with existing request");
+    }
+    if (progress_ >= Progress::AgentNotified)
+    {
+        notify_agents();
+    }
+    return true;
+}
+
+bool MultiSession::handle_cancel(CtrlCommand command, const AgentPeer &session, const CancelRequest &request)
+{
+    if (close_reason_ || agent_ != session)
+    {
+        return false;
+    }
+    const bool request_matches = request.request_id && request_id_ == *request.request_id && ingress_;
+    if (!request_matches && !(request.uuid && uuid() == *request.uuid))
+    {
+        return false;
     }
     if (command == CtrlCommand::RelayReject && (progress_ == Progress::Ready || ingress_))
     {
         return true;
     }
-    cancel(progress_ == Progress::Ready ? "transfer" : "prepare",
-           config::optional_string(
-               params, "reason", command == CtrlCommand::RelayReject ? "producer rejected relay" : "relay cancelled"));
+    cancel(progress_ == Progress::Ready ? "transfer" : "prepare", request.reason);
     return true;
 }
 
@@ -513,10 +515,9 @@ bool MultiSession::handle_attach(const AgentPeer &session, const RelayAttach &re
     return true;
 }
 
-bool MultiSession::handle_peer(CtrlCommand command, const CtrlMessage &message)
+bool MultiSession::handle_peer(CtrlCommand command, const PeerEvent &event)
 {
-    const auto &params = *message.params;
-    if (params.at("epoch") != epoch_ || params.at("flow_id") != flow_id_ || params.at("source") != peer_)
+    if (event.epoch != epoch_ || event.flow_id != flow_id_ || event.source != peer_)
     {
         return false;
     }
@@ -537,7 +538,7 @@ bool MultiSession::handle_peer(CtrlCommand command, const CtrlMessage &message)
     else if (command == CtrlCommand::RelayPeerClose)
     {
         from_peer_ = true;
-        cancel(params.value("stage", "control"), params.value("reason", "peer closed"));
+        cancel(event.stage, event.reason);
         return true;
     }
     else

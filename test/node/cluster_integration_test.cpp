@@ -2,6 +2,7 @@
 #include "cluster_mgr.h"
 #include "node_fixture.h"
 #include <deque>
+#include <future>
 #include <iostream>
 #include <set>
 #include <thread>
@@ -11,6 +12,7 @@ using tcp = asio::ip::tcp;
 
 TEST_MEMBER(RelayNode, registry_)
 TEST_MEMBER(RelayNode, topology_)
+TEST_MEMBER(ClusterMgr, retry_timer_)
 
 namespace
 {
@@ -385,7 +387,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
                 "Cluster connection limit did not reject pending peer");
         co_await limited->async_stop();
 
-        // A slave cancels its in-progress handshake through the connector.
+        // A slave directly cancels its in-progress handshake and drains the channel.
         tcp::acceptor silent_master(io, {asio::ip::address_v4::loopback(), 0});
         ClusterConfig handshaking_config{ClusterConfig::Role::Slave, "handshaking", "127.0.0.1",
                                          silent_master.local_endpoint().port()};
@@ -409,6 +411,67 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         co_await node->async_stop();
     if (failure)
         std::rethrow_exception(failure);
+}
+
+/** @brief Stop before slave-loop entry or during real refused-connect backoff without waiting for a retry. */
+void verify_slave_stop_boundaries(asio::ssl::context &context)
+{
+    asio::io_context control(1);
+    asio::io_context tcp_io(1);
+    asio::io_context udp_io(1);
+    asio::io_context data(1);
+    tcp::acceptor unavailable(control);
+    unavailable.open(tcp::v4());
+    unavailable.bind({asio::ip::address_v4::loopback(), 0});
+    auto settings = make_test_node_config();
+    settings.control.address = settings.tcp.address = settings.datagram.address = "127.0.0.1";
+    settings.cluster.role = ClusterConfig::Role::Slave;
+    settings.cluster.node_id = "stopping-slave";
+    settings.cluster.control_port = unavailable.local_endpoint().port();
+    auto owner = std::make_shared<RelayNode>(control, tcp_io, udp_io, data, context, settings);
+
+    for (const bool before_entry : {true, false})
+    {
+        control.restart();
+        auto slave = std::make_shared<ClusterMgr>(*owner, control.get_executor(), context, settings.cluster,
+                                                  settings.channel, 1);
+        std::weak_ptr<ClusterMgr> retained = slave;
+        std::future<bool> stopped;
+        if (before_entry)
+        {
+            stopped = asio::co_spawn(control, slave->async_stop(), asio::use_future);
+            slave->start();
+        }
+        else
+        {
+            slave->start();
+            const auto deadline = std::chrono::steady_clock::now() + 2s;
+            while (test_access::ClusterMgr_retry_timer_(*slave).expiry() <= std::chrono::steady_clock::now() &&
+                   std::chrono::steady_clock::now() < deadline)
+            {
+                control.restart();
+                control.run_one_until(deadline);
+            }
+            require(test_access::ClusterMgr_retry_timer_(*slave).expiry() > std::chrono::steady_clock::now(),
+                    "Refused slave connection did not enter retry backoff");
+            require(slave->send("master", CtrlMessage{"before.join"}) == ClusterMgr::SendResult::NotConnected,
+                    "Retrying slave accepted a send before joining");
+            stopped = asio::co_spawn(control, slave->async_stop(), asio::use_future);
+        }
+        control.restart();
+        control.run_for(1s);
+        require(stopped.wait_for(0s) == std::future_status::ready && stopped.get(),
+                "Slave stop waited for connection or retry expiry");
+        require(slave->send("master", CtrlMessage{"after.stop"}) == ClusterMgr::SendResult::Stopped,
+                "Stopped slave accepted a send");
+        auto repeated = asio::co_spawn(control, slave->async_stop(), asio::use_future);
+        control.restart();
+        control.run_for(1s);
+        require(repeated.wait_for(0s) == std::future_status::ready && repeated.get(),
+                "Repeated slave stop did not finish");
+        slave.reset();
+        require(retained.expired(), "Stopped slave retained a reconnect task");
+    }
 }
 
 asio::awaitable<CtrlMessage> client_reply(const std::shared_ptr<TLSChannel> &client, CtrlCommand command)
@@ -561,6 +624,27 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
     const auto self = co_await client_reply(replacement, CtrlCommand::ServiceLocated);
     require(self.params->at("request_id") == 206U && self.params->at("node_id") == "test-master",
             "Master echoed its own broadcast or failed to deliver a self-unicast");
+    for (const auto command : {CtrlCommand::RelayCancel, CtrlCommand::RelayReject})
+    {
+        auto invalid = co_await connect(client_context, slave_port);
+        invalid->send(CtrlMessage(command, njson{{"reason", false}}));
+        bool closed = false;
+        try
+        {
+            co_await invalid->async_receive(1s);
+        }
+        catch (const asio::system_error &error)
+        {
+            closed = error.code() == asio::experimental::error::channel_closed ||
+                     error.code() == asio::experimental::error::channel_cancelled;
+        }
+        require(closed, "Malformed Agent cancellation did not close its control connection");
+        co_await invalid->async_disconnect();
+    }
+    local->send(CtrlMessage(CtrlCommand::ServiceList, njson{{"request_id", 207U}}));
+    const auto healthy = co_await client_reply(local, CtrlCommand::ServiceListed);
+    require(healthy.params->at("services") == njson::array({"public-query"}),
+            "Malformed Agent messages affected another control connection");
     co_await local->async_disconnect();
     co_await replacement->async_disconnect();
 }
@@ -618,6 +702,10 @@ void verify_relay_node(asio::ssl::context &context, asio::ssl::context &client_c
         require(test_node::cluster(slave).broadcast(CtrlMessage{"cluster.invalid"}) == ClusterMgr::SendResult::InvalidMessage,
                 "Slave accepted a reserved command");
         peer->send(CtrlMessage{"service.lookup", njson{{"target", "slave"}}});
+        peer->send(CtrlMessage(CtrlCommand::RelayPeerClose,
+                              njson{{"target", "slave"}, {"epoch", epoch}, {"flow_id", 1U}, {"reason", false}}));
+        peer->send(CtrlMessage(CtrlCommand::RelayCancel,
+                              njson{{"target", "slave"}, {"agent_session_id", 1U}, {"reason", false}}));
         for (const auto &target : {"slave", "test-master"})
         {
             peer->send(CtrlMessage{CtrlCommand::ServerStatusQuery,
@@ -685,6 +773,7 @@ int main()
         auto result = asio::co_spawn(io, verify(io, context, client_context, anonymous_context), asio::use_future);
         io.run();
         result.get();
+        verify_slave_stop_boundaries(context);
         verify_relay_node(context, client_context);
         std::cout << "[PASS] cluster room, broadcast, mTLS, reconnect and shutdown\n";
         return 0;

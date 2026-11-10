@@ -9,9 +9,12 @@ TEST_MEMBER(RelayNode, start_relay)
 TEST_MEMBER(RelayNode, relay_sessions_)
 TEST_MEMBER(RelayNode, stop_relays)
 TEST_MEMBER(RelayNode, handle_relay_peer)
+TEST_MEMBER(RelayNode, handle_relay)
 TEST_MEMBER(RelayNode, handle_cluster_message)
 TEST_MEMBER(NodeSession, stage_)
 TEST_MEMBER(NodeSession, close_reason_)
+TEST_MEMBER(SingleSession, endpoint_)
+TEST_MEMBER(MultiSession, endpoint_)
 
 using namespace std::chrono_literals;
 
@@ -19,6 +22,113 @@ static void require_capacity(bool value, const char *reason)
 {
     if (!value)
         throw std::runtime_error(reason);
+}
+
+/** @brief Reject malformed business fields before dispatch even when there is no matching session. */
+static void verify_relay_entry_validation(RelayNode &node, const ControlSessionPtr &agent)
+{
+    const std::array<njson, 5> invalid_requests{
+        njson{{"request_id", 7.0}}, njson{{"uuid", 0U}}, njson{{"uuid", 41.0}},
+        njson{{"reason", false}}, njson{{"reason", nullptr}}};
+    for (const auto command : {CtrlCommand::RelayCancel, CtrlCommand::RelayReject})
+    {
+        for (const auto &params : invalid_requests)
+        {
+            bool rejected = false;
+            try
+            {
+                test_access::RelayNode_handle_relay(node, command, agent, CtrlMessage(command, params));
+            }
+            catch (const std::invalid_argument &)
+            {
+                rejected = true;
+            }
+            require_capacity(rejected, "Malformed cancellation depended on finding a matching session");
+        }
+        test_access::RelayNode_handle_relay(node, command, agent, CtrlMessage(command, njson::object()));
+    }
+    for (const auto *field : {"stage", "reason"})
+    {
+        njson params{{"epoch", 17U}, {"flow_id", 39U}, {"source", "peer"}};
+        params[field] = false;
+        bool rejected = false;
+        try
+        {
+            test_access::RelayNode_handle_relay_peer(node, CtrlCommand::RelayPeerClose,
+                                                     CtrlMessage(CtrlCommand::RelayPeerClose, params));
+        }
+        catch (const std::invalid_argument &)
+        {
+            rejected = true;
+        }
+        require_capacity(rejected, "Malformed peer diagnostics depended on finding a matching session");
+    }
+    require_capacity(test_access::RelayNode_relay_sessions_(node).empty(), "Invalid business messages created a session");
+}
+
+/** @brief Preserve authenticated ownership, either-key matching and cancellation defaults through the real entry. */
+static void verify_cancellation_dispatch(RelayNode &node, const ControlSessionPtr &consumer,
+                                          const ControlSessionPtr &producer, const ControlSessionPtr &unrelated)
+{
+    auto &relays = test_access::RelayNode_relay_sessions_(node);
+    auto local = std::make_unique<SingleSession>(node, consumer, producer,
+                                                RelayRequest{"events", RelayProtocol::Tcp, 7}, SRVTrafficPtr{});
+    test_access::SingleSession_endpoint_(*local) = {{41, 21, 4444}, {41, 22, 4444}};
+    auto ingress = std::make_unique<MultiSession>(
+        node, consumer, RelayRequest{"events", RelayProtocol::Tcp, 8, {"test-master", "peer"}, 17}, true);
+    test_access::MultiSession_endpoint_(*ingress) = {42, 23, 4444};
+    auto egress = std::make_unique<MultiSession>(
+        node, producer, RelayRequest{"events", RelayProtocol::Tcp, 0, {}, 17, 39, "peer"}, false);
+    test_access::MultiSession_endpoint_(*egress) = {43, 24, 4444};
+    relays.push_back(std::move(local));
+    relays.push_back(std::move(ingress));
+    relays.push_back(std::move(egress));
+    test_access::RelayNode_handle_relay_peer(node, CtrlCommand::RelayPeerOpen,
+        CtrlMessage(CtrlCommand::RelayPeerOpen, njson{{"epoch", 17U}, {"flow_id", 39U}, {"source", "peer"}}));
+    require_capacity(relays.size() == 3 && !test_access::NodeSession_close_reason_(*relays[2]),
+                     "Duplicate peer open parsed creation fields before matching its existing session");
+    const auto deliver = [&](CtrlCommand command, const ControlSessionPtr &agent, njson params) {
+        test_access::RelayNode_handle_relay(node, command, agent, CtrlMessage(command, std::move(params)));
+    };
+    deliver(CtrlCommand::RelayCancel, unrelated, {{"request_id", 7U}, {"uuid", 42U}});
+    deliver(CtrlCommand::RelayReject, consumer, {{"request_id", 7U}});
+    for (const auto &relay : relays)
+    {
+        require_capacity(!test_access::NodeSession_close_reason_(*relay),
+                         "Unrelated Agent or wrong-role rejection cancelled a session");
+    }
+    deliver(CtrlCommand::RelayCancel, consumer, {{"request_id", 7U}, {"uuid", 42U}, {"reason", ""}});
+    require_capacity(test_access::NodeSession_close_reason_(*relays[0]) == std::optional<std::string>("") &&
+                         !test_access::NodeSession_close_reason_(*relays[1]),
+                     "Either-key matching changed precedence or lost an empty cancellation cause");
+    deliver(CtrlCommand::RelayCancel, consumer, {{"uuid", 41U}, {"reason", "later failure"}});
+    require_capacity(test_access::NodeSession_close_reason_(*relays[0]) == std::optional<std::string>(""),
+                     "A late cancellation replaced the first cause");
+    deliver(CtrlCommand::RelayCancel, consumer, {{"request_id", 999U}, {"uuid", 42U}});
+    require_capacity(test_access::NodeSession_close_reason_(*relays[1]) ==
+                         std::optional<std::string>("relay cancelled"),
+                     "UUID cancellation lost either-key matching or its default reason");
+    deliver(CtrlCommand::RelayReject, consumer, {{"uuid", 43U}});
+    require_capacity(!test_access::NodeSession_close_reason_(*relays[2]), "Wrong Agent rejected a peer endpoint");
+    deliver(CtrlCommand::RelayReject, producer, {{"uuid", 43U}});
+    require_capacity(test_access::NodeSession_close_reason_(*relays[2]) ==
+                         std::optional<std::string>("producer rejected relay"),
+                     "Producer rejection lost its default reason");
+    relays.push_back(std::make_unique<MultiSession>(
+        node, producer, RelayRequest{"events", RelayProtocol::Tcp, 0, {}, 17, 40, "peer"}, false));
+    test_access::RelayNode_handle_relay_peer(node, CtrlCommand::RelayPeerClose,
+        CtrlMessage(CtrlCommand::RelayPeerClose, njson{{"epoch", 17U}, {"flow_id", 40U}, {"source", "peer"}}));
+    require_capacity(test_access::NodeSession_close_reason_(*relays.back()) ==
+                         std::optional<std::string>("peer closed") &&
+                         test_access::NodeSession_stage_(*relays.back()) == "control",
+                     "Peer close lost its default diagnostics");
+    relays.clear();
+    relays.push_back(std::make_unique<SingleSession>(
+        node, consumer, producer, RelayRequest{"zero-request", RelayProtocol::Tcp, 0}, SRVTrafficPtr{}));
+    deliver(CtrlCommand::RelayCancel, consumer, {{"request_id", 0U}, {"reason", ""}});
+    require_capacity(test_access::NodeSession_close_reason_(*relays.front()) == std::optional<std::string>(""),
+                     "A zero-valued Single request ID stopped matching");
+    relays.clear();
 }
 
 // Exercise instance events on control_io before any endpoint or business task is installed.
@@ -42,8 +152,6 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
         require_capacity(rejected, "Invalid peer identity lost its original error while constructing a reply");
     }
 
-    const njson params{{"request_id", 7U}, {"service", "events"}, {"protocol", "tcp"},
-                       {"epoch", 17U}, {"path", {"test-master", "peer"}}};
     const RelayRequest request{"events", RelayProtocol::Tcp, 7, {"test-master", "peer"}, 17};
     MultiSession ingress(node, consumer, request, true);
     SingleSession single(node, consumer, producer,
@@ -53,34 +161,37 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
     unsigned single_cancelled = 0;
     ingress.cancellation_slot().assign([&](asio::cancellation_type) { ++ingress_cancelled; });
     single.cancellation_slot().assign([&](asio::cancellation_type) { ++single_cancelled; });
-    const CtrlMessage open(CtrlCommand::RelayOpen, params);
-    require_capacity(ingress.handle(CtrlCommand::RelayOpen, consumer, open) &&
-                         ingress.handle(CtrlCommand::RelayOpen, consumer, open),
+    require_capacity(ingress.handle_open(consumer, request) &&
+                         ingress.handle_open(consumer, request),
                      "Opening duplicate was not consumed before endpoint installation");
-    require_capacity(!ingress.handle(CtrlCommand::RelayOpen, unrelated, open) &&
-                         !single.handle(CtrlCommand::RelayOpen, consumer, open),
+    require_capacity(!ingress.handle_open(unrelated, request) &&
+                         !single.handle_open(consumer, request),
                      "Opening request crossed session ownership or changed Single creation semantics");
     require_capacity(ingress_cancelled == 0 && single_cancelled == 0,
                      "Opening duplicate cancelled a business instance");
     for (const auto *field : {"path", "epoch", "service", "protocol"})
     {
-        auto conflict = params;
+        auto conflict = request;
         if (std::string_view(field) == "path")
         {
-            conflict[field] = {"test-master", "other"};
+            conflict.path = {"test-master", "other"};
         }
         else if (std::string_view(field) == "epoch")
         {
-            conflict[field] = 18U;
+            conflict.epoch = 18;
+        }
+        else if (std::string_view(field) == "protocol")
+        {
+            conflict.protocol = RelayProtocol::Tls;
         }
         else
         {
-            conflict[field] = std::string_view(field) == "protocol" ? "tls" : "other-service";
+            conflict.service = "other-service";
         }
         bool rejected = false;
         try
         {
-            ingress.handle(CtrlCommand::RelayOpen, consumer, CtrlMessage(CtrlCommand::RelayOpen, conflict));
+            ingress.handle_open(consumer, conflict);
         }
         catch (const std::invalid_argument &error)
         {
@@ -88,6 +199,11 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
         }
         require_capacity(rejected && ingress_cancelled == 0, "Conflicting duplicate changed the existing instance");
     }
+    test_access::MultiSession_endpoint_(ingress) = {42, 23, 4444};
+    auto by_uuid = request;
+    by_uuid.request_id = 999;
+    by_uuid.uuid = 42;
+    require_capacity(ingress.handle_open(consumer, by_uuid), "Open retry stopped matching by UUID");
 
     ingress.invalidate(17, {});
     ingress.control_disconnected(unrelated);
@@ -116,40 +232,42 @@ static void verify_session_events(RelayNode &node, const ControlSessionPtr &cons
     MultiSession egress(node, producer, peer_params, false);
     unsigned egress_cancelled = 0;
     egress.cancellation_slot().assign([&](asio::cancellation_type) { ++egress_cancelled; });
-    const njson identity{{"epoch", 17U}, {"flow_id", 39U}, {"source", "peer"}, {"reason", "peer failure"}};
+    const PeerEvent identity{17, 39, "peer", "control", "peer failure"};
     for (const auto *field : {"epoch", "flow_id", "source"})
     {
         auto wrong = identity;
         if (std::string_view(field) == "source")
         {
-            wrong[field] = "other-peer";
+            wrong.source = "other-peer";
+        }
+        else if (std::string_view(field) == "epoch")
+        {
+            --wrong.epoch;
         }
         else
         {
-            wrong[field] = wrong.at(field).get<unsigned>() - 1U;
+            --wrong.flow_id;
         }
-        require_capacity(!egress.handle_peer(CtrlCommand::RelayPeerClose, CtrlMessage(CtrlCommand::RelayPeerClose, wrong)) &&
+        require_capacity(!egress.handle_peer(CtrlCommand::RelayPeerClose, wrong) &&
                              egress_cancelled == 0,
                          "Unmatched peer message cancelled an unrelated instance");
     }
     for (const auto command : {CtrlCommand::RelayPeerReady, CtrlCommand::RelayPeerFinished})
     {
-        const CtrlMessage notification(command, identity);
-        require_capacity(egress.handle_peer(command, notification) && egress.handle_peer(command, notification) &&
+        require_capacity(egress.handle_peer(command, identity) && egress.handle_peer(command, identity) &&
                              egress_cancelled == 0,
                          "Duplicate peer notification cancelled its instance");
     }
     auto close_identity = identity;
-    close_identity["reason"] = "";
-    const CtrlMessage close(CtrlCommand::RelayPeerClose, std::move(close_identity));
-    require_capacity(!single.handle_peer(CtrlCommand::RelayPeerClose, close), "Single consumed a peer message");
-    require_capacity(egress.handle_peer(CtrlCommand::RelayPeerClose, close) && egress_cancelled == 1,
+    close_identity.reason.clear();
+    require_capacity(!single.handle_peer(CtrlCommand::RelayPeerClose, close_identity), "Single consumed a peer message");
+    require_capacity(egress.handle_peer(CtrlCommand::RelayPeerClose, close_identity) && egress_cancelled == 1,
                      "Authenticated matching peer close did not cancel its instance");
     egress.cancel("late", "later failure");
     const auto &peer_reason = test_access::NodeSession_close_reason_(egress);
     require_capacity(peer_reason && peer_reason->empty() && egress_cancelled == 1,
                      "An empty peer close reason was lost or cancellation was repeated");
-    require_capacity(egress.handle_peer(CtrlCommand::RelayPeerOpen, CtrlMessage(CtrlCommand::RelayPeerOpen, identity)) &&
+    require_capacity(egress.handle_peer(CtrlCommand::RelayPeerOpen, identity) &&
                          egress_cancelled == 1,
                      "Closing instance released its peer identity before draining");
 }
@@ -302,6 +420,8 @@ int main()
         // TCP and TLS share one quota; UDP has its own. Do not pump either transfer executor:
         // all admitted requests must remain counted while install is pending.
         asio::post(control, [&] {
+            verify_relay_entry_validation(*node, session);
+            verify_cancellation_dispatch(*node, session, producer, unrelated);
             verify_session_events(*node, session, producer, unrelated);
             verify_cluster_failure_reason(*node, session);
             admit();
