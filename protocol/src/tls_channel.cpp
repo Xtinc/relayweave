@@ -1,4 +1,5 @@
 #include "tls_channel.h"
+#include "xfr_channel.h"
 #include "asio/experimental/parallel_group.hpp"
 
 static void configure_tls_socket(TLSStream &stream)
@@ -69,16 +70,7 @@ TLSChannel::TLSChannel(tcp::socket &&socket, asio::ssl::context &ssl_context, TL
       receive_channel_(executor_, config_.max_queued_messages), close_channel_(executor_, 1),
       run_done_channel_(executor_, 1)
 {
-    asio::error_code error;
-    const auto endpoint = stream_.lowest_layer().remote_endpoint(error);
-    std::string peer = "unknown";
-    if (!error)
-    {
-        const auto address = endpoint.address().to_string();
-        peer = endpoint.address().is_v6() ? "[" + address + "]:" + std::to_string(endpoint.port())
-                                          : address + ":" + std::to_string(endpoint.port());
-    }
-    log_context_ = "[" + peer + "]";
+    log_context_ = "[" + socket_peer(stream_) + "]";
 }
 
 TLSChannel::~TLSChannel()

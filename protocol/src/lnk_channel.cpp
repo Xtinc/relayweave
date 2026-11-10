@@ -79,7 +79,7 @@ void LnkChannel::start()
     {
         throw std::invalid_argument("cluster.tcp_port and cluster.udp_port must be nonzero");
     }
-    const tcp::endpoint tcp_endpoint(asio::ip::make_address(tcp_address_), tcp_port_);
+    const tcp::endpoint tcp_endpoint(asio::ip::make_address_v4(tcp_address_), tcp_port_);
     const udp::endpoint udp_endpoint(asio::ip::make_address(udp_address_), udp_port_);
     acceptor_.open(tcp_endpoint.protocol());
     acceptor_.set_option(tcp::acceptor::reuse_address(true));
@@ -344,11 +344,16 @@ asio::awaitable<void> LnkChannel::accept_loop()
 {
     for (;;)
     {
-        auto socket = co_await acceptor_.async_accept(asio::use_awaitable);
+        tcp::endpoint source;
+        auto socket = co_await acceptor_.async_accept(source, asio::use_awaitable);
         // A successful accept can already be queued when stop closes the listener.
         if (protocol_.stopping_)
         {
             co_return;
+        }
+        if (blacklist_.blocked(source.address().to_v4()))
+        {
+            continue;
         }
         if (accepting_.size() >= max_pending_accepts)
         {
@@ -358,40 +363,54 @@ asio::awaitable<void> LnkChannel::accept_loop()
         auto *observed = pending.get();
         accepting_.insert(observed);
         ScopeGuard rollback([this, observed] { accepting_.erase(observed); });
-        protocol_.spawn(accept(std::move(pending)));
+        protocol_.spawn(accept(std::move(pending), source.address().to_v4()));
         rollback.dismiss();
     }
 }
 
-asio::awaitable<void> LnkChannel::accept(std::unique_ptr<tcp::socket> socket)
+asio::awaitable<void> LnkChannel::accept(std::unique_ptr<tcp::socket> socket, asio::ip::address_v4 source)
 {
     std::shared_ptr<NodeLink> link;
-    try
     {
+        ScopeGuard cleanup([this, &socket]() { accepting_.erase(socket.get()); });
+        try
         {
-            // Only bootstrap owns the pending socket; the authenticated Link takes over its I/O.
-            ScopeGuard cleanup([this, &socket]() { accepting_.erase(socket.get()); });
             auto message = co_await read_ctrl_frame(*socket, Clock::now() + link_setup_timeout);
-            if (message.type() != CtrlCommand::LinkAttach)
+            if (protocol_.stopping_)
             {
                 co_return;
+            }
+            if (message.type() != CtrlCommand::LinkAttach)
+            {
+                throw std::invalid_argument("expected link.attach");
             }
             auto id = config::require_unsigned(config::message_params(message), "id", true);
             auto found = connections_.find(id);
             if (found == connections_.end())
             {
-                co_return;
+                throw std::invalid_argument("unknown or expired link ID");
             }
             link = found->second;
             if (link->spec.transport != RelayProtocol::Tcp || link->spec.initiator || link->attached ||
                 !matches(*link, message))
             {
-                co_return;
+                throw std::invalid_argument("invalid link.attach state or credentials");
             }
-            link->attached = true;
-            link->phase = LinkPhase::Attaching;
-            *link->socket = std::move(*socket);
         }
+        catch (const std::exception &e)
+        {
+            if (!protocol_.stopping_)
+            {
+                blacklist_.record_failure(source, e.what());
+            }
+            co_return;
+        }
+    }
+    try
+    {
+        link->attached = true;
+        link->phase = LinkPhase::Attaching;
+        *link->socket = std::move(*socket);
         socket.reset();
         auto response = WireMessage::pack(attach_message(*link, CtrlCommand::LinkAttached));
         co_await asio::async_write(*link->socket, asio::buffer(response),
@@ -406,10 +425,7 @@ asio::awaitable<void> LnkChannel::accept(std::unique_ptr<tcp::socket> socket)
     }
     catch (const std::exception &e)
     {
-        if (link && link->attached)
-        {
-            fail(*link, e.what());
-        }
+        fail(*link, e.what());
     }
 }
 

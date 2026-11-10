@@ -2,6 +2,7 @@
 #define RELAYWEAVE_STREAM_PIPELINE_H
 
 #include "node_common.h"
+#include "peer_blacklist.h"
 #include "xfr_channel.h"
 #include <atomic>
 #include <map>
@@ -128,7 +129,8 @@ class StreamPipeline : public RelayTransport, public std::enable_shared_from_thi
     asio::awaitable<void> bind(RelayAttach request);
     asio::awaitable<void> accept_loop();
     struct PendingConnection;
-    asio::awaitable<void> run_transfer_session(ConnectionId id, std::shared_ptr<PendingConnection> pending);
+    asio::awaitable<void> run_transfer_session(ConnectionId id, std::shared_ptr<PendingConnection> pending,
+                                               asio::ip::address_v4 source);
     // run_remote_pair retains the endpoint and drains both directions before releasing it.
     asio::awaitable<void> read_remote_pair(RemotePair &endpoint);
     asio::awaitable<void> write_remote_pair(RemotePair &endpoint);
@@ -142,6 +144,7 @@ class StreamPipeline : public RelayTransport, public std::enable_shared_from_thi
     std::chrono::steady_clock::duration setup_timeout_;
     TrafficLimitConfig config_;
     tcp::acceptor acceptor_;
+    PeerBlacklist blacklist_{"agent-data"};
     std::unordered_map<std::uint64_t, std::shared_ptr<LocalPair>> local_pairs_;
     std::unordered_map<std::uint64_t, std::shared_ptr<RemotePair>> remote_pairs_;
     /** @brief Unclaimed sockets on the data executor; its size controls setup admission. */

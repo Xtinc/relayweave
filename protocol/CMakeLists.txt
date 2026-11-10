@@ -2,6 +2,7 @@ add_library(relayweave_protocol
     src/message.cpp
     src/xfr_channel.cpp
     src/tls_channel.cpp
+    src/peer_blacklist.cpp
     src/tls_rpk.cpp
     src/lnk_channel.cpp
     src/flow_protocol.cpp

@@ -8,6 +8,8 @@ relayweave_test(node_lifecycle node_lifecycle_test.cpp
     LIBRARIES relayweave_node_lib LABELS node integration)
 relayweave_test(node_shutdown node_shutdown_test.cpp
     LIBRARIES relayweave_node_lib LABELS node integration)
+relayweave_test(node_blacklist node_blacklist_test.cpp TIMEOUT 20
+    LIBRARIES relayweave_node_lib LABELS node integration)
 relayweave_test(node_metrics node_metrics_test.cpp
     LIBRARIES relayweave_node_lib LABELS node integration)
 relayweave_test(node_relay_capacity node_relay_capacity_test.cpp

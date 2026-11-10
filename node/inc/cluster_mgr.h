@@ -2,6 +2,7 @@
 #define PROXY_CLUSTER_MGR_H
 
 #include "async_event.h"
+#include "peer_blacklist.h"
 #include "tls_channel.h"
 
 class RelayNode;
@@ -108,6 +109,7 @@ class ClusterMgr : public std::enable_shared_from_this<ClusterMgr>
     TLSChannelConfig channel_config_;
     std::size_t max_connections_;
     tcp::acceptor acceptor_;
+    PeerBlacklist blacklist_{"cluster-control"};
     tcp::resolver resolver_;
     tcp::socket connect_socket_;
     asio::steady_timer retry_timer_;

@@ -352,8 +352,7 @@ asio::awaitable<void> DatagramMgr::receive_datagram()
         }
         else if (!stopped_)
         {
-            PROXY_ERROR_PRINT("Transfer send failed udp -> %s:%u reason=%s", destination.address().to_string().c_str(),
-                              static_cast<unsigned int>(destination.port()),
+            PROXY_ERROR_PRINT("Transfer send failed udp -> %s reason=%s", socket_peer(destination).c_str(),
                               send_error ? send_error.message().c_str() : "partial datagram send");
         }
     }

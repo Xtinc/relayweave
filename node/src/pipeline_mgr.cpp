@@ -96,7 +96,7 @@ void StreamPipeline::start()
     if (started_ || stopped_)
         throw std::logic_error("TCP pipeline can only be started once");
 
-    const tcp::endpoint endpoint(asio::ip::make_address(listen_address_), data_port_);
+    const tcp::endpoint endpoint(asio::ip::make_address_v4(listen_address_), data_port_);
     acceptor_.open(endpoint.protocol());
     ScopeGuard close_acceptor([this]() noexcept {
         asio::error_code ignored;
@@ -121,7 +121,8 @@ asio::awaitable<void> StreamPipeline::accept_loop()
 {
     for (;;)
     {
-        auto [error, socket] = co_await acceptor_.async_accept(use_nothrow_awaitable);
+        tcp::endpoint source;
+        auto [error, socket] = co_await acceptor_.async_accept(source, use_nothrow_awaitable);
         if (stopped_ || error == asio::error::operation_aborted)
         {
             co_return;
@@ -130,6 +131,10 @@ asio::awaitable<void> StreamPipeline::accept_loop()
         {
             PROXY_ERROR_PRINT("Transfer accept failed TCP reason=%s category=%s", error.message().c_str(),
                               error.category().name());
+            continue;
+        }
+        if (blacklist_.blocked(source.address().to_v4()))
+        {
             continue;
         }
 
@@ -154,12 +159,15 @@ asio::awaitable<void> StreamPipeline::accept_loop()
         setup_tasks_.fetch_add(1);
         asio::co_spawn(
             executor_,
-            [self = shared_from_this(), id, connection] { return self->run_transfer_session(id, connection); },
+            [self = shared_from_this(), id, connection, address = source.address().to_v4()] {
+                return self->run_transfer_session(id, connection, address);
+            },
             asio::detached);
     }
 }
 
-asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id, std::shared_ptr<PendingConnection> pending)
+asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id, std::shared_ptr<PendingConnection> pending,
+                                                           asio::ip::address_v4 source)
 {
     ScopeGuard cleanup([&]() noexcept {
         unbound_.erase(id);
@@ -174,11 +182,8 @@ asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id, std:
         co_await asio::async_write(pending->socket, asio::buffer(id),
                                    asio::cancel_at(pending->deadline, asio::use_awaitable));
         pending->announced.notify_all();
-        if (unbound_.contains(id))
-        {
-            co_await pending->socket.async_wait(tcp::socket::wait_read,
-                                                asio::cancel_at(pending->deadline, use_nothrow_awaitable));
-        }
+        co_await pending->socket.async_wait(tcp::socket::wait_read,
+                                            asio::cancel_at(pending->deadline, use_nothrow_awaitable));
     }
     catch (const std::exception &error)
     {
@@ -186,6 +191,10 @@ asio::awaitable<void> StreamPipeline::run_transfer_session(ConnectionId id, std:
         {
             PROXY_DEBUG_PRINT("Data greeting failed reason=%s", error.what());
         }
+    }
+    if (!stopped_ && unbound_.contains(id))
+    {
+        blacklist_.record_failure(source, "data connection not authorized");
     }
 }
 

@@ -656,8 +656,7 @@ class ProxySession
             }
             const auto bound = datagrams_->endpoint();
             co_await send_socks_reply(0x00, tcp::endpoint(bound.address(), bound.port()));
-            PROXY_INFO_PRINT("Proxy [+] socks5 udp peer=%s relay=%s:%u", peer_.c_str(),
-                             bound.address().to_string().c_str(), static_cast<unsigned int>(bound.port()));
+            PROXY_INFO_PRINT("Proxy [+] socks5 udp peer=%s relay=%s", peer_.c_str(), socket_peer(bound).c_str());
             ScopeGuard log_closed([this] {
                 PROXY_INFO_PRINT("Proxy [x] socks5 udp peer=%s", peer_.c_str());
             });

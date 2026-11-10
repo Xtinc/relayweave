@@ -180,7 +180,7 @@ class ClusterRoom
 /**
  * @brief Own one remote member's TLS channel and join/read lifecycle on the master.
  * @details The room retains this participant; reader completion removes it only after TLS
- * drainage. The room and borrowed TLS context must outlive the session task.
+ * drainage. The room, TLS context and listener blacklist must outlive the session task.
  */
 class ClusterSession : public ClusterParticipant
 {
@@ -193,10 +193,11 @@ class ClusterSession : public ClusterParticipant
     {
     }
 
-    /** @brief Launch the independent reader on the channel executor and leave the room on completion. */
-    void start()
+    /** @brief Launch the reader with its borrowed listener blacklist and leave the room on completion. */
+    void start(PeerBlacklist &blacklist, asio::ip::address_v4 source)
     {
-        asio::co_spawn(channel_->executor(), reader(), [this](std::exception_ptr) { room_.leave(*this); });
+        asio::co_spawn(channel_->executor(), reader(blacklist, source),
+                       [this](std::exception_ptr) { room_.leave(*this); });
     }
 
     /** @copydoc ClusterParticipant::node_id */
@@ -225,11 +226,13 @@ class ClusterSession : public ClusterParticipant
     }
 
   private:
-    asio::awaitable<void> reader()
+    asio::awaitable<void> reader(PeerBlacklist &blacklist, asio::ip::address_v4 source)
     {
+        bool authenticated = false;
         try
         {
             co_await channel_->start({});
+            authenticated = true;
             auto join = co_await channel_->async_receive(join_timeout_);
             if (join.type() != CtrlCommand::ClusterJoin)
             {
@@ -273,6 +276,10 @@ class ClusterSession : public ClusterParticipant
         {
             if (!stopping_)
                 PROXY_ERROR_PRINT("Cluster session failed node=%s reason=%s", node_id_.c_str(), exception.what());
+        }
+        if (!authenticated && !stopping_)
+        {
+            blacklist.record_failure(source, "cluster authentication incomplete");
         }
         co_await channel_->async_disconnect();
         if (!node_id_.empty())
@@ -379,7 +386,7 @@ void ClusterMgr::start()
     });
     if (config_.role == ClusterConfig::Role::Master)
     {
-        tcp::endpoint endpoint(asio::ip::make_address(config_.address), config_.control_port);
+        tcp::endpoint endpoint(asio::ip::make_address_v4(config_.address), config_.control_port);
         acceptor_.open(endpoint.protocol());
         acceptor_.set_option(tcp::acceptor::reuse_address(true));
         acceptor_.bind(endpoint);
@@ -581,7 +588,8 @@ asio::awaitable<void> ClusterMgr::accept_sessions(ClusterRoom &room)
 {
     while (running_)
     {
-        auto [error, socket] = co_await acceptor_.async_accept(use_nothrow_awaitable);
+        tcp::endpoint source;
+        auto [error, socket] = co_await acceptor_.async_accept(source, use_nothrow_awaitable);
         if (!running_ || error == asio::error::operation_aborted)
             co_return;
         if (error)
@@ -589,9 +597,13 @@ asio::awaitable<void> ClusterMgr::accept_sessions(ClusterRoom &room)
             PROXY_ERROR_PRINT("Cluster accept failed reason=%s", error.message().c_str());
             continue;
         }
+        if (blacklist_.blocked(source.address().to_v4()))
+        {
+            continue;
+        }
         if (room.size() >= max_connections_ + 1)
         {
-            PROXY_ERROR_PRINT("Cluster rejected peer=%s limit=%zu", socket_peer(socket).c_str(), max_connections_);
+            PROXY_ERROR_PRINT("Cluster rejected peer=%s limit=%zu", socket_peer(source).c_str(), max_connections_);
             continue;
         }
 
@@ -599,7 +611,7 @@ asio::awaitable<void> ClusterMgr::accept_sessions(ClusterRoom &room)
         auto *participant = session.get();
         room.join(std::move(session));
         ScopeGuard rollback([&room, participant] { room.leave(*participant); });
-        participant->start();
+        participant->start(blacklist_, source.address().to_v4());
         rollback.dismiss();
     }
 }

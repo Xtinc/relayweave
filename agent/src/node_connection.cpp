@@ -1,5 +1,6 @@
 #include "node_connection.h"
 #include "relay_agent.h"
+#include "xfr_channel.h"
 #include <algorithm>
 
 NodeConnection::Operations::Operations(asio::any_io_executor executor)
@@ -66,8 +67,7 @@ asio::awaitable<void> NodeConnection::run()
                     throw asio::system_error(asio::error::operation_aborted);
                 }
 
-                PROXY_DEBUG_PRINT("Control TCP connected -> %s:%u", endpoint.address().to_string().c_str(),
-                                  static_cast<unsigned int>(endpoint.port()));
+                PROXY_DEBUG_PRINT("Control TCP connected -> %s", socket_peer(endpoint).c_str());
                 stage = "start control TLS channel";
                 channel = std::make_shared<TLSChannel>(std::move(operations.socket), ssl_context_, TLSChannelRole::C,
                                                        config_.channel);

@@ -2,6 +2,7 @@
 #define RELAYWEAVE_LNK_CHANNEL_H
 #include "fair_queue.h"
 #include "tls_channel.h"
+#include "peer_blacklist.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -215,7 +216,7 @@ class LnkChannel
 
     void process(lnk::NodeLink &link, const LnkFrameHeader &header, lnk::PooledBuffer payload);
     asio::awaitable<void> accept_loop();
-    asio::awaitable<void> accept(std::unique_ptr<tcp::socket> socket);
+    asio::awaitable<void> accept(std::unique_ptr<tcp::socket> socket, asio::ip::address_v4 source);
     asio::awaitable<void> prepare_udp(std::shared_ptr<lnk::NodeLink> link);
     asio::awaitable<void> establish(std::shared_ptr<lnk::NodeLink> link);
     // The establishment/accept task owns the Link and joins both borrowed I/O loops here.
@@ -229,6 +230,7 @@ class LnkChannel
     asio::any_io_executor executor_;
     std::string node_id_;
     tcp::acceptor acceptor_;
+    PeerBlacklist blacklist_{"nodelink-tcp"};
     udp::socket udp_socket_;
     std::string tcp_address_;
     std::string udp_address_;

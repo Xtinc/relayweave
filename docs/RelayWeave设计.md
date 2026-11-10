@@ -1594,6 +1594,32 @@ RelayNode 启动时接受一个 JSON 格式的配置文件，各段落对应不�
 
 ---
 
+#### 9.1.1 Node IPv4 临时黑名单
+
+Agent 控制、Agent TCP 数据、集群控制和 NodeLink TCP 四个监听入口在创建时使用 IPv4 地址，各自直接持有
+`protocol/PeerBlacklist`。入口之间及 Node 之间不共享封禁；键为实际 socket 来源的 IPv4 地址，忽略源端口。
+每个实例仅在所属的单线程执行域访问，无锁、无独立协程；UDP 维持现有校验与丢弃策略。
+黑名单默认启用，参数固定，不增加 JSON 配置；只保存在内存中，重启清空。
+
+每轮一分钟，以实例共同的 `steady_clock` 基准划分。在同一轮内累计五次未完成认证或授权的连接后，封禁剩余轮数设为
+30；每个来自已封禁地址的 TCP 新连接被拒绝时增加一轮，剩余轮数最高为 720。每次访问先检查是否跨轮，
+跨轮时统一扫描：清除未封禁 IP 的失败计数，从已封禁 IP 的剩余轮数中扣除经过的轮数，归零则删除。
+每个 IP 只保存计数器，不保存单独的时间戳、失败时间线或定时器；空闲期间无维护任务，下次访问统一补齐。
+跨分钟边界的失败不合并；首次封禁实际约 29–30 分钟，720 轮表示约 12 小时的剩余时长上限，持续访问可持续续封。
+成功接入不清除本轮失败；封禁前已接受的连接后续失败不续封，也不重复触发封禁日志。
+
+判据统一为连接退出时是否已经完成认证或授权，不再区分协议错误、证书错误、EOF/RST 或超时。
+Agent 和集群控制入口以 TLS 握手完成为认证成功；NodeLink TCP 以 attach 凭据校验通过为授权成功。
+Agent 数据入口保留原来的 `wait_read`，等待对端活动或授权取消；退出时仍在未绑定表内就累计一次。
+正常授权取消等待、移交 socket 并删除未绑定记录，因此不会被计数，无需读或 peek 业务字节。
+每个连接最多记一次，服务停机清理、容量拒绝以及认证或授权成功后的业务异常不累计。
+
+accept 直接返回来源端点，无需再查询 socket 地址；成功后只查询一次黑名单，命中即关闭 socket，不进行 TLS
+握手、不生成数据连接编号或创建会话；
+不主动关闭已有连接。TCP 连接建立仍由内核处理。每个入口最多保留 16384 个地址，表满时保留已有封禁，暂停新增
+地址记录，并且每轮最多打印一次容量错误。新封禁打印一条 INF，含入口、IP、失败次数、轮数和最后违规原因，
+续封及拒绝不逐次打印。
+
 ### 9.2 RelayAgent 完整配置字典与示例
 
 RelayAgent 负责声明导出的服务（`services`）或本地监听端口映射（`forwards`）：
@@ -2007,6 +2033,7 @@ Commit、Close 和以上回复均不携带 path、addresses、links、transport�
 | **`protocol/inc/flow_protocol.h`**<br>`protocol/src/flow_protocol.cpp` | `FlowProtocol`<br>`FlowState`<br>`FlowStream`<br>`FlowDatagram` | `cluster_data_io` | 逻辑流状态机、端点接口抽象、逐跳信用发布与背压、帧分发管理。 |
 | **`protocol/inc/lnk_channel.h`**<br>`protocol/src/lnk_channel.cpp` | `LnkChannel`<br>`NodeLink`<br>`PooledBuffer`<br>`Frame` | `cluster_data_io` | 物理相邻节点 Socket（TCP/UDP）长连接维护、PMR 缓冲池管理、帧定界。 |
 | **`protocol/inc/fair_queue.h`** | `FairQueue<Tag, T>` | `cluster_data_io` | 物理 TCP NodeLink 上的流标签交错插入近似公平调度器。 |
+| **`protocol/inc/peer_blacklist.h`**<br>`protocol/src/peer_blacklist.cpp` | `PeerBlacklist` | 各 TCP 监听入口所属执行域 | 独立 IPv4 违规计数、统一分钟老化、有界临时封禁及访问续封，无后台任务。 |
 | **`protocol/inc/tls_channel.h`**<br>`protocol/src/tls_channel.cpp` | `TLSChannel` | 独立 Strand / 执行域 | 安全 mTLS 控制流通信管道，带心跳与消息队列。 |
 | **`protocol/inc/dualindex_map.h`** | `DualIndexMap<A, B, V>` | 单域值类型 | 模板化双向键安全索引哈希表。 |
 | **`route/inc/link_quality.h`**<br>`route/src/link_quality.cpp` | `LinkQuality` | `control_io` | 基于 EMA 与打分截断的单尺度网络链路质量评估器。 |

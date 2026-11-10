@@ -16,14 +16,33 @@
  */
 void set_current_thread_name(const char *name);
 
+/**
+ * @brief Format a TCP or UDP peer endpoint consistently for diagnostics.
+ * @tparam Protocol Endpoint IP transport protocol.
+ * @param endpoint Numeric peer address and port, including endpoints returned directly by accept.
+ * @return Address and port as IPv4:port or [IPv6]:port.
+ */
+template <class Protocol> std::string socket_peer(const asio::ip::basic_endpoint<Protocol> &endpoint)
+{
+    const auto address = endpoint.address().to_string();
+    return (endpoint.address().is_v6() ? "[" + address + "]" : address) + ":" + std::to_string(endpoint.port());
+}
+
+/**
+ * @brief Query a socket's peer and delegate to the common endpoint formatter.
+ * @tparam Socket A socket or TLS stream exposing its lowest transport layer.
+ * @param socket Socket whose current remote endpoint is queried for diagnostics.
+ * @return Formatted peer address and port, or "unknown" if the endpoint cannot be queried.
+ */
 template <class Socket> std::string socket_peer(const Socket &socket)
 {
     asio::error_code error;
     const auto endpoint = socket.lowest_layer().remote_endpoint(error);
     if (error)
+    {
         return "unknown";
-    const auto address = endpoint.address().to_string();
-    return (endpoint.address().is_v6() ? "[" + address + "]" : address) + ":" + std::to_string(endpoint.port());
+    }
+    return socket_peer(endpoint);
 }
 
 class TrafficCounter

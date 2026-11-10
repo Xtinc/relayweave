@@ -5,6 +5,7 @@
 #include "datagram_mgr.h"
 #include "node_session.h"
 #include "nodelink_mgr.h"
+#include "peer_blacklist.h"
 #include "pipeline_mgr.h"
 #include "registry_mgr.h"
 #include "topology.h"
@@ -138,7 +139,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     friend class MultiSession;
 
     asio::awaitable<void> control_accept_loop();
-    asio::awaitable<void> run_control_session(SessionId id, ControlSessionPtr session);
+    asio::awaitable<void> run_control_session(SessionId id, ControlSessionPtr session, asio::ip::address_v4 source);
     void handle_cluster_message(CtrlCommand command, CtrlMessage message);
     /** @brief Stop admission and invalidate business state before notifying the external owner. */
     void cluster_failed(std::string reason);
@@ -167,6 +168,7 @@ class RelayNode : public std::enable_shared_from_this<RelayNode>
     asio::ssl::context cluster_context_{asio::ssl::context::tls};
 
     tcp::acceptor control_acceptor_;
+    PeerBlacklist control_blacklist_{"agent-control"};
     asio::steady_timer control_sessions_done_;
     asio::steady_timer relays_done_;
 
