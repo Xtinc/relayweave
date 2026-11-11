@@ -184,20 +184,14 @@ sudo apt install ./build-package/packages/relayweave-proxy_1.0.0-1_arm64.deb
 
 首次安装执行以下动作：
 
-1. 安装程序、示例配置和 systemd unit；Node/Agent 另创建证书目录；
+1. 安装程序、示例配置和 systemd unit；Node/Agent/Dashboard 另创建证书目录；
 2. 执行 `systemctl daemon-reload`；
 3. enable 对应服务，使其在以后开机时启动；
 4. 不立即启动服务，避免使用尚未修改的示例地址和缺失证书启动。
 
-随后编辑当前角色的 `/etc/relayweave/node.json` 或 `/etc/relayweave/agent.json`，将签发端生成的本机证书压缩包传到目标机器。完整流程是：安装 Deb → 编辑配置 → 安装证书 → 手工启动服务。
+随后编辑当前角色的 `/etc/relayweave/node.json`、`/etc/relayweave/agent.json` 或 `/etc/relayweave/dashboard.json`，将签发端生成的本机证书压缩包传到目标机器。完整流程是：安装 Deb → 编辑配置 → 安装证书 → 手工启动服务。
 
-```console
-# 无参数进入证书安装/更新/卸载菜单，只运行当前主机所需角色。
-sudo relayweave-provision-node
-sudo relayweave-provision-agent
-```
-
-命令方式同样支持首次安装和更新：
+所有 Deb 随附的部署工具均通过命令参数指定操作，不读取交互输入或请求确认。缺少操作参数时显示用法并退出；`--help` 查看参数，`--dry-run` 与具体操作一起使用。首次安装和更新证书使用同一命令：
 
 ```console
 relayweave-provision-node --install-certs ./node-master-1.tar.gz --dry-run
@@ -207,9 +201,13 @@ sudo systemctl start relayweave-node
 relayweave-provision-agent --install-certs ./client.tar.gz --dry-run
 sudo relayweave-provision-agent --install-certs ./client.tar.gz
 sudo systemctl start relayweave-agent
+
+relayweave-provision-dashboard --install-certs ./client.tar.gz --dry-run
+sudo relayweave-provision-dashboard --install-certs ./client.tar.gz
+sudo systemctl start relayweave-dashboard
 ```
 
-更新后需要加载新证书时手工执行 `systemctl restart relayweave-node` 或 `relayweave-agent`。证书流程不调用 systemd，不覆盖配置；`--remove-certs` 备份并卸载当前角色证书，也不改变服务状态。Node 只安装四个证书文件，Agent 只安装三个；具体内容和生成方法见 [证书制作与部署](证书制作与部署.md)。Node/Agent 同机且共用证书目录时，卸载一方保留另一方使用的 Server CA。`--cert-dir DEST` 可指定目标目录，配置中的路径须与之对应。
+更新后需要加载新证书时手工执行 `systemctl restart relayweave-node`、`relayweave-agent` 或 `relayweave-dashboard`。证书流程不调用 systemd，不覆盖配置；`--remove-certs` 备份并卸载当前角色证书，也不改变服务状态。Node 只安装四个证书文件，Agent / Dashboard 只安装三个；具体内容和生成方法见 [证书制作与部署](证书制作与部署.md)。Node/Agent 同机且共用证书目录时，卸载一方保留另一方使用的 Server CA。Dashboard 默认使用独立的 `/etc/relayweave/dashboard-certs/`，自动设置专用用户的读取权限。`--cert-dir DEST` 可指定目标目录，配置中的路径须与之对应。
 
 覆盖或卸载前备份到 `/var/backups/relayweave/<role>-<UTC时间>-<随机后缀>/`；写入失败时尝试恢复。`--dry-run` 验证文件但不修改目标或服务，无需 root。
 
@@ -230,7 +228,7 @@ sudo relayweave-provision-proxy --config /secure/relayweave/config/proxy.json --
 
 这里的 Node/Agent 证书目录来自对应压缩包的解压结果；Agent 若额外提供 `client-ca.pem` 则做签发链验证，但不安装该文件。完整部署接口默认不改变服务状态；只有显式的 `--start` 执行 `systemctl enable --now`，`--restart` 执行 `systemctl try-restart`。`--verify-host` 仅适用于 Node，可重复指定。
 
-Proxy 和 Dashboard 的接口保持原样。Proxy 不需要证书；Dashboard 仍使用 `relayweave-provision-dashboard --cert-dir DIR --config FILE [--dry-run] [--start|--restart]`，输入需包含 Client CA 公钥证书以验证客户端签发链，安装到独立的 `/etc/relayweave/dashboard-certs/`；详见 [Dashboard 部署说明](../dashboard/README.md#独立服务部署)。
+Proxy 不需要证书。Dashboard 复用同一部署脚本和 Agent 的 `client.tar.gz`，支持 `--install-certs` 和 `--remove-certs`；旧的 `--cert-dir DIR --config FILE [--dry-run] [--start|--restart]` 完整部署接口继续保留，输入只需三个运行时文件，额外提供 Client CA 时才验证签发链。详见 [Dashboard 部署说明](../dashboard/README.md#独立服务部署)。
 
 检查状态和日志：
 
@@ -367,6 +365,16 @@ sudo apt purge relayweave-agent relayweave-node relayweave-proxy
 
 `remove` 和 `purge` 都会停止并 disable 对应服务。手工放入 `/etc/relayweave/certs/` 的证书和私钥不会被维护脚本删除；确认不再需要后应由管理员单独归档或安全删除。
 
+Dashboard 单独卸载，更新后的同一部署脚本也能移除旧版安装的证书：
+
+```console
+sudo systemctl disable --now relayweave-dashboard
+sudo relayweave-provision-dashboard --remove-certs
+sudo apt purge relayweave-dashboard
+```
+
+`--remove-certs` 先备份再移除三个运行时文件。`purge` 删除程序和包管理的 `/etc/relayweave/dashboard.json`，保留历史库、证书备份和自定义 systemd override。只有旧脚本时的手工清理、历史库及 Agent 发布配置清理见 [移除旧版 Dashboard](../dashboard/README.md#移除旧版安装的证书和程序)。
+
 ## 9. 常见问题
 
 ### 包名没有架构
@@ -438,7 +446,7 @@ journalctl -u relayweave-proxy.service -n 100 --no-pager
 
 ### 部署工具提示缺少 `client-ca.pem`
 
-Agent 运行时不需要 Client CA，但部署工具需要它验证 `shared-client.pem`。应传入证书生成脚本创建的 `agent/` 部署目录；工具验证后不会把 `client-ca.pem` 安装到 Agent。
+Node 需要 `client-ca.pem`，其四文件 Node 证书包中已包含。Agent / Dashboard 的三文件客户端包不需要额外分发 Client CA；若旧版 Dashboard 工具仍提示缺少此文件，更新 Deb 或使用当前源码中的 `bash scripts/provision_relayweave.sh dashboard --install-certs ./client.tar.gz`。旧的完整部署接口在输入目录额外提供 Client CA 时仍做签发链验证，但不安装它。
 
 ### Node 或 Agent 提示缺少 `CAP_NET_RAW`
 
@@ -458,7 +466,7 @@ systemctl show relayweave-node.service -p AmbientCapabilities -p CapabilityBound
 
 - [`cmake/Packaging.cmake`](../cmake/Packaging.cmake)：CPack 组件、包名、依赖、版本和控制脚本；
 - [`scripts/build_deb.sh`](../scripts/build_deb.sh)：Release 配置、单作业构建和 CPack 调用；
-- [`scripts/provision_relayweave.sh`](../scripts/provision_relayweave.sh)：Node/Agent 证书验证、三类配置的备份部署和显式服务操作；
+- [`scripts/provision_relayweave.sh`](../scripts/provision_relayweave.sh)：Node/Agent/Dashboard 证书包安装与移除、配置的备份部署和显式服务操作；
 - Agent、Node 与 Proxy 各自的 `CMakeLists.txt`：组件安装布局；
 - `packaging/agent`、`packaging/node`、`packaging/proxy`：systemd unit、conffiles 和 maintainer scripts。
 

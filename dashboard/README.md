@@ -292,27 +292,47 @@ cpack --config build/CPackConfig.cmake -G DEB -D CPACK_COMPONENTS_ALL=dashboard
 | 持久化历史库 | `/var/lib/relayweave-dashboard/history.sqlite3` |
 | 部署工具 | `/usr/sbin/relayweave-provision-dashboard` |
 
-准备自己的看板配置文件，例如 `/secure/relayweave/config/dashboard.json`，参考 [dashboard.example.json](dashboard.example.json)。`server.host` / `port` 指向入口 Node；可以连接同机 `127.0.0.1:18443`，也可以连接集群内其他 Node。`certificate.server_name` 必须匹配 Node 服务端证书中的 DNS/IP SAN：连接回环地址而证书只包含公网地址时，填写证书中的实际公网地址或域名，不能保留示例 `203.0.113.10`。
+安装 Deb 后编辑 `/etc/relayweave/dashboard.json`，参考 [dashboard.example.json](dashboard.example.json)。`server.host` / `port` 指向入口 Node；可以连接同机 `127.0.0.1:18443`，也可以连接集群内其他 Node。`certificate.server_name` 必须匹配 Node 服务端证书中的 DNS/IP SAN：连接回环地址而证书只包含公网地址时，填写证书中的实际公网地址或域名，不能保留示例 `203.0.113.10`。
 
 采集连接和 TLS 握手超时均默认为 5 秒，示例省略对应字段。证书用于采集连接的 mTLS 认证，即使连接同机 Node 也需要保留。
 
-Dashboard 复用与 Node、Agent 相同的部署脚本。证书输入目录采用 Agent 的命名：`server-ca.pem`、`client-ca.pem`、`shared-client.pem`、`shared-client.key`。其中 `client-ca.pem` 仅用于部署前验证客户端证书，不会安装。若使用新的三文件 `client.tar.gz`，解压后还需由签发端单独提供 `client-ca.pem` 公钥证书，供此旧部署接口验证；不要复制含 CA 私钥的离线备份包。也可按上述四个文件名准备专用客户端证书。
+Dashboard 与 Node、Agent 共用 `scripts/provision_relayweave.sh`，Deb 将同一脚本安装为 `relayweave-provision-dashboard`，不增加专用脚本或证书格式。直接复用签发脚本生成的 `client.tar.gz`，包内仅含 `server-ca.pem`、`shared-client.pem`、`shared-client.key`，不需要解压或额外提供 `client-ca.pem`。也可安装由同一 Client CA 签发、采用相同三文件格式的专用客户端证书包；Dashboard 只建立控制 mTLS 采集连接，无需与发布网页的 Agent 使用相同私钥。
 
-先校验，再安装配置和证书并启动：
+与其他 Deb 随附的部署工具一致，必须通过参数指定操作，不读取交互输入或请求确认。缺少操作参数时显示用法并退出，`--help` 查看参数。校验并安装证书，然后手动启动服务：
 
 ```bash
-relayweave-provision-dashboard \
-  --cert-dir /secure/relayweave/agent \
-  --config /secure/relayweave/config/dashboard.json --dry-run
-sudo relayweave-provision-dashboard \
-  --cert-dir /secure/relayweave/agent \
-  --config /secure/relayweave/config/dashboard.json --start
+relayweave-provision-dashboard --install-certs ./client.tar.gz --dry-run
+sudo relayweave-provision-dashboard --install-certs ./client.tar.gz
+sudo systemctl start relayweave-dashboard
 curl http://127.0.0.1:5000/api/health
 ```
 
-工具检查客户端证书信任链和私钥匹配，将配置原样安装到 `/etc/relayweave/dashboard.json`，将证书安装到独立的 `/etc/relayweave/dashboard-certs/`。配置中的证书路径须与示例一致，使用 `shared-client.pem` / `shared-client.key`；工具不会重写 JSON。目录为 `root:relayweave-dashboard`、`0750`，私钥和配置为 `0640`，看板用户可以读取，无需修改 Agent 的证书权限。
+安装和更新使用同一条命令；更新后执行 `sudo systemctl restart relayweave-dashboard` 加载。证书操作不修改 JSON，也不启动、停止或重启服务。`--remove-certs` 备份并移除证书，`--cert-dir DEST` 可自定义目标目录，配置中的路径须同步调整。默认安装到独立的 `/etc/relayweave/dashboard-certs/`，目录为 `root:relayweave-dashboard`、`0750`，公钥证书为 `0644`，私钥为 `0640`。同机 Agent 仍使用自己的证书目录和权限。
 
-覆盖前备份到 `/var/backups/relayweave/dashboard-<UTC时间>-<随机后缀>/`。不带启停参数时仅安装文件；`--start` 启用并启动服务，`--restart` 仅重启已运行的服务。源码中可用 `bash scripts/provision_relayweave.sh dashboard ...` 调用相同流程。`--dry-run` 不修改文件或服务，也不检查安装后的权限和采集连接。
+工具检查证书有效期、用途和私钥匹配，客户端签发链由签发端验证，与 Agent 一致。覆盖或移除前备份到 `/var/backups/relayweave/dashboard-<UTC时间>-<随机后缀>/`，失败时尝试恢复。源码中用 `bash scripts/provision_relayweave.sh dashboard ...` 调用相同流程；新参数需使用更新后的脚本或 Deb。`--dry-run` 不修改文件或服务，也不检查安装后的权限和采集连接。
+
+旧的 `--cert-dir SOURCE --config FILE [--dry-run] [--start|--restart]` 完整部署接口仍可用，三文件输入即可；若输入目录额外带有 `client-ca.pem`，则验证签发链但不安装该文件。此接口把配置原样安装到 `/etc/relayweave/dashboard.json`，权限为 `root:relayweave-dashboard`、`0640`，证书安装到上述默认目录；不会重写 JSON 中的路径。仅此完整部署接口支持 `--start` 启用并启动服务、`--restart` 重启已运行的服务。
+
+#### 移除旧版安装的证书和程序
+
+旧版与新版使用相同的默认路径，无需先卸载即可升级。需要卸载时，先停止服务。更新后的脚本可以直接移除旧版安装的证书，再卸载程序和包管理的配置：
+
+```bash
+sudo systemctl disable --now relayweave-dashboard
+sudo bash scripts/provision_relayweave.sh dashboard --remove-certs
+sudo apt purge relayweave-dashboard
+```
+
+只有旧版脚本且不准备更新时，第一步停止服务后，手动删除旧部署工具安装的三个文件，再卸载程序：
+
+```bash
+sudo rm -f -- /etc/relayweave/dashboard-certs/server-ca.pem \
+  /etc/relayweave/dashboard-certs/shared-client.pem \
+  /etc/relayweave/dashboard-certs/shared-client.key
+sudo apt purge relayweave-dashboard
+```
+
+自定义过路径时按实际路径处理。`apt purge` 不删除手动部署的证书、历史库、部署备份或 systemd override。以下均为按需清理：不再需要历史数据时删除 `/var/lib/relayweave-dashboard/`；不再需要自定义服务设置时删除 `/etc/systemd/system/relayweave-dashboard.service.d/` 并执行 `sudo systemctl daemon-reload`；确认无须恢复后清理 `/var/backups/relayweave/dashboard-*` 中的配置和私钥备份。旧工具不会安装 `client-ca.pem`，手动放入过的文件及原始输入目录需自行处理。Agent 中用于发布/消费看板的 `services` / `forwards` 项也需手动移除并重启对应 Agent。
 
 服务始终使用单进程 Waitress，HTTP 监听地址固定为 `127.0.0.1`，默认端口 `5000`。不需要开放服务器的公网 5000 端口。`/api/health` 的 HTTP 200 表示 HTTP 服务可用，JSON 的 `ok` 才表示集群采集正常；入口 Node 暂时离线时，页面继续可用，采集客户端会自动重连。
 

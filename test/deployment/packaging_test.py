@@ -146,7 +146,7 @@ fi
         if previous_version is not None:
             arguments.append(previous_version)
         result = subprocess.run(arguments, env=environment, capture_output=True, text=True,
-                                timeout=5)
+                                stdin=subprocess.DEVNULL, timeout=5)
         return result, self.calls.read_text().splitlines()
 
     def expected_reload_calls(self, role):

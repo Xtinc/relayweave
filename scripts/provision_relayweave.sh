@@ -11,15 +11,10 @@ relayweave-provision-dashboard) role=dashboard ;;
 relayweave-provision-proxy) role=proxy ;;
 esac
 die() { echo "$*" >&2; exit 1; }
-ask() {
-    read -r -p "$1: " REPLY || die "End of input; cancelled."
-    REPLY=${REPLY:-${2:-}}
-}
 usage() {
     local prefix=$program_name
     [[ -n "$role" ]] || prefix+=" <node|agent|proxy|dashboard>"
-    echo "Usage: $prefix [options]" >&2
-    echo "  Node/Agent without arguments: interactively install, update or remove certificates; configuration and services are unchanged." >&2
+    echo "Usage: $prefix <operation> [options]" >&2
     echo "  --install-certs FILE [--cert-dir DEST] [--dry-run]  Install or update a certificate bundle" >&2
     echo "  --remove-certs [--cert-dir DEST] [--dry-run]        Back up and remove certificates" >&2
     echo "  --config FILE [--cert-dir SOURCE] [--verify-host HOST]... [--start|--restart] [--dry-run]" >&2
@@ -29,23 +24,9 @@ usage() {
 if [[ -z "$role" ]]; then
     case "${1:-}" in
     node|agent|proxy|dashboard) role=$1; shift ;;
-    ""|--dry-run)
-        ask "Certificate role: 1) RelayNode  2) RelayAgent [1]" 1
-        case "$REPLY" in
-        1) role=node ;;
-        2) role=agent ;;
-        *) die "Invalid role." ;;
-        esac
-        ;;
     -h|--help) usage 0 ;;
     *) usage ;;
     esac
-fi
-interactive=false
-if [[ "$role" == node || "$role" == agent ]]; then
-    if [[ $# == 0 || ( $# == 1 && "$1" == --dry-run ) ]]; then
-        interactive=true
-    fi
 fi
 cert_dir=
 config_file=
@@ -85,20 +66,11 @@ while [[ $# -gt 0 ]]; do
     *) usage ;;
     esac
 done
-if [[ "$interactive" == true ]]; then
-    ask "1) Install/update certificates  2) Remove certificates [1]" 1
-    case "$REPLY" in
-    1) certificate_action=install; ask "Path to certificate bundle"; archive=$REPLY ;;
-    2) certificate_action=remove ;;
-    *) die "Invalid operation." ;;
-    esac
-    ask "Certificate destination [/etc/relayweave/certs]" /etc/relayweave/certs
-    cert_dir=$REPLY
-fi
 if [[ -n "$certificate_action" ]]; then
-    [[ "$role" == node || "$role" == agent ]] || usage
+    [[ "$role" == node || "$role" == agent || "$role" == dashboard ]] || usage
     [[ -z "$config_file" && "$service_action" == none ]] || usage
 else
+    [[ -n "$config_file" ]] || usage
     [[ -s "$config_file" ]] || die "Configuration file does not exist or is empty: $config_file"
     config_file=$(realpath -- "$config_file")
 fi
@@ -129,7 +101,6 @@ agent|dashboard)
 proxy) [[ -z "$cert_dir" ]] || die "--cert-dir does not apply to RelayWeave Proxy." ;;
 esac
 required_files=("${deployed_files[@]}")
-[[ "$role" != dashboard ]] || required_files+=(client-ca.pem)
 
 work_dir=$(mktemp -d)
 staging_dir=
@@ -189,7 +160,7 @@ node_identity() {
 }
 
 if [[ -n "$certificate_action" ]]; then
-    destination_cert_dir=${cert_dir:-/etc/relayweave/certs}
+    destination_cert_dir=${cert_dir:-$destination_cert_dir}
 fi
 # Keep the spelling until links have been checked; realpath would hide them.
 destination_cert_dir=$(realpath -ms -- "$destination_cert_dir")
@@ -267,9 +238,9 @@ fi
 for file in "${deployed_files[@]}"; do
     destination=$destination_cert_dir/$file
     if [[ "$certificate_action" == remove ]]; then
-        # The Server CA is shared when Node and Agent use the same directory.
+        # Keep the Node/client shared CA when both identities use this directory.
         other_identity=shared-client
-        [[ "$role" != agent ]] || other_identity=server
+        [[ "$role" == node ]] || other_identity=server
         if [[ "$file" == server-ca.pem && ( -e "$destination_cert_dir/$other_identity.pem" ||
               -L "$destination_cert_dir/$other_identity.pem" ) ]]; then
             echo "Keeping server-ca.pem because the other role uses it."
@@ -296,10 +267,6 @@ fi
 if [[ ${#destinations[@]} == 0 ]]; then
     echo "No certificates to remove."
     exit 0
-fi
-if [[ "$interactive" == true ]]; then
-    ask "Proceed? Existing files will be backed up before removal/replacement [y/N]" n
-    [[ "$REPLY" == y || "$REPLY" == Y ]] || exit 0
 fi
 [[ $(id -u) == 0 ]] || die "Provisioning must run as root; use --dry-run to validate without installing."
 if [[ -z "$certificate_action" && ( "$role" == node || "$role" == agent ) ]]; then

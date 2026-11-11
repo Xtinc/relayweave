@@ -50,6 +50,12 @@ class DashboardProvisionTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('do not match', result.stderr)
 
+    def test_three_file_client_directory_needs_no_client_ca(self):
+        (self.work / 'client-ca.pem').unlink()
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Dry run complete', result.stdout)
+
     def test_untrusted_client_certificate_is_rejected(self):
         shutil.copyfile(DATA / 'tls_channel_test_ca.pem', self.work / 'client-ca.pem')
         result = self.run_script()

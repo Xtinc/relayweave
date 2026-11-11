@@ -104,18 +104,19 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
         for name in (*real_tools, 'id', 'systemctl', 'relayweave-node'):
             (self.tools / name).symlink_to(wrapper)
 
-    def provision(self, role='node', *options, answers=None, alias=False):
+    def provision(self, role='node', *options, alias=False):
         executable = PROVISION
         prefix = [role]
         if alias:
             executable = self.tools / f'relayweave-provision-{role}'
-            executable.symlink_to(PROVISION)
+            if not executable.exists():
+                executable.symlink_to(PROVISION)
             prefix = []
         return run('bash', str(executable), *prefix, *options,
-                   input=answers, env=self.environment)
+                   stdin=subprocess.DEVNULL, env=self.environment)
 
     def install(self, role='node', archive=None, *options):
-        archive = archive or self.first / ('client.tar.gz' if role == 'agent'
+        archive = archive or self.first / ('client.tar.gz' if role in ('agent', 'dashboard')
                                           else 'node-master-1.tar.gz')
         return self.provision(role, '--install-certs', str(archive),
                               '--cert-dir', str(self.target), *options)
@@ -254,16 +255,90 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
         self.assertEqual(set(self.snapshot()), AGENT_FILES)
         self.assertEqual(self.snapshot()['shared-client.key'][1], 0o600)
 
-    def test_interactive_alias_and_source_entry(self):
-        answers = f'1\n{self.first / "client.tar.gz"}\n{self.target}\ny\n'
-        self.assert_success(self.provision('agent', answers=answers, alias=True))
+    def test_dashboard_client_bundle_install_update_and_remove(self):
+        self.assert_success(self.install('dashboard'))
         self.assertEqual(set(self.snapshot()), AGENT_FILES)
-        dry_target = self.work / 'dry'
-        result = run('bash', str(PROVISION), '--dry-run',
-                     input=f'1\n1\n{self.first / "node-master-1.tar.gz"}\n{dry_target}\n',
-                     env=self.environment)
+        self.assertEqual(self.snapshot()['shared-client.key'][1], 0o640)
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o750)
+        installs = [cmd for cmd in self.commands() if cmd[0] == 'install']
+        self.assertTrue(all(cmd[cmd.index('-g') + 1] == 'relayweave-dashboard'
+                            for cmd in installs))
+        before = self.snapshot()
+        (self.target / 'unrelated').write_text('keep')
+        self.assert_success(self.install('dashboard'))
+        self.assert_success(self.provision('dashboard', '--remove-certs',
+                                           '--cert-dir', str(self.target)))
+        self.assertEqual(set(self.snapshot()), {'unrelated'})
+        backups = list((self.work / 'backups').iterdir())
+        self.assertEqual(len(backups), 2)
+        for backup in backups:
+            self.assertTrue(backup.name.startswith('dashboard-'))
+            self.assertEqual({p.name: (p.read_bytes(), stat.S_IMODE(p.stat().st_mode))
+                              for p in backup.iterdir()}, before)
+        self.assert_success(self.provision('dashboard', '--remove-certs',
+                                           '--cert-dir', str(self.target)))
+        self.assertNotIn('systemctl', [cmd[0] for cmd in self.commands()])
+
+    def test_dashboard_default_directory_for_source_and_alias(self):
+        for alias in (False, True):
+            result = self.provision('dashboard', '--install-certs',
+                                    str(self.first / 'client.tar.gz'), '--dry-run', alias=alias)
+            self.assert_success(result)
+            self.assertIn('/etc/relayweave/dashboard-certs/shared-client.key', result.stdout)
+            self.assertNotIn('/etc/relayweave/certs/', result.stdout)
+        result = self.provision('dashboard', '--remove-certs', '--dry-run')
         self.assert_success(result)
-        self.assertFalse(dry_target.exists())
+        self.assertFalse({'install', 'mv', 'systemctl'} & {cmd[0] for cmd in self.commands()})
+        self.assertFalse(self.target.exists())
+        self.assertFalse((self.work / 'backups').exists())
+
+    def test_dashboard_failure_restores_previous_certificates(self):
+        self.assert_success(self.install('dashboard'))
+        (self.target / 'server-ca.pem').write_bytes(
+            (self.target / 'server-ca.pem').read_bytes() + b'\n# old bundle\n')
+        before = self.snapshot()
+        self.environment['MOCK_FAIL'] = 'mv'
+        self.assertNotEqual(self.install('dashboard').returncode, 0)
+        self.assertEqual(self.snapshot(), before)
+        self.assertFalse(list(self.target.glob('.provision.*')))
+
+    def test_dashboard_remove_preserves_colocated_node_ca(self):
+        self.assert_success(self.install())
+        self.assert_success(self.install('dashboard'))
+        self.assert_success(self.provision('dashboard', '--remove-certs',
+                                           '--cert-dir', str(self.target)))
+        self.assertEqual(set(self.snapshot()), NODE_FILES)
+
+    def test_alias_certificate_operations_without_stdin(self):
+        for role in ('node', 'agent', 'dashboard'):
+            with self.subTest(role=role):
+                package = 'node-master-1.tar.gz' if role == 'node' else 'client.tar.gz'
+                self.assert_success(self.provision(role, '--install-certs',
+                    str(self.first / package), '--cert-dir', str(self.target), alias=True))
+                self.assertEqual(set(self.snapshot()), NODE_FILES if role == 'node' else AGENT_FILES)
+                self.assert_success(self.provision(role, '--remove-certs',
+                    '--cert-dir', str(self.target), alias=True))
+                self.assertEqual(self.snapshot(), {})
+
+    def test_missing_operations_and_arguments_show_usage_without_side_effects(self):
+        for role in ('node', 'agent', 'dashboard', 'proxy'):
+            for alias in (False, True):
+                for options in ((), ('--dry-run',), ('--install-certs',),
+                                ('--cert-dir', str(self.target))):
+                    with self.subTest(role=role, alias=alias, options=options):
+                        result = self.provision(role, *options, alias=alias)
+                        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                        self.assertIn('Usage:', result.stderr)
+                result = self.provision(role, '--help', alias=alias)
+                self.assert_success(result)
+                self.assertIn('Usage:', result.stderr)
+        for options, expected in (((), 2), (('--dry-run',), 2), (('--help',), 0)):
+            result = run('bash', str(PROVISION), *options, stdin=subprocess.DEVNULL,
+                         env=self.environment)
+            self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+            self.assertIn('Usage:', result.stderr)
+        self.assertFalse(self.commands())
+        self.assertFalse(self.target.exists())
 
     def test_dry_run_has_no_destination_backup_or_service_side_effects(self):
         self.assert_success(self.install('node', None, '--dry-run'))
@@ -329,11 +404,13 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
         for i, contents in enumerate(cases):
             with self.subTest(case=i):
                 archive = self.make_archive(f'bad-{i}.tar.gz', contents)
-                self.assertNotEqual(self.install('agent', archive, '--dry-run').returncode, 0)
+                for role in ('agent', 'dashboard'):
+                    self.assertNotEqual(self.install(role, archive, '--dry-run').returncode, 0)
                 self.assertFalse(self.target.exists())
 
     def test_ca_backup_cannot_be_installed_as_deployment_package(self):
-        self.assertNotEqual(self.install('node', self.first / 'ca-backup.tar.gz').returncode, 0)
+        for role in ('node', 'agent', 'dashboard'):
+            self.assertNotEqual(self.install(role, self.first / 'ca-backup.tar.gz').returncode, 0)
         self.assertFalse(self.target.exists())
 
     def test_corrupt_archive_bad_identity_and_mismatched_key_are_rejected(self):
@@ -349,9 +426,11 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
         files = [(name, (self.agent / name).read_bytes()) for name in sorted(AGENT_FILES)]
         files = [(name, (self.node / 'server.key').read_bytes() if name.endswith('.key') else data)
                  for name, data in files]
-        result = self.install('agent', self.make_archive('bad-key.tar.gz', files), '--dry-run')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('do not match', result.stderr)
+        package = self.make_archive('bad-key.tar.gz', files)
+        for role in ('agent', 'dashboard'):
+            result = self.install(role, package, '--dry-run')
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('do not match', result.stderr)
 
     def test_symlink_destination_is_rejected(self):
         real = self.work / 'real'
@@ -379,9 +458,10 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
                 files = [(name, certificate.read_bytes() if name == 'shared-client.pem'
                           else (self.agent / name).read_bytes()) for name in sorted(AGENT_FILES)]
                 package = self.make_archive(f'bad-{purpose}.tar.gz', files)
-                result = self.install('agent', package, '--dry-run')
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn('expired' if days == '0' else 'purpose', result.stderr)
+                for role in ('agent', 'dashboard'):
+                    result = self.install(role, package, '--dry-run')
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn('expired' if days == '0' else 'purpose', result.stderr)
                 if days == '0':
                     backup = self.make_archive('expired-ca-backup.tar.gz', [
                         (name, certificate.read_bytes() if name == 'shared-client.pem'
@@ -408,7 +488,8 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
     def test_legacy_agent_node_and_proxy_dry_run_interfaces(self):
         config = self.work / 'config.json'
         config.write_text('{}')
-        for role, cert_dir in (('agent', self.agent), ('node', self.node), ('proxy', None)):
+        for role, cert_dir in (('agent', self.agent), ('dashboard', self.agent),
+                               ('node', self.node), ('proxy', None)):
             with self.subTest(role=role):
                 options = ['--config', str(config), '--dry-run']
                 if cert_dir:
