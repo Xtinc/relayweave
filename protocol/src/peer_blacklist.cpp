@@ -30,6 +30,10 @@ void PeerBlacklist::age(Clock::time_point now)
 
 bool PeerBlacklist::blocked(asio::ip::address_v4 address, Clock::time_point now)
 {
+    if (address.is_loopback())
+    {
+        return false;
+    }
     age(now);
     const auto found = entries_.find(address.to_uint());
     if (found == entries_.end() || found->second.rounds == 0)
@@ -45,6 +49,10 @@ bool PeerBlacklist::blocked(asio::ip::address_v4 address, Clock::time_point now)
 
 bool PeerBlacklist::record_failure(asio::ip::address_v4 address, std::string_view reason, Clock::time_point now)
 {
+    if (address.is_loopback())
+    {
+        return false;
+    }
     age(now);
     auto found = entries_.find(address.to_uint());
     if (found == entries_.end())

@@ -217,20 +217,20 @@ asio::awaitable<void> unfinished_connections(Fixture &fixture)
                 socket.set_option(asio::socket_base::linger(true, 0));
             }
             socket.close();
-            co_await fixture.expect(index, reset ? 2 : 1, 0, source);
+            co_await fixture.expect(index, 0, 0, source);
         }
     }
     for (int index = 0; index < 3; ++index)
     {
         auto socket = co_await fixture.connect(index, source);
         co_await drain(socket);
-        co_await fixture.expect(index, 3, 0, source);
+        co_await fixture.expect(index, 0, 0, source);
     }
     auto unknown = co_await fixture.connect(3, source);
     const auto frame = WireMessage::pack(CtrlMessage(CtrlCommand::LinkAttach, njson{{"id", 987654321U}}));
     co_await asio::async_write(unknown, asio::buffer(frame), asio::use_awaitable);
     co_await drain(unknown);
-    co_await fixture.expect(3, 3, 0, source);
+    co_await fixture.expect(3, 0, 0, source);
     for (int index = 0; index < 4; ++index)
     {
         co_await fixture.expect(index, 0, 0);
@@ -279,7 +279,7 @@ asio::awaitable<void> stale_link(Fixture &fixture)
               {"data_version", LnkFrameHeader::version}}));
     co_await asio::async_write(socket, asio::buffer(frame), asio::use_awaitable);
     co_await drain(socket);
-    co_await fixture.expect(3, 4, 0, source);
+    co_await fixture.expect(3, 0, 0, source);
 }
 
 asio::awaitable<void> violate(Fixture &fixture, int index, int attempt)
@@ -358,11 +358,12 @@ asio::awaitable<void> scenario(Fixture &fixture, std::vector<tcp::socket> &pendi
             {
                 co_await violate(fixture, index, attempt);
             }
-            co_await fixture.expect(index, attempt == 5 ? 0 : attempt, attempt == 5 ? 30 : 0);
+            co_await fixture.expect(index, 0, 0);
         }
-        auto rejected = co_await fixture.connect(index);
-        require(co_await drain(rejected) == 0, "Banned source received handshake or greeting bytes");
-        co_await fixture.expect(index, 0, 31);
+        auto admitted = co_await fixture.connect(index);
+        require(co_await drain(admitted) == (index == 1 ? sizeof(RelayAttach::ConnectionId) : 0),
+                "Loopback connection did not follow normal authentication or authorization");
+        co_await fixture.expect(index, 0, 0);
         for (int other = index + 1; other < 4; ++other)
         {
             co_await fixture.expect(other, 0, 0);
@@ -371,8 +372,16 @@ asio::awaitable<void> scenario(Fixture &fixture, std::vector<tcp::socket> &pendi
     const auto ping = WireMessage::pack(CtrlMessage(CtrlCommand::Ping));
     co_await asio::async_write(existing, asio::buffer(ping), asio::cancel_after(1s, asio::use_awaitable));
     require((co_await read_ctrl_frame(existing, std::chrono::steady_clock::now() + 1s)).type() == CtrlCommand::Pong,
-            "Banning an IP interrupted an authenticated connection");
+            "Loopback failures interrupted an authenticated connection");
     existing.lowest_layer().close();
+
+    TLSStream fresh(co_await fixture.connect(0), fixture.client_context);
+    configure_tls_client(fresh, "127.0.0.1");
+    co_await fresh.async_handshake(asio::ssl::stream_base::client, asio::cancel_after(1s, asio::use_awaitable));
+    co_await asio::async_write(fresh, asio::buffer(ping), asio::cancel_after(1s, asio::use_awaitable));
+    require((co_await read_ctrl_frame(fresh, std::chrono::steady_clock::now() + 1s)).type() == CtrlCommand::Pong,
+            "Loopback failures prevented a new authenticated connection");
+    fresh.lowest_layer().close();
 
     const auto other_source = asio::ip::make_address_v4("127.0.0.2");
     pending.push_back(co_await fixture.connect(3, other_source));
@@ -380,7 +389,7 @@ asio::awaitable<void> scenario(Fixture &fixture, std::vector<tcp::socket> &pendi
     pending.push_back(co_await fixture.connect(1, other_source));
     RelayAttach::ConnectionId id{};
     co_await asio::async_read(pending.back(), asio::buffer(id), asio::cancel_after(1s, asio::use_awaitable));
-    require((co_await fixture.state(1, other_source)).rounds == 0, "Another source inherited the ban");
+    require((co_await fixture.state(1, other_source)).rounds == 0, "Loopback source was penalized");
 }
 } // namespace
 
@@ -394,13 +403,12 @@ int main()
         auto result = asio::co_spawn(client, scenario(fixture, pending), asio::use_future);
         client.run();
         result.get();
-        require(fixture.node->stop(), "Node did not drain blacklisted or pending connections");
-        for (const int index : {0, 1, 3})
+        require(fixture.node->stop(), "Node did not drain authenticated or pending connections");
+        for (const int index : {0, 1, 2, 3})
         {
             auto check = [&fixture, index]() -> asio::awaitable<void> {
                 const auto &entries = test_access::PeerBlacklist_entries_(fixture.blacklist(index));
-                require(!entries.contains(asio::ip::make_address_v4("127.0.0.2").to_uint()),
-                        "Shutdown penalized an unauthenticated source");
+                require(entries.empty(), "Listener recorded a loopback failure or shutdown penalty");
                 co_return;
             };
             asio::co_spawn(fixture.executor(index), check(), asio::use_future).get();

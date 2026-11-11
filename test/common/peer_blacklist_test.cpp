@@ -54,6 +54,27 @@ void rounds_and_expiry()
     require(!active.blocked(address, start + 31min), "One rejected connection did not add exactly one round");
 }
 
+void loopback_exemption()
+{
+    const auto start = Clock::time_point{};
+    PeerBlacklist list("test", start);
+    for (const char *text : {"127.0.0.0", "127.0.0.1", "127.0.0.2", "127.1.2.3", "127.255.255.255"})
+    {
+        const auto ip = asio::ip::make_address_v4(text);
+        for (int i = 0; i < 20; ++i)
+        {
+            require(!list.record_failure(ip, "loopback failure", start), "Loopback failure triggered a ban");
+            require(!list.blocked(ip, start), "Loopback address was blocked");
+        }
+    }
+    for (const char *text : {"126.255.255.255", "128.0.0.0", "10.0.0.1", "192.168.1.1"})
+    {
+        const auto ip = asio::ip::make_address_v4(text);
+        ban(list, ip, start);
+        require(list.blocked(ip, start), "Non-loopback address was exempted");
+    }
+}
+
 void renewal_and_cap()
 {
     const auto start = Clock::time_point{};
@@ -84,6 +105,11 @@ void capacity_and_isolation()
     const auto start = Clock::time_point{};
     PeerBlacklist first("first", start);
     PeerBlacklist second("second", start);
+    for (std::uint32_t i = 0; i < PeerBlacklist::capacity; ++i)
+    {
+        require(!first.record_failure(asio::ip::address_v4(0x7f000000U + i), "loopback failure", start),
+                "Loopback source was tracked");
+    }
     ban(first, address, start);
     require(!second.blocked(address, start), "Listeners shared a ban");
     for (std::uint32_t i = 1; i < PeerBlacklist::capacity; ++i)
@@ -107,6 +133,7 @@ int main()
     try
     {
         rounds_and_expiry();
+        loopback_exemption();
         renewal_and_cap();
         capacity_and_isolation();
         std::cout << "peer_blacklist_test passed\n";
