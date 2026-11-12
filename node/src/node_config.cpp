@@ -55,7 +55,9 @@ ClusterConfig parse_cluster_config(const njson &root)
     using namespace config;
     ClusterConfig result;
     const auto &cluster = required_object(root, "cluster", "root");
-    reject_unknown_fields(cluster, {"role", "node_id", "address", "control_port", "tcp_port", "udp_port"}, "cluster");
+    reject_unknown_fields(
+        cluster, {"role", "node_id", "address", "control_port", "tcp_port", "udp_port", "label", "label_address"},
+        "cluster");
     const auto role = required_string(cluster, "role", "cluster");
     if (role != "master" && role != "slave")
     {
@@ -75,6 +77,10 @@ ClusterConfig parse_cluster_config(const njson &root)
     result.control_port = required_port(cluster, "control_port", "cluster");
     result.tcp_port = required_port(cluster, "tcp_port", "cluster");
     result.udp_port = required_port(cluster, "udp_port", "cluster");
+    result.label = optional_string(cluster, "label", "default");
+    if (const auto field = cluster.find("label_address"); field != cluster.end() && !field->is_null())
+        result.label_address = required_string(cluster, "label_address", "cluster");
+    NodeAddress{result.node_id, result.label, result.label_address}.validate("cluster");
 
     const auto control = required_port(required_object(root, "control", "root"), "port", "control");
     const auto tcp = required_port(required_object(root, "tcp", "root"), "port", "tcp");

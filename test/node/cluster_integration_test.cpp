@@ -135,8 +135,24 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         require(master_topology.epoch() != 0 && master_topology.members().size() == 1 &&
                     master_topology.members().contains("master"),
                 "Single-node master did not apply its own membership");
-        a->send(CtrlMessage{"cluster.join", njson{{"node_id", "a"}}});
-        b->send(CtrlMessage{"cluster.join", njson{{"node_id", "b"}}});
+        auto legacy = co_await connect(context, port);
+        legacy->send(CtrlMessage{CtrlCommand::ClusterJoin,
+                                 njson{{"node_id", "legacy"}, {"address", "127.0.0.1"}}});
+        bool legacy_rejected = false;
+        try
+        {
+            legacy_rejected = (co_await legacy->async_receive(1s)).type() == CtrlCommand::ClusterError;
+        }
+        catch (const asio::system_error &error)
+        {
+            legacy_rejected = error.code() == asio::experimental::error::channel_closed ||
+                              error.code() == asio::experimental::error::channel_cancelled;
+        }
+        require(legacy_rejected && !master_topology.members().contains("legacy"),
+                "Legacy peer without label metadata joined the cluster");
+        co_await legacy->async_disconnect();
+        a->send(CtrlMessage{"cluster.join", test_node_member("a")});
+        b->send(CtrlMessage{"cluster.join", test_node_member("b")});
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("cluster.joined") == 1; });
         co_await receive_until(b, b_inbox, [&] { return b_inbox.count("cluster.joined") == 1; });
         require(master_topology.members().size() == 3 && master_topology.members().contains("a") &&
@@ -207,7 +223,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         const auto legal_size = cluster_max_message_length - 256;
         const std::string longest_id(cluster_max_node_id_length, 'n');
         auto large = co_await connect(context, port);
-        large->send(CtrlMessage{CtrlCommand::ClusterJoin, njson{{"node_id", longest_id}}});
+        large->send(CtrlMessage{CtrlCommand::ClusterJoin, test_node_member(longest_id)});
         Inbox large_inbox;
         co_await receive_until(large, large_inbox, [&] { return large_inbox.count("cluster.joined") == 1; });
         auto receive_budget = [&](const std::shared_ptr<TLSChannel> &peer, Inbox &inbox) -> asio::awaitable<void> {
@@ -243,13 +259,13 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         co_await large->async_disconnect();
 
         auto duplicate = co_await connect(context, port);
-        duplicate->send(CtrlMessage{"cluster.join", njson{{"node_id", "a"}}});
+        duplicate->send(CtrlMessage{"cluster.join", test_node_member("a")});
         require((co_await duplicate->async_receive()).type() == CtrlCommand::ClusterError,
                 "Duplicate node joined the room");
         co_await duplicate->async_disconnect();
 
         auto reserved = co_await connect(context, port);
-        reserved->send(CtrlMessage{"cluster.join", njson{{"node_id", "all"}}});
+        reserved->send(CtrlMessage{"cluster.join", test_node_member("all")});
         require((co_await reserved->async_receive()).command == "cluster.error",
                 "Reserved all node_id joined the room");
         // A rejected peer may send another frame instead of closing voluntarily.
@@ -259,7 +275,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
 
         auto oversized_id = co_await connect(context, port);
         oversized_id->send(CtrlMessage{CtrlCommand::ClusterJoin,
-                                      njson{{"node_id", std::string(cluster_max_node_id_length + 1, 'n')}}});
+                                      test_node_member(std::string(cluster_max_node_id_length + 1, 'n'))});
         require((co_await oversized_id->async_receive()).type() == CtrlCommand::ClusterError,
                 "Oversized remote identity joined the cluster");
         co_await oversized_id->async_disconnect();
@@ -272,7 +288,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
             try
             {
                 peer = co_await connect(*invalid_context, port);
-                peer->send(CtrlMessage{"cluster.join", njson{{"node_id", "unauthorized"}}});
+                peer->send(CtrlMessage{"cluster.join", test_node_member("unauthorized")});
                 co_await peer->async_receive();
             }
             catch (const std::exception &)
@@ -296,7 +312,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         require(wrong_host, "Master hostname verification bypassed");
 
         auto raw = co_await connect(context, port);
-        raw->send(CtrlMessage{"cluster.join", njson{{"node_id", "raw"}}});
+        raw->send(CtrlMessage{"cluster.join", test_node_member("raw")});
         require((co_await raw->async_receive()).command == "cluster.joined", "Raw peer did not join");
         raw->send(CtrlMessage{"identity", njson{{"target", "all"}, {"source", "a"}}});
         co_await receive_until(a, a_inbox, [&] { return a_inbox.count("identity") == 1; });
@@ -683,7 +699,7 @@ void verify_relay_node(asio::ssl::context &context, asio::ssl::context &client_c
     // A real cluster peer observes wire replies; RelayNode needs no generic inbox.
     auto scenario = [&](std::uint64_t previous_epoch) -> asio::awaitable<std::uint64_t> {
         auto peer = co_await connect(context, port);
-        peer->send(CtrlMessage{"cluster.join", njson{{"node_id", "observer"}}});
+        peer->send(CtrlMessage{"cluster.join", test_node_member("observer")});
         std::uint64_t epoch = 0;
         bool members_ready = false;
         while (!members_ready)

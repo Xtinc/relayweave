@@ -5,6 +5,53 @@
 #include <random>
 #include <vector>
 
+void NodeAddress::validate(std::string_view location) const
+{
+    const auto prefix = std::string(location);
+    if (label.empty())
+    {
+        throw std::invalid_argument(prefix + ".label must not be empty");
+    }
+    if (label == "default")
+    {
+        if (!label_address.empty())
+            throw std::invalid_argument(prefix + ".label_address must not be set for the default label");
+        return;
+    }
+    if (label_address.empty())
+        throw std::invalid_argument(prefix + ".label_address is required for a non-default label");
+    asio::error_code error;
+    const auto ip = asio::ip::make_address_v4(label_address, error);
+    if (error || ip.is_unspecified() || ip.is_multicast() || ip.to_uint() == 0xffffffffU)
+        throw std::invalid_argument(prefix + ".label_address must be a unicast IPv4 address");
+}
+
+NodeAddress NodeAddress::from_params(const njson &params, std::string_view location)
+{
+    NodeAddress result;
+    result.address = config::required_string(params, "address", location);
+    result.label = config::required_string(params, "label", location);
+    const auto field = params.find("label_address");
+    if (field == params.end())
+        throw std::invalid_argument(std::string(location) + ".label_address is required (Node versions must match)");
+    if (!field->is_null())
+        result.label_address = config::required_string(params, "label_address", location);
+    result.validate(location);
+    return result;
+}
+
+njson NodeAddress::to_params() const
+{
+    return {{"address", address},
+            {"label", label},
+            {"label_address", label_address.empty() ? njson(nullptr) : njson(label_address)}};
+}
+
+const std::string &NodeAddress::address_for(const NodeAddress &peer) const noexcept
+{
+    return label != "default" && label == peer.label ? label_address : address;
+}
+
 /**
  * @brief Define a master-room participant on control_io.
  * @details The room retains participants until their connection tasks leave; delivery only
@@ -18,7 +65,7 @@ class ClusterParticipant
     /** @brief Borrow the joined node identity, or an empty identity before join completes. */
     virtual std::string_view node_id() const noexcept = 0;
     /** @brief Borrow the participant's advertised Node address. */
-    virtual std::string_view address() const noexcept = 0;
+    virtual const NodeAddress &address() const noexcept = 0;
     /** @brief Queue a control message for this participant on control_io. */
     virtual void deliver(CtrlMessage message) = 0;
     /** @brief Request participant shutdown on control_io. */
@@ -150,7 +197,9 @@ class ClusterRoom
         {
             if (!participant->node_id().empty())
             {
-                members.push_back(njson{{"node_id", participant->node_id()}, {"address", participant->address()}});
+                auto member = participant->address().to_params();
+                member["node_id"] = participant->node_id();
+                members.push_back(std::move(member));
             }
         }
         std::sort(members.begin(), members.end(), [](const njson &left, const njson &right) {
@@ -207,7 +256,7 @@ class ClusterSession : public ClusterParticipant
     }
 
     /** @copydoc ClusterParticipant::address */
-    std::string_view address() const noexcept override
+    const NodeAddress &address() const noexcept override
     {
         return address_;
     }
@@ -247,17 +296,14 @@ class ClusterSession : public ClusterParticipant
             }
             else
             {
-                node_id_ = std::move(node_id);
                 const auto &params = config::message_params(join);
-                address_ = config::optional_string(params, "address", node_id_);
-                if (address_.empty())
-                {
-                    address_ = node_id_;
-                }
+                address_ = NodeAddress::from_params(params, "cluster.join");
+                node_id_ = std::move(node_id);
                 deliver(CtrlMessage{CtrlCommand::ClusterJoined});
                 room_.ready();
                 PROXY_INFO_PRINT("Cluster [+] node=%s peer=%.*s address=%s", node_id_.c_str(),
-                                 static_cast<int>(channel_->peer().size()), channel_->peer().data(), address_.c_str());
+                                 static_cast<int>(channel_->peer().size()), channel_->peer().data(),
+                                 address_.address.c_str());
                 while (!stopping_)
                 {
                     room_.deliver(node_id_, co_await channel_->async_receive());
@@ -285,7 +331,8 @@ class ClusterSession : public ClusterParticipant
         if (!node_id_.empty())
         {
             PROXY_INFO_PRINT("Cluster [x] node=%s peer=%.*s address=%s", node_id_.c_str(),
-                             static_cast<int>(channel_->peer().size()), channel_->peer().data(), address_.c_str());
+                             static_cast<int>(channel_->peer().size()), channel_->peer().data(),
+                             address_.address.c_str());
         }
     }
 
@@ -293,7 +340,7 @@ class ClusterSession : public ClusterParticipant
     ClusterRoom &room_;
     std::chrono::steady_clock::duration join_timeout_;
     std::string node_id_;
-    std::string address_;
+    NodeAddress address_;
     bool stopping_ = false;
 };
 
@@ -302,13 +349,13 @@ class ClusterMgr::LocalParticipant : public ClusterParticipant
 {
   public:
     /** @brief Retain master identity and borrow the manager that receives local messages. */
-    LocalParticipant(std::string node_id, std::string address, ClusterMgr &manager)
+    LocalParticipant(std::string node_id, NodeAddress address, ClusterMgr &manager)
         : node_id_(std::move(node_id)), address_(std::move(address)), manager_(manager)
     {
     }
 
     /** @copydoc ClusterParticipant::address */
-    std::string_view address() const noexcept override
+    const NodeAddress &address() const noexcept override
     {
         return address_;
     }
@@ -332,7 +379,7 @@ class ClusterMgr::LocalParticipant : public ClusterParticipant
 
   private:
     std::string node_id_;
-    std::string address_;
+    NodeAddress address_;
     ClusterMgr &manager_;
 };
 
@@ -361,6 +408,7 @@ ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::
     {
         config_.advertise_address = config_.address;
     }
+    NodeAddress{config_.advertise_address, config_.label, config_.label_address}.validate("cluster");
 
     if (config_.role == ClusterConfig::Role::Master)
     {
@@ -464,7 +512,8 @@ asio::awaitable<bool> ClusterMgr::async_stop()
 asio::awaitable<void> ClusterMgr::accept_loop()
 {
     ClusterRoom room(executor_, config_.node_id, epoch_);
-    room.join(std::make_unique<LocalParticipant>(config_.node_id, config_.advertise_address, *this));
+    room.join(std::make_unique<LocalParticipant>(
+        config_.node_id, NodeAddress{config_.advertise_address, config_.label, config_.label_address}, *this));
 
     try
     {
@@ -508,8 +557,9 @@ asio::awaitable<void> ClusterMgr::slave_loop()
                                                        channel_config_);
                 master_channel_ = channel;
                 co_await channel->start(config_.address);
-                channel->send(CtrlMessage{CtrlCommand::ClusterJoin,
-                                          njson{{"node_id", config_.node_id}, {"address", config_.advertise_address}}});
+                auto member = NodeAddress{config_.advertise_address, config_.label, config_.label_address}.to_params();
+                member["node_id"] = config_.node_id;
+                channel->send(CtrlMessage{CtrlCommand::ClusterJoin, std::move(member)});
                 auto joined = co_await channel->async_receive(channel_config_.handshake_timeout);
                 if (joined.type() == CtrlCommand::ClusterJoined)
                 {

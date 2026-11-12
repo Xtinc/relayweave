@@ -177,8 +177,10 @@ asio::awaitable<void> LnkChannel::prepare_udp(std::shared_ptr<NodeLink> link)
     }
     try
     {
+        // Links share a TCP resolver; constrain its address family to the UDP listener.
+        const auto family = udp_socket_.local_endpoint().address().is_v4() ? tcp::v4() : tcp::v6();
         const auto endpoints = co_await link->resolver.async_resolve(
-            link->spec.peer_address, std::to_string(link->spec.udp_port),
+            family, link->spec.peer_address, std::to_string(link->spec.udp_port),
             asio::cancel_after(link->deadline - Clock::now(), asio::use_awaitable));
         if (link->phase == LinkPhase::Closed)
         {
@@ -190,11 +192,6 @@ asio::awaitable<void> LnkChannel::prepare_udp(std::shared_ptr<NodeLink> link)
             co_return;
         }
         link->endpoint = {endpoints.begin()->endpoint().address(), link->spec.udp_port};
-        if (link->endpoint.protocol() != udp_socket_.local_endpoint().protocol())
-        {
-            fail(*link, "UDP peer address family differs from listener");
-            co_return;
-        }
         link->phase = LinkPhase::Prepared;
         notify(*link, CtrlCommand::LinkPrepared);
     }

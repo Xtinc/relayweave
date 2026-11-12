@@ -19,6 +19,8 @@ relayweave_test(cluster_integration cluster_integration_test.cpp TIMEOUT 90
     LIBRARIES relayweave_node_lib LABELS node cluster integration)
 relayweave_test(node_links node_links_test.cpp TIMEOUT 90
     LIBRARIES relayweave_node_lib LABELS node cluster integration)
+relayweave_test(node_label_links node_label_links_test.cpp TIMEOUT 45
+    LIBRARIES relayweave_node_lib LABELS node cluster integration)
 relayweave_test(node_flows node_flows_test.cpp TIMEOUT 100
     LIBRARIES relayweave_node_lib LABELS node cluster integration)
 relayweave_test(udp_session_routing udp_session_routing_test.cpp TIMEOUT 15

@@ -135,10 +135,11 @@ class NodeLinkMgr
         std::string right;
         RelayProtocol transport = RelayProtocol::Tcp;
         std::string token;
-        std::string left_address;
-        std::string right_address;
         std::uint16_t tcp_port = 0;
         std::uint16_t udp_port = 0;
+        // Freeze membership for selection and invalidation; selected addresses are derived from it.
+        NodeAddress left_member;
+        NodeAddress right_member;
     };
     /** @brief Retain validated path parameters without a JSON runtime mirror. */
     struct FlowParams

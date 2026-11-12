@@ -109,6 +109,29 @@ flowchart TB
 | 18447 | TCP/mTLS | `cluster.control_port` | Master 监听集群控制；Slave 使用 `cluster.address` 和此端口连接 Master。 |
 | 18448 | 普通 TCP/UDP | `cluster.tcp_port` / `cluster.udp_port` | NodeLink；TCP 先交换 CBOR `link.attach` / `link.attached`，后续使用二进制帧；UDP 还带 8 字节 link ID。 |
 
+NodeLink 支持按对端标签选择地址。现有 `cluster` 可增加 `label` 和 `label_address`：
+
+```json
+"label": "vpc-a",
+"label_address": "10.20.0.12"
+```
+
+每个 Node 只有一个标签。两端标签相同且不是 `default` 时，各自向对端提供自己的
+`label_address`；不同标签或默认标签使用各自的 `control.advertise_address`。未配置标签的
+现有配置继续使用公网；显式默认标签写作 `"label": "default", "label_address": null`。
+非默认标签必须填写单播 IPv4 地址；标签只是运维声明的互通关系，不是鉴权凭证。
+
+Master 通过已有 `cluster.join` 和 `topology.members` 收集、分发公网地址与标签元数据，
+建链时在 `link.prepare` 中指定按节点对选择的两端地址，两端重新校验后连接。
+节点探测使用相同的选路规则；Agent 接入、服务发现和拓扑节点地址始终使用公网地址。
+NodeLink 仍按节点对和协议复用，每次新建链路生成独立 ID/token。标签或地址变化时关闭
+涉及的旧链路及其 Flow，再按新信息建链；不会把内网失败自动回退成公网，也不会迁移存量 Flow。
+
+监听配置保持不变：TCP 使用 `tcp.address` 与 `cluster.tcp_port`，UDP 使用 `udp.address`
+与 `cluster.udp_port`。混合部署应使监听覆盖两类入口，例如监听 `0.0.0.0`，并确保实际
+路由和 NAT 后的 UDP 源地址符合公布地址。标签信息随集群成员协议传输，Node 应统一升级，
+新版本拒绝缺少标签元数据的旧集群消息。控制通道和 NodeLink 端口配置不变。
+
 ---
 
 ### 1.5 核心设计原则与架构约束

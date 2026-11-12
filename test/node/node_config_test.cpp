@@ -95,6 +95,34 @@ void verify_server_config()
         }
         require(rejected, "Invalid server configuration was accepted: " + std::string(description));
     };
+    require(modern.cluster.label == "default" && modern.cluster.label_address.empty(),
+            "Existing configuration did not retain default public routing");
+    {
+        auto candidate = baseline;
+        candidate["cluster"]["label"] = "default";
+        candidate["cluster"]["label_address"] = nullptr;
+        write_candidate(candidate);
+        require(load_node_config(temporary).cluster.label == "default", "Explicit default label failed");
+        candidate["cluster"]["label"] = "vpc-a";
+        require_rejected(candidate, "missing non-default label IP", "label_address");
+        candidate["cluster"]["label_address"] = "10.20.0.12";
+        write_candidate(candidate);
+        const auto labeled = load_node_config(temporary);
+        require(labeled.cluster.label == "vpc-a" && labeled.cluster.label_address == "10.20.0.12",
+                "Label routing configuration was not parsed");
+        for (const auto *ip : {"", "0.0.0.0", "::", "224.0.0.1", "255.255.255.255", "not-an-ip"})
+        {
+            candidate["cluster"]["label_address"] = ip;
+            require_rejected(candidate, "invalid label IP", "label_address");
+        }
+        candidate["cluster"]["label_address"] = "10.20.0.12";
+        candidate["cluster"]["label"] = "";
+        require_rejected(candidate, "empty label", "label");
+        candidate["cluster"]["label"] = "default";
+        require_rejected(candidate, "default label with private address", "label_address");
+        candidate["cluster"].erase("label");
+        require_rejected(candidate, "private address without label", "label_address");
+    }
     for (const auto *direction : {"rx", "tx"})
     {
         const auto rate = std::string(direction) + "_bytes_per_second";

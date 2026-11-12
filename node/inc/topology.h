@@ -70,11 +70,11 @@ class Topology
      */
     std::string_view master_id() const noexcept;
     /**
-     * @brief Borrow the current node-to-advertised-address membership map.
-     * @return Read-only reference to the current Node ID to advertised-address map; do not retain across
+     * @brief Borrow public addresses and per-peer NodeLink label metadata.
+     * @return Read-only reference to the current Node ID to member map; do not retain across
      * asynchronous waits.
      */
-    const std::map<std::string, std::string> &members() const noexcept
+    const std::map<std::string, NodeAddress> &members() const noexcept
     {
         return members_;
     }
@@ -157,7 +157,7 @@ class Topology
     AsyncEvent finished_;
     std::exception_ptr drain_error_;
     ProbeSet probes_;
-    std::map<std::string, std::string> members_;
+    std::map<std::string, NodeAddress> members_;
     std::map<std::string, Report> reports_;
     Snapshot snapshot_;
     std::string master_id_;

@@ -57,11 +57,11 @@ static void verify_flow_transactions()
     auto &cluster = test_node::cluster(node);
     auto &topology = *test_access::RelayNode_topology_(*node);
     std::vector<std::string> names{config.cluster.node_id};
-    njson members = njson::array({{{"node_id", names.front()}, {"address", "127.0.0.1"}}});
+    njson members = njson::array({test_node_member(names.front(), "127.0.0.1")});
     for (int i = 1; i < 8; ++i)
     {
         names.push_back("node-" + std::to_string(i));
-        members.push_back({{"node_id", names.back()}, {"address", "127.0.0." + std::to_string(i + 1)}});
+        members.push_back(test_node_member(names.back(), "127.0.0." + std::to_string(i + 1)));
     }
     topology.update_members({{"source", names.front()}, {"master", names.front()},
                              {"epoch", 0x2122232425262728ULL}, {"version", 1U}, {"members", members}});
@@ -501,11 +501,11 @@ static void verify_path_progression()
     auto &cluster = test_node::cluster(node);
     auto &topology = *test_access::RelayNode_topology_(*node);
     std::vector<std::string> names{config.cluster.node_id};
-    njson members = njson::array({{{"node_id", names.front()}, {"address", "127.0.0.1"}}});
+    njson members = njson::array({test_node_member(names.front(), "127.0.0.1")});
     for (unsigned i = 1; i < 8; ++i)
     {
         names.push_back("path-node-" + std::to_string(i));
-        members.push_back({{"node_id", names.back()}, {"address", "127.0.0." + std::to_string(i + 1)}});
+        members.push_back(test_node_member(names.back(), "127.0.0." + std::to_string(i + 1)));
     }
     topology.update_members({{"source", names.front()}, {"master", names.front()},
                              {"epoch", 23U}, {"version", 1U}, {"members", members}});

@@ -9,7 +9,9 @@
     "address": "0.0.0.0",
     "control_port": 18447,
     "tcp_port": 18448,
-    "udp_port": 18448
+    "udp_port": 18448,
+    "label": "default",
+    "label_address": null
   },
   "control": {
     "address": "0.0.0.0",

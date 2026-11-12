@@ -237,11 +237,11 @@ void Topology::update_members(const njson &params)
     {
         throw std::invalid_argument("topology.members.members must be a non-empty array");
     }
-    std::map<std::string, std::string> members;
+    std::map<std::string, NodeAddress> members;
     for (const auto &entry : *raw_members)
     {
         const auto id = config::required_string(entry, "node_id", "topology.members");
-        auto address = config::required_string(entry, "address", "topology.members");
+        auto address = NodeAddress::from_params(entry, "topology.members");
         if (!members.emplace(id, std::move(address)).second)
         {
             throw std::invalid_argument("topology.members contains a duplicate node_id");
@@ -258,8 +258,10 @@ void Topology::update_members(const njson &params)
     members_ = std::move(members);
     reports_.clear();
     report_sequence_ = 0;
-    auto targets = members_;
-    targets.erase(node_id_);
+    ProbeSet::Targets targets;
+    for (const auto &[id, member] : members_)
+        if (id != node_id_)
+            targets.emplace(id, member.address_for(members_.at(node_id_)));
     probes_.set_targets(std::move(targets));
     if (master_)
     {
@@ -417,7 +419,7 @@ void Topology::rebuild_snapshot()
 
     for (const auto &[id, address] : members_)
     {
-        njson node{{"node_id", id}, {"address", address}};
+        njson node{{"node_id", id}, {"address", address.address}};
         const auto report = reports_.find(id);
         if (report == reports_.end() || now - report->second.received_at >= report_expiry)
         {

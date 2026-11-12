@@ -4,6 +4,13 @@
 #include "relay_node.h"
 #include <thread>
 
+inline njson test_node_member(std::string id, std::string address = {})
+{
+    auto params = NodeAddress{address.empty() ? id : std::move(address)}.to_params();
+    params["node_id"] = std::move(id);
+    return params;
+}
+
 // Explicit fourth execution domain in fixtures, including fixtures that only use controls.
 struct TestClusterDataIO
 {
