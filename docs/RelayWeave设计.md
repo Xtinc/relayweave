@@ -109,23 +109,36 @@ flowchart TB
 | 18447 | TCP/mTLS | `cluster.control_port` | Master 监听集群控制；Slave 使用 `cluster.address` 和此端口连接 Master。 |
 | 18448 | 普通 TCP/UDP | `cluster.tcp_port` / `cluster.udp_port` | NodeLink；TCP 先交换 CBOR `link.attach` / `link.attached`，后续使用二进制帧；UDP 还带 8 字节 link ID。 |
 
-NodeLink 支持按对端标签选择地址。现有 `cluster` 可增加 `label` 和 `label_address`：
+Node 与 Agent 使用公共 `protocol/NodeAddress` 选择网络地址。Node 根级配置 `network_ports`，
+内部采用 `std::array<Entry, 4>` 加有效数量，保存 1～4 个唯一且非空的标签与地址，必须包含 `default`：
 
 ```json
-"label": "vpc-a",
-"label_address": "10.20.0.12"
+"network_ports": [
+  {"label": "default", "address": "203.0.113.10"},
+  {"label": "vpc-a", "address": "192.168.1.10"},
+  {"label": "lo:host-a", "address": "127.0.0.1"}
+]
 ```
 
-每个 Node 只有一个标签。两端标签相同且不是 `default` 时，各自向对端提供自己的
-`label_address`；不同标签或默认标签使用各自的 `control.advertise_address`。未配置标签的
-现有配置继续使用公网；显式默认标签写作 `"label": "default", "label_address": null`。
-非默认标签必须填写单播 IPv4 地址；标签只是运维声明的互通关系，不是鉴权凭证。
+全部条目从配置读取，不内置 `lo`。`default` 支持主机名或有效单播 IPv4，其余地址必须为有效单播 IPv4。
+地址有效性在构造或解码时校验，序列化和查询不重复校验；主机名交由现有 resolver 解析，不另行实现 DNS 名称规则。
+Agent 只缓存按自身标签选定的地址；Dashboard 只校验展示所需的报文结构，不重复 Node 的地址校验。
+不同标签可以对应同一地址；回环标签由部署者限定到具体机器，不同机器不能共享回环标签。
+条目按标签排序，配置顺序不影响集合身份。输入标签精确匹配，未命中时使用 `default`。
 
-Master 通过已有 `cluster.join` 和 `topology.members` 收集、分发公网地址与标签元数据，
-建链时在 `link.prepare` 中指定按节点对选择的两端地址，两端重新校验后连接。
-节点探测使用相同的选路规则；Agent 接入、服务发现和拓扑节点地址始终使用公网地址。
-NodeLink 仍按节点对和协议复用，每次新建链路生成独立 ID/token。标签或地址变化时关闭
-涉及的旧链路及其 Flow，再按新信息建链；不会把内网失败自动回退成公网，也不会迁移存量 Flow。
+NodeLink 与 Node 间探测从双方共同的非 `default` 标签中按字典序选取第一个，没有共同标签时使用 `default`。
+建链两端根据成员元数据复核选择结果。Agent 根级配置单个 `network_label`，缺省为 `default`，
+用同一标签选择每个 Node 的探测和 TCP/TLS/UDP 接入地址，服务方与访问方分别选择。
+内网连接失败不自动回退公网，也不迁移存量会话。
+UDP 沿用单一监听 socket 和系统的回包源地址选择；多地址部署需保证回包源地址与 Agent 选择的目的地址一致。
+同网段多个本地地址使用通配监听时，需相应配置监听地址或系统路由，标签组件不改变 UDP 源地址选择。
+
+成员宣告、拓扑、服务定位、节点识别与业务接入通知统一携带 `network_ports` 数组，
+地址或标签变化时关闭涉及的旧 NodeLink 及 Flow；Flow Prepare 的成员快照保存完整地址集合。
+Agent 在所选地址变化时更新探测目标并清除路径缓存；已知节点以最新拓扑地址为准，
+服务发现和主控地址仅补充拓扑尚未包含的节点。现有直连会话继续运行，新连接使用新的宣告。
+首次 Agent 控制连接仍由 `server.host:port` 引导；Slave 连接 Master 仍使用 `cluster.address:control_port`。
+旧 `control.advertise_address`、`cluster.label` / `label_address` 及单地址宣告均明确拒绝，Node/Agent/Dashboard 必须配套升级。
 
 监听配置保持不变：TCP 使用 `tcp.address` 与 `cluster.tcp_port`，UDP 使用 `udp.address`
 与 `cluster.udp_port`。混合部署应使监听覆盖两类入口，例如监听 `0.0.0.0`，并确保实际
@@ -426,13 +439,13 @@ RelayWeave 采用分布式的服务发现架构，服务注册在节点本地集
 
 #### 3.2.2 节点地址发布与 Agent 服务发现全流程
 
-1. **公网地址发布 (`advertise_address`)**：
-   - 每个 RelayNode 在配置文件中指定公网可达的 `advertise_address`。
-   - 节点在向集群和 Agent 宣告存在时，统一发布此地址，屏蔽内网 NAT 私有 IP 的差异。
+1. **多网络地址发布 (`network_ports`)**：
+   - 每个 RelayNode 配置最多四组标签与地址，并向集群和 Agent 宣告完整集合。
+   - NodeLink 按双方共同标签选址，Agent 按自身 `network_label` 选址；未匹配时使用 `default`。
 2. **服务发现流程 (`ServiceLookup`)**：
    - Consumer Agent 连接就绪后为配置的 forwards 查询服务；发现循环每 5 秒对未解析条目重试 `service.lookup` 并查询拓扑，得到映射后才供本地业务选择。
    - Node 优先检索本地 `RegistryMgr`；若本地未注册，则通过集群控制网向各节点查询，获取注册了该服务的宿主节点（Egress Node）。
-   - 查询成功后，Node 向 Agent 返回 `service.located` 报文，包含 `request_id`、`service`、`protocol`、`node_id` 与 `address`；地址用于探测，不再携带未使用的控制端口。
+   - 查询成功后，Node 向 Agent 返回 `service.located` 报文，包含 `request_id`、`service`、`protocol`、`node_id` 与 `network_ports`；按 Agent 标签选出的地址用于探测，不再携带未使用的控制端口。
    - 集群返回的 `topology.snapshot` 仅在认证后的 `source` 等于当前 Master 时回送给 Agent；随后继续验证 requester、会话及快照结构。
    - Consumer Agent 将发现结果记录在 `service_locations_` 映射表中，并据此更新链路探测目标。
 
@@ -1269,7 +1282,7 @@ Forwarder 拥有独立业务 TLS context，复用原控制凭据，并严格固�
 
 1. **IP 条目（`IP:<address>`）**：
    - 必须包含该节点绑定的所有对外公网 IP、专网 IP 或浮动 IP。
-   - 必须精确覆盖节点配置文件中的 `control.advertise_address`。
+   - 必须覆盖 Agent 的 `server.host` 及 Slave 的 `cluster.address` 使用的控制连接 IP；业务数据地址不参与 X.509 主机名校验。
 2. **DNS 条目（`DNS:<hostname>`）**：
    - 若通过域名或内部服务名访问，必须包含对应的完整主机名（如 `DNS:master-1.internal`）。
    - 推荐将节点的 `node_id` 本身作为一个标准 DNS 条目写入 SAN（如 `DNS:master-1`），用于集群内部的纯逻辑身份识别。
@@ -1556,6 +1569,11 @@ RelayNode 启动时接受一个 JSON 格式的配置文件，各段落对应不�
     "heartbeat_timeout_ms": 20000,
     "max_queued_messages": 100
   },
+  "network_ports": [
+    {"label": "default", "address": "203.0.113.10"},
+    {"label": "vpc-a", "address": "192.168.1.10"},
+    {"label": "lo:host-a", "address": "127.0.0.1"}
+  ],
   "cluster": {
     "role": "master",
     "node_id": "master-1",
@@ -1567,7 +1585,6 @@ RelayNode 启动时接受一个 JSON 格式的配置文件，各段落对应不�
   "control": {
     "address": "0.0.0.0",
     "port": 18443,
-    "advertise_address": "203.0.113.10",
     "max_connections": 512,
     "max_services": 256,
     "max_services_per_session": 64
@@ -1609,7 +1626,7 @@ RelayNode 启动时接受一个 JSON 格式的配置文件，各段落对应不�
 | **`certificate.private_key`** | 路径 | 必填 | 本节点的 TLS 私钥文件（权限必须为 0600）。 |
 | **`cluster.role`** | 字符串 | `"master"` 或 `"slave"` | 集群角色。`master` 负责路径安装协调；`slave` 需配置连接 Master。 |
 | **`cluster.node_id`** | 字符串 | 必填 | 全网唯一的节点标识字符串（<=256 字节，非保留名 all）。 |
-| **`control.advertise_address`** | 字符串 | 必填 | 向集群和 Agent 广播的本节点公网可达 IP 或主机名。必须包含在节点证书的 SAN 列表中。 |
+| **`network_ports`** | 数组 | 必填，1～4 项 | 每项为唯一 `label` 与 `address`；必须包含 `default`，详细规则见 1.4。 |
 | **`tcp/udp.setup_timeout_ms`** | 整数 | 10000 ms (10s) | 会话建立阶段等待两端 `RelayAttach` 握手的绝对超时时限。 |
 | **`rx/tx_bytes_per_second`** | 整数 | 字节/秒 | 令牌桶流量整形速率。设置为 0 时表示不限速。 |
 
@@ -1646,10 +1663,11 @@ accept 直接返回来源端点，无需再查询 socket 地址；成功后只�
 
 ### 9.2 RelayAgent 完整配置字典与示例
 
-RelayAgent 负责声明导出的服务（`services`）或本地监听端口映射（`forwards`）：
+RelayAgent 负责声明导出的服务（`services`）或本地监听端口映射（`forwards`）；`network_label` 控制探测与数据接入选址：
 
 ```json
 {
+  "network_label": "default",
   "server": {
     "host": "203.0.113.10",
     "port": 18443,
@@ -1717,6 +1735,7 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 
 | 配置段落 / 字段 | 类型 | 说明 |
 |---|---|---|
+| **`network_label`** | 字符串 | Node 地址选择标签，缺省 `default`，非空、精确匹配。 |
 | **`server.host` / `port`** | 字符串/整数 | 初次启动连接的主控 RelayNode 控制端口（默认 18443）。 |
 | **`relay.open_timeout_ms`** | 正整数，默认 10000 | 单个业务会话从创建到业务 Ready 的总建立预算，各阶段不续期。 |
 | **`server.connect_timeout_ms`** | 正整数，默认 5000 | DNS/TCP 连接操作上限；业务连接同时受剩余总建立预算限制。 |
@@ -1764,6 +1783,12 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
 
 
 ## 附录 A. 控制协议全量报文规范 (Wire Protocol Specification)
+
+Node 地址元数据统一为 `network_ports: [{label, address}, ...]`，遵守 1.4 的数量、校验与选址规则。
+`cluster.join`、`topology.members` 成员、`topology.snapshot` 节点、`server.identified`、`service.located`、
+`relay.opened` 与 `relay.offer` 使用该字段，后两者仍分别携带原有数据端口、票据及会话标识。
+不再发送单地址 `address`、`data_address` 或旧标签字段。
+
 
 本附录列出 RelayWeave 控制信道承载的全部 JSON 控制指令，涵盖命令字编码、作用域以及报文参数定义。
 
@@ -1954,7 +1979,11 @@ RelayAgent 负责声明导出的服务（`services`）或本地监听端口映�
     "flow_id": 5001,
     "request_id": 9001,
     "path": ["node-1", "node-2", "node-3"],
-    "addresses": ["203.0.113.1", "203.0.113.2", "203.0.113.3"],
+    "addresses": [
+      {"network_ports": [{"label": "default", "address": "203.0.113.1"}]},
+      {"network_ports": [{"label": "default", "address": "203.0.113.2"}]},
+      {"network_ports": [{"label": "default", "address": "203.0.113.3"}]}
+    ],
     "links": [1001, 1002],
     "transport": "tcp",
     "ttl_ms": 10000
@@ -2043,7 +2072,7 @@ Commit、Close 和以上回复均不携带 path、addresses、links、transport�
     "service": "prod-ssh",
     "protocol": "tcp",
     "node_id": "node-3",
-    "address": "203.0.113.12"
+    "network_ports": [{"label": "default", "address": "203.0.113.12"}]
   }
 }
 ```
@@ -2053,12 +2082,11 @@ Commit、Close 和以上回复均不携带 path、addresses、links、transport�
 
 | 源码路径 | 核心类 / 结构体 | 宿主执行域 (`executor`) | 核心职责与对象包含关系 |
 |---|---|---|---|
-| **`protocol/inc/message.h`**<br>`protocol/src/message.cpp` | `CtrlMessage`<br>`WireMessage`<br>`LnkFrameHeader`<br>`DatagramHeader`<br>`RelayAttach` | 跨域共享值类型 | 定义全系统固定二进制帧结构、CBOR 控制信令打包、控制指令枚举。无堆状态。 |
+| **`protocol/inc/message.h`**<br>`protocol/src/message.cpp` | `CtrlMessage`<br>`WireMessage`<br>`LnkFrameHeader`<br>`DatagramHeader`<br>`RelayAttach`<br>`NodeAddress` | 跨域共享值类型 | 定义固定二进制帧、CBOR 控制信令、控制指令枚举及 Node 多地址元数据的编解码与选址。 |
 | **`protocol/inc/flow_protocol.h`**<br>`protocol/src/flow_protocol.cpp` | `FlowProtocol`<br>`FlowState`<br>`FlowStream`<br>`FlowDatagram` | `cluster_data_io` | 逻辑流状态机、端点接口抽象、逐跳信用发布与背压、帧分发管理。 |
 | **`protocol/inc/lnk_channel.h`**<br>`protocol/src/lnk_channel.cpp` | `LnkChannel`<br>`NodeLink`<br>`PooledBuffer`<br>`Frame` | `cluster_data_io` | 物理相邻节点 Socket（TCP/UDP）长连接维护、PMR 缓冲池管理、帧定界。 |
 | **`protocol/inc/fair_queue.h`** | `FairQueue<Tag, T>` | `cluster_data_io` | 物理 TCP NodeLink 上的流标签交错插入近似公平调度器。 |
-| **`protocol/inc/peer_blacklist.h`**<br>`protocol/src/peer_blacklist.cpp` | `PeerBlacklist` | 各 TCP 监听入口所属执行域 | 独立 IPv4 违规计数、统一分钟老化、有界临时封禁及访问续封，无后台任务。 |
-| **`protocol/inc/tls_channel.h`**<br>`protocol/src/tls_channel.cpp` | `TLSChannel` | 独立 Strand / 执行域 | 安全 mTLS 控制流通信管道，带心跳与消息队列。 |
+| **`protocol/inc/tls_channel.h`**<br>`protocol/src/tls_channel.cpp` | `TLSChannel`<br>`PeerBlacklist` | 连接或监听入口所属执行域 | mTLS 控制通道与帧读取、业务 RPK 认证配置，以及各 TCP 入口独立的 IPv4 违规计数与临时封禁。 |
 | **`protocol/inc/dualindex_map.h`** | `DualIndexMap<A, B, V>` | 单域值类型 | 模板化双向键安全索引哈希表。 |
 | **`route/inc/link_quality.h`**<br>`route/src/link_quality.cpp` | `LinkQuality` | `control_io` | 基于 EMA 与打分截断的单尺度网络链路质量评估器。 |
 | **`route/inc/route_graph.h`**<br>`route/src/route_graph.cpp` | `RouteGraph` | `control_io` | 有向加权图模型，执行带 `relay_penalty` 的 Dijkstra 最短路径搜索。 |

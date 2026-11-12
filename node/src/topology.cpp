@@ -120,7 +120,7 @@ void Topology::validate_snapshot(const njson &params, std::string_view location)
     for (const auto &node : *nodes)
     {
         config::required_string(node, "node_id", location);
-        config::required_string(node, "address", location);
+        NodeAddress::from_params(node, location);
         if (!node.at("available").is_null())
             finite_number(node, "available", 0.0, 1.0, location);
         const auto report_age = node.find("report_age_ms");
@@ -419,7 +419,8 @@ void Topology::rebuild_snapshot()
 
     for (const auto &[id, address] : members_)
     {
-        njson node{{"node_id", id}, {"address", address.address}};
+        auto node = address.to_params();
+        node["node_id"] = id;
         const auto report = reports_.find(id);
         if (report == reports_.end() || now - report->second.received_at >= report_expiry)
         {

@@ -1,6 +1,9 @@
 #include "message.h"
 #include <algorithm>
+#include <asio/ip/address.hpp>
+#include <cassert>
 #include <fstream>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 
@@ -887,4 +890,113 @@ LnkFrameHeader LnkFrameHeader::decode(std::span<const std::uint8_t, length> head
                           decode_lnk_integer(header.subspan<24, 8>())};
     result.validate();
     return result;
+}
+
+CtrlMessage decode_ctrl_datagram(std::span<const std::uint8_t> datagram)
+{
+    if (datagram.size() < WireMessage::header_length)
+    {
+        throw std::invalid_argument("datagram frame header truncated");
+    }
+    const auto length = WireMessage::decode_length(datagram.first<WireMessage::header_length>());
+    if (length != datagram.size() - WireMessage::header_length)
+    {
+        throw std::invalid_argument("datagram frame length mismatch");
+    }
+    return CtrlMessage::deserialize(datagram.subspan(WireMessage::header_length));
+}
+
+NodeAddress NodeAddress::from_params(const njson &params, std::string_view location)
+{
+    const auto prefix = std::string(location);
+    const auto ports = params.find("network_ports");
+    if (ports == params.end() || !ports->is_array() || ports->empty() || ports->size() > 4)
+    {
+        throw std::invalid_argument(prefix + ": network_ports must contain 1 to 4 entries");
+    }
+    NodeAddress result;
+    for (const auto &entry : *ports)
+    {
+        config::reject_unknown_fields(entry, {"label", "address"}, location);
+        result.entries_[result.count_++] = {config::required_string(entry, "label", location),
+                                           config::required_string(entry, "address", location)};
+    }
+    std::sort(result.entries_.begin(), result.entries_.begin() + result.count_,
+              [](const Entry &a, const Entry &b) { return a.label < b.label; });
+    bool has_default = false;
+    std::string_view previous;
+    for (const auto &entry : result.entries())
+    {
+        if (entry.label == previous)
+        {
+            throw std::invalid_argument(prefix + ": network_ports labels must be unique");
+        }
+        previous = entry.label;
+        has_default = has_default || entry.label == "default";
+        asio::error_code error;
+        const auto ip = asio::ip::make_address(entry.address, error);
+        if (error ? entry.label != "default"
+                  : (!ip.is_v4() || ip.is_unspecified() || ip.is_multicast() || ip.to_v4().to_uint() == 0xffffffffU))
+        {
+            throw std::invalid_argument(prefix + ": network_ports address must be unicast IPv4 (default also permits a hostname)");
+        }
+    }
+    if (!has_default)
+    {
+        throw std::invalid_argument(prefix + ": network_ports requires a default label");
+    }
+    return result;
+}
+
+njson NodeAddress::to_params() const
+{
+    assert(count_ != 0);
+    auto ports = njson::array();
+    for (const auto &entry : entries())
+    {
+        ports.push_back(njson{{"label", entry.label}, {"address", entry.address}});
+    }
+    return njson{{"network_ports", std::move(ports)}};
+}
+
+const NodeAddress::Entry &NodeAddress::select(std::string_view label) const noexcept
+{
+    const Entry *fallback = nullptr;
+    for (const auto &entry : entries())
+    {
+        if (entry.label == label)
+        {
+            return entry;
+        }
+        if (entry.label == "default")
+        {
+            fallback = &entry;
+        }
+    }
+    assert(fallback != nullptr);
+    return *fallback;
+}
+
+const std::string &NodeAddress::address_for(std::string_view label) const noexcept
+{
+    return select(label).address;
+}
+
+std::string_view NodeAddress::common_label(const NodeAddress &peer) const noexcept
+{
+    for (const auto &entry : entries())
+    {
+        if (entry.label != "default" && std::ranges::any_of(peer.entries(), [&](const Entry &other) {
+                return entry.label == other.label;
+            }))
+        {
+            return entry.label;
+        }
+    }
+    return "default";
+}
+
+const std::string &NodeAddress::address_for(const NodeAddress &peer) const
+{
+    return address_for(common_label(peer));
 }

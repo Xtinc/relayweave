@@ -17,6 +17,21 @@ constexpr auto max_flow_ttl_ms = std::chrono::duration_cast<std::chrono::millise
 
 static_assert(NodeLinkMgr::max_flow_nodes <= std::numeric_limits<std::uint8_t>::digits);
 
+/** @brief Decode complete membership snapshots used to authorize a Flow path. */
+static std::vector<NodeAddress> parse_flow_addresses(const njson &values)
+{
+    if (!values.is_array())
+    {
+        throw std::invalid_argument("flow addresses must be an array");
+    }
+    std::vector<NodeAddress> result;
+    for (const auto &value : values)
+    {
+        result.push_back(NodeAddress::from_params(value, "flow.addresses"));
+    }
+    return result;
+}
+
 static bool valid_flow_path(const std::vector<std::string> &path)
 {
     if (path.size() < 2 || path.size() > NodeLinkMgr::max_flow_nodes)
@@ -36,8 +51,9 @@ static bool valid_flow_path(const std::vector<std::string> &path)
 
 njson NodeLinkMgr::LinkParams::to_params(std::string_view node) const
 {
-    const auto &left_address = left_member.address_for(right_member);
-    const auto &right_address = right_member.address_for(left_member);
+    const auto label = left_member.common_label(right_member);
+    const auto &left_address = left_member.address_for(label);
+    const auto &right_address = right_member.address_for(label);
     njson p{{"id", id},
             {"epoch", epoch},
             {"master", master},
@@ -66,7 +82,11 @@ njson NodeLinkMgr::FlowParams::to_params() const
 {
     auto p = identity_params();
     p["path"] = path;
-    p["addresses"] = addresses;
+    p["addresses"] = njson::array();
+    for (const auto &address : addresses)
+    {
+        p["addresses"].push_back(address.to_params());
+    }
     p["links"] = links;
     p["transport"] = relay_protocol_name(transport);
     return p;
@@ -281,13 +301,11 @@ std::shared_ptr<NodeLinkMgr::SharedLink> NodeLinkMgr::start_link(std::string lef
     params.right_member = members.at(right);
     params.tcp_port = config_.tcp_port;
     params.udp_port = config_.udp_port;
-    PROXY_INFO_PRINT(
-        "Node link selecting left=%s address=%s label=%s right=%s address=%s label=%s transport=%s via=%s",
-        left.c_str(), params.left_member.address_for(params.right_member).c_str(), params.left_member.label.c_str(),
-        right.c_str(), params.right_member.address_for(params.left_member).c_str(), params.right_member.label.c_str(),
-        relay_protocol_name(transport).data(),
-        params.left_member.label != "default" && params.left_member.label == params.right_member.label ? "label"
-                                                                                                       : "public");
+    const auto label = params.left_member.common_label(params.right_member);
+    PROXY_INFO_PRINT("Node link selecting left=%s address=%s right=%s address=%s transport=%s label=%s",
+                     left.c_str(), params.left_member.address_for(label).c_str(), right.c_str(),
+                     params.right_member.address_for(label).c_str(), relay_protocol_name(transport).data(),
+                     std::string(label).c_str());
     const auto request = std::make_shared<SharedLink>(control_, std::move(params));
     shared_links_.emplace(pair, request);
     request->timeout.expires_after(link_setup_timeout);
@@ -408,8 +426,9 @@ void NodeLinkMgr::handle_link_command(CtrlCommand type, const njson &p, std::uin
         }
         const auto &left_member = members.at(left);
         const auto &right_member = members.at(right);
-        const auto &left_address = left_member.address_for(right_member);
-        const auto &right_address = right_member.address_for(left_member);
+        const auto label = left_member.common_label(right_member);
+        const auto &left_address = left_member.address_for(label);
+        const auto &right_address = right_member.address_for(label);
         const auto &peer_address = config_.node_id == left ? right_address : left_address;
         if (p.at("left_address") != left_address || p.at("right_address") != right_address ||
             p.at("peer_address") != peer_address)
@@ -613,7 +632,7 @@ bool NodeLinkMgr::valid_flow(const FlowParams &p) const
     for (std::size_t i = 0; i < nodes.size(); ++i)
     {
         auto member = topology_.members().find(nodes[i]);
-        if (member == topology_.members().end() || member->second.address != addresses[i])
+        if (member == topology_.members().end() || member->second != addresses[i])
         {
             return false;
         }
@@ -719,7 +738,7 @@ std::shared_ptr<NodeLinkMgr::MasterPath> NodeLinkMgr::create_path(std::vector<st
         throw std::runtime_error("requires an acyclic 2..8 Node path and tcp/udp");
     }
 
-    std::vector<std::string> addresses;
+    std::vector<NodeAddress> addresses;
     for (const auto &node : path)
     {
         auto member = topology_.members().find(node);
@@ -727,7 +746,7 @@ std::shared_ptr<NodeLinkMgr::MasterPath> NodeLinkMgr::create_path(std::vector<st
         {
             throw std::runtime_error("path node offline");
         }
-        addresses.push_back(member->second.address);
+        addresses.push_back(member->second);
     }
     if (!topology_.epoch() || paths_.size() >= lnk::max_flow_count)
     {
@@ -923,7 +942,7 @@ void NodeLinkMgr::handle_flow_command(CtrlCommand type, const njson &p, std::uin
                           id,
                           config::require_unsigned(p, "request_id", true),
                           p.at("path").get<std::vector<std::string>>(),
-                          p.at("addresses").get<std::vector<std::string>>(),
+                          parse_flow_addresses(p.at("addresses")),
                           p.at("links").get<std::vector<std::uint64_t>>(),
                           parse_relay_protocol(p.at("transport").get<std::string>())};
         const auto reject = [&](std::string reason) {

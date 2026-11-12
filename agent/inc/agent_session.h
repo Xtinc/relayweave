@@ -50,7 +50,7 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
     struct RelayEndpoint
     {
         /** @brief Parse and validate an attachment before installing it in a session. */
-        static RelayEndpoint from_params(const njson &params, RelayProtocol protocol);
+        static RelayEndpoint from_params(const njson &params, RelayProtocol protocol, std::string_view network_label);
         std::uint64_t uuid = 0;
         std::uint64_t ticket = 0;
         std::string address;

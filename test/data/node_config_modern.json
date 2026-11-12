@@ -10,7 +10,6 @@
   },
   "control": {
     "address": "127.0.0.1",
-    "advertise_address": "198.51.100.10",
     "port": 18443,
     "max_connections": 12,
     "max_services": 20,
@@ -42,5 +41,11 @@
     "ca_file": "tls_channel_test_client_ca.pem",
     "certificate_chain": "tls_channel_test_server.pem",
     "private_key": "tls_channel_test_server.key"
-  }
+  },
+  "network_ports": [
+    {
+      "label": "default",
+      "address": "198.51.100.10"
+    }
+  ]
 }

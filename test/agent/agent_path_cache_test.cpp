@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "test_data.h"
 #include "relay_agent.h"
 #include "agent_routing.h"
@@ -138,8 +139,8 @@ class ControlPeer
   public:
     ControlPeer(asio::io_context &io, asio::ssl::context &context) : acceptor(io), context_(context)
     {
-        // IPv6 cannot be measured by the IPv4 ProbeSet: this makes empty candidate results
-        // deterministic, without requiring raw sockets. Fall back where IPv6 is unavailable.
+        // Exercise IPv6 bootstrap independently of the unresolved IPv4 probe declaration.
+        // The declared hostname keeps candidate results empty even when raw sockets are available.
         asio::error_code error;
         acceptor.open(tcp::v6(), error);
         if (!error)
@@ -183,8 +184,8 @@ class ControlPeer
                 {"epoch", 1u},
                 {"snapshot_version", 1u},
                 {"created_age_ms", 0u},
-                {"nodes", njson::array({njson{{"node_id", "cache-node"}, {"address", host}, {"report_age_ms", 0u}},
-                                        njson{{"node_id", "other-node"}, {"address", host}, {"report_age_ms", 0u}}})},
+                {"nodes", njson::array({njson{{"node_id", "cache-node"}, {"network_ports", test_node_address("unresolved.invalid").to_params().at("network_ports")}, {"report_age_ms", 0u}},
+                                        njson{{"node_id", "other-node"}, {"network_ports", test_node_address("unresolved.invalid").to_params().at("network_ports")}, {"report_age_ms", 0u}}})},
                 {"links", njson::array({njson{{"source", "cache-node"},
                                               {"destination", "other-node"},
                                               {"age_ms", 0u},
@@ -215,13 +216,13 @@ class ControlPeer
                 switch (message.type())
                 {
                 case CtrlCommand::ServerIdentify:
-                    current->send(CtrlMessage{CtrlCommand::ServerIdentified, njson{{"node_id", "cache-node"}}});
+                    current->send(CtrlMessage{CtrlCommand::ServerIdentified, njson{{"node_id", "cache-node"}, {"network_ports", test_node_address("unresolved.invalid").to_params().at("network_ports")}}});
                     ++identifications;
                     break;
                 case CtrlCommand::ServiceLookup: {
                     auto located = params;
                     located["node_id"] = "cache-node";
-                    located["address"] = host;
+                    located.update(test_node_address("unresolved.invalid").to_params());
                     current->send(CtrlMessage{CtrlCommand::ServiceLocated, std::move(located)});
                     ++lookups;
                     break;

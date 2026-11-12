@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "test_data.h"
 #include "relay_agent.h"
 #include "routing_fixture.h"
@@ -8,6 +9,8 @@
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+
+TEST_MEMBER(ProbeSet, targets_)
 
 namespace
 {
@@ -39,7 +42,7 @@ Json snapshot(unsigned request, Json nodes, Json links, unsigned version = 1)
 }
 Json node(std::string id, std::string address)
 {
-    return {{"node_id", std::move(id)}, {"address", std::move(address)}, {"report_age_ms", 0u}};
+    return {{"node_id", std::move(id)}, {"network_ports", test_node_address(std::move(address)).to_params().at("network_ports")}, {"report_age_ms", 0u}};
 }
 std::optional<RouteGraph::Path> calculate_path(test_routing::Fixture &routing, std::string_view destination,
                                      std::span<const RouteGraph::Entry> access, AgentRouting::Clock::time_point now)
@@ -60,6 +63,44 @@ template <typename Fn> void rejects(Fn function, const char *reason)
         rejected = true;
     }
     require(rejected, reason);
+}
+
+void test_network_selection(asio::io_context &io)
+{
+    test_routing::Fixture routing(io, 4, "vpc-a");
+    const auto now = AgentRouting::Clock::now();
+    auto a = node("A", "192.0.2.1");
+    a.update(test_node_address({{"default", "192.0.2.1"}, {"vpc-a", "192.168.1.1"}}).to_params());
+    auto b = node("B", "192.0.2.2");
+    b.update(test_node_address({{"default", "192.0.2.2"}, {"vpc-a", "192.168.1.2"}}).to_params());
+    auto topology = snapshot(1, Json::array({a, b}), Json::array({edge("A", "B", 2.0)}));
+    topology["created_age_ms"] = 0u;
+    routing.set_required_targets({{"A", "192.0.2.99"}});
+    routing.begin_request(1, now);
+    require(routing.accept_snapshot(topology, now), "Labeled snapshot rejected");
+    const auto &targets = test_access::ProbeSet_targets_(test_access::AgentRouting_probes_(routing));
+    require(targets.at("A") == "192.168.1.1" && targets.at("B") == "192.168.1.2",
+            "Stale discovery or primary host overrode selected topology addresses");
+    const std::vector<RouteGraph::Entry> initial{{"A", 1.0}};
+    test_routing::candidates(routing, "B", now, initial);
+    const ServiceKey service{"network-test", RelayProtocol::Tcp};
+    require(routing.select_path(service, "B") == std::vector<std::string>({"A", "B"}), "Initial path not cached");
+    topology["request_id"] = 2u;
+    topology["snapshot_version"] = 2u;
+    topology["nodes"][1]["network_ports"][1]["address"] = "192.168.1.3";
+    routing.begin_request(2, now);
+    require(routing.accept_snapshot(topology, now) && targets.at("B") == "192.168.1.3",
+            "Selected address update did not replace the probe target");
+    const std::vector<RouteGraph::Entry> changed{{"A", 1.0}, {"B", 0.1}};
+    test_routing::candidates(routing, "B", now, changed);
+    require(routing.select_path(service, "B") == std::vector<std::string>({"B"}),
+            "Selected address change retained the old cached path");
+    topology["request_id"] = 3u;
+    topology["snapshot_version"] = 3u;
+    topology["nodes"][1]["network_ports"][1]["label"] = "other";
+    routing.begin_request(3, now);
+    require(routing.accept_snapshot(topology, now) && targets.at("B") == "192.0.2.2",
+            "Missing Agent label did not fall back to default");
 }
 
 void test_bandwidth(asio::io_context &io)
@@ -142,6 +183,7 @@ int main()
     {
         asio::io_context io(1);
         test_bandwidth(io);
+        test_network_selection(io);
         require(AgentConfig{}.routing_max_nodes == 4, "Default real Node budget changed");
         const auto data = test_data::directory();
         const auto temporary = std::filesystem::temp_directory_path() /
@@ -152,6 +194,18 @@ int main()
                              {"certificate_chain", (data / "tls_channel_test_client.pem").string()},
                              {"private_key", (data / "tls_channel_test_client.key").string()}}}};
         const auto write_settings = [&] { std::ofstream file(temporary); file << settings; };
+        write_settings();
+        require(load_agent_config(temporary).network_label == "default", "Missing Agent network label did not default");
+        settings["network_label"] = "lo:host-a";
+        write_settings();
+        require(load_agent_config(temporary).network_label == "lo:host-a", "Agent network label was not parsed");
+        for (const Json invalid : {Json(""), Json(1), Json(nullptr)})
+        {
+            settings["network_label"] = invalid;
+            write_settings();
+            rejects([&] { load_agent_config(temporary); }, "Invalid Agent network label accepted");
+        }
+        settings.erase("network_label");
         write_settings();
         require(load_agent_config(temporary).routing_max_nodes == 4, "Omitted routing did not default to four nodes");
         for (unsigned maximum : {1u, 4u, 8u})

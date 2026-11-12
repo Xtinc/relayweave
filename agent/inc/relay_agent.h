@@ -24,6 +24,7 @@ struct AgentForwardConfig
 struct AgentConfig
 {
     std::string host;
+    std::string network_label = "default";
     std::uint16_t port = 0;
     std::filesystem::path ca_file;
     std::filesystem::path certificate_chain;

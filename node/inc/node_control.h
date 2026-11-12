@@ -111,10 +111,10 @@ class NodeControl
      * @param metrics Node-owned metrics provider borrowed for control-side snapshots.
      * @param relays Node-owned business container borrowed for read-only status reporting.
      * @param node_id Unique nonempty cluster Node identity.
-     * @param advertise_address Reachable Node address published for Agent probes.
+     * @param network_ports Labeled Node addresses borrowed from the owning Node configuration through destruction.
      */
     NodeControl(RegistryMgr &registry, ClusterMgr &cluster, const Topology &topology, const NodeMetrics &metrics,
-                const NodeSessionList &relays, std::string node_id, std::string advertise_address);
+                const NodeSessionList &relays, std::string node_id, const NodeAddress &network_ports);
     /**
      * @brief Handle a public client command; return false if the command belongs elsewhere.
      * @pre RelayNode has validated the params object; command-specific fields are checked here.
@@ -159,7 +159,7 @@ class NodeControl
     const NodeMetrics &metrics_;
     const NodeSessionList &relay_sessions_;
     std::string node_id_;
-    std::string advertise_address_;
+    const NodeAddress &network_ports_;
 };
 
 #endif

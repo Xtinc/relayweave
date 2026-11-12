@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "agent_routing.h"
 #include "link_quality.h"
 #include "member_access.h"
@@ -158,12 +159,11 @@ asio::awaitable<void> verify(asio::io_context &io)
     quality.confidence = 1.0;
     quality.usable = true;
     using Json = nlohmann::json;
-    // IPv4 probes cannot measure the IPv6-only destination, so the first route
-    // must use the measured entry and the reported Node link.
+    // An unresolved destination must initially use the measured entry and reported Node link.
     const Json snapshot{
         {"request_id", 1u}, {"epoch", 1u}, {"snapshot_version", 1u}, {"created_age_ms", 0u},
-        {"nodes", Json::array({{{"node_id", "entry"}, {"address", "127.0.0.1"}, {"report_age_ms", 0u}},
-                               {{"node_id", "service"}, {"address", "::1"}, {"report_age_ms", 0u}}})},
+        {"nodes", Json::array({{{"node_id", "entry"}, {"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")}, {"report_age_ms", 0u}},
+                               {{"node_id", "service"}, {"network_ports", test_node_address("unresolved.invalid").to_params().at("network_ports")}, {"report_age_ms", 0u}}})},
         {"links", Json::array({{{"source", "entry"}, {"destination", "service"},
                                {"age_ms", 0u}, {"quality", quality_json(quality)}}})}};
     routing.accept_snapshot(snapshot, now);
@@ -177,7 +177,12 @@ asio::awaitable<void> verify(asio::io_context &io)
         require(path && path->nodes == std::vector<std::string>({"entry", "service"}),
                 "Agent did not combine its real ICMP access edge with the cluster graph");
 
-        routing.set_required_targets({{"entry", "127.0.0.1"}, {"service", "127.0.0.2"}});
+        auto updated = snapshot;
+        updated["request_id"] = 2u;
+        updated["snapshot_version"] = 2u;
+        updated["nodes"][1].update(test_node_address("127.0.0.2").to_params());
+        routing.begin_request(2, AgentRouting::Clock::now());
+        require(routing.accept_snapshot(updated, AgentRouting::Clock::now()), "Address update was rejected");
         require(co_await routing.refresh_probes(), "Service discovery did not apply new targets");
         co_await wait(200ms);
         path = best_candidate(routing, "service");
@@ -199,7 +204,7 @@ asio::awaitable<void> verify(asio::io_context &io)
     now = AgentRouting::Clock::now();
     candidates.begin_request(1, now);
     auto measured_snapshot = snapshot;
-    measured_snapshot["nodes"][1]["address"] = "127.0.0.2";
+    measured_snapshot["nodes"][1].update(test_node_address("127.0.0.2").to_params());
     candidates.accept_snapshot(measured_snapshot, now);
     failure = nullptr;
     try

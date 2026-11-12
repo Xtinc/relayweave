@@ -51,5 +51,6 @@
     "heartbeat_interval_ms": 5000,
     "heartbeat_timeout_ms": 20000,
     "max_queued_messages": 100
-  }
+  },
+  "network_label": "default"
 }

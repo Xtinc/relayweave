@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
@@ -70,7 +71,7 @@ NodeConfig server_config(std::string node_id, ClusterConfig::Role role, std::uin
     config.cluster = {role, std::move(node_id), "127.0.0.1", cluster_port};
     configure_test_cluster_data(config.cluster);
     config.control.address = is_master ? "0.0.0.0" : "127.0.0.1";
-    config.control.advertise_address = is_master ? "localhost" : "127.0.0.1";
+    config.cluster.network_ports = test_node_address(is_master ? "localhost" : "127.0.0.1");
     config.control.port = control_port;
     config.tcp.address = "127.0.0.1";
     config.tcp.port = transfer_port;
@@ -275,7 +276,7 @@ asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context
     auto location = [&](std::uint64_t request, bool available) {
         channel->send(CtrlMessage{"service.located", njson{{"request_id", request},
             {"service", "service-b"}, {"protocol", "tcp"},
-            {"node_id", available ? "master" : "unavailable"}, {"address", "127.0.0.1"}}});
+            {"node_id", available ? "master" : "unavailable"}, {"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")}}});
     };
     auto receive_client = [&]() -> asio::awaitable<void> {
         for (;;)
@@ -283,7 +284,7 @@ asio::awaitable<void> discovery_peer(tcp::acceptor &acceptor, asio::ssl::context
             auto message = co_await channel->async_receive();
             if (message.command == "server.identify")
             {
-                channel->send(CtrlMessage{"server.identified", njson{{"node_id", "discovery"}}});
+                channel->send(CtrlMessage{"server.identified", njson{{"node_id", "discovery"}, {"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")}}});
             }
             else if (message.command == "service.lookup")
             {
@@ -352,7 +353,7 @@ asio::awaitable<void> verify_discovery(asio::ssl::context &context, std::uint16_
         require(config::message_service(params) == (index ? "service-b" : "service-a"),
                 "Location routed to the wrong client session");
         require(params.at("node_id") == (index ? "slave" : "master"), "Incorrect location source");
-        require(params.at("address") == (index ? "127.0.0.1" : "localhost"),
+        require(NodeAddress::from_params(params, "service.located").address_for("default") == (index ? "127.0.0.1" : "localhost"),
                 "Configured control advertise address was not returned");
         require(!params.contains("port"), "Service location retained an unused control port");
         require(!params.contains("source") && !params.contains("session_id") &&

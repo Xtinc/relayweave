@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "node_fixture.h"
 TEST_MEMBER(NodeMetrics, bandwidth_at_)
 TEST_MEMBER(RelayNode, topology_)
@@ -717,7 +718,7 @@ static void verify_path_progression()
     const std::vector<std::string> membership_path{names[1], names[6], names[7]};
     remote(CtrlCommand::FlowOpen, 104, membership_path);
     const auto membership_links = collect_links(take(), 1);
-    members[1]["address"] = "127.0.1.2";
+    members[1]["network_ports"][0]["address"] = "127.0.1.2";
     topology.update_members({{"source", names.front()}, {"master", names.front()},
                              {"epoch", topology.epoch()}, {"version", 2U}, {"members", members}});
     manager.members_changed();
@@ -864,10 +865,11 @@ void flow_integration()
     {
         auto config = make_test_node_config();
         const auto address = "127.0.0." + std::to_string(i + 1);
-        config.control.address = config.control.advertise_address = config.tcp.address =
+        config.control.address = config.tcp.address =
             config.datagram.address = address;
         config.cluster = {
             i == 0 ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave, names[i], "127.0.0.1", cp, tp, up};
+        config.cluster.network_ports = test_node_address(address);
         config.channel.disconnect_timeout = 100ms;
         auto node = std::make_shared<RelayNode>(control, transfer, udp, data, ssl, config);
         node->start();

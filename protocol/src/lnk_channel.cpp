@@ -1,5 +1,5 @@
 #include "flow_protocol.h"
-#include "frame_io.h"
+#include "tls_channel.h"
 #include <asio/experimental/parallel_group.hpp>
 #include <cassert>
 #include <chrono>

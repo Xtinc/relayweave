@@ -1,6 +1,6 @@
 #include "failing_payload_pool.h"
 #include "flow_test_io.h"
-#include "frame_io.h"
+#include "tls_channel.h"
 #include "flow_test_state.h"
 #include <future>
 #include <iostream>

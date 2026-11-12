@@ -1,4 +1,6 @@
+#include "node_address_fixture.h"
 #include "test_data.h"
+#include "agent_network_check.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
 #include "forwarder.h"
@@ -17,8 +19,6 @@
 
 TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(RelayAgent, control_)
-TEST_MEMBER(RelayAgent, forwarder_)
-TEST_MEMBER(Forwarder, relays_)
 TEST_MEMBER(RelayNode, relay_sessions_)
 TEST_MEMBER(RelayNode, registry_)
 
@@ -237,6 +237,7 @@ int main()
         settings.tcp.address = "127.0.0.1";
         settings.tcp.port = tcp_data_port;
         settings.datagram.address = "127.0.0.1";
+        settings.cluster.network_ports = test_node_address({{"default", "127.0.0.2"}, {"lo:host-a", "127.0.0.1"}});
         settings.datagram.port = udp_data_port;
         settings.tcp.max_relays = 8;
         settings.datagram.max_relays = 8;
@@ -255,6 +256,7 @@ int main()
         std::thread server_transfer_udp_thread([&server_transfer_udp_io]() { server_transfer_udp_io.run(); });
 
         auto consumer_settings = client_config(control_port);
+        consumer_settings.network_label = "lo:host-a";
         consumer_settings.udp_idle_timeout = 500ms;
         consumer_settings.forwards.push_back(
             AgentForwardConfig{"udp-echo", "127.0.0.1", forward_port, RelayProtocol::Udp});
@@ -270,6 +272,7 @@ int main()
         std::thread consumer_transfer_thread([&consumer_transfer_io]() { consumer_transfer_io.run(); });
 
         auto producer_settings = client_config(control_port);
+        producer_settings.network_label = "lo:host-a";
         producer_settings.services.push_back(
             AgentServiceConfig{"udp-echo", "127.0.0.1", target_port, RelayProtocol::Udp});
         auto producer = std::make_shared<RelayAgent>(producer_control_io, producer_transfer_io, producer_context,
@@ -296,6 +299,8 @@ int main()
         const BytesBuf maximum_payload(DatagramHeader::maximum_user_payload, 0x5a);
         expect_round_trip(probe, maximum_payload);
         expect_round_trip(self_probe, maximum_payload);
+        asio::co_spawn(consumer_transfer_io, test_agent::check_network(*consumer, "127.0.0.1"), asio::use_future).get();
+        asio::co_spawn(producer_transfer_io, test_agent::check_network(*producer, "127.0.0.1"), asio::use_future).get();
 
         const BytesBuf oversized_payload(DatagramHeader::maximum_user_payload + 1, 0x6b);
         expect_drop(probe, oversized_payload);
@@ -368,6 +373,7 @@ int main()
         asio::ssl::context replacement_context(asio::ssl::context::tls_client);
         configure_client(replacement_context, files);
         auto replacement_settings = client_config(control_port);
+        replacement_settings.network_label = "lo:host-a";
         replacement_settings.services.push_back(
             AgentServiceConfig{"udp-echo", "127.0.0.1", target_port, RelayProtocol::Udp});
         auto replacement = std::make_shared<RelayAgent>(replacement_control_io, replacement_transfer_io,

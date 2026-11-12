@@ -7,7 +7,7 @@ Mirrors the C++ definitions in protocol/inc/message.h and protocol/src/message.c
   * Large messages = consecutive {"__fragment": [index, count, CBOR bytes]} frames.
     TCP assembly delivers only the complete message; a final page with gaps is discarded.
   * Control commands used here:
-        server.identify -> server replies server.identified {node_id}
+        server.identify -> server replies server.identified {node_id, network_ports}
         server.cluster  -> every cluster node replies with one complete server.status.reported message
                               {request_id, node_id, uptime_ms,
                               services:[{service, protocol, rx_bytes, tx_bytes,

@@ -154,7 +154,7 @@ class NodeLinkMgr
         std::uint64_t id = 0;
         std::uint64_t request_id = 0;
         std::vector<std::string> path;
-        std::vector<std::string> addresses;
+        std::vector<NodeAddress> addresses;
         std::vector<std::uint64_t> links;
         RelayProtocol transport = RelayProtocol::Tcp;
     };

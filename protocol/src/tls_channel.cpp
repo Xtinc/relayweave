@@ -463,3 +463,116 @@ TLSChannelConfig parse_channel_config(const njson &root)
     }
     return result;
 }
+
+/** @brief Verify only the RPK against this context's pinned shared public key. */
+static int verify_rpk(X509_STORE_CTX *store, void *argument)
+{
+    auto *context = static_cast<SSL_CTX *>(argument);
+    auto *received = X509_STORE_CTX_get0_rpk(store);
+    auto *expected = X509_get0_pubkey(SSL_CTX_get0_certificate(context));
+    const bool valid = received && expected && EVP_PKEY_eq(received, expected) == 1;
+    X509_STORE_CTX_set_error(store, valid ? X509_V_OK : X509_V_ERR_APPLICATION_VERIFICATION);
+    return valid ? 1 : 0;
+}
+
+void configure_tls_rpk(asio::ssl::context &context, asio::ssl::context &identity)
+{
+    auto *ctx = context.native_handle();
+    auto *certificate = SSL_CTX_get0_certificate(identity.native_handle());
+    auto *key = SSL_CTX_get0_privatekey(identity.native_handle());
+    const unsigned char types[] = {TLSEXT_cert_type_rpk};
+    if (!certificate || !key || SSL_CTX_use_certificate(ctx, certificate) != 1 ||
+        SSL_CTX_use_PrivateKey(ctx, key) != 1 || SSL_CTX_check_private_key(ctx) != 1 ||
+        SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION) != 1 ||
+        SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION) != 1 ||
+        SSL_CTX_set1_client_cert_type(ctx, types, sizeof(types)) != 1 ||
+        SSL_CTX_set1_server_cert_type(ctx, types, sizeof(types)) != 1 ||
+        SSL_CTX_set_num_tickets(ctx, 0) != 1 || SSL_CTX_set_max_early_data(ctx, 0) != 1)
+    {
+        throw std::runtime_error("Cannot configure mutual TLS raw-public-key authentication");
+    }
+    SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+    SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT, nullptr);
+    SSL_CTX_set_cert_verify_callback(ctx, verify_rpk, ctx);
+}
+
+PeerBlacklist::PeerBlacklist(std::string_view listener, Clock::time_point now) : listener_(listener), round_at_(now)
+{
+}
+
+void PeerBlacklist::age(Clock::time_point now)
+{
+    const auto elapsed = (now - round_at_) / round_duration;
+    if (elapsed <= 0)
+    {
+        return;
+    }
+    for (auto it = entries_.begin(); it != entries_.end();)
+    {
+        if (it->second.rounds <= elapsed)
+        {
+            it = entries_.erase(it);
+        }
+        else
+        {
+            it->second.rounds -= static_cast<std::uint16_t>(elapsed);
+            ++it;
+        }
+    }
+    round_at_ += round_duration * elapsed;
+    capacity_reported_ = false;
+}
+
+bool PeerBlacklist::blocked(asio::ip::address_v4 address, Clock::time_point now)
+{
+    if (address.is_loopback())
+    {
+        return false;
+    }
+    age(now);
+    const auto found = entries_.find(address.to_uint());
+    if (found == entries_.end() || found->second.rounds == 0)
+    {
+        return false;
+    }
+    if (found->second.rounds < maximum_rounds)
+    {
+        ++found->second.rounds;
+    }
+    return true;
+}
+
+bool PeerBlacklist::record_failure(asio::ip::address_v4 address, std::string_view reason, Clock::time_point now)
+{
+    if (address.is_loopback())
+    {
+        return false;
+    }
+    age(now);
+    auto found = entries_.find(address.to_uint());
+    if (found == entries_.end())
+    {
+        if (entries_.size() >= capacity)
+        {
+            if (!capacity_reported_)
+            {
+                capacity_reported_ = true;
+                PROXY_ERROR_PRINT("Blacklist full listener=%s limit=%zu", listener_.c_str(), capacity);
+            }
+            return false;
+        }
+        found = entries_.try_emplace(address.to_uint()).first;
+    }
+    auto &entry = found->second;
+    if (entry.rounds != 0 || ++entry.failures < failure_limit)
+    {
+        return false;
+    }
+    entry.failures = 0;
+    entry.rounds = initial_rounds;
+    PROXY_INFO_PRINT("Blacklist ban listener=%s ip=%s failures=%u rounds=%u reason=%.*s", listener_.c_str(),
+                     address.to_string().c_str(), static_cast<unsigned int>(failure_limit),
+                     static_cast<unsigned int>(initial_rounds), static_cast<int>(reason.size()), reason.data());
+    return true;
+}

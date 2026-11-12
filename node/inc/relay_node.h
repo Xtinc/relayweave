@@ -5,7 +5,7 @@
 #include "datagram_mgr.h"
 #include "node_session.h"
 #include "nodelink_mgr.h"
-#include "peer_blacklist.h"
+#include "tls_channel.h"
 #include "pipeline_mgr.h"
 #include "registry_mgr.h"
 #include "topology.h"
@@ -19,7 +19,6 @@ class NodeMetrics;
 struct ControlNodeConfig
 {
     std::string address;
-    std::string advertise_address;
     std::uint16_t port = 0;
     std::size_t max_connections = 1024;
     std::size_t max_services = 256;

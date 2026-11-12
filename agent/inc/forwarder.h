@@ -35,6 +35,7 @@ class Forwarder
         std::chrono::steady_clock::duration handshake_timeout;
         std::chrono::steady_clock::duration connect_timeout;
         std::chrono::steady_clock::duration disconnect_timeout;
+        std::string network_label = "default";
     };
     /** @brief Read the business execution domain. @return Executor owning every session socket. */
     asio::any_io_executor executor() const

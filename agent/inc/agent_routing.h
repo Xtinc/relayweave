@@ -18,8 +18,9 @@ class AgentRouting
      * @brief Own topology, probe targets, and the destination cache on control_io.
      * @param io Single-threaded control execution domain, valid through close().
      * @param max_nodes Maximum real Nodes per path, in [1, 8].
+     * @param network_label Local Agent label used for every Node address selection.
      */
-    AgentRouting(asio::io_context &io, std::size_t max_nodes);
+    AgentRouting(asio::io_context &io, std::size_t max_nodes, std::string network_label = "default");
     // Returns true only when the required targets changed.
     bool set_required_targets(ProbeSet::Targets targets);
     void begin_request(std::uint64_t request_id, Clock::time_point now);
@@ -94,6 +95,7 @@ class AgentRouting
     // Destination cache has its own TTL; routine snapshot/probe updates retain valid entries.
     LRUCache<std::string, std::vector<std::string>> path_cache_{PATH_CACHE_CAPACITY, PATH_CACHE_TTL};
     std::size_t max_nodes_;
+    std::string network_label_;
     ProbeSet probes_;
     ProbeSet::Targets required_targets_;
     Snapshot snapshot_;

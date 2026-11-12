@@ -5,10 +5,14 @@
 
 using Clock = std::chrono::steady_clock;
 
-AgentSession::RelayEndpoint AgentSession::RelayEndpoint::from_params(const njson &p, RelayProtocol protocol)
+AgentSession::RelayEndpoint AgentSession::RelayEndpoint::from_params(const njson &p, RelayProtocol protocol,
+                                                                      std::string_view network_label)
 {
     RelayEndpoint endpoint;
-    endpoint.address = config::required_string(p, "data_address", "relay endpoint");
+    const auto addresses = NodeAddress::from_params(p, "relay endpoint");
+    const auto &selected = addresses.select(network_label);
+    endpoint.address = selected.address;
+    PROXY_DEBUG_PRINT("Relay address selecting label=%s address=%s", selected.label.c_str(), endpoint.address.c_str());
     endpoint.port = config::message_data_port(p);
     endpoint.uuid = config::require_unsigned(p, "uuid", true);
     endpoint.ticket = config::require_unsigned(p, "ticket", true);
@@ -113,7 +117,7 @@ void AgentSession::handle(const CtrlMessage &message)
 
     if (command == CtrlCommand::RelayOpened && !endpoint)
     {
-        endpoint = RelayEndpoint::from_params(p, service.protocol);
+        endpoint = RelayEndpoint::from_params(p, service.protocol, owner.session_options().network_label);
         changed.cancel();
     }
     else if (command == CtrlCommand::RelayReady && !tunnel_ready())

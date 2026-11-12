@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "test_data.h"
 #include "agent_session.h"
 #include "forwarder.h"
@@ -28,7 +29,7 @@ struct AgentSessionTestAccess
                                                      std::string{}, std::chrono::steady_clock::now() + std::chrono::seconds(2));
         test_access::AgentSession_target(*session) = AgentServiceConfig{"drain-test", "127.0.0.1", target_port};
         test_access::AgentSession_handle(*session, CtrlMessage(CtrlCommand::RelayOpened,
-            njson{{"data_address", "127.0.0.1"}, {"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
+            njson{{"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")}, {"uuid", std::uint64_t{1}}, {"ticket", std::uint64_t{2}},
                   {"flow_id", std::uint64_t{3}}, {"data_port", entry_port}}));
         return session;
     }
@@ -115,7 +116,7 @@ struct AgentSessionTestAccess
         try
         {
             test_access::AgentSession_handle(*session, CtrlMessage(CtrlCommand::RelayOpened,
-                njson{{"data_address", "127.0.0.1"}, {"uuid", 1U}, {"ticket", 2U}, {"data_port", 0U}}));
+                njson{{"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")}, {"uuid", 1U}, {"ticket", 2U}, {"data_port", 0U}}));
         }
         catch (const std::invalid_argument &error)
         {

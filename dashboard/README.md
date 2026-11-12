@@ -47,7 +47,7 @@ during collection and queries, including while collection is idle.
   drops the channel after `heartbeat_timeout_ms` (20s) of silence. The client
   replies `pong` to each `ping`.
 - **Commands used here**:
-  - `server.identify {}` → `server.identified {node_id}`. This handshake is
+  - `server.identify {}` → `server.identified {node_id, network_ports}`. This handshake is
     completed before cluster polling starts.
   - `server.cluster {request_id}` → one complete `server.status.reported` message per node with
     `{request_id, node_id, uptime_ms, services:[...], relays:[...]}`. `proxy_protocol.MessageReceiver`
@@ -439,3 +439,5 @@ slots 5 (magenta = RX) and 6 (green = TX); a
 per-service dropdown picks which service's history to plot, and the same
 RX/TX color pairing carries to the service table's rate columns so identity
 stays consistent across the table and the chart.
+
+Topology Node 地址宣告使用 `network_ports` 数组，Dashboard 校验报文结构并显示 `default` 地址，地址有效性由 Node 校验。升级时须同步升级 Node/Agent；不接受旧单地址宣告。

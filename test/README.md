@@ -124,3 +124,6 @@ build/test/tools/test_tls_channel_peer client localhost 18443
 
 公平队列的手动 Release 容器对比见 [FairQueue 设计](../docs/RelayWeave设计.md#55-近似公平队列调度算法-fairqueue)。`fair_queue_compare` 与
 `fair_queue_memory` 分离计时和分配计数，不加入 CTest 或既有五个通道 benchmark。
+
+- 多地址组件（`node_address`）：固定四槽、标签与地址校验、规范化比较、共同标签和默认回退、旧宣告拒绝。
+- 标签接入：`relay_integration`、`agent_cluster_control`、`udp_relay_integration` 检查两端真实 TCP/TLS/UDP socket 的远端地址；`agent_routing` 检查地址更新后的探测目标和路径缓存失效。

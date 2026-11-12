@@ -1,6 +1,6 @@
 #include "datagram_mgr.h"
 #include "flow_protocol.h"
-#include "frame_io.h"
+#include "message.h"
 #include <algorithm>
 
 /** @brief Own both Agent UDP identities, authenticated sources, limits, and lifetime events. */

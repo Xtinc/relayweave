@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "node_test_config.h"
 #include "topology.h"
 #include "node_control.h"
@@ -76,10 +77,8 @@ int main()
                                       {"master", "master"},
                                       {"epoch", std::uint64_t{101}},
                                       {"version", std::uint64_t{7}},
-                                      {"members", njson::array({njson{{"node_id", "master"},
-                                                                        {"address", "192.0.2.1"}, {"label", "default"}, {"label_address", nullptr}},
-                                                                 njson{{"node_id", "slave"},
-                                                                       {"address", "192.0.2.2"}, {"label", "default"}, {"label_address", nullptr}}})}});
+                                      {"members", njson::array({test_node_member("master", "192.0.2.1"),
+                                                                 test_node_member("slave", "192.0.2.2")})}});
         bool rejected_master_change = false;
         try
         {
@@ -87,10 +86,8 @@ int main()
                                           {"master", "slave"},
                                           {"epoch", std::uint64_t{102}},
                                           {"version", std::uint64_t{1}},
-                                          {"members", njson::array({njson{{"node_id", "master"},
-                                                                            {"address", "192.0.2.1"}, {"label", "default"}, {"label_address", nullptr}},
-                                                                     njson{{"node_id", "slave"},
-                                                                           {"address", "192.0.2.2"}, {"label", "default"}, {"label_address", nullptr}}})}});
+                                          {"members", njson::array({test_node_member("master", "192.0.2.1"),
+                                                                     test_node_member("slave", "192.0.2.2")})}});
         }
         catch (const std::invalid_argument &)
         {
@@ -125,15 +122,15 @@ int main()
                 "Duplicate report sequence changed the immutable snapshot");
 
         stage = "label addresses and probes";
-        const NodeAddress a{"192.0.2.1", "vpc-a", "10.20.0.1"};
-        const NodeAddress b{"192.0.2.2", "vpc-a", "10.20.0.2"};
-        const NodeAddress c{"192.0.2.3", "vpc-b", "10.30.0.3"};
-        const NodeAddress d{"192.0.2.4"};
+        const auto a = test_node_address({{"default", "192.0.2.1"}, {"vpc-a", "10.20.0.1"}});
+        const auto b = test_node_address({{"default", "192.0.2.2"}, {"vpc-a", "10.20.0.2"}});
+        const auto c = test_node_address({{"default", "192.0.2.3"}, {"vpc-b", "10.30.0.3"}});
+        const auto d = test_node_address("192.0.2.4");
         require(a.address_for(b) == "10.20.0.1" && b.address_for(a) == "10.20.0.2",
                 "Same-label members did not select their own label IP");
-        require(a.address_for(c) == a.address && c.address_for(a) == c.address &&
-                    a.address_for(d) == a.address && d.address_for(a) == d.address &&
-                    d.address_for(NodeAddress{"192.0.2.5"}) == d.address,
+        require(a.address_for(c) == a.address_for("default") && c.address_for(a) == c.address_for("default") &&
+                    a.address_for(d) == a.address_for("default") && d.address_for(a) == d.address_for("default") &&
+                    d.address_for(test_node_address("192.0.2.5")) == d.address_for("default"),
                 "Cross-label or default members did not select public addresses");
         require(NodeAddress::from_params(a.to_params(), "test") == a, "Member metadata did not round-trip");
         Topology labeled(control_io, "master", true, *cluster, metrics);
@@ -156,19 +153,19 @@ int main()
         for (const auto &node : public_snapshot->params->at("nodes"))
         {
             const auto &member = labeled.members().at(node.at("node_id").get<std::string>());
-            require(node.at("address") == member.address && !node.contains("label_address"),
-                    "Agent snapshot exposed a label IP instead of its public address");
+            require(NodeAddress::from_params(node, "snapshot") == member,
+                    "Agent snapshot lost labeled addresses");
         }
         membership["version"] = 2U;
-        membership["members"][1]["label"] = "vpc-b";
+        membership["members"][1]["network_ports"][1]["label"] = "vpc-b";
         labeled.update_members(membership);
         require(targets.at("slave") == "192.0.2.2", "Label changes did not replace probe targets");
         membership["version"] = 3U;
-        membership["members"][1].erase("label");
+        membership["members"][1].erase("network_ports");
         bool rejected_legacy = false;
         try { labeled.update_members(membership); }
         catch (const std::exception &) { rejected_legacy = true; }
-        require(rejected_legacy && labeled.members().at("slave").label == "vpc-b",
+        require(rejected_legacy && labeled.members().at("slave").address_for("vpc-b") == "10.20.0.2",
                 "Legacy membership was accepted or partially applied");
 
         std::cout << "[PASS] topology aggregation, label selection, probes and public snapshots\n";

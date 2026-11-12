@@ -1,5 +1,6 @@
+#include "node_address_fixture.h"
 #include "stream_attach.h"
-#include "tls_rpk.h"
+#include "tls_channel.h"
 #include "test_data.h"
 #include "node_fixture.h"
 #include "relay_agent.h"
@@ -275,8 +276,8 @@ asio::awaitable<void> exercise(const std::shared_ptr<TLSChannel> &consumer, cons
             require(descriptor->at("session_id").get<std::uint64_t>() != 0, "UDP attachment has a zero session ID");
         }
     }
-    require(first.at("data_address") == entry.control.advertise_address &&
-            last.at("data_address") == exit.control.advertise_address &&
+    require(NodeAddress::from_params(first, "first") == entry.cluster.network_ports &&
+            NodeAddress::from_params(last, "last") == exit.cluster.network_ports &&
             first.at("node_id") == entry.cluster.node_id && last.at("node_id") == exit.cluster.node_id,
             "Relay did not publish the actual data endpoint");
     require(!first.contains("agent_session_id") && !last.contains("agent_session_id") &&
@@ -573,7 +574,6 @@ void integration()
         config.server_ca_file = sample.server_ca_file;
         const auto host = "127.0.0." + std::to_string(index + 1);
         config.control.address = host;
-        config.control.advertise_address = host;
         config.control.port = tcp_port(control);
         config.tcp.address = host;
         config.tcp.port = tcp_port(transfer);
@@ -597,6 +597,7 @@ void integration()
         }
         config.cluster = {index == 0 ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave,
                           names[index], "127.0.0.1", cluster_port, cluster_tcp, cluster_udp};
+        config.cluster.network_ports = test_node_address(host);
         config.channel.disconnect_timeout = 100ms;
         auto node = std::make_shared<RelayNode>(control, transfer, udp_io, data, server_ssl, config);
         node->start();

@@ -9,13 +9,10 @@
     "address": "0.0.0.0",
     "control_port": 18447,
     "tcp_port": 18448,
-    "udp_port": 18448,
-    "label": "default",
-    "label_address": null
+    "udp_port": 18448
   },
   "control": {
     "address": "0.0.0.0",
-    "advertise_address": "203.0.113.10",
     "port": 18443,
     "max_connections": 512,
     "max_services": 256,
@@ -54,5 +51,11 @@
     "heartbeat_interval_ms": 5000,
     "heartbeat_timeout_ms": 20000,
     "max_queued_messages": 100
-  }
+  },
+  "network_ports": [
+    {
+      "label": "default",
+      "address": "203.0.113.10"
+    }
+  ]
 }

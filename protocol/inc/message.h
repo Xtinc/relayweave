@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 
 using njson = nlohmann::json;
@@ -177,6 +178,8 @@ struct WireMessage
     static BytesBuf pack(CtrlMessage message);
 };
 
+CtrlMessage decode_ctrl_datagram(std::span<const std::uint8_t> datagram);
+
 class MessageReceiver
 {
   public:
@@ -251,6 +254,49 @@ struct RelayAttach
     std::uint64_t uuid;
     std::uint64_t ticket;
     std::optional<ConnectionId> connection_id;
+};
+
+/** @brief Own up to four normalized, labeled Node addresses shared by configuration and wire messages. */
+class NodeAddress
+{
+  public:
+    /** @brief Associate one exact network label with a reachable address. */
+    struct Entry
+    {
+        std::string label;
+        std::string address;
+        bool operator==(const Entry &) const = default;
+    };
+
+    /** @brief Create an empty staging value; assign initialized addresses before selection or serialization. */
+    NodeAddress() = default;
+    /** @brief Compare normalized address sets, independently of input ordering. */
+    bool operator==(const NodeAddress &) const = default;
+    /** @brief Decode mandatory network_ports metadata. @param params Enclosing object. @param location Diagnostic path.
+     * @return Validated, normalized addresses; legacy single-address metadata is rejected. */
+    static NodeAddress from_params(const njson &params, std::string_view location);
+    /** @brief Encode initialized addresses. @return Object containing the network_ports array.
+     * @pre This object was initialized by from_params(). */
+    njson to_params() const;
+    /** @brief Select a labeled entry, falling back to default.
+     * @param label Requested exact network label. @return Borrowed selected entry with its actual label and address.
+     * @pre This object was initialized by from_params(). */
+    const Entry &select(std::string_view label) const noexcept;
+    /** @brief Select an exact label, falling back to default. @param label Caller's network label.
+     * @return Borrowed selected address. @pre This object has been initialized. */
+    const std::string &address_for(std::string_view label) const noexcept;
+    /** @brief Select the first shared non-default label in lexical order. @param peer Other endpoint's addresses.
+     * @return Shared label, or default if none exists; both address sets must be validated. */
+    std::string_view common_label(const NodeAddress &peer) const noexcept;
+    /** @brief Select this endpoint's address for a Node peer. @param peer Other endpoint's addresses.
+     * @return Address selected using the symmetric common-label rule. */
+    const std::string &address_for(const NodeAddress &peer) const;
+    /** @brief Inspect normalized entries. @return View valid for this object's lifetime, until reassignment. */
+    std::span<const Entry> entries() const noexcept { return {entries_.data(), count_}; }
+
+  private:
+    std::array<Entry, 4> entries_{};
+    std::size_t count_ = 0;
 };
 
 namespace config

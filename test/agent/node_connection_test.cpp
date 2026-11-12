@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "agent_stop.h"
 #include "node_connection.h"
 #include "relay_agent.h"
@@ -84,7 +85,7 @@ class Peer
 
     void identify_node()
     {
-        channel->send(CtrlMessage(CtrlCommand::ServerIdentified, njson{{"node_id", node}}));
+        channel->send(CtrlMessage(CtrlCommand::ServerIdentified, njson{{"node_id", node}, {"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")}}));
     }
 
     void stop()

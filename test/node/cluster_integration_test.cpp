@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "test_data.h"
 #include "cluster_mgr.h"
 #include "node_fixture.h"
@@ -106,6 +107,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         settings.control.address = settings.tcp.address = settings.datagram.address =
             "127.0.0.1";
         settings.cluster = cluster;
+        settings.cluster.network_ports = test_node_address("127.0.0.1");
         settings.channel = channel;
         auto owner = std::make_shared<RelayNode>(io, tcp_io, udp_io, cluster_data.io, context, std::move(settings));
         owners.push_back(owner);
@@ -113,6 +115,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
     };
     auto make = [&](ClusterConfig::Role role, std::string node_id, std::shared_ptr<RelayNode> &owner) {
         ClusterConfig config{role, std::move(node_id), "127.0.0.1", port};
+        config.network_ports = test_node_address("127.0.0.1");
         owner = make_owner(config);
         auto node = std::make_shared<ClusterMgr>(
             *owner, io.get_executor(), context, std::move(config), channel, 16);
@@ -387,6 +390,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
 
         // Pending handshakes count against the cluster connection limit.
         ClusterConfig limited_config{ClusterConfig::Role::Master, "limited", "127.0.0.1", port};
+        limited_config.network_ports = test_node_address("127.0.0.1");
         auto limited_owner = make_owner(limited_config);
         auto limited = std::make_shared<ClusterMgr>(*limited_owner, io.get_executor(), context,
                                                     std::move(limited_config), channel, 1);
@@ -407,6 +411,7 @@ asio::awaitable<void> verify(asio::io_context &io, asio::ssl::context &context, 
         tcp::acceptor silent_master(io, {asio::ip::address_v4::loopback(), 0});
         ClusterConfig handshaking_config{ClusterConfig::Role::Slave, "handshaking", "127.0.0.1",
                                          silent_master.local_endpoint().port()};
+        handshaking_config.network_ports = test_node_address("127.0.0.1");
         auto handshaking_owner = make_owner(handshaking_config);
         auto handshaking = std::make_shared<ClusterMgr>(*handshaking_owner, io.get_executor(), context,
                                                         std::move(handshaking_config), channel, 1);
@@ -519,7 +524,7 @@ CtrlMessage located_reply(const CtrlMessage &query)
     return CtrlMessage(CtrlCommand::ServiceLocated,
         njson{{"target", params.at("source")}, {"requester_node", params.at("source")},
               {"session_id", params.at("session_id")}, {"request_id", params.at("request_id")},
-              {"source", "forged"}, {"node_id", "forged"}, {"address", "127.0.0.1"},
+              {"source", "forged"}, {"node_id", "forged"}, {"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")},
               {"service", params.at("service")}, {"protocol", params.at("protocol")}});
 }
 
@@ -538,7 +543,7 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
         client->send(CtrlMessage(CtrlCommand::ServiceLookup,
                                 njson{{"request_id", 101U}, {"service", "public-query"}, {"protocol", "tcp"}}));
         const auto service = co_await client_reply(client, CtrlCommand::ServiceLocated);
-        require(service.params->at("node_id") == "slave" && service.params->at("address") == "127.0.0.1" &&
+        require(service.params->at("node_id") == "slave" && NodeAddress::from_params(*service.params, "service.located").address_for("default") == "127.0.0.1" &&
                     !service.params->contains("port"),
                 "Local/remote service discovery changed its owner or endpoint");
         client->send(CtrlMessage(CtrlCommand::TopologyQuery, njson{{"request_id", 103U}}));
@@ -600,7 +605,7 @@ asio::awaitable<void> verify_public_queries(const std::shared_ptr<TLSChannel> &p
     peer->send(std::move(wrong));
     peer->send(located_reply(query));
     const auto correct = co_await client_reply(remote, CtrlCommand::ServiceLocated);
-    require(correct.params->at("node_id") == "observer" && correct.params->at("address") == "127.0.0.1",
+    require(correct.params->at("node_id") == "observer" && NodeAddress::from_params(*correct.params, "service.located").address_for("default") == "127.0.0.1",
             "Reply accepted a wrong requester or trusted a forged source/node ID");
 
     remote->send(CtrlMessage(CtrlCommand::ServiceLookup,

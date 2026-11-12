@@ -46,6 +46,11 @@ TCP 共享发送队列按流标签交错插入，算法、接口与实现见 [�
 和 [管理面板部署说明](dashboard/README.md)。
 SOCKS5 TCP/UDP 能力、关联所有权与容量配置见 [SOCKS5 代理](docs/SOCKS5代理设计.md)。
 
+Node 根级 `network_ports` 宣告 1～4 组标签与地址，必须包含 `default`；不内置回环地址。
+NodeLink 和节点探测使用按字典序选出的共同非默认标签，Agent 使用根级 `network_label`（缺省 `default`）；
+未匹配时使用目标 Node 的 `default`。具体结构、机器专属回环标签与迁移规则见
+[网络接口与端口划分](docs/RelayWeave设计.md#14-网络接口与端口划分)。
+
 ## C++ / Asio 编码约束
 
 - 类与结构体说明、对外接口统一使用 Doxygen 风格的英文注释（`/** ... */`），以 `@brief` 概括职责或行为。

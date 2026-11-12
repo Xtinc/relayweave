@@ -1,4 +1,6 @@
+#include "node_address_fixture.h"
 #include "stream_attach.h"
+#include "agent_network_check.h"
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
@@ -478,7 +480,8 @@ asio::awaitable<void> echo_accept_loop(tcp::acceptor &acceptor, const std::atomi
 }
 
 asio::awaitable<void> relay_round_trip(std::uint16_t port, bool half_close, asio::ssl::context &context,
-                                     std::uint16_t control_port)
+                                     std::uint16_t control_port, asio::io_context &transfer_io,
+                                     RelayAgent &producer, RelayAgent &consumer)
 {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
@@ -503,6 +506,8 @@ asio::awaitable<void> relay_round_trip(std::uint16_t port, bool half_close, asio
         co_await asio::async_read(socket, asio::buffer(received),
                                   asio::cancel_after(2s, asio::use_awaitable));
         require(received == payload, "TLS relay round trip payload mismatch");
+        co_await asio::co_spawn(transfer_io, test_agent::check_network(producer, "127.0.0.3"), asio::use_awaitable);
+        co_await asio::co_spawn(transfer_io, test_agent::check_network(consumer, "127.0.0.2"), asio::use_awaitable);
         auto monitor = co_await connect_control(context, control_port);
         const auto relays = co_await relay_status(monitor, 1004);
         require(relays.size() == 1 && relays.at(0).at("mode") == "single" &&
@@ -565,7 +570,9 @@ int main()
         NodeConfig server_config = make_test_node_config();
         server_config.control.address = "127.0.0.1";
         server_config.control.port = control_port;
-        server_config.tcp.address = "127.0.0.1";
+        server_config.tcp.address = "0.0.0.0";
+        server_config.cluster.network_ports = test_node_address(
+            {{"default", "127.0.0.1"}, {"vpc-a", "127.0.0.2"}, {"lo:host-a", "127.0.0.3"}});
         server_config.tcp.port = transfer_port;
         server_config.datagram.address = "127.0.0.1";
         server_config.datagram.port = transfer_port;
@@ -614,6 +621,7 @@ int main()
         require(!transfer_tcp_io.stopped(), "TCP transfer io_context stopped after lifecycle verification");
         require(!transfer_udp_io.stopped(), "UDP transfer io_context stopped after lifecycle verification");
         AgentConfig producer_config;
+        producer_config.network_label = "lo:host-a";
         producer_config.host = "127.0.0.1";
         producer_config.port = control_port;
         producer_config.connect_timeout = 1s;
@@ -626,6 +634,7 @@ int main()
             std::make_shared<RelayAgent>(control_io, transfer_tcp_io, producer_context, std::move(producer_config));
 
         AgentConfig consumer_config;
+        consumer_config.network_label = "vpc-a";
         consumer_config.host = "127.0.0.1";
         consumer_config.port = control_port;
         consumer_config.connect_timeout = 1s;
@@ -649,7 +658,8 @@ int main()
             bool succeeded = false;
             for (int attempt = 0; attempt < 20 && !succeeded; ++attempt)
             {
-                auto result = asio::co_spawn(control_io, relay_round_trip(forward_port, half_close, consumer_context, control_port), asio::use_future);
+                auto result = asio::co_spawn(control_io, relay_round_trip(forward_port, half_close, consumer_context, control_port,
+                    transfer_tcp_io, *producer, *consumer), asio::use_future);
                 try
                 {
                     result.get();

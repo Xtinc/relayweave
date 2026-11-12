@@ -111,7 +111,11 @@ void AgentControl::query_topology()
 void AgentControl::update_probe_targets()
 {
     const auto &primary = connection_;
-    std::map<std::string, std::string> targets{{primary.node_id(), config_.host}};
+    ProbeSet::Targets targets;
+    if (primary.ready())
+    {
+        targets.emplace(primary.node_id(), primary.address());
+    }
     for (const auto &[service, location] : service_locations_)
     {
         if (!location.node.empty())
@@ -193,10 +197,11 @@ void AgentControl::locate_service(const njson &params)
         return;
     }
     auto node = config::required_string(params, "node_id", "service.located");
-    auto address = config::required_string(params, "address", "service.located");
-    desired->second = ServiceLocation{0, node, std::move(address)};
+    auto addresses = NodeAddress::from_params(params, "service.located");
+    desired->second = ServiceLocation{0, node, addresses.address_for(config_.network_label)};
     PROXY_INFO_PRINT("Service located service=%s/%s -> %s@%s", service.service.c_str(),
-                     relay_protocol_name(service.protocol).data(), node.c_str(), desired->second.address.c_str());
+                     relay_protocol_name(service.protocol).data(), node.c_str(),
+                     desired->second.address.c_str());
     update_probe_targets();
     asio::post(transfer_executor_,
                [&forwarder = forwarder_, service = std::move(service), node = std::move(node)]() mutable {

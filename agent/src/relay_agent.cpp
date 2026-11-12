@@ -9,7 +9,7 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
     using namespace config;
     const auto root = load_json(path);
     reject_unknown_fields(
-        root, {"log", "server", "certificate", "services", "forwards", "relay", "reconnect", "channel", "routing"},
+        root, {"log", "server", "certificate", "services", "forwards", "relay", "reconnect", "channel", "routing", "network_label"},
         "root");
 
     const auto &server = required_object(root, "server", "root");
@@ -18,6 +18,11 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
     reject_unknown_fields(certificate, {"ca_file", "certificate_chain", "private_key", "server_name"}, "certificate");
 
     AgentConfig result;
+    result.network_label = optional_string(root, "network_label", "default");
+    if (result.network_label.empty())
+    {
+        throw std::invalid_argument("network_label must not be empty");
+    }
     result.host = required_string(server, "host", "server");
     result.port = required_port(server, "port", "server");
     result.connect_timeout = optional_duration(server, "connect_timeout_ms", result.connect_timeout, "server");
@@ -139,7 +144,7 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
 RelayAgent::RelayAgent(asio::io_context &control_io, asio::io_context &transfer_io, asio::ssl::context &ssl_context,
                        AgentConfig config)
     : control_executor_(control_io.get_executor()), transfer_executor_(transfer_io.get_executor()),
-      config_(std::move(config)), routing_(control_io, config_.routing_max_nodes),
+      config_(std::move(config)), routing_(control_io, config_.routing_max_nodes, config_.network_label),
       connection_(*this, control_executor_, ssl_context, config_),
       forwarder_(std::make_unique<Forwarder>(*this, transfer_executor_, ssl_context, config_)),
       control_(control_executor_, transfer_executor_, config_, connection_, routing_, *forwarder_)

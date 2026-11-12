@@ -25,7 +25,7 @@ def configuration(data, reservations):
     for section in ("control", "tcp"):
         config[section]["port"] = reserve(reservations, socket.SOCK_STREAM).getsockname()[1]
     config["udp"]["port"] = reserve(reservations, socket.SOCK_DGRAM).getsockname()[1]
-    config["control"]["advertise_address"] = "127.0.0.1"
+    config["network_ports"] = [{"label": "default", "address": "127.0.0.1"}]
     config["cluster"]["address"] = "127.0.0.1"
     for key, kind in (("control_port", socket.SOCK_STREAM), ("tcp_port", socket.SOCK_STREAM),
                       ("udp_port", socket.SOCK_DGRAM)):

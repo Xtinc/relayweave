@@ -1,12 +1,13 @@
 #include "test_data.h"
 #ifndef RELAYWEAVE_NODE_TEST_CONFIG_H
 #define RELAYWEAVE_NODE_TEST_CONFIG_H
+#include "node_address_fixture.h"
 #include "relay_node.h"
 #include <thread>
 
 inline njson test_node_member(std::string id, std::string address = {})
 {
-    auto params = NodeAddress{address.empty() ? id : std::move(address)}.to_params();
+    auto params = test_node_address(address.empty() ? "127.0.0.1" : std::move(address)).to_params();
     params["node_id"] = std::move(id);
     return params;
 }
@@ -44,7 +45,7 @@ inline NodeConfig make_test_node_config()
     config.server_ca_file = data / "tls_channel_test_ca.pem";
     config.cluster = {ClusterConfig::Role::Master, "test-master", "127.0.0.1", 0};
     configure_test_cluster_data(config.cluster);
-    config.control.advertise_address = "127.0.0.1";
+    config.cluster.network_ports = test_node_address("127.0.0.1");
     return config;
 }
 

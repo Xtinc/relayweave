@@ -2,7 +2,7 @@
 #define PROXY_CLUSTER_MGR_H
 
 #include "async_event.h"
-#include "peer_blacklist.h"
+#include "message.h"
 #include "tls_channel.h"
 
 class RelayNode;
@@ -14,24 +14,6 @@ inline constexpr std::size_t cluster_message_headroom = 1024;
 inline constexpr std::size_t cluster_max_message_length = WireMessage::max_message_length - cluster_message_headroom;
 // Allow space for the identity and a generous routing-envelope overhead.
 static_assert(cluster_message_headroom >= cluster_max_node_id_length + 64);
-
-/** @brief Keep public identity addresses separate from per-peer NodeLink selection. */
-struct NodeAddress
-{
-    std::string address;
-    std::string label = "default";
-    std::string label_address;
-
-    bool operator==(const NodeAddress &) const = default;
-    /** @brief Validate the label and its unicast IPv4 address, empty for the default label. */
-    void validate(std::string_view location) const;
-    /** @brief Decode mandatory member metadata; legacy wire messages are rejected. */
-    static NodeAddress from_params(const njson &params, std::string_view location);
-    /** @brief Encode all member metadata, including a null default-label address. */
-    njson to_params() const;
-    /** @brief Select this node's address for a peer; both members must have validated metadata. */
-    const std::string &address_for(const NodeAddress &peer) const noexcept;
-};
 
 /** @brief Configure the Node role, identity, master control endpoint, and local NodeLink ports. */
 struct ClusterConfig
@@ -48,9 +30,7 @@ struct ClusterConfig
     std::uint16_t control_port = 0;
     std::uint16_t tcp_port = 0;
     std::uint16_t udp_port = 0;
-    std::string advertise_address;
-    std::string label = "default";
-    std::string label_address;
+    NodeAddress network_ports;
 };
 
 /**

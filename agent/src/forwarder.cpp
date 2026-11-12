@@ -1,6 +1,6 @@
 #include "forwarder.h"
 #include "agent_session.h"
-#include "tls_rpk.h"
+#include "tls_channel.h"
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -23,7 +23,7 @@ Forwarder::Forwarder(RelayAgent &agent, asio::any_io_executor executor, asio::ss
                      const AgentConfig &config)
     : agent_(agent), transfer_work_(asio::make_work_guard(std::move(executor))),
       session_options_{business_context_, config.channel.handshake_timeout, config.connect_timeout,
-                       config.channel.disconnect_timeout},
+                       config.channel.disconnect_timeout, config.network_label},
       relay_open_timeout_(config.relay_open_timeout), udp_idle_timeout_(config.udp_idle_timeout),
       udp_idle_timer_(transfer_work_.get_executor()), stopped_event_(transfer_work_.get_executor())
 {
@@ -395,7 +395,7 @@ void Forwarder::relay_message(ServerRoute route, CtrlMessage message)
             relay->target = target->second;
             relay->selection.server = route;
             relay->selection.epoch = config::optional_unsigned(p, "epoch", true).value_or(0);
-            relay->endpoint = AgentSession::RelayEndpoint::from_params(p, protocol);
+            relay->endpoint = AgentSession::RelayEndpoint::from_params(p, protocol, session_options_.network_label);
             start_relay(std::move(relay));
         }
         catch (const std::exception &error)

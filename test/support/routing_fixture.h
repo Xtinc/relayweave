@@ -14,8 +14,8 @@ namespace test_routing
 {
 struct Fixture : AgentRouting
 {
-    Fixture(asio::io_context &io, std::size_t max_nodes)
-        : AgentRouting(io, max_nodes), io(io) {}
+    Fixture(asio::io_context &io, std::size_t max_nodes, std::string label = "default")
+        : AgentRouting(io, max_nodes, std::move(label)), io(io) {}
     asio::io_context &io;
 };
 

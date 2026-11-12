@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "agent_session.h"
 #include "forwarder.h"
 #include "member_access.h"
@@ -11,6 +12,7 @@ TEST_MEMBER(RelayAgent, forwarder_)
 TEST_MEMBER(NodeConnection, connected_)
 TEST_MEMBER(NodeConnection, channel_)
 TEST_MEMBER(NodeConnection, node_id_)
+TEST_MEMBER(NodeConnection, address_)
 TEST_MEMBER(AgentControl, running_)
 TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(Forwarder, start_relay)
@@ -36,7 +38,7 @@ std::string service_name(RelayProtocol protocol)
 njson endpoint_params(RelayProtocol protocol)
 {
     return njson{{"service", service_name(protocol)}, {"protocol", relay_protocol_name(protocol)},
-                 {"data_address", "127.0.0.1"}, {"data_port", 1U}, {"uuid", 11U}, {"ticket", 12U},
+                 {"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")}, {"data_port", 1U}, {"uuid", 11U}, {"ticket", 12U},
                  {"session_id", 13U}};
 }
 
@@ -81,6 +83,7 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
     test_access::NodeConnection_connected_(connection) = true;
     test_access::NodeConnection_channel_(connection) = channel;
     test_access::NodeConnection_node_id_(connection) = "node";
+    test_access::NodeConnection_address_(connection) = "127.0.0.1";
     auto &agent_control = test_access::RelayAgent_control_(*agent);
     test_access::AgentControl_running_(agent_control) = true;
     for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
@@ -105,7 +108,11 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
         };
         add("data_port", 0U);
         add("data_port", 65536U);
-        add("data_address", 1U);
+        add("network_ports", 1U);
+        auto legacy = endpoint_params(protocol);
+        legacy.erase("network_ports");
+        legacy["data_address"] = "127.0.0.1";
+        invalid.push_back(std::move(legacy));
         add("ticket", 0U);
         auto missing = endpoint_params(protocol);
         missing.erase("ticket");

@@ -2,6 +2,7 @@
 #define RELAYWEAVE_AGENT_COMMON_H
 
 #include "tls_channel.h"
+#include "message.h"
 #include <functional>
 #include <type_traits>
 

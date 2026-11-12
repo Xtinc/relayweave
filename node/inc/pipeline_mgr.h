@@ -2,7 +2,7 @@
 #define RELAYWEAVE_STREAM_PIPELINE_H
 
 #include "node_common.h"
-#include "peer_blacklist.h"
+#include "tls_channel.h"
 #include "xfr_channel.h"
 #include <atomic>
 #include <map>

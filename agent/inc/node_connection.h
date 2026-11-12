@@ -46,6 +46,9 @@ class NodeConnection
      * @return Identified Node and weak primary control channel.
      */
     ServerRoute route() const;
+    /** @brief Borrow the primary Node address selected for this Agent's label on control_io.
+     * @return Selected address while ready(); valid until the next identification. */
+    const std::string &address() const noexcept { return address_; }
     /** @brief Enqueue control output on control_io.
      * @param message Owned message to send.
      * @pre ready() is true on the same executor; run() owns the active channel.
@@ -71,6 +74,7 @@ class NodeConnection
     asio::ssl::context &ssl_context_;
     const AgentConfig &config_;
     std::string node_id_;
+    std::string address_;
     std::string id_;
     std::weak_ptr<TLSChannel> channel_;
     std::optional<Operations> operations_;

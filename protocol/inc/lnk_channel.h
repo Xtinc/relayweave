@@ -2,7 +2,6 @@
 #define RELAYWEAVE_LNK_CHANNEL_H
 #include "fair_queue.h"
 #include "tls_channel.h"
-#include "peer_blacklist.h"
 #include <algorithm>
 #include <array>
 #include <bit>

@@ -1,4 +1,6 @@
+#include "node_address_fixture.h"
 #include "stream_attach.h"
+#include "agent_network_check.h"
 #include "test_data.h"
 #include "node_test_config.h"
 #include "relay_agent.h"
@@ -25,7 +27,6 @@ TEST_MEMBER(RelayNode, relay_sessions_)
 TEST_MEMBER(RelayAgent, control_)
 TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(RelayAgent, connection_)
-TEST_MEMBER(RelayAgent, forwarder_)
 
 namespace
 {
@@ -99,14 +100,16 @@ NodeConfig server_config(std::string node_id, ClusterConfig::Role role, std::uin
 {
     auto config = make_test_node_config();
     const bool is_master = node_id == "master";
+    const auto local_label = "lo:" + node_id;
     config.cluster = {role, std::move(node_id), "127.0.0.1", cluster_port};
     asio::io_context port_io;
     config.cluster.tcp_port = unused_port(port_io, used);
     config.cluster.udp_port = unused_udp_port(port_io, used);
     config.control.address = is_master ? "0.0.0.0" : "127.0.0.1";
-    config.control.advertise_address = is_master ? "localhost" : "127.0.0.1";
+    config.cluster.network_ports = test_node_address(
+        {{"default", is_master ? "localhost" : "127.0.0.1"}, {local_label, "127.0.0.2"}});
     config.control.port = control_port;
-    config.tcp.address = "127.0.0.1";
+    config.tcp.address = "0.0.0.0";
     config.tcp.port = transfer_port;
     config.tcp.setup_timeout = 1s;
     config.datagram.address = "127.0.0.1";
@@ -345,7 +348,7 @@ asio::awaitable<tcp::socket> attach_stream(const std::shared_ptr<TLSChannel> &co
 {
     const auto executor = co_await asio::this_coro::executor;
     tcp::socket socket(executor);
-    co_await socket.async_connect({asio::ip::make_address(endpoint.at("data_address").get<std::string>()),
+    co_await socket.async_connect({asio::ip::make_address(NodeAddress::from_params(endpoint, "endpoint").address_for("default")),
                                   config::message_data_port(endpoint)}, asio::use_awaitable);
     co_await attach_stream_control(socket, control, {role,
         endpoint.at("uuid").get<std::uint64_t>(), endpoint.at("ticket").get<std::uint64_t>()},
@@ -455,6 +458,7 @@ int main()
                           unused_port(transfer_io, used), unused_udp_port(udp_io, used), used)));
         auto consumer_config = client_config(primary_port);
         consumer_config.routing_max_nodes = 1;
+        consumer_config.network_label = "unmatched-label";
         for (unsigned i = 0; i < 10; ++i)
         {
             const auto control_port = unused_port(control_io, used);
@@ -464,6 +468,7 @@ int main()
                 server_config("entry-" + std::to_string(i), ClusterConfig::Role::Slave, cluster_port, control_port,
                               unused_port(transfer_io, used), unused_udp_port(udp_io, used), used)));
             auto producer_config = client_config(control_port);
+            producer_config.network_label = i == 8 ? "default" : "lo:entry-" + std::to_string(i);
             producer_config.services.push_back({service, "127.0.0.1", echo.local_endpoint().port(), RelayProtocol::Tcp});
             if (i == 8)
             {
@@ -509,9 +514,13 @@ int main()
             nodes.back()->start();
         });
         asio::co_spawn(control_io, verify_entries(*agents.back(), nodes, forwards, clients), asio::use_future).get();
+        asio::co_spawn(transfer_io, test_agent::check_network(*agents.back(), "127.0.0.1"), asio::use_future).get();
+        asio::co_spawn(transfer_io, test_agent::check_network(*agents[0], "127.0.0.2"), asio::use_future).get();
         asio::co_spawn(control_io, verify_late_udp(*agents.back(), udp_forward), asio::use_future).get();
         asio::co_spawn(control_io, verify_primary_reconnect(*agents.back(), clients), asio::use_future).get();
         asio::co_spawn(control_io, verify_entries(*agents.back(), nodes, forwards, clients), asio::use_future).get();
+        asio::co_spawn(transfer_io, test_agent::check_network(*agents.back(), "127.0.0.1"), asio::use_future).get();
+        asio::co_spawn(transfer_io, test_agent::check_network(*agents[0], "127.0.0.2"), asio::use_future).get();
         asio::co_spawn(control_io, verify_late_udp(*agents.back(), udp_forward), asio::use_future).get();
         agents.back()->stop();
         asio::co_spawn(control_io, wait_empty(nodes), asio::use_future).get();

@@ -40,7 +40,6 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
     }
     cluster_context_.load_verify_file(config_.server_ca_file.string());
 
-    config_.cluster.advertise_address = config_.control.advertise_address;
     cluster_mgr_ = std::make_shared<ClusterMgr>(*this, control_executor_, cluster_context_, config_.cluster,
                                                 config_.channel, config_.control.max_connections);
     metrics_ = std::make_shared<NodeMetrics>(control_executor_, transfer_tcp_executor_, transfer_udp_executor_,
@@ -52,7 +51,7 @@ RelayNode::RelayNode(asio::io_context &control_io, asio::io_context &transfer_tc
         std::make_unique<NodeLinkMgr>(control_executor_, cluster_data_executor_, config_.cluster, config_.tcp.address,
                                       config_.datagram.address, *cluster_mgr_, *topology_);
     control_ = std::make_unique<NodeControl>(registry_, *cluster_mgr_, *topology_, *metrics_, relay_sessions_,
-                                             config_.cluster.node_id, config_.control.advertise_address);
+                                             config_.cluster.node_id, config_.cluster.network_ports);
 }
 
 RelayNode::~RelayNode() = default;
@@ -618,7 +617,7 @@ bool RelayNode::send_relay(const AgentPeer &route, CtrlMessage message)
     const auto command = message.type();
     if (command == CtrlCommand::RelayOpened || command == CtrlCommand::RelayOffer)
     {
-        params["data_address"] = config_.control.advertise_address;
+        params.update(config_.cluster.network_ports.to_params());
     }
     if (route.node.empty())
     {

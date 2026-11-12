@@ -88,6 +88,8 @@ asio::awaitable<void> NodeConnection::run()
 
                 const auto identified_node =
                     config::required_string(config::message_params(identified), "node_id", "server.identified");
+                address_ = NodeAddress::from_params(config::message_params(identified), "server.identified")
+                               .address_for(config_.network_label);
                 node_id_ = identified_node;
                 connected_ = true;
                 reconnect_delay = config_.reconnect_initial_delay;

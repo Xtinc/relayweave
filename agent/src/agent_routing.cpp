@@ -11,7 +11,8 @@ static std::chrono::milliseconds age(std::uint64_t value)
     return std::chrono::milliseconds(std::min(value, std::uint64_t(std::chrono::milliseconds::max().count())));
 }
 
-AgentRouting::AgentRouting(asio::io_context &io, std::size_t max_nodes) : max_nodes_(max_nodes), probes_(io)
+AgentRouting::AgentRouting(asio::io_context &io, std::size_t max_nodes, std::string network_label)
+    : max_nodes_(max_nodes), network_label_(std::move(network_label)), probes_(io)
 {
     if (max_nodes == 0 || max_nodes > MAX_PATH_NODES)
     {
@@ -36,7 +37,7 @@ void AgentRouting::update_targets()
     auto targets = required_targets_;
     for (const auto &[id, node] : snapshot_.nodes)
     {
-        targets.try_emplace(id, node.address);
+        targets.insert_or_assign(id, node.address);
     }
     probes_.set_targets(std::move(targets));
 }
@@ -94,7 +95,7 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
         for (const auto &node : nodes)
         {
             auto id = required_string(node, "node_id", "topology.snapshot");
-            Node parsed{required_string(node, "address", "topology.snapshot"),
+            Node parsed{NodeAddress::from_params(node, "topology.snapshot").address_for(network_label_),
                         node.at("report_age_ms").is_null() ? std::chrono::milliseconds::max()
                                                            : age(require_unsigned(node, "report_age_ms")),
                         std::nullopt};
@@ -139,7 +140,10 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
         }
 
         if (snapshot_.epoch != next.epoch ||
-            std::ranges::any_of(snapshot_.nodes, [&](const auto &node) { return !next.nodes.contains(node.first); }))
+            std::ranges::any_of(snapshot_.nodes, [&](const auto &node) {
+                const auto found = next.nodes.find(node.first);
+                return found == next.nodes.end() || found->second.address != node.second.address;
+            }))
         {
             path_cache_.clear();
         }

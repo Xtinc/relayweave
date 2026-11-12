@@ -27,8 +27,27 @@ from dashboard import (
 )
 from history_store import HistoryStore
 from flow_map import FlowCollection
-from proxy_client import ProxyControlClient
+from proxy_client import ProxyControlClient, _default_network_address
 from proxy_protocol import CtrlMessage, HEADER_LENGTH, from_cbor, pack_frame
+
+
+class NetworkPortsTests(unittest.TestCase):
+    def test_default_is_selected_among_labeled_interfaces(self):
+        ports = [{"label": "vpc-a", "address": "192.168.1.10"},
+                 {"label": "lo:host-a", "address": "127.0.0.1"},
+                 {"label": "default", "address": "node.example"}]
+        self.assertEqual(_default_network_address({"network_ports": ports}), "node.example")
+
+    def test_invalid_and_legacy_address_metadata_is_rejected(self):
+        default = {"label": "default", "address": "127.0.0.1"}
+        for ports in ([], [default] * 5, [default, default],
+                      [{"label": "vpc-a", "address": "192.168.1.10"}],
+                      [{"label": "default", "address": ""}],
+                      [default, {"label": "vpc-a", "address": None}]):
+            with self.subTest(ports=ports), self.assertRaises(ValueError):
+                _default_network_address({"network_ports": ports})
+        with self.assertRaises(ValueError):
+            _default_network_address({"address": "127.0.0.1"})
 
 
 class _Socket:
@@ -112,7 +131,7 @@ def _topology(
             "nodes": [
                 {
                     "node_id": identity,
-                    "address": "127.0.0.1",
+                    "network_ports": [{"label": "default", "address": "127.0.0.1"}],
                     "report_age_ms": 100,
                     "control_queue_delay_us": 1,
                     "transfer_tcp_queue_delay_us": 2,
@@ -325,7 +344,7 @@ class ClusterPollingTest(unittest.TestCase):
     def test_identity_handshake_precedes_cluster_queries(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             client = self.make_client(directory)
-            sock = _Socket(CtrlMessage("server.identified", {"node_id": "node-a"}))
+            sock = _Socket(CtrlMessage("server.identified", {"node_id": "node-a", "network_ports": [{"label": "default", "address": "127.0.0.1"}]}))
             try:
                 self.assertEqual(client._identify_server(sock), "node-a")
                 length = int.from_bytes(sock.outgoing[:HEADER_LENGTH], "big")

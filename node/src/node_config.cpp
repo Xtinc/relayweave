@@ -56,7 +56,7 @@ ClusterConfig parse_cluster_config(const njson &root)
     ClusterConfig result;
     const auto &cluster = required_object(root, "cluster", "root");
     reject_unknown_fields(
-        cluster, {"role", "node_id", "address", "control_port", "tcp_port", "udp_port", "label", "label_address"},
+        cluster, {"role", "node_id", "address", "control_port", "tcp_port", "udp_port"},
         "cluster");
     const auto role = required_string(cluster, "role", "cluster");
     if (role != "master" && role != "slave")
@@ -77,10 +77,7 @@ ClusterConfig parse_cluster_config(const njson &root)
     result.control_port = required_port(cluster, "control_port", "cluster");
     result.tcp_port = required_port(cluster, "tcp_port", "cluster");
     result.udp_port = required_port(cluster, "udp_port", "cluster");
-    result.label = optional_string(cluster, "label", "default");
-    if (const auto field = cluster.find("label_address"); field != cluster.end() && !field->is_null())
-        result.label_address = required_string(cluster, "label_address", "cluster");
-    NodeAddress{result.node_id, result.label, result.label_address}.validate("cluster");
+    result.network_ports = NodeAddress::from_params(root, "root");
 
     const auto control = required_port(required_object(root, "control", "root"), "port", "control");
     const auto tcp = required_port(required_object(root, "tcp", "root"), "port", "tcp");
@@ -99,12 +96,12 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     using namespace config;
     const auto root = load_json(path);
 
-    reject_unknown_fields(root, {"log", "bandwidth_mbps", "control", "cluster", "tcp", "udp", "certificate", "channel"},
+    reject_unknown_fields(root, {"log", "bandwidth_mbps", "control", "cluster", "tcp", "udp", "certificate", "channel", "network_ports"},
                           "root");
     const auto &control = required_object(root, "control", "root");
     reject_unknown_fields(
         control,
-        {"address", "advertise_address", "port", "max_connections", "max_services", "max_services_per_session"},
+        {"address", "port", "max_connections", "max_services", "max_services_per_session"},
         "control");
     const auto &udp = required_object(root, "udp", "root");
     reject_unknown_fields(udp,
@@ -120,13 +117,6 @@ NodeConfig load_node_config(const std::filesystem::path &path)
     result.cluster = parse_cluster_config(root);
 
     result.control.address = required_string(control, "address", "control");
-    result.control.advertise_address = required_string(control, "advertise_address", "control");
-    asio::error_code advertise_error;
-    const auto advertise_ip = asio::ip::make_address(result.control.advertise_address, advertise_error);
-    if (!advertise_error && advertise_ip.is_unspecified())
-    {
-        throw std::invalid_argument("control.advertise_address must identify a reachable server address");
-    }
     result.control.port = required_port(control, "port", "control");
     result.control.max_connections = static_cast<std::size_t>(optional_unsigned(
         control, "max_connections", result.control.max_connections, 1, max_connection_count, "control"));

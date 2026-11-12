@@ -1,6 +1,6 @@
 #include "relay_workload.h"
 #include "test_data.h"
-#include "tls_rpk.h"
+#include "tls_channel.h"
 
 namespace
 {

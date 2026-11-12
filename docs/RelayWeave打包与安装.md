@@ -5,6 +5,15 @@
 
 本文集中说明 RelayWeave 的 CMake/CPack Debian 打包、版本和架构命名、文件布局、systemd 服务生命周期、安装、升级、卸载和排错。系统原理见 [RelayWeave 设计](RelayWeave设计.md)，证书生成和信任关系见 [证书制作与部署](证书制作与部署.md)。
 
+升级多地址版本时，Node、Agent 和 Dashboard 必须配套更新。Node 删除 `control.advertise_address`、
+`cluster.label` 与 `cluster.label_address`，改为根级 `network_ports` 数组（1～4 个 `{label,address}` 条目，
+必须包含 `default`）。公网地址放在 `default`，内网地址使用通信组标签，回环地址使用机器专属标签，
+例如 `lo:host-a`；不自动添加回环地址。Agent 可配置根级 `network_label`，缺省 `default`。
+标签只选择宣告地址，不改变监听 IP 或端口；监听地址须覆盖需要接入的接口。
+UDP 通配监听仍由系统选择回包源地址；使用同网段多个本地地址时，应保证回包源地址与 Agent 接入的地址一致。
+主控引导地址 `server.host` 和 `cluster.address` 仍需显式配置。完整示例与选址规则见
+[网络接口与端口划分](RelayWeave设计.md#14-网络接口与端口划分)。旧配置与旧宣告协议不再接受。
+
 ## 1. 包与版本
 
 项目通过 CPack 的 DEB generator 从一次构建生成四个独立组件包：

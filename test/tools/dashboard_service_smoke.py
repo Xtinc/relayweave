@@ -54,8 +54,9 @@ def main() -> None:
         link_tcp, link_udp = [sock.getsockname()[1] for sock in reserved[8:10]]
         config = json.loads((ROOT / 'node' / 'node.example.json').read_text())
         config['cluster'].update(role='master', node_id='dashboard-smoke', address='127.0.0.1', control_port=cluster, tcp_port=link_tcp, udp_port=link_udp)
-        config['control'].update(address='127.0.0.1', advertise_address='127.0.0.1', port=control)
-        for name, port in [('tcp', tcp), ('tls', tls), ('udp', udp)]:
+        config['network_ports'] = [{'label': 'default', 'address': '127.0.0.1'}]
+        config['control'].update(address='127.0.0.1', port=control)
+        for name, port in [('tcp', tcp), ('udp', udp)]:
             config[name].update(address='127.0.0.1', port=port)
         config['certificate'] = {
             'server_ca_file': str(DATA / 'tls_channel_test_ca.pem'),
@@ -73,7 +74,7 @@ def main() -> None:
             slave_link_tcp, slave_link_udp = [sock.getsockname()[1] for sock in reserved[14:16]]
             slave_config['cluster'].update(tcp_port=slave_link_tcp, udp_port=slave_link_udp)
             slave_config['control']['port'] = slave_control
-            for name, port in [('tcp', slave_tcp), ('tls', slave_tls), ('udp', slave_udp)]:
+            for name, port in [('tcp', slave_tcp), ('udp', slave_udp)]:
                 slave_config[name]['port'] = port
             (work / 'slave.json').write_text(json.dumps(slave_config))
         published_services = [

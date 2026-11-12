@@ -1,3 +1,4 @@
+#include "node_address_fixture.h"
 #include "node_fixture.h"
 #include <future>
 #include <iostream>
@@ -55,11 +56,12 @@ struct Cluster
             auto config = settings;
             const auto address = "127.0.0." + std::to_string(i + 1);
             config.control.address = config.tcp.address = config.datagram.address = address;
-            config.control.advertise_address = i == 0 ? "localhost" : i == 1 ? "127.0.1.2" : address;
             config.cluster = {i == 0 ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave,
                               std::string(1, 'a' + i), "127.0.0.1", cp, tp, up};
-            config.cluster.label = i < 2 ? "vpc-a" : "vpc-b";
-            config.cluster.label_address = i < 2 ? address : "127.0.1.3";
+            config.cluster.network_ports = test_node_address(
+                {{"default", i == 0 ? "localhost" : i == 1 ? "127.0.1.2" : address},
+                 {i < 2 ? "vpc-a" : "vpc-b", i < 2 ? address : "127.0.1.3"},
+                 {i < 2 ? "vpc-z" : "other", "127.0.1.99"}});
             config.channel.disconnect_timeout = 100ms;
             auto node = std::make_shared<RelayNode>(control, transfer, datagram, data, ssl, config);
             node->start();
@@ -166,8 +168,9 @@ asio::awaitable<void> verify(Cluster &f)
         member["node_id"] = id;
         if (id == "b")
         {
-            member["address"] = "127.0.0.2";
-            member["label"] = "vpc-b";
+            member["network_ports"][0]["address"] = "127.0.0.2";
+            member["network_ports"][1]["label"] = "vpc-b";
+            member["network_ports"].erase(2);
         }
         members.push_back(std::move(member));
     }
@@ -210,15 +213,15 @@ asio::awaitable<void> verify(Cluster &f)
             "Stale selected addresses were accepted");
     // An unused label IP change must also invalidate cached authorization.
     const auto before = f.shared("b", RelayProtocol::Tcp)->params;
-    members[1]["label_address"] = "127.0.1.22";
+    members[1]["network_ports"][1]["address"] = "127.0.1.22";
     publish(101);
     rebuilt = co_await test_node::ensure_link(f.nodes[0], "a", "b", RelayProtocol::Tcp);
     require(bool(rebuilt) && rebuilt.id != before.id && f.shared("b", RelayProtocol::Tcp)->params.token != before.token,
             "Label metadata change retained a cached Link");
     // A label-only change switches back to the private route without touching the public address.
     const auto public_id = rebuilt.id;
-    members[1]["label"] = "vpc-a";
-    members[1]["label_address"] = "127.0.0.2";
+    members[1]["network_ports"][1]["label"] = "vpc-a";
+    members[1]["network_ports"][1]["address"] = "127.0.0.2";
     publish(102);
     rebuilt = co_await test_node::ensure_link(f.nodes[0], "a", "b", RelayProtocol::Tcp);
     require(bool(rebuilt) && rebuilt.id != public_id &&

@@ -31,6 +31,29 @@ from proxy_protocol import (
 )
 
 
+def _default_network_address(params: dict) -> str:
+    """Check the display metadata shape and select default; Node owns address validation."""
+    ports = params.get("network_ports")
+    if not isinstance(ports, list) or not 1 <= len(ports) <= 4:
+        raise ValueError("network_ports must contain 1 to 4 entries")
+    labels: set[str] = set()
+    default = None
+    for entry in ports:
+        if not isinstance(entry, dict):
+            raise ValueError("Invalid network_ports entry")
+        label, address = entry.get("label"), entry.get("address")
+        if not isinstance(label, str) or not label or label in labels:
+            raise ValueError("network_ports labels must be nonempty and unique")
+        if not isinstance(address, str) or not address:
+            raise ValueError("Invalid network_ports address")
+        labels.add(label)
+        if label == "default":
+            default = address
+    if default is None:
+        raise ValueError("network_ports requires a default label")
+    return default
+
+
 @dataclass
 class QueueSample:
     """One queue-delay measurement from a topology snapshot."""
@@ -659,8 +682,8 @@ class ProxyControlClient:
             if not isinstance(entry, dict):
                 raise ValueError("topology.snapshot node must be an object")
             node_id = entry.get("node_id")
-            address = entry.get("address")
-            if not isinstance(node_id, str) or not node_id or not isinstance(address, str) or not address:
+            address = _default_network_address(entry)
+            if not isinstance(node_id, str) or not node_id:
                 raise ValueError("topology.snapshot node identity is invalid")
             available = self._nullable_number(entry, "available")
             if available is not None and available > 1:

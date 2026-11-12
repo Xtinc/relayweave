@@ -1,6 +1,7 @@
+#include "node_address_fixture.h"
 #include "agent_session.h"
 #include "forwarder.h"
-#include "frame_io.h"
+#include "message.h"
 #include "member_access.h"
 #include "test_data.h"
 #include <algorithm>
@@ -14,6 +15,7 @@ TEST_MEMBER(RelayAgent, forwarder_)
 TEST_MEMBER(NodeConnection, connected_)
 TEST_MEMBER(NodeConnection, channel_)
 TEST_MEMBER(NodeConnection, node_id_)
+TEST_MEMBER(NodeConnection, address_)
 TEST_MEMBER(AgentControl, running_)
 TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(Forwarder, datagram_forwards_)
@@ -81,7 +83,7 @@ asio::awaitable<Attached> attach(Forwarder &owner, TLSChannel &peer, const Serve
     const auto opened = co_await command(peer, CtrlCommand::RelayOpen);
     const auto request = opened.params->at("request_id").get<std::uint64_t>();
     njson endpoint{{"protocol", "udp"}, {"request_id", request}, {"uuid", uuid}, {"ticket", uuid + 1},
-                   {"session_id", uuid + 2}, {"data_address", "127.0.0.1"},
+                   {"session_id", uuid + 2}, {"network_ports", test_node_address("127.0.0.1").to_params().at("network_ports")},
                    {"data_port", node.local_endpoint().port()}};
     if (multi)
         endpoint["flow_id"] = uuid + 3;
@@ -144,6 +146,7 @@ asio::awaitable<void> exercise(asio::io_context &control, asio::io_context &tran
     test_access::NodeConnection_connected_(connection) = true;
     test_access::NodeConnection_channel_(connection) = channel;
     test_access::NodeConnection_node_id_(connection) = "node";
+    test_access::NodeConnection_address_(connection) = "127.0.0.1";
     auto &agent_control = test_access::RelayAgent_control_(*agent);
     test_access::AgentControl_running_(agent_control) = true;
     const ServiceKey service{"udp-test", RelayProtocol::Udp};

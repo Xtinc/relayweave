@@ -117,9 +117,9 @@ static void validate_server_status(const njson &params, std::string_view locatio
 
 NodeControl::NodeControl(RegistryMgr &registry, ClusterMgr &cluster, const Topology &topology,
                          const NodeMetrics &metrics, const NodeSessionList &relays, std::string node_id,
-                         std::string advertise_address)
+                         const NodeAddress &network_ports)
     : registry_(registry), cluster_(cluster), topology_(topology), metrics_(metrics), relay_sessions_(relays),
-      node_id_(std::move(node_id)), advertise_address_(std::move(advertise_address))
+      node_id_(std::move(node_id)), network_ports_(network_ports)
 {
 }
 
@@ -131,9 +131,12 @@ bool NodeControl::handle_client(SessionId id, const ControlSessionPtr &session, 
     case CtrlCommand::ServiceRegister:
         register_service(id, session, params);
         break;
-    case CtrlCommand::ServerIdentify:
-        session->send(CtrlMessage{CtrlCommand::ServerIdentified, njson{{"node_id", node_id_}}});
+    case CtrlCommand::ServerIdentify: {
+        auto reply = network_ports_.to_params();
+        reply["node_id"] = node_id_;
+        session->send(CtrlMessage{CtrlCommand::ServerIdentified, std::move(reply)});
         break;
+    }
     case CtrlCommand::ServiceLookup:
         locate_service(id, session, params);
         break;
@@ -289,7 +292,7 @@ void NodeControl::handle_cluster_location(CtrlMessage message)
     config::require_unsigned(params, "request_id", true);
     config::message_service(params);
     config::message_protocol(params);
-    config::required_string(params, "address", "service.located");
+    NodeAddress::from_params(params, "service.located");
     session->send(std::move(message));
 }
 
@@ -376,11 +379,12 @@ std::optional<CtrlMessage> NodeControl::service_location(const njson &params)
     {
         return std::nullopt;
     }
-    return CtrlMessage{CtrlCommand::ServiceLocated, njson{{"request_id", request_id},
-                                                          {"service", service},
-                                                          {"protocol", relay_protocol_name(protocol)},
-                                                          {"node_id", node_id_},
-                                                          {"address", advertise_address_}}};
+    auto reply = network_ports_.to_params();
+    reply["request_id"] = request_id;
+    reply["service"] = service;
+    reply["protocol"] = relay_protocol_name(protocol);
+    reply["node_id"] = node_id_;
+    return CtrlMessage{CtrlCommand::ServiceLocated, std::move(reply)};
 }
 
 CtrlMessage NodeControl::server_status_message(std::uint64_t request_id)

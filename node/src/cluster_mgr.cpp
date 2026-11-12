@@ -5,53 +5,6 @@
 #include <random>
 #include <vector>
 
-void NodeAddress::validate(std::string_view location) const
-{
-    const auto prefix = std::string(location);
-    if (label.empty())
-    {
-        throw std::invalid_argument(prefix + ".label must not be empty");
-    }
-    if (label == "default")
-    {
-        if (!label_address.empty())
-            throw std::invalid_argument(prefix + ".label_address must not be set for the default label");
-        return;
-    }
-    if (label_address.empty())
-        throw std::invalid_argument(prefix + ".label_address is required for a non-default label");
-    asio::error_code error;
-    const auto ip = asio::ip::make_address_v4(label_address, error);
-    if (error || ip.is_unspecified() || ip.is_multicast() || ip.to_uint() == 0xffffffffU)
-        throw std::invalid_argument(prefix + ".label_address must be a unicast IPv4 address");
-}
-
-NodeAddress NodeAddress::from_params(const njson &params, std::string_view location)
-{
-    NodeAddress result;
-    result.address = config::required_string(params, "address", location);
-    result.label = config::required_string(params, "label", location);
-    const auto field = params.find("label_address");
-    if (field == params.end())
-        throw std::invalid_argument(std::string(location) + ".label_address is required (Node versions must match)");
-    if (!field->is_null())
-        result.label_address = config::required_string(params, "label_address", location);
-    result.validate(location);
-    return result;
-}
-
-njson NodeAddress::to_params() const
-{
-    return {{"address", address},
-            {"label", label},
-            {"label_address", label_address.empty() ? njson(nullptr) : njson(label_address)}};
-}
-
-const std::string &NodeAddress::address_for(const NodeAddress &peer) const noexcept
-{
-    return label != "default" && label == peer.label ? label_address : address;
-}
-
 /**
  * @brief Define a master-room participant on control_io.
  * @details The room retains participants until their connection tasks leave; delivery only
@@ -303,7 +256,7 @@ class ClusterSession : public ClusterParticipant
                 room_.ready();
                 PROXY_INFO_PRINT("Cluster [+] node=%s peer=%.*s address=%s", node_id_.c_str(),
                                  static_cast<int>(channel_->peer().size()), channel_->peer().data(),
-                                 address_.address.c_str());
+                                 address_.address_for("default").c_str());
                 while (!stopping_)
                 {
                     room_.deliver(node_id_, co_await channel_->async_receive());
@@ -332,7 +285,7 @@ class ClusterSession : public ClusterParticipant
         {
             PROXY_INFO_PRINT("Cluster [x] node=%s peer=%.*s address=%s", node_id_.c_str(),
                              static_cast<int>(channel_->peer().size()), channel_->peer().data(),
-                             address_.address.c_str());
+                             address_.address_for("default").c_str());
         }
     }
 
@@ -404,11 +357,10 @@ ClusterMgr::ClusterMgr(RelayNode &server, asio::any_io_executor executor, asio::
         throw std::invalid_argument("cluster node_id must not be all");
     }
 
-    if (config_.advertise_address.empty())
+    if (config_.network_ports.entries().empty())
     {
-        config_.advertise_address = config_.address;
+        throw std::invalid_argument("cluster.network_ports is required");
     }
-    NodeAddress{config_.advertise_address, config_.label, config_.label_address}.validate("cluster");
 
     if (config_.role == ClusterConfig::Role::Master)
     {
@@ -513,7 +465,7 @@ asio::awaitable<void> ClusterMgr::accept_loop()
 {
     ClusterRoom room(executor_, config_.node_id, epoch_);
     room.join(std::make_unique<LocalParticipant>(
-        config_.node_id, NodeAddress{config_.advertise_address, config_.label, config_.label_address}, *this));
+        config_.node_id, config_.network_ports, *this));
 
     try
     {
@@ -557,7 +509,7 @@ asio::awaitable<void> ClusterMgr::slave_loop()
                                                        channel_config_);
                 master_channel_ = channel;
                 co_await channel->start(config_.address);
-                auto member = NodeAddress{config_.advertise_address, config_.label, config_.label_address}.to_params();
+                auto member = config_.network_ports.to_params();
                 member["node_id"] = config_.node_id;
                 channel->send(CtrlMessage{CtrlCommand::ClusterJoin, std::move(member)});
                 auto joined = co_await channel->async_receive(channel_config_.handshake_timeout);

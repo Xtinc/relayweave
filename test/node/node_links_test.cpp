@@ -1,5 +1,6 @@
+#include "node_address_fixture.h"
 #include "failing_payload_pool.h"
-#include "frame_io.h"
+#include "tls_channel.h"
 #include "node_fixture.h"
 #include "flow_test_io.h"
 #include <future>
@@ -57,7 +58,7 @@ void integration()
     {
         auto config = make_test_node_config();
         const auto address = "127.0.0." + std::to_string(i + 1);
-        config.control.address = config.control.advertise_address = config.tcp.address =
+        config.control.address = config.tcp.address =
             config.datagram.address = address;
         config.cluster = {i == 0 ? ClusterConfig::Role::Master : ClusterConfig::Role::Slave,
                           i == 0   ? "master"
@@ -67,6 +68,7 @@ void integration()
                           cp,
                           tp,
                           up};
+        config.cluster.network_ports = test_node_address(address);
         config.channel.disconnect_timeout = 100ms;
         auto node = std::make_shared<RelayNode>(control, transfer, datagram, data, ssl, config);
         node->start();
@@ -630,7 +632,7 @@ void data_failures()
                        {"request_id", std::uint64_t(21)},
                        {"master", "a"},
                        {"path", std::vector<std::string>{"b", "a"}},
-                       {"addresses", std::vector<std::string>{"127.0.0.1", "127.0.0.1"}},
+                       {"addresses", njson::array({test_node_address("127.0.0.1").to_params(), test_node_address("127.0.0.1").to_params()})},
                        {"links", std::vector<std::uint64_t>{8}},
                        {"transport", "tcp"},
                        {"ttl_ms", unsigned(10000)}};
