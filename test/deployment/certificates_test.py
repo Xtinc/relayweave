@@ -230,7 +230,6 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
     def test_node_install_update_and_permissions_without_service_or_config_changes(self):
         result = self.install()
         self.assert_success(result)
-        self.assertIn('IP Address:127.0.0.1', result.stdout)
         self.assertEqual(set(self.snapshot()), NODE_FILES)
         self.assertEqual(self.snapshot()['server.key'][1], 0o600)
         self.assertTrue(all(mode == 0o644 for name, (_, mode) in self.snapshot().items()
@@ -419,7 +418,7 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
         self.assertNotEqual(self.install('node', corrupt, '--dry-run').returncode, 0)
         self.assert_success(self.install())
         before = self.snapshot()
-        result = self.install('node', self.first / 'node-slave-1.tar.gz')
+        result = self.install('node', self.first / 'node-slave-1.tar.gz', '--verify-certs')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('identity mismatch', result.stderr)
         self.assertEqual(self.snapshot(), before)
@@ -428,7 +427,7 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
                  for name, data in files]
         package = self.make_archive('bad-key.tar.gz', files)
         for role in ('agent', 'dashboard'):
-            result = self.install(role, package, '--dry-run')
+            result = self.install(role, package, '--dry-run', '--verify-certs')
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('do not match', result.stderr)
 
@@ -459,7 +458,7 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
                           else (self.agent / name).read_bytes()) for name in sorted(AGENT_FILES)]
                 package = self.make_archive(f'bad-{purpose}.tar.gz', files)
                 for role in ('agent', 'dashboard'):
-                    result = self.install(role, package, '--dry-run')
+                    result = self.install(role, package, '--dry-run', '--verify-certs')
                     self.assertNotEqual(result.returncode, 0)
                     self.assertIn('expired' if days == '0' else 'purpose', result.stderr)
                 if days == '0':
@@ -495,6 +494,29 @@ sys.exit(subprocess.run([tools[name], *args]).returncode)
                 if cert_dir:
                     options += ['--cert-dir', str(cert_dir)]
                 self.assert_success(self.provision(role, *options))
+
+    def test_certificate_operations_without_system_openssl(self):
+        # Fail every OpenSSL invocation, even on hosts where it is installed.
+        openssl = self.tools / 'openssl'
+        openssl.write_text('#!/bin/sh\necho "unexpected openssl invocation" >&2\nexit 99\n')
+        openssl.chmod(0o755)
+        for role in ('node', 'agent', 'dashboard'):
+            with self.subTest(role=role):
+                self.assert_success(self.install(role, None, '--dry-run'))
+                self.assert_success(self.install(role))
+                self.assert_success(self.install(role))
+                self.assert_success(self.provision(role, '--remove-certs',
+                                                   '--cert-dir', str(self.target)))
+                result = self.install(role, None, '--dry-run', '--verify-certs')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('unexpected openssl invocation', result.stderr)
+
+    def test_verify_host_opts_in_to_certificate_validation(self):
+        self.assert_success(self.install('node', None, '--dry-run',
+                                         '--verify-host', 'node.example.test'))
+        result = self.install('node', None, '--dry-run', '--verify-host', 'wrong.example.test')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(self.target.exists())
 
 
 if __name__ == '__main__':

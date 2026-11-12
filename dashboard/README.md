@@ -309,9 +309,9 @@ curl http://127.0.0.1:5000/api/health
 
 安装和更新使用同一条命令；更新后执行 `sudo systemctl restart relayweave-dashboard` 加载。证书操作不修改 JSON，也不启动、停止或重启服务。`--remove-certs` 备份并移除证书，`--cert-dir DEST` 可自定义目标目录，配置中的路径须同步调整。默认安装到独立的 `/etc/relayweave/dashboard-certs/`，目录为 `root:relayweave-dashboard`、`0750`，公钥证书为 `0644`，私钥为 `0640`。同机 Agent 仍使用自己的证书目录和权限。
 
-工具检查证书有效期、用途和私钥匹配，客户端签发链由签发端验证，与 Agent 一致。覆盖或移除前备份到 `/var/backups/relayweave/dashboard-<UTC时间>-<随机后缀>/`，失败时尝试恢复。源码中用 `bash scripts/provision_relayweave.sh dashboard ...` 调用相同流程；新参数需使用更新后的脚本或 Deb。`--dry-run` 不修改文件或服务，也不检查安装后的权限和采集连接。
+工具默认只检查文件清单、非空和目标路径，不依赖系统 `openssl`；客户端证书内容由签发端验证。显式添加 `--verify-certs` 可使用系统 `openssl` 检查有效期、用途和私钥匹配，与 Agent 一致。覆盖或移除前备份到 `/var/backups/relayweave/dashboard-<UTC时间>-<随机后缀>/`，失败时尝试恢复。源码中用 `bash scripts/provision_relayweave.sh dashboard ...` 调用相同流程；新参数需使用更新后的脚本或 Deb。`--dry-run` 不修改文件或服务，也不检查安装后的权限和采集连接。
 
-旧的 `--cert-dir SOURCE --config FILE [--dry-run] [--start|--restart]` 完整部署接口仍可用，三文件输入即可；若输入目录额外带有 `client-ca.pem`，则验证签发链但不安装该文件。此接口把配置原样安装到 `/etc/relayweave/dashboard.json`，权限为 `root:relayweave-dashboard`、`0640`，证书安装到上述默认目录；不会重写 JSON 中的路径。仅此完整部署接口支持 `--start` 启用并启动服务、`--restart` 重启已运行的服务。
+旧的 `--cert-dir SOURCE --config FILE [--dry-run] [--start|--restart]` 完整部署接口仍可用，三文件输入即可；启用 `--verify-certs` 且输入目录额外带有 `client-ca.pem` 时，验证签发链但不安装该文件。此接口把配置原样安装到 `/etc/relayweave/dashboard.json`，权限为 `root:relayweave-dashboard`、`0640`，证书安装到上述默认目录；不会重写 JSON 中的路径。仅此完整部署接口支持 `--start` 启用并启动服务、`--restart` 重启已运行的服务。
 
 #### 移除旧版安装的证书和程序
 

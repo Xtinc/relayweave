@@ -17,7 +17,8 @@ usage() {
     echo "Usage: $prefix <operation> [options]" >&2
     echo "  --install-certs FILE [--cert-dir DEST] [--dry-run]  Install or update a certificate bundle" >&2
     echo "  --remove-certs [--cert-dir DEST] [--dry-run]        Back up and remove certificates" >&2
-    echo "  --config FILE [--cert-dir SOURCE] [--verify-host HOST]... [--start|--restart] [--dry-run]" >&2
+    echo "  --config FILE [--cert-dir SOURCE] [--start|--restart] [--dry-run]" >&2
+    echo "  --verify-certs [--verify-host HOST]...             Opt in to certificate validation using system openssl" >&2
     exit "${1:-2}"
 }
 
@@ -34,6 +35,7 @@ archive=
 certificate_action=
 service_action=none
 dry_run=false
+verify_certs=false
 verify_hosts=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -42,7 +44,7 @@ while [[ $# -gt 0 ]]; do
         case "$1" in
         --cert-dir) cert_dir=$2 ;;
         --config) config_file=$2 ;;
-        --verify-host) verify_hosts+=("$2") ;;
+        --verify-host) verify_hosts+=("$2"); verify_certs=true ;;
         --install-certs)
             [[ -z "$certificate_action" ]] || usage
             certificate_action=install
@@ -62,6 +64,7 @@ while [[ $# -gt 0 ]]; do
         shift
         ;;
     --dry-run) dry_run=true; shift ;;
+    --verify-certs) verify_certs=true; shift ;;
     -h|--help) usage 0 ;;
     *) usage ;;
     esac
@@ -76,6 +79,8 @@ else
 fi
 [[ "$role" == node || ${#verify_hosts[@]} == 0 ]] ||
     die "--verify-host applies only to RelayNode certificates."
+[[ "$verify_certs" == false || ( "$role" != proxy && "$certificate_action" != remove ) ]] ||
+    die "--verify-certs applies only to certificate installation or deployment."
 
 deployed_files=()
 destination_cert_dir=/etc/relayweave/certs
@@ -182,12 +187,21 @@ if [[ "$certificate_action" == install ]]; then
 fi
 
 if [[ "$certificate_action" != remove && "$role" != proxy ]]; then
-    command -v openssl >/dev/null || die "OpenSSL was not found in PATH."
     [[ -d "$cert_dir" ]] || die "Certificate directory does not exist: $cert_dir"
     cert_dir=$(realpath -- "$cert_dir")
     for file in "${required_files[@]}"; do
-        [[ -f "$cert_dir/$file" ]] || die "Required certificate file does not exist: $cert_dir/$file"
+        [[ -s "$cert_dir/$file" && -f "$cert_dir/$file" ]] ||
+            die "Required certificate file does not exist or is empty: $cert_dir/$file"
     done
+    if [[ "$role" == node && -z "$certificate_action" ]]; then
+        command -v relayweave-node >/dev/null ||
+            die "relayweave-node is required to validate cluster listener configuration."
+        relayweave-node --check-cluster-config "$config_file"
+    fi
+fi
+
+if [[ "$verify_certs" == true ]]; then
+    command -v openssl >/dev/null || die "--verify-certs requires the openssl command."
     certificate_file=$cert_dir/$identity.pem
     private_key_file=$cert_dir/$identity.key
     check_certificate "$cert_dir/server-ca.pem" "SSL server CA"
@@ -195,11 +209,6 @@ if [[ "$certificate_action" != remove && "$role" != proxy ]]; then
     [[ "$role" != node ]] || purpose="SSL server"
     check_certificate "$certificate_file" "$purpose"
     if [[ "$role" == node ]]; then
-        if [[ -z "$certificate_action" ]]; then
-            command -v relayweave-node >/dev/null ||
-                die "relayweave-node is required to validate cluster listener configuration."
-            relayweave-node --check-cluster-config "$config_file"
-        fi
         check_certificate "$cert_dir/client-ca.pem" "SSL client CA"
         openssl verify -CAfile "$cert_dir/server-ca.pem" -purpose sslserver "$certificate_file"
         openssl verify -CAfile "$cert_dir/server-ca.pem" -purpose sslclient "$certificate_file"

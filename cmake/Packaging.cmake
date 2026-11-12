@@ -1,4 +1,4 @@
-set(RELAYWEAVE_PACKAGE_RELEASE "3" CACHE STRING "Debian package revision")
+set(RELAYWEAVE_PACKAGE_RELEASE "4" CACHE STRING "Debian package revision")
 set(RELAYWEAVE_PACKAGE_MAINTAINER "xtc <784092840@qq.com>" CACHE STRING "Debian package maintainer")
 
 set(CPACK_GENERATOR "DEB")
@@ -27,17 +27,19 @@ set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 set(CPACK_DEBIAN_PACKAGE_CONTROL_STRICT_PERMISSION ON)
 
+# Service deployment requires systemd; shared library dependencies come from ELF.
+# OpenSSL CLI certificate checks are optional.
 set(CPACK_DEBIAN_AGENT_PACKAGE_NAME "relayweave-agent")
 set(CPACK_DEBIAN_AGENT_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_AGENT_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_AGENT_PACKAGE_DEPENDS "systemd, openssl")
+set(CPACK_DEBIAN_AGENT_PACKAGE_DEPENDS "systemd")
 set(CPACK_DEBIAN_AGENT_PACKAGE_DESCRIPTION
     "RelayWeave agent for publishing services and forwarding local TCP, TLS, and UDP traffic.")
 
 set(CPACK_DEBIAN_NODE_PACKAGE_NAME "relayweave-node")
 set(CPACK_DEBIAN_NODE_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_NODE_PACKAGE_SHLIBDEPS ON)
-set(CPACK_DEBIAN_NODE_PACKAGE_DEPENDS "systemd, openssl")
+set(CPACK_DEBIAN_NODE_PACKAGE_DEPENDS "systemd")
 set(CPACK_DEBIAN_NODE_PACKAGE_DESCRIPTION
     "RelayWeave node for clustered service discovery and TCP, TLS, and UDP traffic relay.")
 
@@ -53,7 +55,7 @@ set(CPACK_COMPONENT_DASHBOARD_DESCRIPTION "Independent cluster dashboard publish
 set(CPACK_DEBIAN_DASHBOARD_PACKAGE_NAME "relayweave-dashboard")
 set(CPACK_DEBIAN_DASHBOARD_FILE_NAME DEB-DEFAULT)
 set(CPACK_DEBIAN_DASHBOARD_PACKAGE_ARCHITECTURE "all")
-set(CPACK_DEBIAN_DASHBOARD_PACKAGE_DEPENDS "systemd, adduser, openssl, python3 (>= 3.10), python3-flask, python3-cbor2, python3-waitress")
+set(CPACK_DEBIAN_DASHBOARD_PACKAGE_DEPENDS "systemd, adduser, python3 (>= 3.10), python3-flask, python3-cbor2, python3-waitress")
 set(CPACK_DEBIAN_DASHBOARD_PACKAGE_DESCRIPTION
     "Single-process cluster dashboard with persistent history and a loopback HTTP listener, published by a separate RelayWeave Agent.")
 

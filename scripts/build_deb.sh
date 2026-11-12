@@ -4,7 +4,7 @@ set -euo pipefail
 script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 source_dir=$(cd -- "$script_dir/.." && pwd -P)
 build_dir=${1:-"$source_dir/build-package"}
-package_release=${RELAYWEAVE_PACKAGE_RELEASE:-3}
+package_release=${RELAYWEAVE_PACKAGE_RELEASE:-4}
 build_jobs=${RELAYWEAVE_BUILD_JOBS:-1}
 
 if [[ ! "$build_jobs" =~ ^[1-9][0-9]*$ ]]; then
@@ -16,6 +16,9 @@ cmake -S "$source_dir" -B "$build_dir" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CXX_FLAGS="--param=ggc-min-expand=20 --param=ggc-min-heapsize=65536" \
     -DBUILD_TESTING=OFF \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DOPENSSL_USE_STATIC_LIBS=ON \
+    -DENABLE_IO_URING=OFF \
     -DRELAYWEAVE_PACKAGE_RELEASE="$package_release"
 cmake --build "$build_dir" --parallel "$build_jobs"
 cpack --config "$build_dir/CPackConfig.cmake" -G DEB

@@ -10,7 +10,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@unittest.skipUnless(all(shutil.which(tool) for tool in ('cmake', 'cpack', 'dpkg-deb')),
+@unittest.skipUnless(all(shutil.which(tool) for tool in
+                         ('cmake', 'cpack', 'dpkg-deb', 'dpkg-shlibdeps', 'cc')),
                      'Debian packaging tools are required')
 class DebianControlFilesTest(unittest.TestCase):
     def test_crlf_checkout_produces_executable_lf_maintainer_scripts(self):
@@ -38,16 +39,22 @@ class DebianControlFilesTest(unittest.TestCase):
             # Exercise the real packaging rules with a tiny payload instead of
             # compiling C++. No packages or services are installed on the host.
             (source / 'payload').write_text('test payload\n')
+            (source / 'main.c').write_text('#include <stdio.h>\nint main(void) { return puts("fixture") < 0; }\n')
             (source / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.24)
-project(relayweave VERSION 1.0.4 LANGUAGES NONE)
+project(relayweave VERSION 1.0.4 LANGUAGES C)
+add_executable(dependency-fixture main.c)
 foreach(component IN ITEMS agent node proxy dashboard)
     install(FILES payload DESTINATION usr/share/relayweave COMPONENT ${component})
+    if(NOT component STREQUAL "dashboard")
+        install(TARGETS dependency-fixture RUNTIME DESTINATION usr/bin COMPONENT ${component})
+    endif()
 endforeach()
 add_subdirectory(dashboard)
 include(cmake/Packaging.cmake)
 ''')
             for command in (
                 ['cmake', '-S', str(source), '-B', str(build)],
+                ['cmake', '--build', str(build)],
                 ['cpack', '--config', str(build / 'CPackConfig.cmake'), '-G', 'DEB'],
             ):
                 result = subprocess.run(command, cwd=work, capture_output=True, text=True,
@@ -58,6 +65,14 @@ include(cmake/Packaging.cmake)
             for component in components:
                 with self.subTest(component=component):
                     package, = (build / 'packages').glob(f'relayweave-{component}_*.deb')
+                    dependencies = subprocess.check_output(
+                        ['dpkg-deb', '-f', str(package), 'Depends'], text=True).strip()
+                    names = {item.strip().split()[0] for item in dependencies.split(',')}
+                    if component == 'dashboard':
+                        self.assertEqual(names, {'systemd', 'adduser', 'python3', 'python3-flask',
+                                                 'python3-cbor2', 'python3-waitress'})
+                    else:
+                        self.assertEqual(names, {'systemd', 'libc6'})
                     contents = subprocess.check_output(['dpkg-deb', '--contents', str(package)], text=True)
                     self.assertNotIn('/usr/share/doc/', contents)
                     self.assertNotIn('requirements.txt', contents)

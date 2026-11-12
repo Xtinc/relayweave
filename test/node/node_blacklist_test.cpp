@@ -361,6 +361,11 @@ asio::awaitable<void> scenario(Fixture &fixture, std::vector<tcp::socket> &pendi
             co_await fixture.expect(index, 0, 0);
         }
         auto admitted = co_await fixture.connect(index);
+        if (index == 3)
+        {
+            const std::array<std::uint8_t, 4> invalid_frame{};
+            co_await asio::async_write(admitted, asio::buffer(invalid_frame), asio::use_awaitable);
+        }
         require(co_await drain(admitted) == (index == 1 ? sizeof(RelayAttach::ConnectionId) : 0),
                 "Loopback connection did not follow normal authentication or authorization");
         co_await fixture.expect(index, 0, 0);

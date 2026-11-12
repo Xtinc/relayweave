@@ -46,7 +46,7 @@ class DashboardProvisionTest(unittest.TestCase):
 
     def test_mismatched_private_key_is_rejected(self):
         shutil.copyfile(DATA / 'tls_channel_test_server.key', self.work / 'shared-client.key')
-        result = self.run_script()
+        result = self.run_script('--verify-certs')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('do not match', result.stderr)
 
@@ -58,7 +58,7 @@ class DashboardProvisionTest(unittest.TestCase):
 
     def test_untrusted_client_certificate_is_rejected(self):
         shutil.copyfile(DATA / 'tls_channel_test_ca.pem', self.work / 'client-ca.pem')
-        result = self.run_script()
+        result = self.run_script('--verify-certs')
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('Dry run complete', result.stdout)
 

@@ -95,9 +95,9 @@ vendor 静态构建固定包含 `no-zlib no-zstd no-brotli`，不查找或链接
 cmake -S . -B build -DOPENSSL_USE_STATIC_LIBS=OFF
 ```
 
-动态模式配置时会重新查找系统 OpenSSL 头文件和库，避免沿用旧缓存的静态库路径；切换方式无需手动清理缓存。Deb 中的 `openssl` 命令行工具供证书部署脚本使用，与程序链接的 libssl/libcrypto 分开，不设置相同的版本要求。
+动态模式配置时会重新查找系统 OpenSSL 头文件和库，避免沿用旧缓存的静态库路径；切换方式无需手动清理缓存。Deb 不硬依赖系统 `openssl` 命令行工具。证书部署默认只处理文件；显式指定 `--verify-certs` 或 `--verify-host` 时才使用系统 `openssl` 校验证书，与程序链接的 libssl/libcrypto 分开，不设置相同的版本要求。
 
-Linux 上 GCC 的 `libstdc++` 和 `libgcc` 也被静态链接，glibc 等其他系统库仍按动态依赖处理。CPack 启用 `dpkg-shlibdeps` 自动计算三个包的共享库依赖，并显式依赖 `systemd`。Agent/Node 包保留 `openssl` 命令行工具依赖，供证书部署脚本使用；默认静态模式无需部署 OpenSSL 3.2+ 共享库。
+Linux 上 GCC 的 `libstdc++` 和 `libgcc` 也被静态链接，glibc 等其他系统库仍按动态依赖处理。Agent/Node/Proxy 的 Deb 保留服务部署所需的 `systemd` 依赖，共享库依赖由 `dpkg-shlibdeps` 按实际 ELF 自动计算，不额外硬依赖 `openssl`。默认静态模式无需部署 OpenSSL 3.2+ 共享库；glibc 的最低版本由构建产物决定，需在预期支持的最老系统上构建。Deb 的默认部署方式通过 systemd 管理服务。二进制也可手动运行，但这不改变 Deb 的服务部署依赖。Dashboard 是 Python 应用，保留 `systemd`、`adduser`、Python 和 Python 模块依赖。
 
 ## 3. 生成 Deb 包
 
@@ -112,6 +112,8 @@ scripts/build_deb.sh
 - 使用 `build-package/`；
 - 配置 `Release`；
 - 关闭测试目标；
+- 使用静态 OpenSSL 和项目库、关闭 io_uring，避免沿用旧构建缓存引入额外动态库；
+- Debian revision 默认为 `4`，当前包版本为 `1.0.7-4`；
 - 使用单作业编译，降低小内存设备的峰值占用；
 - 把结果写入 `build-package/packages/`。
 
@@ -130,7 +132,10 @@ RELAYWEAVE_BUILD_JOBS=2 scripts/build_deb.sh
 cmake -S . -B build-package \
   -DCMAKE_BUILD_TYPE=Release \
   -DBUILD_TESTING=OFF \
-  -DRELAYWEAVE_PACKAGE_RELEASE=2
+  -DBUILD_SHARED_LIBS=OFF \
+  -DOPENSSL_USE_STATIC_LIBS=ON \
+  -DENABLE_IO_URING=OFF \
+  -DRELAYWEAVE_PACKAGE_RELEASE=4
 cmake --build build-package --parallel 1
 cpack --config build-package/CPackConfig.cmake -G DEB
 ```
@@ -209,7 +214,7 @@ sudo systemctl start relayweave-dashboard
 
 更新后需要加载新证书时手工执行 `systemctl restart relayweave-node`、`relayweave-agent` 或 `relayweave-dashboard`。证书流程不调用 systemd，不覆盖配置；`--remove-certs` 备份并卸载当前角色证书，也不改变服务状态。Node 只安装四个证书文件，Agent / Dashboard 只安装三个；具体内容和生成方法见 [证书制作与部署](证书制作与部署.md)。Node/Agent 同机且共用证书目录时，卸载一方保留另一方使用的 Server CA。Dashboard 默认使用独立的 `/etc/relayweave/dashboard-certs/`，自动设置专用用户的读取权限。`--cert-dir DEST` 可指定目标目录，配置中的路径须与之对应。
 
-覆盖或卸载前备份到 `/var/backups/relayweave/<role>-<UTC时间>-<随机后缀>/`；写入失败时尝试恢复。`--dry-run` 验证文件但不修改目标或服务，无需 root。
+覆盖或卸载前备份到 `/var/backups/relayweave/<role>-<UTC时间>-<随机后缀>/`；写入失败时尝试恢复。`--dry-run` 检查文件清单、非空和目标路径，不修改目标或服务，无需 root。证书默认只安装、备份和替换，不调用系统 `openssl`。需要额外检查有效期、用途、私钥匹配以及 Node 签发链和已有身份时，显式添加 `--verify-certs`，并自行提供 `openssl` 命令；程序运行时的 TLS 校验不受此选项影响。
 
 原有完整部署接口继续保留：
 
@@ -226,9 +231,9 @@ sudo relayweave-provision-agent \
 sudo relayweave-provision-proxy --config /secure/relayweave/config/proxy.json --start
 ```
 
-这里的 Node/Agent 证书目录来自对应压缩包的解压结果；Agent 若额外提供 `client-ca.pem` 则做签发链验证，但不安装该文件。完整部署接口默认不改变服务状态；只有显式的 `--start` 执行 `systemctl enable --now`，`--restart` 执行 `systemctl try-restart`。`--verify-host` 仅适用于 Node，可重复指定。
+这里的 Node/Agent 证书目录来自对应压缩包的解压结果；启用 `--verify-certs` 时，Agent 若额外提供 `client-ca.pem` 则做签发链验证，但不安装该文件。完整部署接口默认不改变服务状态；只有显式的 `--start` 执行 `systemctl enable --now`，`--restart` 执行 `systemctl try-restart`。`--verify-host` 仅适用于 Node，可重复指定，并自动启用 `--verify-certs`；普通文件部署无需此参数。
 
-Proxy 不需要证书。Dashboard 复用同一部署脚本和 Agent 的 `client.tar.gz`，支持 `--install-certs` 和 `--remove-certs`；旧的 `--cert-dir DIR --config FILE [--dry-run] [--start|--restart]` 完整部署接口继续保留，输入只需三个运行时文件，额外提供 Client CA 时才验证签发链。详见 [Dashboard 部署说明](../dashboard/README.md#独立服务部署)。
+Proxy 不需要证书。Dashboard 复用同一部署脚本和 Agent 的 `client.tar.gz`，支持 `--install-certs` 和 `--remove-certs`；旧的 `--cert-dir DIR --config FILE [--dry-run] [--start|--restart]` 完整部署接口继续保留，输入只需三个运行时文件；启用 `--verify-certs` 且额外提供 Client CA 时才验证签发链。详见 [Dashboard 部署说明](../dashboard/README.md#独立服务部署)。
 
 检查状态和日志：
 
