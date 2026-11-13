@@ -6,6 +6,7 @@
 #include "relay_agent.h"
 #include "agent_control.h"
 #include "agent_routing.h"
+#include "routing_fixture.h"
 #include "forwarder.h"
 #include "xfr_channel.h"
 #include <asio/experimental/awaitable_operators.hpp>
@@ -23,6 +24,7 @@ TEST_MEMBER(RelayAgent, forwarder_)
 TEST_MEMBER(AgentControl, service_locations_)
 TEST_MEMBER(RelayAgent, connection_)
 TEST_MEMBER(AgentRouting, path_cache_)
+TEST_MEMBER(AgentRouting, snapshot_)
 TEST_MEMBER(RelayNode, config_)
 TEST_MEMBER(RelayNode, datagram_mgr_)
 TEST_MEMBER(RelayNode, tcp_pipeline_)
@@ -80,6 +82,32 @@ struct RelayAgentTestAccess
         }
         throw std::runtime_error("Consumer Agent service/topology did not become ready");
     }
+    static asio::awaitable<void> select_configured_path(RelayAgent &agent, asio::io_context &io, ServiceKey service,
+                                                         std::uint64_t epoch, std::vector<std::string> path)
+    {
+        co_await select_cached_path(agent, service, epoch, path);
+        auto &route = routing(agent);
+        auto &snapshot = test_access::AgentRouting_snapshot_(route);
+        const auto now = AgentRouting::Clock::now();
+        snapshot.created = now;
+        snapshot.links.clear();
+        for (auto &[id, node] : snapshot.nodes)
+        {
+            node.report_age = std::chrono::milliseconds(0);
+        }
+        for (std::size_t index = 1; index < path.size(); ++index)
+        {
+            snapshot.links.push_back({path[index - 1], path[index], {1.0, 1.0, true}, std::chrono::milliseconds(0)});
+        }
+        const std::vector<RouteGraph::Entry> entries{{path.front(), 1.0}};
+        test_routing::candidates(route, io, path.back(), now, entries);
+        test_access::AgentRouting_path_cache_(route).put(path.back(), {path.back()});
+        if (route.select_path(service, path.back(), path) != path)
+        {
+            throw std::runtime_error("Configured path was overridden by the automatic cache");
+        }
+    }
+
     static asio::awaitable<void> verify_primary_routing(RelayAgent &agent, std::uint64_t epoch)
     {
         const ServiceKey service{"auto-tcp", RelayProtocol::Tcp};
@@ -209,6 +237,33 @@ asio::awaitable<void> verify_flow_reports(const std::shared_ptr<TLSChannel> &mon
             }
         }
         require(found == (active ? 1U : 0U), active ? "Ready Flow missing from report" : "Inactive Flow leaked into report");
+    }
+}
+
+// Verify the installed Node path, so a silently ignored listener configuration cannot pass via direct access.
+asio::awaitable<void> verify_configured_flow(const std::shared_ptr<TLSChannel> &monitor, RelayProtocol protocol)
+{
+    monitor->send(CtrlMessage(CtrlCommand::ServerCluster, njson{{"request_id", 880}}));
+    for (;;)
+    {
+        const auto message = co_await monitor->async_receive(4s);
+        const auto &params = config::message_params(message);
+        if (message.type() != CtrlCommand::ServerStatusReported || params.at("request_id") != 880 ||
+            params.at("node_id") != "a")
+        {
+            continue;
+        }
+        for (const auto &relay : params.at("relays"))
+        {
+            if (relay.at("service") == "auto-" + std::string(relay_protocol_name(protocol)) &&
+                relay.at("protocol") == std::string(relay_protocol_name(protocol)) && relay.at("mode") == "multi")
+            {
+                require(relay.at("path") == std::vector<std::string>({"a", "b", "master"}),
+                        "Configured listener path was not installed on Nodes");
+                co_return;
+            }
+        }
+        throw std::runtime_error("Configured listener did not establish the expected multi-Node Flow");
     }
 }
 
@@ -1128,12 +1183,17 @@ void integration()
             consumer_config.relay_open_timeout = 5s;
             consumer_config.channel.disconnect_timeout = 100ms;
             std::vector<std::uint16_t> ports;
+            std::vector<std::uint16_t> fallback_ports;
             for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
             {
                 const auto port = protocol == RelayProtocol::Udp ? udp_port(client) : tcp_port(client);
                 ports.push_back(port);
                 consumer_config.forwards.push_back({"auto-" + std::string(relay_protocol_name(protocol)),
-                    "127.0.0.1", port, protocol});
+                    "127.0.0.1", port, protocol, {"a", "b", "master"}});
+                const auto fallback_port = protocol == RelayProtocol::Udp ? udp_port(client) : tcp_port(client);
+                fallback_ports.push_back(fallback_port);
+                consumer_config.forwards.push_back({"auto-" + std::string(relay_protocol_name(protocol)),
+                    "127.0.0.1", fallback_port, protocol, {"missing", "master"}});
             }
             auto discovery_config = consumer_config;
             discovery_config.forwards.resize(1);
@@ -1172,8 +1232,8 @@ void integration()
             for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
             {
                 const ServiceKey service{"auto-" + std::string(relay_protocol_name(protocol)), protocol};
-                co_await asio::co_spawn(agent_control, RelayAgentTestAccess::select_cached_path(
-                    *consumer_agent, service, epoch, {"a", "b", "master"}), asio::use_awaitable);
+                co_await asio::co_spawn(agent_control, RelayAgentTestAccess::select_configured_path(
+                    *consumer_agent, agent_control, service, epoch, {"a", "b", "master"}), asio::use_awaitable);
                 if (protocol == RelayProtocol::Udp)
                 {
                     udp::socket app(client, udp::v4());
@@ -1186,6 +1246,9 @@ void integration()
                         asio::cancel_after(3s, asio::use_awaitable));
                     require(first_size == bytes.size() && std::equal(bytes.begin(), bytes.end(), data.begin()),
                             "Consumer Agent lost or changed its one-shot first UDP packet");
+                    auto monitor = co_await connect_control(client_ssl, configs[1]);
+                    co_await verify_configured_flow(monitor, protocol);
+                    co_await monitor->async_disconnect();
                     const auto original_sender = sender;
                     co_await udp_target.async_send_to(asio::buffer(bytes), sender, asio::use_awaitable);
                     const auto n = co_await app.async_receive(asio::buffer(data), asio::cancel_after(1s, asio::use_awaitable));
@@ -1263,6 +1326,9 @@ void integration()
                     BytesBuf data(bytes.size());
                     co_await asio::async_read(service_socket, asio::buffer(data), asio::cancel_after(2s, asio::use_awaitable));
                     require(data == bytes, "Consumer Agent stream forward payload changed");
+                    auto monitor = co_await connect_control(client_ssl, configs[1]);
+                    co_await verify_configured_flow(monitor, protocol);
+                    co_await monitor->async_disconnect();
                     std::array<std::uint8_t, 1> byte;
                     const auto [eof, n] = co_await service_socket.async_read_some(asio::buffer(byte),
                         asio::cancel_after(1s, use_nothrow_awaitable));
@@ -1280,6 +1346,40 @@ void integration()
                     const auto [final_eof, final_size] = co_await app.async_read_some(asio::buffer(byte),
                         asio::cancel_after(1s, use_nothrow_awaitable));
                     require(final_eof == asio::error::eof, "Service FIN did not reach the application");
+                }
+                ++protocol_index;
+            }
+            protocol_index = 0;
+            for (const auto protocol : {RelayProtocol::Tcp, RelayProtocol::Tls, RelayProtocol::Udp})
+            {
+                const std::array<std::uint8_t, 3> bytes{4, 2, 1};
+                std::array<std::uint8_t, 3> data{};
+                if (protocol == RelayProtocol::Udp)
+                {
+                    udp::socket app(client, udp::v4());
+                    app.connect({asio::ip::address_v4::loopback(), fallback_ports[protocol_index]});
+                    co_await app.async_send(asio::buffer(bytes), asio::use_awaitable);
+                    udp::endpoint sender;
+                    const auto size = co_await udp_target.async_receive_from(asio::buffer(data), sender,
+                        asio::cancel_after(3s, asio::use_awaitable));
+                    require(size == bytes.size() && data == bytes, "Unavailable configured UDP path did not fall back");
+                    co_await udp_target.async_send_to(asio::buffer(bytes), sender, asio::use_awaitable);
+                    const auto returned = co_await app.async_receive(asio::buffer(data),
+                        asio::cancel_after(1s, asio::use_awaitable));
+                    require(returned == bytes.size() && data == bytes, "Fallback UDP response changed");
+                }
+                else
+                {
+                    tcp::socket app(client);
+                    co_await app.async_connect({asio::ip::address_v4::loopback(), fallback_ports[protocol_index]},
+                        asio::use_awaitable);
+                    auto service_socket = co_await target.async_accept(asio::cancel_after(3s, asio::use_awaitable));
+                    co_await asio::async_write(app, asio::buffer(bytes), asio::use_awaitable);
+                    co_await asio::async_read(service_socket, asio::buffer(data), asio::cancel_after(1s, asio::use_awaitable));
+                    require(data == bytes, "Unavailable configured stream path did not fall back");
+                    co_await asio::async_write(service_socket, asio::buffer(bytes), asio::use_awaitable);
+                    co_await asio::async_read(app, asio::buffer(data), asio::cancel_after(1s, asio::use_awaitable));
+                    require(data == bytes, "Fallback stream response changed");
                 }
                 ++protocol_index;
             }

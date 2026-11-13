@@ -52,10 +52,12 @@ class Forwarder
      * @param service Discovered service name and protocol.
      * @param destination Expected destination Node identity.
      * @param deadline Original absolute steady-clock establishment deadline.
+     * @param path Configured preferred Node sequence; empty selects automatically.
      * @return Selection result on transfer_io after control-side lookup/connection completes.
      */
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                                 std::chrono::steady_clock::time_point deadline);
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 std::vector<std::string> path = {});
     /**
      * @brief Unregister a drained session and release its UDP association on transfer_io.
      * @param relay Session retained by its run task through this notification.
@@ -148,7 +150,7 @@ class Forwarder
     asio::awaitable<void> receive_local_datagrams(DatagramForwardId forward_id);
     asio::awaitable<void> send_datagram(AgentSession &relay, std::span<const std::uint8_t> payload);
     asio::awaitable<void> expire_datagrams();
-    void start_relay(std::shared_ptr<AgentSession> relay);
+    void start_relay(std::shared_ptr<AgentSession> relay, std::vector<std::string> path = {});
     void spawn_task(asio::awaitable<void> task, std::string_view context);
     void finish_if_stopped();
     std::uint64_t allocate_request_id();

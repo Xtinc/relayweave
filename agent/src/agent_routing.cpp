@@ -139,8 +139,7 @@ bool AgentRouting::accept_snapshot(const nlohmann::json &snapshot, Clock::time_p
             throw std::invalid_argument("Topology contains duplicate directed links");
         }
 
-        if (snapshot_.epoch != next.epoch ||
-            std::ranges::any_of(snapshot_.nodes, [&](const auto &node) {
+        if (snapshot_.epoch != next.epoch || std::ranges::any_of(snapshot_.nodes, [&](const auto &node) {
                 const auto found = next.nodes.find(node.first);
                 return found == next.nodes.end() || found->second.address != node.second.address;
             }))
@@ -270,9 +269,60 @@ std::vector<RouteGraph::Path> AgentRouting::candidate_paths(const std::string &d
     return result;
 }
 
-std::vector<std::string> AgentRouting::select_path(const ServiceKey &service, const std::string &destination)
+bool AgentRouting::path_available(const std::vector<std::string> &path, const std::string &destination,
+                                  Clock::time_point now) const
+{
+    if (path.size() > max_nodes_ || path.back() != destination)
+    {
+        return false;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - snapshot_.created);
+    if (elapsed >= SNAPSHOT_EXPIRY)
+    {
+        return false;
+    }
+    for (const auto &node : path)
+    {
+        const auto found = snapshot_.nodes.find(node);
+        if (found == snapshot_.nodes.end() || found->second.report_age >= SNAPSHOT_EXPIRY - elapsed)
+        {
+            return false;
+        }
+    }
+    const auto entries = measured_entries();
+    if (std::ranges::none_of(entries, [&](const auto &entry) { return entry.node == path.front(); }))
+    {
+        return false;
+    }
+    for (std::size_t index = 1; index < path.size(); ++index)
+    {
+        const auto endpoints = std::tie(path[index - 1], path[index]);
+        const auto link =
+            std::lower_bound(snapshot_.links.begin(), snapshot_.links.end(), endpoints,
+                             [](const Link &edge, const auto &key) { return std::tie(edge.from, edge.to) < key; });
+        if (link == snapshot_.links.end() || std::tie(link->from, link->to) != endpoints)
+        {
+            return false;
+        }
+        const auto current_age = link->age + std::min(elapsed, std::chrono::milliseconds::max() - link->age);
+        if (!routing_cost(link->quality, current_age))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::vector<std::string> AgentRouting::select_path(const ServiceKey &service, const std::string &destination,
+                                                   const std::vector<std::string> &configured_path)
 {
     const auto now = AgentRouting::Clock::now();
+    if (!configured_path.empty() && path_available(configured_path, destination, now))
+    {
+        PROXY_DEBUG_PRINT("Route forced=true service=%s/%s -> %s", service.service.c_str(),
+                          relay_protocol_name(service.protocol).data(), destination.c_str());
+        return configured_path;
+    }
     if (const auto cached = path_cache_.get(destination, now))
     {
         return *cached;

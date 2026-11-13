@@ -153,7 +153,7 @@ void AgentSession::handle(const CtrlMessage &message)
     }
 }
 
-asio::awaitable<void> AgentSession::run()
+asio::awaitable<void> AgentSession::run(std::vector<std::string> configured_path)
 {
     // relay_finished() removes the owner's references before this coroutine returns.
     auto keep_alive = shared_from_this();
@@ -168,7 +168,7 @@ asio::awaitable<void> AgentSession::run()
                 throw asio::system_error(asio::error::operation_aborted);
             }
             // Selection accesses control_io state; attach and transfer stay on transfer_io.
-            selection = co_await owner.select_relay(service, destination, deadline);
+            selection = co_await owner.select_relay(service, destination, deadline, std::move(configured_path));
             if (!reason.empty())
             {
                 throw asio::system_error(asio::error::operation_aborted);

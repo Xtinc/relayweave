@@ -19,6 +19,7 @@ struct AgentForwardConfig
     std::string listen_address;
     std::uint16_t listen_port = 0;
     RelayProtocol protocol = RelayProtocol::Tcp;
+    std::vector<std::string> path;
 };
 
 struct AgentConfig
@@ -84,11 +85,13 @@ class RelayAgent
      * @param service Service name and transport identifying the discovered service.
      * @param destination Expected destination Node identity from Forwarder.
      * @param deadline Absolute steady-clock establishment deadline; never renewed.
+     * @param path Configured preferred Node sequence; empty selects automatically.
      * @return Path, epoch, logical entrance, and primary control route.
      * @throws std::exception If selection fails, expires, or is invalidated by shutdown.
      */
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                                 std::chrono::steady_clock::time_point deadline);
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 std::vector<std::string> path = {});
 
   private:
     friend class NodeConnection;

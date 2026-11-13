@@ -337,7 +337,8 @@ std::uint64_t AgentControl::allocate_request_id()
 }
 
 asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, std::string destination,
-                                                           std::chrono::steady_clock::time_point deadline)
+                                                           std::chrono::steady_clock::time_point deadline,
+                                                           std::vector<std::string> configured_path)
 {
     const auto location = service_locations_.find(service);
     if (!running_ || location == service_locations_.end() || location->second.node != destination ||
@@ -354,7 +355,7 @@ asio::awaitable<RelaySelection> AgentControl::select_relay(ServiceKey service, s
     {
         throw std::runtime_error("primary control unavailable");
     }
-    auto path = routing_.select_path(service, destination);
+    auto path = routing_.select_path(service, destination, configured_path);
     auto route = primary.route();
     route.node = path.size() > 1 ? path.front() : destination;
     co_return RelaySelection{std::move(route), std::move(path), routing_.epoch()};

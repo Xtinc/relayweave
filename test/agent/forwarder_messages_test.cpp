@@ -46,7 +46,7 @@ asio::awaitable<void> start_consumer(Forwarder &owner, RelayProtocol protocol, s
 {
     auto session = std::make_shared<AgentSession>(owner, request, ServiceKey{service_name(protocol), protocol},
                                                  "node", std::chrono::steady_clock::now() + 30s);
-    test_access::Forwarder_start_relay(owner, std::move(session));
+    test_access::Forwarder_start_relay(owner, std::move(session), std::vector<std::string>{});
     co_return;
 }
 

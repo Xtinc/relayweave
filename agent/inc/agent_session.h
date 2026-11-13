@@ -13,7 +13,12 @@ class AgentSession : public std::enable_shared_from_this<AgentSession>
   public:
     AgentSession(Forwarder &owner, std::uint64_t request, ServiceKey service, std::string destination,
                  std::chrono::steady_clock::time_point deadline);
-    asio::awaitable<void> run();
+    /**
+     * @brief Own the session lifecycle on transfer_io, using a one-shot preferred path for consumers.
+     * @param configured_path Validated configured Node sequence; empty selects automatically.
+     * @return Completes after transfer tasks, sockets and the owner's session entry have drained.
+     */
+    asio::awaitable<void> run(std::vector<std::string> configured_path = {});
     // Returns true when this call supplies the first cancellation cause.
     bool cancel(std::string cause);
 

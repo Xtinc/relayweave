@@ -11,6 +11,7 @@
 #include <stdexcept>
 
 TEST_MEMBER(ProbeSet, targets_)
+TEST_MEMBER(AgentRouting, path_available)
 
 namespace
 {
@@ -175,6 +176,79 @@ void test_bandwidth(asio::io_context &io)
     routing.invalidate_snapshot();
     require(direct_cost() == 50.0, "Disconnected snapshot retained bandwidth penalty");
 }
+
+void test_configured_paths(asio::io_context &io)
+{
+    test_routing::Fixture routing(io, 4);
+    const auto now = AgentRouting::Clock::now();
+    auto topology = snapshot(1, Json::array({node("A", "192.0.2.1"), node("X", "192.0.2.2"),
+                                           node("Y", "192.0.2.3"), node("D", "192.0.2.4")}),
+                             Json::array({edge("A", "D", 1.0), edge("A", "X", 5.0), edge("X", "D", 5.0),
+                                          edge("A", "Y", 6.0), edge("Y", "D", 6.0)}));
+    topology["created_age_ms"] = 0u;
+    unsigned sequence = 0;
+    const auto update = [&] {
+        topology["request_id"] = ++sequence;
+        topology["snapshot_version"] = sequence;
+        routing.begin_request(sequence, AgentRouting::Clock::now());
+        require(routing.accept_snapshot(topology, AgentRouting::Clock::now()), "Configured-route snapshot rejected");
+    };
+    update();
+    const std::vector<RouteGraph::Entry> entries{{"A", 1.0}, {"D", 50.0}};
+    test_routing::candidates(routing, "D", AgentRouting::Clock::now(), entries);
+    const ServiceKey service{"shared", RelayProtocol::Tcp};
+    const std::vector<std::string> automatic{"A", "D"};
+    const std::vector<std::string> via_x{"A", "X", "D"};
+    const std::vector<std::string> via_y{"A", "Y", "D"};
+    require(routing.select_path(service, "D") == automatic, "Automatic baseline route changed");
+    require(routing.select_path(service, "D", via_x) == via_x, "Cached cheaper route overrode configured path");
+    require(routing.select_path(service, "D", via_y) == via_y, "Listeners to the same service shared manual paths");
+    require(routing.select_path(service, "D", {"D"}) == std::vector<std::string>({"D"}),
+            "Single-Node configured path was not preferred");
+    require(routing.select_path(service, "D") == automatic, "Configured path polluted the automatic cache");
+    for (const auto &invalid : std::vector<std::vector<std::string>>{
+             {"A", "missing", "D"}, {"A", "X"}, {"X", "A", "D"},
+             {"A", "X", "Y", "D"}, {"A", "X", "Y", "missing", "D"}})
+    {
+        require(routing.select_path(service, "D", invalid) == automatic,
+                "Unavailable or invalid configured path did not fall back automatically");
+    }
+    require(!test_access::AgentRouting_path_available(routing, via_x, "D", now + std::chrono::seconds(16)),
+            "Expired topology accepted a configured path");
+    topology["nodes"][1]["report_age_ms"] = 15000u;
+    update();
+    require(routing.select_path(service, "D", via_x) == automatic, "Stale Node report accepted configured path");
+    topology["nodes"][1]["report_age_ms"] = 0u;
+    topology["links"][1]["quality"]["usable"] = false;
+    update();
+    require(routing.select_path(service, "D", via_x) == automatic, "Unusable link accepted configured path");
+    topology["links"][1]["quality"]["usable"] = true;
+    topology["links"][1]["age_ms"] = 45000u;
+    update();
+    require(routing.select_path(service, "D", via_x) == automatic, "Expired link accepted configured path");
+    topology["links"][1]["age_ms"] = 0u;
+    update();
+    require(routing.select_path(service, "D", via_x) == via_x, "Recovered configured path remained behind cache");
+    require(routing.select_path(service, "Y", via_x) == std::vector<std::string>({"A", "Y"}),
+            "Service relocation did not reject the old configured destination");
+
+    test_routing::Fixture limited(io, 2);
+    limited.begin_request(sequence, AgentRouting::Clock::now());
+    require(limited.accept_snapshot(topology, AgentRouting::Clock::now()), "Limited-route snapshot rejected");
+    test_routing::candidates(limited, "D", AgentRouting::Clock::now(), entries);
+    require(limited.select_path(service, "D", via_x) == automatic, "Configured path bypassed max_nodes");
+
+    test_routing::candidates(routing, "D", AgentRouting::Clock::now(), std::span(&entries[1], 1));
+    require(routing.select_path(service, "D", via_x) == automatic, "Unmeasured ingress accepted configured path");
+    test_routing::candidates(routing, "D", AgentRouting::Clock::now(), entries);
+    topology["nodes"].erase(1);
+    topology["links"].erase(topology["links"].begin() + 1, topology["links"].begin() + 3);
+    update();
+    require(routing.select_path(service, "D", via_x) == automatic, "Offline Node did not trigger automatic fallback");
+
+    test_routing::Fixture empty(io, 4);
+    require(empty.select_path(service, "D", via_x).empty(), "No-topology fallback changed direct behavior");
+}
 }
 
 int main()
@@ -184,6 +258,7 @@ int main()
         asio::io_context io(1);
         test_bandwidth(io);
         test_network_selection(io);
+        test_configured_paths(io);
         require(AgentConfig{}.routing_max_nodes == 4, "Default real Node budget changed");
         const auto data = test_data::directory();
         const auto temporary = std::filesystem::temp_directory_path() /
@@ -222,6 +297,31 @@ int main()
         }
 
         settings.erase("routing");
+        settings["forwards"] = Json::array({Json{{"service", "shared"}, {"protocol", "tcp"},
+                                                  {"listen_address", "127.0.0.1"}, {"listen_port", 10022}},
+                                             Json{{"service", "shared"}, {"protocol", "tcp"},
+                                                  {"listen_address", "127.0.0.1"}, {"listen_port", 10023},
+                                                  {"path", {"A", "X", "D"}}}});
+        write_settings();
+        const auto forwards = load_agent_config(temporary).forwards;
+        require(forwards[0].path.empty() && forwards[1].path == std::vector<std::string>({"A", "X", "D"}),
+                "Per-forward path was not parsed independently");
+        settings["forwards"][1]["path"] = Json::array();
+        write_settings();
+        require(load_agent_config(temporary).forwards[1].path.empty(), "Empty path did not select automatically");
+        settings["forwards"][1]["path"] = {"A", "B", "C", "D", "E", "F", "G", "H"};
+        write_settings();
+        require(load_agent_config(temporary).forwards[1].path.size() == 8, "Eight-Node configured path rejected");
+        for (const Json invalid : {Json(nullptr), Json(1), Json("A"), Json::array({1}), Json::array({""}),
+                                   Json::array({"all"}), Json::array({std::string(257, 'x')}),
+                                   Json::array({"A", "B", "A"}),
+                                   Json::array({"A", "B", "C", "D", "E", "F", "G", "H", "I"})})
+        {
+            settings["forwards"][1]["path"] = invalid;
+            write_settings();
+            rejects([&] { load_agent_config(temporary); }, "Malformed configured path was accepted");
+        }
+        settings.erase("forwards");
         settings["relay"] = {{"udp_idle_timeout_ms", 250}};
         write_settings();
         const auto udp_settings = load_agent_config(temporary);

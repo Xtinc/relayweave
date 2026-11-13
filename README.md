@@ -29,6 +29,7 @@ NodeControl 借用注册表、拓扑和业务元数据，统一处理公共注�
 RelayNode 在业务消息入口集中解析字段，以普通值类型交给 NodeSession；重复请求冲突、peer 身份匹配、控制断线与 epoch 失效判断仍由会话处理。
 master 只保留 NodeLinkMgr 原有建路职责，不保存中继业务状态。
 Agent 支持最佳路径提交、首 Node 定位及首末接入；首末 socket 直接桥接 NodeFlow，双方绑定后发送 relay.ready。
+Consumer 可在每条 `forwards` 中配置完整 `path`；拓扑与探测判定可用时优先采用，否则沿用自动选路。省略或 `[]` 为纯自动模式，见设计文档 §4.3.4。
 RelayAgent 直接持有 AgentControl、NodeConnection、AgentRouting 和 Forwarder，配置保留在 relay_agent.h/.cpp。
 AgentControl 借用同级模块，负责发现与入口等待；NodeConnection 直接拥有主控连接及重连和排空状态，AgentRouting 拥有目的 Node 路径缓存。
 Agent 服务发现只保存目的 Node 位置，选路后的逻辑入口控制信令继续由唯一主控连接代转，不提供主控离线定位。

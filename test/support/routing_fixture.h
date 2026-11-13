@@ -21,14 +21,13 @@ struct Fixture : AgentRouting
 
 // Populate existing measurement state without opening raw sockets or changing
 // the production route calculator's inputs. All candidates use measured_entries().
-inline std::vector<RouteGraph::Path> candidates(Fixture &routing, const std::string &destination,
+inline std::vector<RouteGraph::Path> candidates(AgentRouting &routing, asio::io_context &io, const std::string &destination,
                                                 AgentRouting::Clock::time_point now,
                                                 std::span<const RouteGraph::Entry> entries)
 {
     auto &probes = test_access::AgentRouting_probes_(routing);
     auto &icmp = test_access::ProbeSet_icmp_(probes);
     auto &resolved = test_access::ProbeSet_resolved_(probes);
-    auto &io = routing.io;
     if (!icmp)
     {
         icmp.emplace(io, std::chrono::seconds(1), LinkQuality::scoring_timeout);
@@ -51,6 +50,12 @@ inline std::vector<RouteGraph::Path> candidates(Fixture &routing, const std::str
         }
     }
     return test_access::AgentRouting_candidate_paths(routing, destination, now);
+}
+inline std::vector<RouteGraph::Path> candidates(Fixture &routing, const std::string &destination,
+                                                AgentRouting::Clock::time_point now,
+                                                std::span<const RouteGraph::Entry> entries)
+{
+    return candidates(routing, routing.io, destination, now, entries);
 }
 } // namespace test_routing
 #endif

@@ -40,9 +40,12 @@ class AgentRouting
      * @brief Reuse the destination cache or calculate and log candidate paths on control_io.
      * @param service Service name and protocol included in diagnostic logs.
      * @param destination Destination Node identity used as the shared cache key.
+     * @param path Preferred complete Node path, checked before the automatic destination cache.
+     * @pre Nonempty paths have already passed configuration validation (Node IDs, length and no repeats).
      * @return Best Node sequence, or empty when no measured route is available.
      */
-    std::vector<std::string> select_path(const ServiceKey &service, const std::string &destination);
+    std::vector<std::string> select_path(const ServiceKey &service, const std::string &destination,
+                                         const std::vector<std::string> &path = {});
 
   private:
     static constexpr auto REQUEST_TIMEOUT = std::chrono::seconds(10);
@@ -87,6 +90,9 @@ class AgentRouting
 
     /** @brief Compute one path per measured ingress to this destination, ordered by cost and Nodes. */
     std::vector<RouteGraph::Path> candidate_paths(const std::string &destination, Clock::time_point now) const;
+    /** @brief Check a validated nonempty path against current topology and measurements on control_io. */
+    bool path_available(const std::vector<std::string> &path, const std::string &destination,
+                        Clock::time_point now) const;
     RouteGraph graph(Clock::time_point now) const;
     double bandwidth_penalty(const std::string &node, Clock::time_point now) const;
     std::vector<RouteGraph::Entry> measured_entries() const;

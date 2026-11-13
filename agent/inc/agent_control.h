@@ -46,11 +46,13 @@ class AgentControl
      * @param service Discovered service name and transport.
      * @param destination Expected destination Node identity.
      * @param deadline Absolute steady-clock deadline covering the whole establishment.
+     * @param path Configured preferred Node sequence; empty selects automatically.
      * @return Primary control route, logical entrance, path, and epoch.
      * @throws std::exception On missing service, unavailable primary, or deadline expiry.
      */
     asio::awaitable<RelaySelection> select_relay(ServiceKey service, std::string destination,
-                                                 std::chrono::steady_clock::time_point deadline);
+                                                 std::chrono::steady_clock::time_point deadline,
+                                                 std::vector<std::string> path = {});
     /**
      * @brief Register services and start discovery after primary identification.
      * @param connection Borrowed connection, valid until this notification returns on control_io.

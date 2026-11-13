@@ -1,5 +1,6 @@
 #include "relay_agent.h"
 #include "forwarder.h"
+#include <algorithm>
 #include <future>
 #include <unordered_set>
 #include <utility>
@@ -96,7 +97,7 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
         {
             const auto &forward = forwards->at(index);
             const auto location = "forwards[" + std::to_string(index) + "]";
-            reject_unknown_fields(forward, {"service", "listen_address", "listen_port", "protocol"}, location);
+            reject_unknown_fields(forward, {"service", "listen_address", "listen_port", "protocol", "path"}, location);
             AgentForwardConfig parsed;
             parsed.service = required_string(forward, "service", location);
             if (check_illegal_service_name(parsed.service))
@@ -106,6 +107,30 @@ AgentConfig load_agent_config(const std::filesystem::path &path)
             parsed.listen_address = required_string(forward, "listen_address", location);
             parsed.listen_port = required_port(forward, "listen_port", location);
             parsed.protocol = required_protocol(forward, location);
+            if (const auto path = forward.find("path"); path != forward.end())
+            {
+                if (!path->is_array() || path->size() > 8)
+                {
+                    throw std::runtime_error(location + ".path must be an array of at most 8 Node IDs");
+                }
+                for (const auto &node : *path)
+                {
+                    if (!node.is_string())
+                    {
+                        throw std::runtime_error(location + ".path requires valid nonempty Node IDs");
+                    }
+                    const auto &id = node.get_ref<const std::string &>();
+                    if (id.empty() || id.size() > 256 || id == "all")
+                    {
+                        throw std::runtime_error(location + ".path requires valid nonempty Node IDs");
+                    }
+                    if (std::ranges::find(parsed.path, id) != parsed.path.end())
+                    {
+                        throw std::runtime_error(location + ".path must not repeat a Node");
+                    }
+                    parsed.path.push_back(id);
+                }
+            }
             const auto endpoint_key = std::string(parsed.protocol == RelayProtocol::Udp ? "udp" : "stream") + ":" +
                                       parsed.listen_address + ":" + std::to_string(parsed.listen_port);
             if (!listen_endpoints.insert(endpoint_key).second)
@@ -180,10 +205,11 @@ void RelayAgent::stop()
 }
 
 asio::awaitable<RelaySelection> RelayAgent::select_relay(ServiceKey service, std::string destination,
-                                                         std::chrono::steady_clock::time_point deadline)
+                                                         std::chrono::steady_clock::time_point deadline,
+                                                         std::vector<std::string> path)
 {
     return asio::co_spawn(control_executor_,
-                          control_.select_relay(std::move(service), std::move(destination), deadline),
+                          control_.select_relay(std::move(service), std::move(destination), deadline, std::move(path)),
                           asio::use_awaitable);
 }
 

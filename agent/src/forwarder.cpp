@@ -210,7 +210,7 @@ asio::awaitable<void> Forwarder::accept_stream(StreamForward &forward)
         auto relay = std::make_shared<AgentSession>(*this, allocate_request_id(), service, destination->second,
                                                     Clock::now() + relay_open_timeout_);
         std::get<AgentSession::StreamData>(relay->data).local = std::move(socket);
-        start_relay(std::move(relay));
+        start_relay(std::move(relay), forward.config.path);
     }
 }
 
@@ -267,7 +267,7 @@ asio::awaitable<void> Forwarder::receive_local_datagrams(DatagramForwardId forwa
                 auto &sockets = std::get<AgentSession::DatagramData>(relay->data);
                 sockets.local_peer = source;
                 sockets.first_packet.emplace(payload.begin(), payload.begin() + size);
-                start_relay(std::move(relay));
+                start_relay(std::move(relay), forward.config.path);
             }
             catch (const std::exception &error)
             {
@@ -325,7 +325,7 @@ asio::awaitable<void> Forwarder::expire_datagrams()
     }
 }
 
-void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
+void Forwarder::start_relay(std::shared_ptr<AgentSession> relay, std::vector<std::string> path)
 {
     if (relays_.size() >= relay_capacity)
     {
@@ -346,7 +346,7 @@ void Forwarder::start_relay(std::shared_ptr<AgentSession> relay)
             const auto &peer = std::get<AgentSession::DatagramData>(relay->data).local_peer;
             datagram_forwards_[*relay->forward].clients.emplace(peer, relay->request);
         }
-        spawn_task(relay->run(), "Agent session");
+        spawn_task(relay->run(std::move(path)), "Agent session");
     }
     catch (...)
     {
@@ -506,9 +506,9 @@ std::uint64_t Forwarder::allocate_request_id()
 }
 
 asio::awaitable<RelaySelection> Forwarder::select_relay(ServiceKey service, std::string destination,
-                                                        Clock::time_point deadline)
+                                                        Clock::time_point deadline, std::vector<std::string> path)
 {
-    return agent_.select_relay(std::move(service), std::move(destination), deadline);
+    return agent_.select_relay(std::move(service), std::move(destination), deadline, std::move(path));
 }
 
 void Forwarder::relay_finished(AgentSession &relay)
