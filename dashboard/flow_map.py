@@ -20,10 +20,7 @@ ROUTE_COLORS = ("#4389bd", "#7764b7", "#369b91", "#c68b42", "#bd6884", "#607eaa"
                 "#b87552", "#719b70", "#a56ca6", "#4f9caf", "#c47563", "#939044")
 
 # Geometry is expressed in SVG units; zoom scales stations and tracks together.
-TRACK_BASE_WIDTH = 3
-TRACK_WIDTH_SCALE = .8
-TRACK_CONNECTION_CAP = 100
-TRACK_MAX_WIDTH = TRACK_BASE_WIDTH + TRACK_WIDTH_SCALE * math.sqrt(TRACK_CONNECTION_CAP)
+TRACK_WIDTH = 4
 TURN_RADIUS = 24
 NODE_RING_RADIUS = 18
 NODE_RING_WIDTH = 7
@@ -32,15 +29,15 @@ NODE_PORT_LENGTH = 64
 AGENT_VERTICAL_BIAS = .6
 AGENT_SIZE = 14
 AGENT_OUTLINE_WIDTH = 1.6
-CORRIDOR_GAP = TRACK_MAX_WIDTH + 4
+CORRIDOR_GAP = TRACK_WIDTH + 4
 
 
 def _symbol_radius(key):
     body = (NODE_BODY_RADIUS if key.startswith("node:")
             else (AGENT_SIZE + AGENT_OUTLINE_WIDTH) / 2)
-    clearance = body + TRACK_MAX_WIDTH / 2
+    clearance = body + TRACK_WIDTH / 2
     # Reserve clearance for both straight strokes and the inward cut of a
-    # quadratic corner fillet; count changes cannot invalidate the corridor.
+    # quadratic corner fillet.
     return math.ceil(max(clearance + 1, TURN_RADIUS / 4 + clearance / math.sqrt(2) + 1))
 
 
@@ -220,7 +217,9 @@ class FlowCollection:
 
 
 def _agent_key(endpoint: dict) -> str:
-    return "agent:" + json.dumps([endpoint["node"], endpoint["peer"]], ensure_ascii=False)
+    # Reports preserve the original control peer when an Agent's businesses
+    # enter through different Nodes. The route's ingress is not its identity.
+    return "agent:" + json.dumps(endpoint["peer"], ensure_ascii=False)
 
 
 def _stations(route: dict) -> list[str]:
@@ -233,13 +232,13 @@ def _route_hops(route):
     return [tuple(sorted((left, right))) for left, right in zip(stations, stations[1:])]
 
 
-def _label(name: str) -> tuple[str, float]:
+def _label(name: str, max_width: float = 168) -> tuple[str, float]:
     """Bound labels by display width, including wide Unicode Node names."""
     text, width = "", 0
     for character in name:
         advance = (12 if not character.isascii() or character in "MW@" else
                    3.6 if character in "il.,:;!'| " else 9 if character.isupper() else 7.2)
-        if width + advance > 168:
+        if width + advance > max_width:
             return text + "…", width + 12
         text += character
         width += advance
@@ -251,10 +250,12 @@ def _station_boxes(key: str, point: tuple[float, float], agents: dict) -> list[t
     is_node = key.startswith("node:")
     name = key[5:] if is_node else agents[key]["peer"]
     half_width = _label(name)[1] / 2 + 10
+    if not is_node:
+        half_width = max(half_width, 60 if len(agents[key]["roles"]) > 1 else 34)
     label_y = y + (46 if is_node else 25)
     radius = 34 if is_node else 17
     return [(x - radius, y - radius, x + radius, y + radius),
-            (x - half_width, label_y - 21, x + half_width, label_y + 10)]
+            (x - half_width, label_y - 21, x + half_width, label_y + (10 if is_node else 24))]
 
 
 def _compact_path(points: list[tuple[float, float]]) -> list[tuple[float, float]]:
@@ -400,10 +401,6 @@ def _station_port(key, point, other, other_key):
     vertical = abs(dy) >= abs(dx) * (1 if other_key.startswith("node:") else AGENT_VERTICAL_BIAS)
     direction = ((0, 1 if dy >= 0 else -1) if vertical else (1 if dx >= 0 else -1, 0))
     return tuple(point[i] + NODE_PORT_LENGTH * direction[i] for i in (0, 1))
-
-
-def _track_width(count):
-    return TRACK_BASE_WIDTH + TRACK_WIDTH_SCALE * math.sqrt(min(count, TRACK_CONNECTION_CAP))
 
 
 def _symbol_collisions(points, obstacles):
@@ -566,11 +563,36 @@ def _weighted_tracks(tracks, routes):
         contributions = [by_id[route_id] for route_id in route_ids]
         count = sum(route["count"] for route in contributions)
         result.append({"id": hashlib.sha256(json.dumps(pieces).encode()).hexdigest()[:16],
-                       "count": count, "width": _track_width(count),
+                       "count": count, "width": TRACK_WIDTH,
                        "path": _primitive_path(pieces), "pieces": pieces,
                        "routes": [{"id": route["id"], "color": route["color"], "count": route["count"],
                                    "share": route["count"] / count} for route in contributions]})
     return result
+
+
+def _link_views(topology: dict, node_ids: list[str], routes: list[dict]) -> list[dict]:
+    """Keep diagnostic measurements separate from observed business routes."""
+    members = {node["node_id"]: node for node in topology.get("nodes", [])}
+    route_ids = defaultdict(list)
+    for route in routes:
+        for pair in zip(route["path"], route["path"][1:]):
+            route_ids[pair].append(route["id"])
+    links = {}
+    for link in topology.get("links", []):
+        pair = link["source"], link["destination"]
+        if pair[0] == pair[1] or any(node not in node_ids for node in pair):
+            continue
+        source_age = members.get(pair[0], {}).get("report_age_s")
+        age = link.get("age_s")
+        stale = bool(topology.get("stale") or source_age is None or source_age >= 15 or age is None or age >= 45)
+        unknown = stale or link.get("rtt_ms") is None
+        state = ("unknown" if unknown else "critical" if not link.get("usable") or link.get("loss_rate", 0) >= .1
+                 else "warning" if link.get("loss_rate", 0) >= .01 or link["rtt_ms"] >= 200
+                 or (link.get("jitter_ms") or 0) >= 50 else "good")
+        links[pair] = {**link, "id": hashlib.sha256(json.dumps(pair).encode()).hexdigest()[:16],
+                       "stale": stale, "state": state, "usable": bool(link.get("usable") and not unknown),
+                       "route_ids": sorted(route_ids[pair])}
+    return [links[pair] for pair in sorted(links)]
 
 
 class FlowMapRenderer:
@@ -595,13 +617,23 @@ class FlowMapRenderer:
             for node in route["path"]:
                 routes_by_node[node].append(route)
         stations = []
+        queue_fields = ("control_queue_delay_us", "transfer_tcp_queue_delay_us", "transfer_udp_queue_delay_us")
         for node in node_ids:
             station_routes = routes_by_node[node]
-            stations.append({"node_id": node, "available": (members.get(node, {}).get("available")
-                                                            if not (topology or {}).get("stale") else None),
+            member = members.get(node, {})
+            stale = bool((topology or {}).get("stale") or not member or
+                         ("report_age_s" in member and (member["report_age_s"] is None or member["report_age_s"] >= 15)))
+            queues = [member.get(key) for key in queue_fields]
+            available = member.get("available") if not stale else None
+            max_queue = max((value for value in queues if value is not None), default=0) if not stale else 0
+            state = ("unknown" if stale or available is None else "critical" if available < .1 or max_queue >= 100000
+                     else "warning" if available < .3 or max_queue >= 10000 else "good")
+            stations.append({**member, "node_id": node, "state": state, "stale": stale,
+                             **{key: None if stale else member.get(key) for key in queue_fields},
+                             "available": available,
                              "connection_count": (sum(route["count"] for route in station_routes)
                                                   if snapshot["state"] in {"ready", "partial"} else None),
-                             "partial": snapshot["partial"], "route_ids": [route["id"] for route in station_routes]})
+                             "partial": snapshot["partial"], "route_ids": sorted(route["id"] for route in station_routes)})
         signature = (tuple(sorted(route["id"] for route in routes)), tuple(node_ids))
         with self._lock:
             if signature != self._signature:
@@ -610,21 +642,33 @@ class FlowMapRenderer:
                 self._signature = signature
             geometry, tracks = self._geometry, self._tracks
         shared = _weighted_tracks(tracks, routes)
+        links = _link_views(topology or {}, node_ids, routes)
+        agents = [{"id": key, "peer": agent["peer"], "nodes": sorted(agent["nodes"]),
+                   "roles": sorted(agent["roles"]), "route_ids": sorted(agent["route_ids"])}
+                  for key, agent in sorted(geometry.agents.items())]
         return {**snapshot, "routes": routes, "visible_route_count": len(routes),
                 "visible_flow_count": sum(route["count"] for route in routes),
                 "services": sorted({route["service"] for route in snapshot["routes"]}),
-                "nodes": stations,
+                "nodes": stations, "agents": agents, "links": links,
+                "topology_stale": bool((topology or {}).get("stale", True)),
+                "topology_age_s": (topology or {}).get("age_s"),
                 "shared_tracks": [{key: value for key, value in track.items() if key not in {"pieces", "path"}}
                                   for track in shared],
-                "svg": self._svg(geometry, stations, shared)}
+                "svg": self._svg(geometry, stations, shared, routes, links)}
 
     def _layout(self, routes: list[dict], node_ids=()) -> MetroGeometry:
         agents = {}
         for route in routes:
             for role in ("consumer", "producer"):
                 key = _agent_key(route[role])
-                agent = agents.setdefault(key, {**route[role], "roles": set()})
+                agent = agents.setdefault(key, {"peer": route[role]["peer"], "nodes": set(),
+                                                "roles": set(), "route_ids": set()})
                 agent["roles"].add(role)
+                agent["nodes"].add(route[role]["node"])
+                agent["route_ids"].add(route["id"])
+        for key, agent in agents.items():
+            previous = self._known_agents.get(key, {}).get("node")
+            agent["node"] = previous if previous in agent["nodes"] else min(agent["nodes"])
         # Keep Node reservations even after removal, so a returning Node gets its place back.
         self._positions = {key: point for key, point in self._positions.items()
                            if key.startswith("node:") or key in agents}
@@ -690,22 +734,46 @@ class FlowMapRenderer:
         return MetroGeometry(positions, agents, hops, width, height)
 
     @staticmethod
-    def _svg(geometry: MetroGeometry, stations: list[dict], shared: list[dict]) -> str:
+    def _svg(geometry: MetroGeometry, stations: list[dict], shared: list[dict],
+             routes: list[dict], links: list[dict]) -> str:
         positions, agents, hops, width, height = geometry
         nodes = {station["node_id"]: station for station in stations}
         svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "class": "flow-svg",
                                  "viewBox": f"0 0 {width} {height}", "width": str(width), "height": str(height),
-                                 "preserveAspectRatio": "xMidYMid meet", "role": "img", "focusable": "false",
-                                 "aria-label": "Current relay routes and Node bandwidth headroom"})
+                                 "preserveAspectRatio": "xMidYMid meet", "role": "group",
+                                 "aria-label": "Interactive relay routes, Nodes and directed ICMP measurements"})
         layer = ET.SubElement(svg, "g", {"class": "flow-scene"})
+        quality = ET.SubElement(layer, "g", {"class": "flow-quality"})
+        for link in links:
+            start, end = positions["node:" + link["source"]], positions["node:" + link["destination"]]
+            dx, dy = end[0] - start[0], end[1] - start[1]
+            length = math.hypot(dx, dy)
+            normal = (-dy / length, dx / length)
+            midpoint = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
+            control = (midpoint[0] + normal[0] * 48, midpoint[1] + normal[1] * 48)
+            label = (midpoint[0] + normal[0] * 27, midpoint[1] + normal[1] * 27)
+            group = ET.SubElement(quality, "g", {"class": f'flow-quality-link {link["state"]}',
+                "data-link": link["id"], "data-active": str(bool(link["route_ids"])).lower(),
+                "data-routes": json.dumps(link["route_ids"]), "role": "button", "tabindex": "0",
+                "aria-label": f'ICMP {link["source"]} to {link["destination"]}: {link["state"]}'})
+            path = f"M{start[0]},{start[1]} Q{control[0]},{control[1]} {end[0]},{end[1]}"
+            ET.SubElement(group, "path", {"class": "flow-quality-path", "d": path})
+            ET.SubElement(group, "path", {"class": "flow-link-hit", "d": path})
+            text = ET.SubElement(group, "text", {"class": "flow-link-label", "x": str(label[0]),
+                "y": str(label[1] - 7), "text-anchor": "middle"})
+            ET.SubElement(text, "tspan", {"x": str(label[0])}).text = f'{_label(link["source"], 72)[0]} → {_label(link["destination"], 72)[0]}'
+            diagnostic = ("Stale / unknown" if link["state"] == "unknown" else
+                          f'{link["rtt_ms"]:.1f} ms · {link["loss_rate"]:.1%} loss')
+            ET.SubElement(text, "tspan", {"x": str(label[0]), "dy": "14"}).text = diagnostic
+            ET.SubElement(group, "title").text = f'Directed ICMP measurement: {link["source"]} → {link["destination"]}\n{diagnostic}'
         tracks = ET.SubElement(layer, "g", {"class": "flow-routes"})
-        # Lay branches down first, then let the wider trunk cover their inner
-        # ends. The branch becomes visible at the trunk's edge rather than
-        # painting a short colored stub across its center. Counts break ties
-        # when both strokes have reached the width cap.
-        for track in sorted(shared, key=lambda track: (track["width"], track["count"], track["id"])):
+        # Paint busier trunks over branch ends so the branches visibly meet
+        # the trunk's edge without a colored stub across its center.
+        for track in sorted(shared, key=lambda track: (track["count"], track["id"])):
             group = ET.SubElement(tracks, "g", {"class": "flow-shared-track", "data-track": track["id"],
-                                                "data-routes": json.dumps([route["id"] for route in track["routes"]])})
+                                                "data-routes": json.dumps([route["id"] for route in track["routes"]]),
+                                                "role": "button", "tabindex": "0",
+                                                "aria-label": f'{track["count"]} connections across {len(track["routes"])} routes'})
             ET.SubElement(group, "title").text = f'{track["count"]} connections across {len(track["routes"])} routes'
             ET.SubElement(group, "path", {"d": track["path"], "class": "flow-track",
                                            "stroke": "var(--flow-ring)", "stroke-width": f'{track["width"]:.6f}'})
@@ -716,18 +784,36 @@ class FlowMapRenderer:
                                                "class": "flow-band", "data-route": contribution["id"],
                                                "stroke": contribution["color"], "stroke-width": f"{band_width:.6f}"})
                 cursor += band_width
+            ET.SubElement(group, "path", {"d": track["path"], "class": "flow-hit"})
+        for route in sorted(routes, key=lambda route: route["id"]):
+            focus = ET.SubElement(layer, "g", {"class": "flow-route-focus", "data-focus-route": route["id"],
+                                               "fill": route["color"], "stroke": route["color"]})
+            keys = _stations(route)
+            pairs = [tuple(sorted(pair)) for pair in zip(keys, keys[1:])]
+            for left, right in zip(keys, keys[1:]):
+                pair = tuple(sorted((left, right)))
+                path, points = hops[pair]
+                ET.SubElement(focus, "path", {"d": path, "class": "flow-focus-path"})
+                ordered = points if pair == (left, right) else list(reversed(points))
+                a, b = max(zip(ordered, ordered[1:]), key=lambda segment: math.dist(*segment))
+                fraction = 1 / 3 if pairs.count(pair) > 1 else .5
+                x, y = tuple(a[index] + (b[index] - a[index]) * fraction for index in (0, 1))
+                angle = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+                ET.SubElement(focus, "path", {"d": "M-5,-4 L5,0 L-5,4 Z", "stroke": "none",
+                    "transform": f"translate({x} {y}) rotate({angle})", "class": "flow-direction"})
         for key, (x, y) in sorted(positions.items()):
-            station = ET.SubElement(layer, "g", {"class": "flow-station", "transform": f"translate({x} {y})"})
+            station = ET.SubElement(layer, "g", {"class": "flow-station", "transform": f"translate({x} {y})",
+                                                 "role": "button", "tabindex": "0"})
             if key.startswith("node:"):
                 name = key[5:]
                 node = nodes[name]
                 available = node["available"]
                 headroom = "—" if available is None else f"{available:.0%}"
-                state = ("unknown" if available is None else "critical" if available < .1 else
-                         "warning" if available < .3 else "good")
+                state = node["state"]
                 station.set("data-node", name)
                 station.set("aria-label", f"Node {name}: {headroom} bandwidth headroom")
                 station.set("class", f"flow-station flow-node-station {state}")
+                station.set("data-routes", json.dumps(node["route_ids"]))
                 # Cover tracks up to the capacity ring's outer edge, without
                 # adding an outline or a blank halo around the station.
                 ET.SubElement(station, "circle", {"r": str(NODE_BODY_RADIUS), "stroke": "none", "class": "flow-node"})
@@ -742,6 +828,11 @@ class FlowMapRenderer:
                 ET.SubElement(station, "text", {"y": "3.5", "text-anchor": "middle",
                                                 "class": "flow-headroom"}).text = headroom
                 title = f"Node {name}\nBandwidth headroom: {headroom}"
+                if state != "good":
+                    badge = ET.SubElement(station, "g", {"class": "flow-alert", "transform": "translate(19 -18)"})
+                    ET.SubElement(badge, "circle", {"r": "7"})
+                    ET.SubElement(badge, "text", {"y": "3.5", "text-anchor": "middle"}).text = "?" if state == "unknown" else "!"
+                    title += f"\n{state.title()} · click for queue delays and report age"
             else:
                 station.set("class", "flow-station flow-agent-station")
                 agent = agents[key]
@@ -750,7 +841,13 @@ class FlowMapRenderer:
                                                 "width": str(AGENT_SIZE), "height": str(AGENT_SIZE),
                                                 "stroke-width": str(AGENT_OUTLINE_WIDTH),
                                                 "rx": "3", "class": "flow-agent"})
-                title = f'Agent {name} · {agent["node"]} · {" / ".join(sorted(agent["roles"]))}'
+                station.set("data-agent", key)
+                station.set("data-routes", json.dumps(sorted(agent["route_ids"])))
+                station.set("aria-label", f'Agent {name}: {" / ".join(sorted(agent["roles"]))}')
+                roles = " / ".join(role.title() for role in sorted(agent["roles"]))
+                title = f'Agent {name} · Route Nodes: {", ".join(sorted(agent["nodes"]))} · {roles}'
+                ET.SubElement(station, "text", {"y": "40", "text-anchor": "middle",
+                                                "class": "flow-agent-role"}).text = roles
             ET.SubElement(station, "title").text = title
             label = ET.SubElement(station, "text", {"x": "0", "y": str(NODE_BODY_RADIUS + 17) if key.startswith("node:") else "25",
                                                     "text-anchor": "middle", "class": "flow-label"})

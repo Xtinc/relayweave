@@ -120,13 +120,17 @@ no inferred route. Disconnects clear current availability; membership or epoch
 changes invalidate old rounds. Empty reports remove closed businesses.
 
 `/api/snapshot` includes `flow_map`: collection state, missing Nodes, unmatched
-count, business/route counts, route details, Node station summaries and escaped SVG. Optional
+count, business/route counts, route details, Node/Agent summaries, directed link
+diagnostics and escaped SVG. Optional
 `flow_service` and `flow_protocol` query parameters filter the map in Python.
 Business UUIDs, Flow IDs and epochs are decimal strings. Routes with identical
 Agents, service, protocol and ordered Node path merge and list every business ID.
-Agent stations are identified by attachment Node plus control IP:port; Nodes
-share stations. Geometry is undirected: reversing a route does not create a
-parallel line between the same stations.
+Agent stations are identified by the complete original control IP:port, including
+the port. The same endpoint entering through different Nodes shares one station,
+with every route Node and Consumer/Producer role retained in its details. Reports
+do not contain a persistent Agent ID; different ports remain distinct. Nodes
+share stations by Node ID. Geometry is undirected: reversing a route shares the
+same track. Selecting a route overlays Consumer-to-Producer direction arrows.
 
 ### Map drawing rules
 
@@ -154,8 +158,8 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    then shortest distance for those ports. A blocked approach port triggers a
    search from the station center instead. Obstacle and unrelated-track rules
    take precedence over the preferred approach; the renderer never deliberately
-   accepts an obstructed candidate. Clearances reserve room for the maximum
-   capped stroke and rounded corners, independently of current counts.
+   accepts an obstructed candidate. Clearances reserve room for the fixed
+   stroke and rounded corners, independently of current counts.
 4. **Shared trunks, not accidental connections.** Hops incident to a common
    station may use the same centerline. Unrelated station pairs may cross
    perpendicularly but cannot share a collinear interval. Coincident straight
@@ -166,35 +170,19 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    Segments use flush end caps at joins, preventing the neutral track underlay
    from forming little arrow-shaped protrusions over neighboring color bands.
    A straight trunk with unchanged route contributions remains one continuous
-   painted path through side branches. Narrow branches are painted before wider
-   trunks, so their inner ends disappear under the trunk and visibly meet its
-   edge. When widths are both capped, the greater connection total is painted
-   on top; stable track ID breaks remaining ties.
-   Turns remain rounded; there are no directional arrows. Text does not cause
-   route detours.
-5. **Count once, then compute width.** Each merged section uses the sum of its
+   painted path through side branches. Tracks with fewer connections are painted
+   before busier trunks, so their inner ends disappear under the trunk and visibly
+   meet its edge; stable track ID breaks ties.
+   Turns remain rounded. Direction arrows appear on the selected route.
+   Text does not cause route detours.
+5. **Fixed line width.** Each merged section uses the sum of its
    distinct routes' business counts. If both incident hops of one route use the
-   same section, that route contributes once. Width is
-   `3 + 0.8 * sqrt(min(count, 100))` SVG units:
-
-   | Connections on the section | Width |
-   |---|---|
-   | 1 | 3.80 |
-   | 10 | 5.53 |
-   | 20 | 6.58 |
-   | 30 | 7.38 |
-   | 40 | 8.06 |
-   | 50 | 8.66 |
-   | 75 | 9.93 |
-   | 100 or more | 11.00 |
-
-   Counts are summed **before** applying the rule: two routes of six connections
-   produce 12 connections and width approximately 5.77, rather than adding their individual widths.
-   The cap keeps tracks narrower than the 14-unit Agent squares.
+   same section, that route contributes once. Every track is 4 SVG units wide,
+   independent of its connection count.
 6. **Proportional color bands.** Each route receives
    `track_width * route_count / total_count`, ordered by stable route ID. Three
-   connections and one connection yield 75% and 25% bands. Counts above 100 keep
-   the width capped while their actual counts determine color shares.
+   connections and one connection yield 75% and 25% bands. Actual counts determine
+   color shares within the fixed total width.
    `flow_map.shared_tracks` exposes the same totals,
    widths, route counts and shares used by SVG.
 7. **Station size and capacity.** Nodes use an 18-unit-radius capacity ring with
@@ -203,9 +191,11 @@ SVG. [`test_flow_map.py`](test_flow_map.py) checks the following contracts:
    radius matches the capacity ring's outer edge (currently 21.5). Incoming
    tracks meet that edge directly. The capacity ring shows bandwidth
    used (`1 - available`); the center shows estimated remaining capacity. No used
-   arc is drawn at 100% headroom. Status is green at 30% or above, amber from
-   10% to 30%, red below 10%, and gray with a dash for unknown capacity. Agent
-   squares are 14 units. All dimensions scale together when zoomed.
+   arc is drawn at 100% headroom. Status is green at 30% or above, amber below
+   30% or with queue delay at least 10 ms, and red below 10% or with queue delay
+   at least 100 ms. Unknown capacity uses a dash and a dashed ring. A `!` badge
+   marks warnings and a `?` marks unknown/stale measurements. Agent squares are
+   14 units, with role labels. All dimensions scale together when zoomed.
 
 Shortened station labels retain their full names in hover titles. The map uses
 background-colored label outlines where tracks pass behind text.
@@ -216,8 +206,9 @@ already in `topology.snapshot`; Dashboard retains it in `topology.nodes` and
 NodeLink capacity or an absolute Mbps value. Snapshot/source-report ages of
 15 seconds or a collection disconnect invalidate the ratio.
 
-`flow_map.nodes` includes `node_id`, `available`, `connection_count`, `partial`
-and `route_ids`. Stations include idle topology members. Connection count sums
+`flow_map.nodes` includes Node address, report age, queue delays, display state,
+`available`, `connection_count`, `partial` and `route_ids`. Stations include idle
+topology members. Connection count sums
 the displayed businesses that traverse the Node once each, including intermediate
 Nodes; it does not sum both incident hops. Pending or disconnected collections
 have unknown counts, and partial rounds expose known counts as lower bounds.
@@ -225,14 +216,33 @@ These counts describe businesses rather than physical NodeLinks.
 
 Routes use a restrained transit palette, matching line swatches in the legend.
 The map uses a subtle dot grid and theme-aware station, label and ring colors.
-Stations remain above all tracks. The map and legend are display-only: clicking
-routes, stations or legend entries does not select, highlight or open details.
-Route geometry has no transparent click targets or keyboard button roles. Legend
-labels retain endpoint/path hover titles.
+Stations remain above all tracks. Click or keyboard-activate a Node, Agent,
+route section, or legend button to inspect its details. Shared sections list their
+routes for selection. Selecting a route highlights its entire path, dims unrelated
+stations/tracks, shows direction arrows and lists both directions of each measured
+Node hop. The panel exposes business UUIDs, epochs and Flow IDs. Service and
+protocol filters affect the map while retaining idle topology members. Refreshes
+retain the selected item while it remains visible; disappearing or filtered items
+clear selection and show an explanatory message.
 
-Node stations show their name and capacity, without connection-count labels
-or click actions. Route details, protocol UUIDs, epochs and Flow IDs remain
-available in the API. The initial map automatically
+The map and inspector share a fixed 480px desktop workspace, with the inspector
+scrolling internally. On small screens the map is 360px high and the inspector
+occupies its own 300px row. Refreshing, filtering and selecting items update content
+without resizing the workspace. Route legends scroll horizontally in a fixed
+footer row. Diagnostic fields and business identifiers expand in the inspector;
+the default page has concise labels and no persistent instruction paragraphs.
+
+An optional **ICMP links** layer shows all directed Node measurements as dashed
+curves. It does not add business connections. Anomalous measurements along
+observed routes have directional RTT/loss labels even with the layer off. Display
+warnings use RTT at least 200 ms, jitter at least 50 ms or loss at least 1%; loss
+at least 10% or an unusable measured link is critical. These are display thresholds,
+independent of route selection. Missing/expired measurements show unknown, and
+details mark retained diagnostic values as last known. Neither per-route throughput
+nor Agent access-link measurements are inferred.
+
+Node stations show their name and capacity, with connection counts in the panel.
+The initial map automatically
 fits the available area without scrollbars, reserving room for Agents when only
 idle Nodes are present. Zoom buttons, directional buttons
 and Fit adjust the view explicitly; hovering, dragging and the mouse wheel do
@@ -426,6 +436,10 @@ The registered-services table combines services from all discovered nodes.
 The cluster Flow map comes first, with five compact health metrics below it;
 queue-delay and per-service bandwidth
 charts share a row on wide screens and stack on narrow screens.
+Metric tiles form one equal-height strip. Both chart cards use the same header,
+toolbar and plotting dimensions. The service table scrolls inside a fixed-height
+area. Neutral surfaces, subtle borders and consistent spacing carry across the
+map, metrics, charts and table; light and dark themes share the same structure.
 Queue history is sampled from the Master's immutable
 topology snapshots rather than duplicated `server.cluster` fields.
 The backend returns every topology member with its queue history even before a

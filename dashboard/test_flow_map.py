@@ -142,6 +142,92 @@ class FlowCollectionTest(unittest.TestCase):
 
 
 class FlowMapTest(unittest.TestCase):
+    def test_same_departure_endpoint_is_one_station_across_ingress_nodes(self):
+        view = collect({"a": [half("ingress", 1, path=["a", "c"])],
+                        "b": [half("ingress", 2, path=["b", "c"])],
+                        "c": [half("egress", 1), half("egress", 2)]}).snapshot(True)
+        renderer = FlowMapRenderer()
+        result = renderer.render(view)
+        source = [agent for agent in result["agents"] if agent["peer"] == "192.0.2.10:123"]
+        self.assertEqual(len(source), 1)
+        self.assertEqual(source[0]["nodes"], ["a", "b"])
+        self.assertEqual(len(source[0]["route_ids"]), 2)
+        self.assertEqual(len(result["agents"]), 2)
+        ns = {"s": "http://www.w3.org/2000/svg"}
+        svg = ET.fromstring(result["svg"])
+        self.assertEqual(len(svg.findall(".//s:rect[@class='flow-agent']", ns)), 2)
+        self.assertEqual(len(svg.findall(".//s:circle[@class='flow-node']", ns)), 3)
+        point = renderer._geometry.positions[source[0]["id"]]
+        for protocol in ("", "tcp", "udp", ""):
+            refreshed = renderer.render(view, protocol=protocol)
+            ids = [agent["id"] for agent in refreshed["agents"]]
+            self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(renderer._geometry.positions[source[0]["id"]], point)
+
+    def test_agent_roles_merge_but_different_control_ports_stay_distinct(self):
+        peer = "[2001:db8::1]:456"
+        view = collect({"a": [single(1, consumer=peer, producer=peer),
+                                single(2, consumer="[2001:db8::1]:457", producer=peer)]}).snapshot(True)
+        result = FlowMapRenderer().render(view)
+        self.assertEqual(len(result["agents"]), 2)
+        agent = next(agent for agent in result["agents"] if agent["peer"] == peer)
+        self.assertEqual(agent["roles"], ["consumer", "producer"])
+        self.assertEqual(len(result["nodes"]), 1)
+        self.assertEqual(result["nodes"][0]["connection_count"], 2)
+
+    @staticmethod
+    def diagnostic_topology():
+        return {"stale": False, "age_s": 1, "nodes": [
+            {"node_id": node, "address": f"{node}.example", "report_age_s": 1,
+             "available": .8, "control_queue_delay_us": 25,
+             "transfer_tcp_queue_delay_us": 100, "transfer_udp_queue_delay_us": 200}
+            for node in ("a", "b", "c")], "links": [
+            {"source": source, "destination": destination, "rtt_ms": rtt, "jitter_ms": 2,
+             "loss_rate": loss, "transmitted": 100, "received": 97, "completed": 100,
+             "quality_cost": 30, "confidence": .95, "usable": True, "age_s": 1}
+            for source, destination, rtt, loss in (("a", "c", 25, .02), ("c", "a", 80, 0), ("a", "b", 10, 0))]}
+
+    def test_directed_quality_layer_preserves_measurements_without_inventing_routes(self):
+        view = collect({"a": [half("ingress", 1, path=["a", "c"])], "b": [],
+                        "c": [half("egress", 1)]}).snapshot(True)
+        renderer = FlowMapRenderer()
+        topology = self.diagnostic_topology()
+        result = renderer.render(view, topology=topology)
+        self.assertEqual(result["flow_count"], 1)
+        self.assertEqual(len(result["links"]), 3)
+        by_pair = {(link["source"], link["destination"]): link for link in result["links"]}
+        self.assertEqual(by_pair["a", "c"]["state"], "warning")
+        self.assertEqual(by_pair["c", "a"]["state"], "good")
+        self.assertEqual(by_pair["a", "c"]["route_ids"], [view["routes"][0]["id"]])
+        self.assertEqual(by_pair["c", "a"]["route_ids"], [])
+        self.assertEqual(by_pair["a", "b"]["route_ids"], [])
+        ns = {"s": "http://www.w3.org/2000/svg"}
+        svg = ET.fromstring(result["svg"])
+        self.assertEqual(len(svg.findall(".//s:g[@data-link]", ns)), 3)
+        self.assertEqual(len(svg.findall(".//s:path[@class='flow-direction']", ns)), 3)
+        self.assertIn("2.0% loss", result["svg"])
+        topology["stale"] = True
+        stale = renderer.render(view, topology=topology)
+        self.assertTrue(all(link["state"] == "unknown" and link["stale"] for link in stale["links"]))
+        self.assertNotIn("2.0% loss", stale["svg"])
+        self.assertTrue(all(node["state"] == "unknown" for node in stale["nodes"]))
+
+    def test_queue_warning_report_expiry_and_route_filtering(self):
+        view = collect({"a": [single()] , "b": [], "c": []}).snapshot(True)
+        topology = self.diagnostic_topology()
+        topology["nodes"][0]["transfer_tcp_queue_delay_us"] = 12000
+        topology["nodes"][1]["report_age_s"] = 16
+        renderer = FlowMapRenderer()
+        result = renderer.render(view, topology=topology)
+        self.assertEqual(result["nodes"][0]["state"], "warning")
+        self.assertEqual(result["nodes"][1]["state"], "unknown")
+        self.assertIsNone(result["nodes"][1]["available"])
+        filtered = renderer.render(view, service="missing", topology=topology)
+        self.assertEqual(len(filtered["nodes"]), 3)
+        self.assertEqual(filtered["agents"], [])
+        self.assertEqual(filtered["visible_flow_count"], 0)
+        self.assertTrue(all(not link["route_ids"] for link in filtered["links"]))
+
     def test_shared_nodes_branch_reverse_ipv6_and_same_agent(self):
         reports = {"a": [half("ingress", 1, path=["a", "b"]), half("egress", 2),
                           single(3, consumer="[2001:db8::1]:99", producer="[2001:db8::1]:99")],
@@ -168,7 +254,7 @@ class FlowMapTest(unittest.TestCase):
         self.assertIn("10 connections", after["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
         width = lambda result: float(ET.fromstring(result["svg"]).find(".//s:path[@class='flow-track']", ns).get("stroke-width"))
-        self.assertGreater(width(after), width(before))
+        self.assertEqual(width(after), width(before))
 
     def test_station_counts_each_business_once_and_includes_idle_members(self):
         view = collect({"a": [half("ingress", 1), half("ingress", 2), single(3)], "b": [],
@@ -217,44 +303,40 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(result["nodes"][0]["connection_count"], 1)
         self.assertTrue(result["nodes"][0]["partial"])
 
-    def test_line_width_uses_square_root_scale_and_caps_at_100(self):
+    def test_line_width_stays_fixed_as_connection_counts_change(self):
         view = collect({"a": [single()]}).snapshot(True)
         renderer = FlowMapRenderer()
         geometry = None
-        for count, expected in ((1, 3.8), (4, 4.6), (9, 5.4), (10, 5.529822128),
-                                (49, 8.6), (50, 8.656854249), (51, 8.713142743),
-                                (99, 10.959899497), (100, 11), (101, 11), (10000, 11)):
+        for count in (1, 4, 9, 10, 49, 50, 51, 99, 100, 101, 10000):
             view["routes"][0]["count"] = count
             result = renderer.render(view)
             widths = {track["width"] for track in result["shared_tracks"]}
             self.assertEqual(len(widths), 1)
-            self.assertAlmostEqual(next(iter(widths)), expected, places=6, msg=f"{count} connections")
+            self.assertEqual(next(iter(widths)), 4, msg=f"{count} connections")
             if geometry is not None:
                 self.assertIs(renderer._geometry, geometry)
             geometry = renderer._geometry
             svg = ET.fromstring(result["svg"])
             ns = {"s": "http://www.w3.org/2000/svg"}
             for track in svg.findall(".//s:path[@class='flow-track']", ns):
-                self.assertAlmostEqual(float(track.get("stroke-width")), expected, places=5)
+                self.assertEqual(float(track.get("stroke-width")), 4)
 
-    def test_nodes_show_name_and_capacity_without_interactive_counts(self):
+    def test_nodes_show_name_capacity_and_keyboard_inspection(self):
         result = FlowMapRenderer().render(collect({"a": [single()]}).snapshot(True),
                                           topology={"nodes": [{"node_id": "a", "available": .64}]})
         svg = ET.fromstring(result["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
         station = svg.find(".//s:g[@data-node='a']", ns)
-        self.assertNotIn("tabindex", station.attrib)
-        self.assertNotIn("role", station.attrib)
+        self.assertEqual(station.get("tabindex"), "0")
+        self.assertEqual(station.get("role"), "button")
         self.assertNotIn("connections", "".join(station.itertext()))
         self.assertEqual(station.find("s:text[@class='flow-label']", ns).text, "a")
         self.assertEqual(station.find("s:text[@class='flow-headroom']", ns).text, "64%")
         self.assertNotIn("min-width", svg.get("style", ""))
         self.assertEqual(svg.get("preserveAspectRatio"), "xMidYMid meet")
-        self.assertEqual(svg.get("role"), "img")
-        self.assertEqual(svg.get("focusable"), "false")
-        self.assertFalse(svg.findall(".//*[@tabindex]"))
-        self.assertFalse(svg.findall(".//*[@role='button']"))
-        self.assertFalse(svg.findall(".//s:path[@class='flow-hit']", ns))
+        self.assertEqual(svg.get("role"), "group")
+        self.assertIn("Interactive relay routes", svg.get("aria-label"))
+        self.assertTrue(svg.findall(".//s:path[@class='flow-hit']", ns))
 
 
     def test_shared_hops_use_the_same_track_without_parallel_offsets(self):
@@ -273,14 +355,14 @@ class FlowMapTest(unittest.TestCase):
         self.assertTrue(all(0 < x < geometry.width and 0 < y < geometry.height
                             for x, y in geometry.positions.values()))
 
-    def test_shared_track_width_and_color_bands_use_summed_connections(self):
+    def test_shared_tracks_keep_fixed_width_and_proportional_color_bands(self):
         view = collect({"a": [single(1), single(2), single(3), single(4, protocol="udp")]}).snapshot(True)
         renderer = FlowMapRenderer()
         rendered = renderer.render(view)
         geometry = renderer._geometry
         for track in rendered["shared_tracks"]:
             self.assertEqual(track["count"], 4)
-            self.assertAlmostEqual(track["width"], 4.6)
+            self.assertEqual(track["width"], 4)
             self.assertEqual(sorted(route["share"] for route in track["routes"]), [.25, .75])
         svg = ET.fromstring(rendered["svg"])
         ns = {"s": "http://www.w3.org/2000/svg"}
@@ -294,11 +376,11 @@ class FlowMapTest(unittest.TestCase):
         merged = renderer.render(view)
         for track in merged["shared_tracks"]:
             self.assertEqual(track["count"], 12)
-            self.assertAlmostEqual(track["width"], 5.771281292, places=6)
+            self.assertEqual(track["width"], 4)
         view["routes"][0]["count"] = 100
         changed = renderer.render(view)
         self.assertIs(renderer._geometry, geometry)
-        self.assertTrue(all(track["width"] <= 11 for track in changed["shared_tracks"]))
+        self.assertTrue(all(track["width"] == 4 for track in changed["shared_tracks"]))
 
     def test_overlapping_tracks_are_merged_instead_of_drawn_on_top_of_each_other(self):
         ingress_a = half("ingress", 1, path=["aliyun-1", "awsyun-1"])
@@ -387,10 +469,10 @@ class FlowMapTest(unittest.TestCase):
             route["count"] = 3 if route["producer"]["peer"] == "target-1" else 1
         renderer = FlowMapRenderer()
         renderer._positions = {"node:llyun-1": (240, 320),
-                               'agent:["llyun-1", "source"]': (140, 528),
-                               'agent:["llyun-1", "target-1"]': (340, 416),
-                               'agent:["llyun-1", "target-2"]': (340, 472),
-                               'agent:["llyun-1", "target-3"]': (540, 416)}
+                               'agent:"source"': (140, 528),
+                               'agent:"target-1"': (340, 416),
+                               'agent:"target-2"': (340, 472),
+                               'agent:"target-3"': (540, 416)}
         rendered = renderer.render(view)
         # At y=344, all four lower Agents use exactly one rendered southbound track.
         trunks = [(pieces, ids) for pieces, ids in renderer._tracks if any(
@@ -402,7 +484,7 @@ class FlowMapTest(unittest.TestCase):
         shared = next(track for track in rendered["shared_tracks"] if len(track["routes"]) == 3)
         self.assertEqual(shared["count"], 5)  # Never count the consumer and producer hop twice.
         self.assertEqual(sorted(route["share"] for route in shared["routes"]), [.2, .2, .6])
-        self.assertAlmostEqual(shared["width"], 4.788854382, places=6)
+        self.assertEqual(shared["width"], 4)
         self.assert_tracks_are_merged(renderer)
 
     def test_lower_agents_branch_from_one_axis_without_a_second_shared_spine(self):
@@ -410,9 +492,9 @@ class FlowMapTest(unittest.TestCase):
                                       single(2, consumer="219.140.92.118:40076", producer="219.140.92.118:14070")]}).snapshot(True)
         renderer = FlowMapRenderer()
         renderer._positions = {"node:llyun-1": (240, 320),
-                               'agent:["llyun-1", "219.140.92.118:40076"]': (140, 528),
-                               'agent:["llyun-1", "192.229.85.177:41132"]': (340, 416),
-                               'agent:["llyun-1", "219.140.92.118:14070"]': (340, 472)}
+                               'agent:"219.140.92.118:40076"': (140, 528),
+                               'agent:"192.229.85.177:41132"': (340, 416),
+                               'agent:"219.140.92.118:14070"': (340, 472)}
         renderer.render(view)
         center = (240, 320)
         for pair, (path, points) in renderer._geometry.hops.items():
@@ -429,9 +511,9 @@ class FlowMapTest(unittest.TestCase):
         target["agent_peer"] = "219.140.92.118:4699"
         renderer = FlowMapRenderer()
         renderer._positions = {"node:other": (240, 320), "node:txyun-1": (480, 320),
-                               'agent:["txyun-1", "219.140.92.118:4699"]': (580, 416)}
+                               'agent:"219.140.92.118:4699"': (580, 416)}
         renderer.render(collect({"other": [source], "txyun-1": [target]}).snapshot(True))
-        path, points = renderer._geometry.hops['agent:["txyun-1", "219.140.92.118:4699"]', 'node:txyun-1']
+        path, points = renderer._geometry.hops['agent:"219.140.92.118:4699"', 'node:txyun-1']
         self.assertEqual(points, [(580, 416), (480, 416), (480, 320)])
         self.assertEqual(path.count(" Q"), 1)
 
@@ -489,13 +571,13 @@ class FlowMapTest(unittest.TestCase):
     def test_blocked_approach_port_does_not_force_a_track_through_an_agent(self):
         renderer = FlowMapRenderer()
         renderer._positions = {"node:a": (240, 320), "node:b": (480, 480),
-                               'agent:["a", "source-a"]': (140, 416),
-                               'agent:["a", "target-a"]': (540, 480),
-                               'agent:["b", "source-b"]': (380, 576),
-                               'agent:["b", "target-b"]': (780, 480)}
+                               'agent:"source-a"': (140, 416),
+                               'agent:"target-a"': (540, 480),
+                               'agent:"source-b"': (380, 576),
+                               'agent:"target-b"': (780, 480)}
         renderer.render(collect({"a": [single(1, consumer="source-a", producer="target-a")],
                                  "b": [single(2, consumer="source-b", producer="target-b")]}).snapshot(True))
-        _, points = renderer._geometry.hops['agent:["b", "target-b"]', 'node:b']
+        _, points = renderer._geometry.hops['agent:"target-b"', 'node:b']
         self.assertEqual(_symbol_collisions(points, [(540, 480, 12)]), 0)
         self.assertEqual(points[0], (780, 480))
         self.assertEqual(points[-1], (480, 480))
