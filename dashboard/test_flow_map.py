@@ -187,7 +187,7 @@ class FlowMapTest(unittest.TestCase):
              "quality_cost": 30, "confidence": .95, "usable": True, "age_s": 1}
             for source, destination, rtt, loss in (("a", "c", 25, .02), ("c", "a", 80, 0), ("a", "b", 10, 0))]}
 
-    def test_directed_quality_layer_preserves_measurements_without_inventing_routes(self):
+    def test_link_measurements_are_retained_without_rendering_icmp_graphics(self):
         view = collect({"a": [half("ingress", 1, path=["a", "c"])], "b": [],
                         "c": [half("egress", 1)]}).snapshot(True)
         renderer = FlowMapRenderer()
@@ -201,11 +201,14 @@ class FlowMapTest(unittest.TestCase):
         self.assertEqual(by_pair["a", "c"]["route_ids"], [view["routes"][0]["id"]])
         self.assertEqual(by_pair["c", "a"]["route_ids"], [])
         self.assertEqual(by_pair["a", "b"]["route_ids"], [])
+        self.assertEqual(by_pair["a", "c"]["rtt_ms"], 25)
+        self.assertEqual(by_pair["a", "c"]["loss_rate"], .02)
         ns = {"s": "http://www.w3.org/2000/svg"}
         svg = ET.fromstring(result["svg"])
-        self.assertEqual(len(svg.findall(".//s:g[@data-link]", ns)), 3)
+        self.assertFalse(svg.findall(".//s:g[@data-link]", ns))
+        self.assertFalse(svg.findall(".//s:g[@class='flow-quality']", ns))
         self.assertEqual(len(svg.findall(".//s:path[@class='flow-direction']", ns)), 3)
-        self.assertIn("2.0% loss", result["svg"])
+        self.assertNotIn("2.0% loss", result["svg"])
         topology["stale"] = True
         stale = renderer.render(view, topology=topology)
         self.assertTrue(all(link["state"] == "unknown" and link["stale"] for link in stale["links"]))

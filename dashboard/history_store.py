@@ -11,15 +11,20 @@ from time import time as _wall_time
 
 
 MAX_HISTORY_SECONDS = 7 * 24 * 60 * 60
+# Table, series key, catalog. The primary key serves both reads and cleanup.
+HISTORY_TABLES = (
+    ("node_queue_history", "node_id", "history_nodes"),
+    ("node_traffic_history", "service_id", "history_services"),
+)
 
 
 class HistoryStore:
     """Persist raw samples and return time-spanning chart data.
 
     Samples expire after seven days. The database is capped at ``max_bytes``.
-    Once the main file plus WAL/SHM
-    exceeds that footprint, the oldest timestamp groups are removed until the
-    compacted database is below a target watermark. Recent history is retained.
+    Once the main file plus WAL/SHM exceeds that footprint, the oldest samples
+    in each series are removed until the compacted database is below a target
+    watermark. Recent history is retained.
     """
 
     def __init__(self, path: str | Path, max_bytes: int = 50 * 1024 * 1024):
@@ -33,73 +38,62 @@ class HistoryStore:
         self._last_size_check = 0.0  # time.monotonic() of the last rolling check
         self._last_retention_check = 0.0
         self._connection = sqlite3.connect(database, check_same_thread=False)
-        with self._connection:
+        try:
             self._connection.execute("PRAGMA journal_mode=WAL")
             self._connection.execute("PRAGMA synchronous=NORMAL")
-            # Old single-node tables are not part of the current schema. Keeping
-            # them would consume the rolling size budget without being queried.
-            self._connection.execute("DROP TABLE IF EXISTS load_history")
-            self._connection.execute("DROP TABLE IF EXISTS traffic_history")
+            self._connection.execute("PRAGMA foreign_keys=ON")
+            self._initialize_schema()
+        except Exception:
+            self._connection.close()
+            raise
+        self._last_retention_check = time.monotonic()
+
+    def _initialize_schema(self) -> None:
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS history_nodes (
+                    node_id INTEGER PRIMARY KEY,
+                    node_key TEXT NOT NULL UNIQUE
+                )
+                """
+            )
+            self._connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS history_services (
+                    service_id INTEGER PRIMARY KEY,
+                    node_id INTEGER NOT NULL REFERENCES history_nodes(node_id),
+                    service TEXT NOT NULL,
+                    UNIQUE (node_id, service)
+                )
+                """
+            )
+            # One B-tree per sample table, no rowid copy or secondary indexes.
+            # Series catalogs let cleanup seek each primary-key timestamp range.
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS node_queue_history (
-                    node_key TEXT NOT NULL,
+                    node_id INTEGER NOT NULL REFERENCES history_nodes(node_id),
                     timestamp REAL NOT NULL,
                     control_queue_delay_us INTEGER NOT NULL,
                     transfer_tcp_queue_delay_us INTEGER NOT NULL,
                     transfer_udp_queue_delay_us INTEGER NOT NULL,
-                    PRIMARY KEY (node_key, timestamp)
-                )
+                    PRIMARY KEY (node_id, timestamp)
+                ) WITHOUT ROWID
                 """
             )
-            if self._connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_load_history'"
-            ).fetchone():
-                self._connection.execute(
-                    "INSERT OR IGNORE INTO node_queue_history "
-                    "SELECT node_key, timestamp, control_queue_delay_us, "
-                    "transfer_tcp_queue_delay_us, transfer_udp_queue_delay_us "
-                    "FROM node_load_history"
-                )
-                self._connection.execute("DROP TABLE node_load_history")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS node_traffic_history (
-                    node_key TEXT NOT NULL,
+                    service_id INTEGER NOT NULL REFERENCES history_services(service_id),
                     timestamp REAL NOT NULL,
-                    service TEXT NOT NULL,
                     rx_bytes_per_second INTEGER NOT NULL,
                     tx_bytes_per_second INTEGER NOT NULL,
-                    PRIMARY KEY (node_key, timestamp, service)
-                )
+                    PRIMARY KEY (service_id, timestamp)
+                ) WITHOUT ROWID
                 """
             )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS node_traffic_history_service_time "
-                "ON node_traffic_history(node_key, service, timestamp)"
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS node_queue_history_time ON node_queue_history(timestamp)"
-            )
-            self._connection.execute(
-                "CREATE INDEX IF NOT EXISTS node_traffic_history_time "
-                "ON node_traffic_history(timestamp)"
-            )
-            location_columns = {
-                row[1]
-                for row in self._connection.execute(
-                    "PRAGMA table_info(ip_location_cache)"
-                )
-            }
-            expected_location_columns = {
-                "ip",
-                "country_code",
-                "location_code",
-                "city",
-                "region",
-            }
-            if location_columns and location_columns != expected_location_columns:
-                self._connection.execute("DROP TABLE ip_location_cache")
             self._connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ip_location_cache (
@@ -108,7 +102,7 @@ class HistoryStore:
                     location_code TEXT NOT NULL,
                     city TEXT NOT NULL,
                     region TEXT NOT NULL
-                )
+                ) WITHOUT ROWID
                 """
             )
             self._connection.execute(
@@ -116,17 +110,41 @@ class HistoryStore:
                 CREATE TABLE IF NOT EXISTS unlocode_country_cache (
                     country_code TEXT PRIMARY KEY,
                     csv_data TEXT NOT NULL
-                )
+                ) WITHOUT ROWID
                 """
             )
-
             self._expire_history(_wall_time())
-        self._last_retention_check = time.monotonic()
+
+    def _node_id(self, node_key: str, *, create: bool = False) -> int | None:
+        row = self._connection.execute(
+            "SELECT node_id FROM history_nodes WHERE node_key = ?", (node_key,)
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        if create:
+            return self._connection.execute(
+                "INSERT INTO history_nodes (node_key) VALUES (?)", (node_key,)
+            ).lastrowid
+        return None
+
+    def _service_id(self, node_id: int, service: str) -> int:
+        row = self._connection.execute(
+            "SELECT service_id FROM history_services WHERE node_id = ? AND service = ?",
+            (node_id, service),
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        return self._connection.execute(
+            "INSERT INTO history_services (node_id, service) VALUES (?, ?)", (node_id, service)
+        ).lastrowid
 
     def _expire_history(self, now: float) -> None:
         cutoff = now - MAX_HISTORY_SECONDS
-        for table in ("node_queue_history", "node_traffic_history"):
-            self._connection.execute(f"DELETE FROM {table} WHERE timestamp < ?", (cutoff,))
+        for table, key, catalog in HISTORY_TABLES:
+            self._connection.execute(
+                f"DELETE FROM {table} WHERE {key} IN (SELECT {key} FROM {catalog}) "
+                "AND timestamp < ?", (cutoff,),
+            )
 
     def _maybe_expire_history(self) -> None:
         now = time.monotonic()
@@ -182,7 +200,8 @@ class HistoryStore:
         """Remove oldest samples and compact when the DB exceeds its cap.
 
         Runs at most once per minute. It targets 80% of the configured limit so
-        normal appends do not immediately trigger another compaction.
+        normal appends do not immediately trigger another compaction. Each
+        series retains its latest sample until it expires after seven days.
         """
         now = time.monotonic()
         if now - self._last_size_check < 60.0:
@@ -196,34 +215,43 @@ class HistoryStore:
         for _ in range(8):
             fraction = min(0.75, max(0.10, 1.0 - target / footprint))
             with self._connection:
-                deleted = self._delete_oldest_fraction("node_queue_history", fraction)
-                deleted += self._delete_oldest_fraction("node_traffic_history", fraction)
+                deleted = sum(
+                    self._delete_oldest_fraction(table, key, fraction)
+                    for table, key, _ in HISTORY_TABLES
+                )
             if deleted == 0:
                 break
 
-            # VACUUM in WAL mode writes the compacted image through the WAL.
-            # Truncate both before and after it so footprint measures allocated
-            # disk rather than an old or newly generated WAL segment.
-            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self._connection.execute("VACUUM")
-            self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._compact()
             footprint = self._database_footprint()
             if footprint <= target:
                 break
 
-    def _delete_oldest_fraction(self, table: str, fraction: float) -> int:
-        timestamps = self._connection.execute(
-            f"SELECT COUNT(DISTINCT timestamp) FROM {table}"
-        ).fetchone()[0]
-        if timestamps <= 1:
-            return 0
-        delete_count = min(timestamps - 1, max(1, math.ceil(timestamps * fraction)))
-        cutoff = self._connection.execute(
-            f"SELECT DISTINCT timestamp FROM {table} ORDER BY timestamp LIMIT 1 OFFSET ?",
-            (delete_count - 1,),
-        ).fetchone()[0]
-        cursor = self._connection.execute(f"DELETE FROM {table} WHERE timestamp <= ?", (cutoff,))
-        return cursor.rowcount
+    def _compact(self) -> None:
+        # VACUUM in WAL mode writes the compacted image through the WAL.
+        # Truncate both before and after it so footprint measures allocated
+        # disk rather than an old or newly generated WAL segment.
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        self._connection.execute("VACUUM")
+        self._connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def _delete_oldest_fraction(self, table: str, key: str, fraction: float) -> int:
+        # Grouping follows primary-key order; each cutoff/delete then seeks a
+        # single series. Keep its latest point even if other series are newer.
+        series = self._connection.execute(
+            f"SELECT {key}, COUNT(*) FROM {table} GROUP BY {key} HAVING COUNT(*) > 1"
+        ).fetchall()
+        deleted = 0
+        for series_id, count in series:
+            delete_count = min(count - 1, max(1, math.ceil(count * fraction)))
+            cutoff = self._connection.execute(
+                f"SELECT timestamp FROM {table} WHERE {key} = ? "
+                "ORDER BY timestamp LIMIT 1 OFFSET ?", (series_id, delete_count - 1),
+            ).fetchone()[0]
+            deleted += self._connection.execute(
+                f"DELETE FROM {table} WHERE {key} = ? AND timestamp <= ?", (series_id, cutoff),
+            ).rowcount
+        return deleted
 
     def _database_footprint(self) -> int:
         """Total on-disk size of the SQLite main file plus its WAL/SHM sidecars."""
@@ -252,7 +280,7 @@ class HistoryStore:
             self._connection.execute(
                 "INSERT OR REPLACE INTO node_queue_history VALUES (?, ?, ?, ?, ?)",
                 (
-                    node_key,
+                    self._node_id(node_key, create=True),
                     timestamp,
                     control_queue_delay_us,
                     transfer_tcp_queue_delay_us,
@@ -270,28 +298,29 @@ class HistoryStore:
         with self._lock, self._connection:
             self._maybe_roll_if_too_large()
             self._maybe_expire_history()
+            node_id = self._node_id(node_key, create=True)
+            rows = [
+                (self._service_id(node_id, service), timestamp, rx_rate, tx_rate)
+                for service, rx_rate, tx_rate in services
+            ]
             self._connection.executemany(
-                "INSERT OR REPLACE INTO node_traffic_history VALUES (?, ?, ?, ?, ?)",
-                (
-                    (node_key, timestamp, service, rx_rate, tx_rate)
-                    for service, rx_rate, tx_rate in services
-                ),
+                "INSERT OR REPLACE INTO node_traffic_history VALUES (?, ?, ?, ?)", rows
             )
 
     def queue_history(
         self, node_key: str, since: float | None, max_points: int = 2000, *, until: float | None = None
     ) -> list[tuple[float, int, int, int]]:
         since = max(since if since is not None else -math.inf, _wall_time() - MAX_HISTORY_SECONDS)
-        conditions = "node_key = ?"
-        params: tuple = (node_key,)
-        if since is not None:
-            conditions += " AND timestamp >= ?"
-            params += (since,)
-        if until is not None:
-            conditions += " AND timestamp <= ?"
-            params += (until,)
         with self._lock, self._connection:
             self._maybe_expire_history()
+            node_id = self._node_id(node_key)
+            if node_id is None:
+                return []
+            conditions = "node_id = ? AND timestamp >= ?"
+            params: tuple = (node_id, since)
+            if until is not None:
+                conditions += " AND timestamp <= ?"
+                params += (until,)
             count, first, last = self._connection.execute(
                 "SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM node_queue_history "
                 f"WHERE {conditions}",
@@ -322,26 +351,27 @@ class HistoryStore:
         result: dict[str, list[tuple[float, int, int]]] = {}
         with self._lock, self._connection:
             self._maybe_expire_history()
-            service_conditions = "node_key = ?"
-            service_params: tuple = (node_key,)
-            if since is not None:
-                service_conditions += " AND timestamp >= ?"
-                service_params += (since,)
+            node_id = self._node_id(node_key)
+            if node_id is None:
+                return {service: [] for service in sorted(set(services))}
+            service_conditions = "h.service_id = s.service_id AND h.timestamp >= ?"
+            service_params: tuple = (node_id, since)
             if until is not None:
-                service_conditions += " AND timestamp <= ?"
+                service_conditions += " AND h.timestamp <= ?"
                 service_params += (until,)
-            stored_services = self._connection.execute(
-                "SELECT DISTINCT service FROM node_traffic_history "
-                f"WHERE {service_conditions}",
+            stored_services = dict(self._connection.execute(
+                "SELECT s.service, s.service_id FROM history_services s WHERE s.node_id = ? "
+                "AND EXISTS (SELECT 1 FROM node_traffic_history h "
+                f"WHERE {service_conditions})",
                 service_params,
-            ).fetchall()
-            names = sorted(set(services).union(row[0] for row in stored_services))
+            ).fetchall())
+            names = sorted(set(services).union(stored_services))
             for service in names:
-                conditions = "node_key = ? AND service = ?"
-                params: tuple = (node_key, service)
-                if since is not None:
-                    conditions += " AND timestamp >= ?"
-                    params += (since,)
+                if service not in stored_services:
+                    result[service] = []
+                    continue
+                conditions = "service_id = ? AND timestamp >= ?"
+                params: tuple = (stored_services[service], since)
                 if until is not None:
                     conditions += " AND timestamp <= ?"
                     params += (until,)

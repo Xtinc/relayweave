@@ -67,7 +67,7 @@
   main { max-width:1488px; margin:auto; padding:28px 32px 40px; }
   .card { min-width:0; border:1px solid var(--border); border-radius:14px; background:var(--surface-2); box-shadow:var(--shadow); overflow:hidden; }
   .card-head { display:flex; align-items:center; gap:12px; min-height:62px; padding:14px 20px; }
-  .card-head h2,.section-head h2 { margin:0; font-size:14px; font-weight:600; letter-spacing:-.15px; }
+  .card-head h2 { margin:0; font-size:14px; font-weight:600; letter-spacing:-.15px; }
   .card-head .head-text { flex:1; min-width:0; }
   .hint { color:var(--text-muted); font-size:12px; }
   .card-head .hint { margin-left:auto; }
@@ -91,8 +91,6 @@
   .flow-options { flex-wrap:wrap; }
   .flow-options select { width:136px; }
   .flow-options #flow-protocol { width:120px; }
-  .link-toggle { display:inline-flex; align-items:center; gap:7px; padding:0 10px; height:32px; border:1px solid var(--border); border-radius:7px; color:var(--text-secondary); font-size:12px; cursor:pointer; }
-  .link-toggle input { width:12px; height:12px; margin:0; }
   .view-tools { flex:none; gap:6px; }
   .control-group { gap:1px; padding:2px; border:1px solid var(--border); border-radius:7px; }
   .flow-controls button { display:grid; place-items:center; padding:0; width:28px; height:26px; border:0; border-radius:4px; background:transparent; color:var(--text-secondary); cursor:pointer; }
@@ -133,7 +131,7 @@
   .flow-inspector details[open]>summary::before { transform:rotate(90deg); }
   .link-detail summary>span:first-of-type { flex:1; }
   .link-rtt { color:var(--text-muted); font-size:11px; white-space:nowrap; font-variant-numeric:tabular-nums; }
-  .flow-inspector,.table-wrap { scrollbar-gutter:stable; }
+  .flow-inspector { scrollbar-gutter:stable; }
   .flow-inspector .business-id { font:10px/1.7 ui-monospace,SFMono-Regular,monospace; color:var(--text-secondary); }
   .flow-legend { display:flex; align-items:center; gap:18px; height:52px; padding:0 20px; border-top:1px solid var(--border); overflow-x:auto; scrollbar-width:thin; white-space:nowrap; }
   .flow-legend:empty::after { content:"No active routes"; color:var(--text-muted); font-size:11px; }
@@ -143,8 +141,8 @@
   .flow-legend-item .route-protocol { color:var(--text-muted); font-size:10px; }
   .flow-legend-item .route-count { color:var(--text-muted); font-variant-numeric:tabular-nums; }
   .flow-track,.flow-band { fill:none; stroke-linejoin:round; stroke-linecap:butt; }
-  .flow-shared-track,.flow-station,.flow-quality-link { cursor:pointer; outline:none; }
-  .flow-hit,.flow-link-hit { fill:none; stroke:transparent; stroke-width:14; pointer-events:stroke; }
+  .flow-shared-track,.flow-station { cursor:pointer; outline:none; }
+  .flow-hit { fill:none; stroke:transparent; stroke-width:14; pointer-events:stroke; }
   .flow-shared-track:focus-visible .flow-track,.flow-station:focus-visible .flow-node,.flow-station:focus-visible .flow-agent { stroke:var(--flow-ink); stroke-width:3; }
   .flow-shared-track.selected .flow-track { stroke:var(--flow-ink); }
   .flow-station.selected .flow-label { text-decoration:underline; }
@@ -152,15 +150,6 @@
   .flow-route-focus.selected { display:initial; }
   .flow-focus-path { fill:none; stroke-width:4; }
   .flow-dimmed { opacity:.16; }
-  .flow-quality-path { fill:none; stroke:var(--flow-muted); stroke-width:1.5; stroke-dasharray:5 5; }
-  .flow-quality-link .flow-quality-path,.flow-quality-link .flow-link-hit,.flow-link-label { display:none; }
-  .flow-show-quality .flow-quality-path,.flow-show-quality .flow-link-hit { display:initial; }
-  .flow-quality-link[data-active="true"].warning .flow-link-label,.flow-quality-link[data-active="true"].critical .flow-link-label,.flow-quality-link[data-active="true"].unknown .flow-link-label,.flow-quality-link.selected .flow-link-label { display:initial; }
-  .flow-quality-link.selected .flow-quality-path { display:initial; stroke:var(--flow-ink); }
-  .flow-quality-link.warning .flow-quality-path { stroke:var(--flow-warning); }
-  .flow-quality-link.critical .flow-quality-path { stroke:var(--flow-critical); }
-  .flow-quality-link:focus-visible .flow-quality-path { stroke:var(--flow-ink); stroke-width:3; }
-  .flow-link-label { fill:var(--flow-ink); font-size:10px; paint-order:stroke; stroke:var(--flow-bg); stroke-width:4; stroke-linejoin:round; }
   .flow-node,.flow-agent { fill:var(--flow-node-bg); stroke:var(--flow-ring); }
   .flow-node { stroke:none; }
   .flow-agent { stroke:var(--flow-muted); }
@@ -179,19 +168,11 @@
   .flow-alert text { fill:var(--flow-ink); stroke:none; font-size:10px; font-weight:700; }
   .flow-node-station.unknown .flow-capacity-track { stroke-dasharray:3 3; opacity:.6; }
   .flow-svg,.flow-legend { user-select:none; -webkit-user-select:none; }
-  .section-head { display:flex; align-items:center; gap:12px; min-height:32px; margin:0 0 14px; }
-  .section-head .svc-select { margin-left:auto; width:160px; }
-  .section-head .hint { font-size:11px; }
-  .tile-row { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); margin-bottom:20px; border:1px solid var(--border); border-radius:12px; background:var(--surface-2); overflow:hidden; }
-  .tile { min-width:0; height:106px; padding:19px 20px; border-right:1px solid var(--border); }
-  .tile:last-child { border:0; }
-  .tile .label { display:flex; align-items:center; gap:7px; color:var(--text-secondary); font-size:12px; white-space:nowrap; }
-  .swatch { width:5px; height:5px; border-radius:50%; flex:none; }
-  .tile .value { margin-top:10px; font-size:25px; font-weight:550; line-height:1.2; letter-spacing:-.6px; font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .chart-row { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:20px; margin-bottom:20px; }
   .chart-card { height:342px; display:grid; grid-template-rows:62px 36px minmax(0,1fr); }
   .chart-toolbar { display:flex; align-items:center; gap:12px; min-width:0; padding:0 20px 8px; }
-  .chart-toolbar .svc-select { flex:1; max-width:calc(100% - 104px); height:28px; font-size:11px; }
+  .chart-toolbar .svc-select { flex:0 1 220px; width:220px; max-width:calc(100% - 104px); height:28px; font-size:11px; }
+  .chart-toolbar .legend { margin-left:auto; }
   .legend { display:flex; align-items:center; gap:16px; white-space:nowrap; }
   .legend .item { display:inline-flex; align-items:center; gap:6px; color:var(--text-secondary); font-size:11px; }
   .legend .key { width:12px; height:2px; border-radius:1px; }
@@ -211,22 +192,23 @@
   .tooltip .row .name { display:inline-flex; align-items:center; gap:7px; color:var(--text-secondary); }
   .tooltip .row .key { width:10px; height:2px; }
   .tooltip .row .val { font-weight:550; font-variant-numeric:tabular-nums; }
-  .table-wrap { height:300px; overflow:auto; scrollbar-width:thin; }
+  .table-wrap { overflow:visible; }
   table.svc { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
-  table.svc th,table.svc td { text-align:left; padding:13px 20px; border-bottom:1px solid var(--border); }
-  table.svc th { position:sticky; top:0; z-index:1; background:var(--surface-1); color:var(--text-muted); font-size:10px; font-weight:500; white-space:nowrap; }
+  table.svc th,table.svc td { text-align:left; padding:13px 16px; border-bottom:1px solid var(--border); }
+  table.svc th { background:var(--surface-1); color:var(--text-muted); font-size:10px; font-weight:500; white-space:nowrap; }
   table.svc td { font-size:12px; vertical-align:top; }
   table.svc td.num,table.svc th.num { text-align:right; }
   table.svc tr:last-child td { border:0; }
-  table.traffic-table { min-width:1080px; table-layout:fixed; }
-  .col-index { width:50px; } .col-node { width:124px; } .col-service { width:280px; } .col-protocol { width:90px; } .col-rate { width:140px; } .col-total { width:124px; }
+  table.traffic-table { table-layout:fixed; }
+  table.traffic-table td { overflow-wrap:anywhere; }
+  .col-index { width:4%; } .col-node { width:12%; } .col-service { width:24%; } .col-protocol { width:8%; } .col-rate,.col-total { width:13%; }
   .proto-pill { display:inline-block; padding:2px 6px; border:1px solid var(--border); border-radius:4px; color:var(--text-secondary); font-size:10px; text-transform:uppercase; }
-  .rate-cell { display:inline-grid; grid-template-columns:5px 12ch; align-items:center; gap:7px; white-space:nowrap; }
+  .rate-cell { display:inline-grid; grid-template-columns:5px minmax(0,1fr); align-items:center; gap:7px; max-width:100%; }
   .rate-cell .key { width:5px; height:5px; border-radius:50%; }
-  .rate-cell .metric-value,.traffic-table .total-value { display:inline-block; width:12ch; text-align:right; font-variant-numeric:tabular-nums; }
+  .rate-cell .metric-value,.traffic-table .total-value { display:inline-block; max-width:100%; text-align:right; font-variant-numeric:tabular-nums; }
   .rate-cell.rx .key { background:var(--series-5); } .rate-cell.tx .key { background:var(--series-6); }
   .cum-cell { color:var(--text-secondary); }
-  .service-tree { min-width:220px; }
+  .service-tree { min-width:0; }
   .service-tree-root { display:flex; align-items:center; gap:7px; min-height:22px; font-weight:550; }
   .service-tree-root::before { content:""; width:5px; height:5px; border-radius:50%; background:var(--series-1); flex:none; }
   .access-count,.connection-count { color:var(--text-muted); font-size:10px; font-weight:400; white-space:nowrap; }
@@ -237,6 +219,12 @@
   .service-tree-children .no-accessor { color:var(--text-muted); }
   .accessor-location { margin-right:5px; white-space:nowrap; cursor:help; }
   .empty { color:var(--text-muted); padding:24px 20px; font-size:12px; }
+  .service-pagination { display:flex; align-items:center; gap:12px; min-height:58px; padding:12px 20px; border-top:1px solid var(--border); color:var(--text-muted); font-size:11px; font-variant-numeric:tabular-nums; }
+  .service-pagination[hidden] { display:none; }
+  #service-page-range { margin-right:auto; }
+  .service-pagination button { display:grid; place-items:center; width:28px; height:28px; border:1px solid var(--border); border-radius:6px; background:var(--surface-2); cursor:pointer; }
+  .service-pagination button:hover:not(:disabled) { background:var(--surface-1); color:var(--text-primary); }
+  .service-pagination button:disabled { opacity:.3; cursor:default; }
   .error-banner { margin-bottom:20px; padding:12px 16px; border:1px solid var(--status-critical); border-radius:8px; color:var(--text-secondary); font-size:12px; }
   .stale { opacity:.55; transition:opacity .2s; }
   @media (max-width:1100px) {
@@ -244,13 +232,20 @@
     .flow-workspace { grid-template-columns:minmax(0,1fr) 272px; }
     .flow-controls { padding:11px 16px; gap:8px; } .flow-options { gap:6px; }
     .flow-options select { width:116px; } .flow-options #flow-protocol { width:110px; }
-    .tile { padding:19px 16px; } .tile .value { font-size:23px; }
+    table.svc th,table.svc td { padding:12px 10px; }
   }
   @media (max-width:900px) {
     .flow-controls { flex-wrap:wrap; } .flow-options { flex:1; } .view-tools { margin-left:auto; }
     .flow-workspace { grid-template-columns:minmax(0,1fr) 248px; }
     .flow-inspector { padding:16px; } .flow-status { gap:10px; }
-    .chart-row { grid-template-columns:1fr; } .tile .label { font-size:10px; } .tile .value { font-size:21px; }
+    .chart-row { grid-template-columns:1fr; }
+    .traffic-table colgroup,.traffic-table thead { display:none; }
+    .traffic-table,.traffic-table tbody { display:block; }
+    .traffic-table tbody tr { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px 20px; padding:16px 20px; border-top:1px solid var(--border); }
+    .traffic-table tbody td { display:block; padding:0; border:0; text-align:left; min-width:0; }
+    .traffic-table tbody td::before { content:attr(data-label); display:block; margin-bottom:4px; color:var(--text-muted); font-size:10px; }
+    .traffic-table tbody td:nth-child(3),.traffic-table tbody td.empty { grid-column:1/-1; }
+    .traffic-table tbody td.empty::before { display:none; }
   }
   @media (max-width:680px) {
     main { padding:16px 12px 24px; } .topbar { height:60px; } .topbar-inner { padding:0 16px; gap:12px; }
@@ -260,17 +255,13 @@
     .flow-card>.card-head { gap:10px; } .flow-status { height:22px; gap:10px; }
     .flow-controls { padding:10px 12px; } .flow-options { width:100%; flex:none; gap:6px; }
     .flow-options select { flex:1; width:0; } .flow-options #flow-protocol { width:0; }
-    .link-toggle { padding:0 8px; } .view-tools { width:100%; justify-content:space-between; }
+    .view-tools { width:100%; justify-content:space-between; }
     .flow-workspace { height:auto; grid-template-columns:1fr; grid-template-rows:var(--map-height) 300px; }
     .flow-inspector { border-left:0; border-top:1px solid var(--border); }
     .flow-legend { padding:0 16px; height:48px; }
-    .tile-row { grid-template-columns:repeat(2,minmax(0,1fr)); } .tile { height:94px; padding:16px; border-bottom:1px solid var(--border); }
-    .tile:nth-child(even) { border-right:0; } .tile:last-child { grid-column:1/-1; }
-    .tile .label { font-size:11px; } .tile .value { font-size:24px; }
-    .section-head { flex-wrap:wrap; gap:8px; } .section-head .svc-select { width:136px; }
     .chart-row { gap:16px; } .chart-card { height:326px; grid-template-rows:56px 36px minmax(0,1fr); }
     .chart-toolbar { padding:0 16px 8px; } .chart-plot { padding:0 6px 8px; }
-    .table-wrap { height:280px; }
+    .service-pagination { padding:12px 16px; }
   }
   @media (pointer:coarse) { .flow-controls button { min-width:32px; height:32px; } .flow-controls { min-height:64px; } }
 </style>
@@ -307,7 +298,6 @@
         <div class="flow-options">
           <select class="svc-select" id="flow-service" aria-label="Flow service filter"><option value="">All services</option></select>
           <select class="svc-select" id="flow-protocol" aria-label="Flow protocol filter"><option value="">All protocols</option><option value="tcp">TCP</option><option value="tls">TLS</option><option value="udp">UDP</option></select>
-          <label class="link-toggle" title="Directed ICMP links"><input type="checkbox" id="flow-quality-toggle"> ICMP</label>
         </div>
         <div class="view-tools">
           <div class="control-group" role="group" aria-label="Map zoom">
@@ -331,23 +321,12 @@
       <div class="flow-legend" id="flow-legend" aria-label="Active routes"></div>
     </section>
 
-    <div class="section-head">
-      <h2>Node health</h2>
-      <select class="svc-select node-select" id="node-select" aria-label="Node health selection"></select>
-      <span class="hint" id="node-health-hint">—</span>
-    </div>
-    <div class="tile-row">
-      <div class="tile" title="Control executor queue delay"><div class="label"><span class="swatch" style="background:var(--series-1)"></span>Control queue</div><div class="value" id="tile-cqd">—</div></div>
-      <div class="tile" title="TCP transfer executor queue delay"><div class="label"><span class="swatch" style="background:var(--series-2)"></span>TCP queue</div><div class="value" id="tile-tcpqd">—</div></div>
-      <div class="tile" title="UDP transfer executor queue delay"><div class="label"><span class="swatch" style="background:var(--series-4)"></span>UDP queue</div><div class="value" id="tile-udpqd">—</div></div>
-      <div class="tile"><div class="label">Services</div><div class="value" id="tile-svc">—</div></div>
-      <div class="tile"><div class="label">Uptime</div><div class="value" id="tile-up">—</div></div>
-    </div>
-
     <div class="chart-row">
       <section class="card chart-card" aria-labelledby="queue-heading">
         <div class="card-head"><span class="head-text"><h2 id="queue-heading">Queue delay</h2></span><select class="range-select" data-chart="chart-queue" aria-label="Queue chart time range"></select></div>
-        <div class="chart-toolbar"><div class="legend">
+        <div class="chart-toolbar">
+          <select class="svc-select" id="node-select" aria-label="Queue delay Node"></select>
+          <div class="legend">
           <span class="item"><span class="key" style="background:var(--series-1)"></span>Control</span>
           <span class="item"><span class="key" style="background:var(--series-2)"></span>TCP</span>
           <span class="item"><span class="key" style="background:var(--series-4)"></span>UDP</span>
@@ -371,6 +350,12 @@
         <thead><tr><th>#</th><th>Node</th><th>Service / accessors</th><th>Protocol</th><th class="num">RX rate</th><th class="num">TX rate</th><th class="num">RX total</th><th class="num">TX total</th></tr></thead>
         <tbody id="svc-body"></tbody>
       </table></div>
+      <nav class="service-pagination" id="service-pagination" aria-label="Services pagination" hidden>
+        <span id="service-page-range" aria-live="polite"></span>
+        <button type="button" id="service-page-prev" aria-label="Previous services page" aria-controls="svc-body" disabled><svg class="icon" aria-hidden="true"><use href="#icon-left"/></svg></button>
+        <span id="service-page-number"></span>
+        <button type="button" id="service-page-next" aria-label="Next services page" aria-controls="svc-body" disabled><svg class="icon" aria-hidden="true"><use href="#icon-right"/></svg></button>
+      </nav>
     </section>
   </main>
 </div>
@@ -381,6 +366,7 @@ const UNSET = 0xFFFFFFFF;          // queue-delay sentinel from the server
 const POLL_MS = 2000;
 const HISTORY_HIGH_WATER = 2500;
 const HISTORY_COMPACT_TO = 2000;
+const SERVICE_PAGE_SIZE = 10;
 
 const $ = (id) => document.getElementById(id);
 function fmtUs(us){ if(us===undefined||us===null||us===UNSET) return "—"; return us<1000 ? us+" µs" : (us/1000).toFixed(1)+" ms"; }
@@ -458,6 +444,7 @@ function setChartView(cid, start, end){
 // The compound key keeps same-named services on different nodes distinct.
 let bandwidthSelection = null;
 let selectedNodeKey = null;
+let servicePage = 0;
 let flowSvgText = null;
 let flowView = null;
 let flowSelection = null;
@@ -546,7 +533,7 @@ function renderFlowMap(map){
   if(map.routes.length || map.nodes.length){
     if(flowSvgText !== map.svg){
       const focused = viewport.contains(document.activeElement) ? document.activeElement : null;
-      const focusKey = focused && ["node", "agent", "link", "track"].find(key => focused.dataset[key]);
+      const focusKey = focused && ["node", "agent", "track"].find(key => focused.dataset[key]);
       const focusId = focusKey && focused.dataset[focusKey];
       viewport.innerHTML = map.svg; flowSvgText = map.svg;
       if(!flowView) resetFlowView(!map.routes.length);
@@ -622,23 +609,16 @@ function flowLinkDetails(link, open=false){
 }
 function updateFlowSelection(map){
   const viewport = $("flow-viewport"), selected = flowSelectedObject(map);
-  viewport.classList.toggle("flow-show-quality", $("flow-quality-toggle").checked);
   const routeId = flowSelection?.type === "route" ? flowSelection.id : null;
-  viewport.querySelectorAll(".flow-shared-track, .flow-station, .flow-quality-link").forEach(element => {
+  viewport.querySelectorAll(".flow-shared-track, .flow-station").forEach(element => {
     const ids = JSON.parse(element.dataset.routes || "[]");
     const active = flowSelection && ((flowSelection.type === "node" && element.dataset.node === flowSelection.id)
       || (flowSelection.type === "agent" && element.dataset.agent === flowSelection.id)
       || (flowSelection.type === "track" && element.dataset.track === flowSelection.id)
-      || (flowSelection.type === "link" && element.dataset.link === flowSelection.id)
       || (routeId && ids.includes(routeId)));
     element.classList.toggle("selected", Boolean(active));
     element.classList.toggle("flow-dimmed", Boolean(routeId && !ids.includes(routeId)));
     element.setAttribute("aria-pressed", String(Boolean(active)));
-    if(element.dataset.link){
-      const visible = $("flow-quality-toggle").checked || active || (element.dataset.active === "true" && !element.classList.contains("good"));
-      element.setAttribute("tabindex", visible ? "0" : "-1");
-      if(visible) element.removeAttribute("aria-hidden"); else element.setAttribute("aria-hidden", "true");
-    }
   });
   viewport.querySelectorAll(".flow-route-focus").forEach(element => element.classList.toggle("selected", element.dataset.focusRoute === routeId));
   $("flow-legend").querySelectorAll("button").forEach(button => button.setAttribute("aria-pressed", String(button.dataset.selectRoute === routeId)));
@@ -711,11 +691,10 @@ function updateFlowSelection(map){
   }
 }
 $("flow-viewport").addEventListener("click", event => {
-  const target = event.target.closest("[data-node], [data-agent], [data-link], [data-track]");
+  const target = event.target.closest("[data-node], [data-agent], [data-track]");
   if(!target) return;
   if(target.dataset.node) selectFlow("node", target.dataset.node);
   else if(target.dataset.agent) selectFlow("agent", target.dataset.agent);
-  else if(target.dataset.link) selectFlow("link", target.dataset.link);
   else{
     const ids = JSON.parse(target.dataset.routes);
     selectFlow(ids.length === 1 ? "route" : "track", ids.length === 1 ? ids[0] : target.dataset.track);
@@ -735,7 +714,6 @@ for(const id of ["flow-legend", "flow-inspector"]){
   });
 }
 $("flow-controls").querySelector("[data-flow-clear]").addEventListener("click", () => selectFlow(null));
-$("flow-quality-toggle").addEventListener("change", () => { if(currentData) updateFlowSelection(currentData.flow_map); });
 for(const id of ["flow-service", "flow-protocol"]){
   $(id).addEventListener("change", () => {
     pollGeneration++;
@@ -1118,6 +1096,39 @@ function resetHistoryAndPoll(){
   poll();
 }
 
+function renderServices(nodes, totalNodes){
+  const services = nodes.flatMap(node => (node.service_traffic || []).map(service => ({node:nodeName(node), ...service})))
+    .sort((a,b) => a.node.localeCompare(b.node) || a.service.localeCompare(b.service) || a.protocol.localeCompare(b.protocol));
+  const pages = Math.max(1, Math.ceil(services.length / SERVICE_PAGE_SIZE));
+  servicePage = Math.max(0, Math.min(servicePage, pages-1));
+  const start = servicePage * SERVICE_PAGE_SIZE;
+  const visible = services.slice(start, start + SERVICE_PAGE_SIZE);
+  $("svc-hint").textContent = services.length + " total";
+  $("svc-hint").title = "Across " + totalNodes + " Nodes";
+  $("svc-body").innerHTML = visible.length ? visible.map((service,index) => `<tr>
+    <td data-label="#">${start+index+1}</td>
+    <td data-label="Node">${escapeText(service.node)}</td>
+    <td data-label="Service / accessors">${serviceTree(service)}</td>
+    <td data-label="Protocol"><span class="proto-pill">${escapeText(service.protocol)}</span></td>
+    <td data-label="RX rate" class="num"><span class="rate-cell rx"><span class="key"></span><span class="metric-value">${fmtBps(service.rx_bytes_per_second)}</span></span></td>
+    <td data-label="TX rate" class="num"><span class="rate-cell tx"><span class="key"></span><span class="metric-value">${fmtBps(service.tx_bytes_per_second)}</span></span></td>
+    <td data-label="RX total" class="num cum-cell"><span class="total-value">${fmtBytes(service.rx_bytes)}</span></td>
+    <td data-label="TX total" class="num cum-cell"><span class="total-value">${fmtBytes(service.tx_bytes)}</span></td>
+  </tr>`).join("") : '<tr><td colspan="8" class="empty">No services</td></tr>';
+  $("service-pagination").hidden = pages <= 1;
+  $("service-page-range").textContent = services.length ? `${start+1}–${start+visible.length} of ${services.length}` : "0";
+  $("service-page-number").textContent = `${servicePage+1} / ${pages}`;
+  $("service-page-prev").disabled = servicePage === 0;
+  $("service-page-next").disabled = servicePage === pages-1;
+}
+for(const [id,delta] of [["service-page-prev",-1],["service-page-next",1]]){
+  $(id).addEventListener("click", () => {
+    if(!currentData || $(id).disabled) return;
+    servicePage += delta;
+    renderServices(currentData.nodes || [], currentData.total_nodes || currentData.nodes?.length || 0);
+  });
+}
+
 function render(data){
   currentData = data;
   if(chartDragging) return;
@@ -1150,25 +1161,8 @@ function render(data){
   }
 
   const node = nodes.find(item => item.key === selectedNodeKey) || nodes[0];
-  const topologyNode = node && data.topology
-    ? (data.topology.nodes || []).find(item => item.node_id === node.node_id)
-    : null;
-  $("node-health-hint").innerHTML = node ? statePill(node.connected ? "good" : "disconnected", node.connected ? "Online" : "Offline") : statePill("pending");
   $("peer").textContent = data.entry_node_id ? "Entry: " + data.entry_node_id : (data.entry_peer || "—");
   const hist = node ? node.history || [] : [];
-  const last = topologyNode ? {
-    cqd:topologyNode.control_queue_delay_us,
-    tcp_qd:topologyNode.transfer_tcp_queue_delay_us,
-    udp_qd:topologyNode.transfer_udp_queue_delay_us,
-  } : null;
-
-  $("tile-cqd").textContent = last ? fmtUs(last.cqd) : "—";
-  $("tile-tcpqd").textContent = last ? fmtUs(last.tcp_qd) : "—";
-  $("tile-udpqd").textContent = last ? fmtUs(last.udp_qd) : "—";
-  $("tile-svc").textContent = node ? (node.service_traffic || []).length : "—";
-  $("tile-svc").title = node ? "Refreshed " + fmtAge(node.service_traffic_age_s) : "Waiting for reports";
-  $("tile-up").textContent = !node || node.uptime_s === null ? "—" : fmtUptime(node.uptime_s);
-  $("tile-up").title = node ? fmtUptime(node.uptime_s) + " · refreshed " + fmtAge(node.report_age_s) : "Waiting for reports";
 
   const queueDomain = chartDomain("chart-queue", renderNow);
   const queueHist = windowHistory(hist, queueDomain);
@@ -1178,34 +1172,10 @@ function render(data){
      {name:"UDP transfer queue", colorVar:"--series-4", key:"udp_qd"}],
     fmtUs, queueDomain);
 
-  // Services from every node remain visible while charts follow the selected node.
-  const body = $("svc-body");
-  const allServices = [];
-  nodes.forEach(item => (item.service_traffic || []).forEach(service => {
-    allServices.push({node: nodeName(item), ...service});
-  }));
-  allServices.sort((a,b) => a.node.localeCompare(b.node) || a.service.localeCompare(b.service));
-  $("svc-hint").textContent = allServices.length + " total";
-  $("svc-hint").title = "Across " + totalNodes + " Nodes";
-  if(!allServices.length){
-    body.innerHTML = `<tr><td colspan="8" class="empty">No services</td></tr>`;
-  } else {
-    body.innerHTML = allServices.map((t,i) => {
-      return `<tr>
-        <td>${i+1}</td>
-        <td>${escapeText(t.node)}</td>
-        <td>${serviceTree(t)}</td>
-        <td><span class="proto-pill">${escapeText(t.protocol)}</span></td>
-        <td class="num"><span class="rate-cell rx"><span class="key"></span><span class="metric-value">${fmtBps(t.rx_bytes_per_second)}</span></span></td>
-        <td class="num"><span class="rate-cell tx"><span class="key"></span><span class="metric-value">${fmtBps(t.tx_bytes_per_second)}</span></span></td>
-        <td class="num cum-cell"><span class="total-value">${fmtBytes(t.rx_bytes)}</span></td>
-        <td class="num cum-cell"><span class="total-value">${fmtBytes(t.tx_bytes)}</span></td>
-      </tr>`;
-    }).join("");
-  }
+  renderServices(nodes, totalNodes);
 
   // Bandwidth can follow any discovered node/service, independently of the
-  // node selected for tiles and queue charts.
+  // node selected for the queue chart.
   const bandwidthServices = [];
   nodes.forEach(item => {
     Object.entries(item.traffic_history || {}).forEach(([service, history]) => {

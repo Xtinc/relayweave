@@ -654,7 +654,7 @@ class FlowMapRenderer:
                 "topology_age_s": (topology or {}).get("age_s"),
                 "shared_tracks": [{key: value for key, value in track.items() if key not in {"pieces", "path"}}
                                   for track in shared],
-                "svg": self._svg(geometry, stations, shared, routes, links)}
+                "svg": self._svg(geometry, stations, shared, routes)}
 
     def _layout(self, routes: list[dict], node_ids=()) -> MetroGeometry:
         agents = {}
@@ -735,37 +735,14 @@ class FlowMapRenderer:
 
     @staticmethod
     def _svg(geometry: MetroGeometry, stations: list[dict], shared: list[dict],
-             routes: list[dict], links: list[dict]) -> str:
+             routes: list[dict]) -> str:
         positions, agents, hops, width, height = geometry
         nodes = {station["node_id"]: station for station in stations}
         svg = ET.Element("svg", {"xmlns": "http://www.w3.org/2000/svg", "class": "flow-svg",
                                  "viewBox": f"0 0 {width} {height}", "width": str(width), "height": str(height),
                                  "preserveAspectRatio": "xMidYMid meet", "role": "group",
-                                 "aria-label": "Interactive relay routes, Nodes and directed ICMP measurements"})
+                                 "aria-label": "Interactive relay routes and Nodes"})
         layer = ET.SubElement(svg, "g", {"class": "flow-scene"})
-        quality = ET.SubElement(layer, "g", {"class": "flow-quality"})
-        for link in links:
-            start, end = positions["node:" + link["source"]], positions["node:" + link["destination"]]
-            dx, dy = end[0] - start[0], end[1] - start[1]
-            length = math.hypot(dx, dy)
-            normal = (-dy / length, dx / length)
-            midpoint = ((start[0] + end[0]) / 2, (start[1] + end[1]) / 2)
-            control = (midpoint[0] + normal[0] * 48, midpoint[1] + normal[1] * 48)
-            label = (midpoint[0] + normal[0] * 27, midpoint[1] + normal[1] * 27)
-            group = ET.SubElement(quality, "g", {"class": f'flow-quality-link {link["state"]}',
-                "data-link": link["id"], "data-active": str(bool(link["route_ids"])).lower(),
-                "data-routes": json.dumps(link["route_ids"]), "role": "button", "tabindex": "0",
-                "aria-label": f'ICMP {link["source"]} to {link["destination"]}: {link["state"]}'})
-            path = f"M{start[0]},{start[1]} Q{control[0]},{control[1]} {end[0]},{end[1]}"
-            ET.SubElement(group, "path", {"class": "flow-quality-path", "d": path})
-            ET.SubElement(group, "path", {"class": "flow-link-hit", "d": path})
-            text = ET.SubElement(group, "text", {"class": "flow-link-label", "x": str(label[0]),
-                "y": str(label[1] - 7), "text-anchor": "middle"})
-            ET.SubElement(text, "tspan", {"x": str(label[0])}).text = f'{_label(link["source"], 72)[0]} → {_label(link["destination"], 72)[0]}'
-            diagnostic = ("Stale / unknown" if link["state"] == "unknown" else
-                          f'{link["rtt_ms"]:.1f} ms · {link["loss_rate"]:.1%} loss')
-            ET.SubElement(text, "tspan", {"x": str(label[0]), "dy": "14"}).text = diagnostic
-            ET.SubElement(group, "title").text = f'Directed ICMP measurement: {link["source"]} → {link["destination"]}\n{diagnostic}'
         tracks = ET.SubElement(layer, "g", {"class": "flow-routes"})
         # Paint busier trunks over branch ends so the branches visibly meet
         # the trunk's edge without a colored stub across its center.

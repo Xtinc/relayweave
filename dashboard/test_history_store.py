@@ -1,4 +1,4 @@
-"""HistoryStore retention tests that require only the Python standard library."""
+"""HistoryStore query and retention tests using the standard library."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from history_store import HistoryStore, MAX_HISTORY_SECONDS
+from history_store import HISTORY_TABLES, HistoryStore, MAX_HISTORY_SECONDS
+
 
 
 class HistoryStoreTest(unittest.TestCase):
@@ -65,59 +66,86 @@ class HistoryStoreTest(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_load_history_is_migrated_to_queue_history(self) -> None:
+    def test_current_database_preserves_samples_and_caches_across_restarts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "history.sqlite3"
-            connection = sqlite3.connect(database)
-            with connection:
-                connection.execute(
-                    "CREATE TABLE node_load_history ("
-                    "node_key TEXT, timestamp REAL, control_queue_delay_us INTEGER, "
-                    "transfer_tcp_queue_delay_us INTEGER, transfer_udp_queue_delay_us INTEGER, "
-                    "rtt_ms REAL)"
-                )
-                connection.execute(
-                    "INSERT INTO node_load_history VALUES ('node-a', 10, 1, 2, 3, 4)"
-                )
-            connection.close()
-
+            store = HistoryStore(database)
+            store.append_queue("node-a", 10.25, 0, 2, 3)
+            store.append_queue("node-a", 11.25, 4, 5, 6)
+            store.append_queue("node-b", 10.25, 7, 8, 9)
+            store.append_traffic("node-a", 10.25, [("ssh", 0, 12)])
+            store.append_traffic("node-a", 11.25, [("ssh", 13, 14)])
+            store.append_traffic("node-b", 10.25, [("ssh", 21, 22), ("已下线服务", 31, 32)])
+            store.save_ip_location("1.1.1.1", "AU", "SYD", "Sydney", "NSW")
+            store.save_unlocode_country("AU", "cached country data")
+            store.close()
             store = HistoryStore(database)
             try:
-                self.assertEqual(store.queue_history("node-a", None), [(10.0, 1, 2, 3)])
-                self.assertIsNone(
-                    store._connection.execute(
-                        "SELECT 1 FROM sqlite_master WHERE name='node_load_history'"
-                    ).fetchone()
-                )
+                self.assertEqual(store.queue_history("node-a", None), [(10.25, 0, 2, 3), (11.25, 4, 5, 6)])
+                self.assertEqual(store.queue_history("node-b", None), [(10.25, 7, 8, 9)])
+                self.assertEqual(store.traffic_history("node-a", None, ["missing"]), {
+                    "missing": [], "ssh": [(10.25, 0, 12), (11.25, 13, 14)],
+                })
+                self.assertEqual(store.traffic_history("node-b", 10, [], until=11), {
+                    "ssh": [(10.25, 21, 22)], "已下线服务": [(10.25, 31, 32)],
+                })
+                self.assertEqual(store.load_ip_locations(), {"1.1.1.1": ("AU", "SYD", "Sydney", "NSW")})
+                self.assertEqual(store.load_unlocode_country("AU"), "cached country data")
+                store.append_queue("node-a", 10.25, 41, 42, 43)
+                store.append_traffic("node-a", 10.25, [("ssh", 51, 52), ("new", 61, 62)])
+                store.append_queue("node-c", 12.25, 71, 72, 73)
+                store.append_traffic("node-c", 12.25, [("ssh", 81, 82)])
+                self.assertEqual(store.queue_history("node-a", None), [(10.25, 41, 42, 43), (11.25, 4, 5, 6)])
+                self.assertEqual(store.traffic_history("node-a", None, []), {
+                    "new": [(10.25, 61, 62)], "ssh": [(10.25, 51, 52), (11.25, 13, 14)],
+                })
+                self.assertEqual(store.traffic_history("node-b", None, ["ssh"])["ssh"], [(10.25, 21, 22)])
+                self.assertEqual(store.queue_history("node-c", None), [(12.25, 71, 72, 73)])
+                self.assertEqual(store.traffic_history("node-c", None, []), {"ssh": [(12.25, 81, 82)]})
+                self.assertEqual(store._connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+                self.assertEqual(store._connection.execute("PRAGMA integrity_check").fetchall(), [("ok",)])
             finally:
                 store.close()
 
-    def test_old_location_cache_is_replaced(self) -> None:
+    def test_primary_storage_serves_both_queries_and_expiration_without_secondary_indexes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            database = Path(directory) / "history.sqlite3"
-            connection = sqlite3.connect(database)
-            with connection:
-                connection.execute(
-                    "CREATE TABLE ip_location_cache (ip TEXT PRIMARY KEY, location TEXT NOT NULL)"
-                )
-                connection.execute(
-                    "INSERT INTO ip_location_cache VALUES ('8.8.8.8', '🇺🇸 MV')"
-                )
-            connection.close()
-
-            store = HistoryStore(database)
+            store = HistoryStore(Path(directory) / "history.sqlite3")
             try:
-                self.assertEqual(store.load_ip_locations(), {})
-                columns = {
-                    row[1]
-                    for row in store._connection.execute(
-                        "PRAGMA table_info(ip_location_cache)"
-                    )
-                }
-                self.assertEqual(
-                    columns,
-                    {"ip", "country_code", "location_code", "city", "region"},
-                )
+                store.append_queue("node-a", 10.25, 1, 2, 3)
+                store.append_traffic("node-a", 10.25, [("ssh", 4, 5)])
+                indexes = store._connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='index' "
+                    "AND tbl_name IN ('node_queue_history', 'node_traffic_history') ORDER BY name"
+                ).fetchall()
+                self.assertEqual(indexes, [])
+                for table, key, catalog in HISTORY_TABLES:
+                    with self.subTest(table=table):
+                        plan = store._connection.execute(
+                            f"EXPLAIN QUERY PLAN SELECT * FROM {table} "
+                            f"WHERE {key} = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp",
+                            (1, 0, 100),
+                        ).fetchall()
+                        self.assertTrue(any("USING PRIMARY KEY" in row[3] for row in plan), plan)
+                        self.assertFalse(any("TEMP B-TREE" in row[3] for row in plan), plan)
+                        plan = store._connection.execute(
+                            f"EXPLAIN QUERY PLAN DELETE FROM {table} "
+                            f"WHERE {key} IN (SELECT {key} FROM {catalog}) AND timestamp < ?", (10,),
+                        ).fetchall()
+                        self.assertTrue(any("USING PRIMARY KEY" in row[3] for row in plan), plan)
+            finally:
+                store.close()
+
+    def test_failed_append_rolls_back_new_names_and_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = HistoryStore(Path(directory) / "history.sqlite3")
+            try:
+                with self.assertRaises(sqlite3.IntegrityError):
+                    store.append_traffic("new-node", 10.25, [("good", 1, 2), ("invalid", None, 3)])
+                self.assertEqual(store._connection.execute("SELECT * FROM history_nodes").fetchall(), [])
+                self.assertEqual(store._connection.execute("SELECT * FROM history_services").fetchall(), [])
+                self.assertEqual(store.traffic_history("new-node", None, ["good"]), {"good": []})
+                store.append_traffic("new-node", 10.25, [("good", 4, 5)])
+                self.assertEqual(store.traffic_history("new-node", None, []), {"good": [(10.25, 4, 5)]})
             finally:
                 store.close()
 
@@ -156,6 +184,8 @@ class HistoryStoreTest(unittest.TestCase):
                 )["ssh"]
                 self.assertEqual((load[0][0], load[-1][0]), (0.0, 9.0))
                 self.assertEqual((traffic[0][0], traffic[-1][0]), (0.0, 9.0))
+                self.assertEqual([row[1] for row in load], [4, 8, 9])
+                self.assertEqual([row[1] for row in traffic], [2, 6, 9])
             finally:
                 store.close()
 
@@ -163,20 +193,29 @@ class HistoryStoreTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = HistoryStore(Path(directory) / "history.sqlite3", max_bytes=1 << 30)
             try:
+                # Seed many samples without thousands of independent commits.
+                with store._connection:
+                    node_id = store._node_id("node-a", create=True)
+                    service_id = store._service_id(node_id, "ssh")
                 rows = [
-                    ("node-a", float(index), index, index, index)
+                    (node_id, float(index), index, index, index)
                     for index in range(6000)
                 ]
                 traffic = [
-                    ("node-a", float(index), "ssh", index, index) for index in range(6000)
+                    (service_id, float(index), index, index) for index in range(6000)
                 ]
                 with store._connection:
                     store._connection.executemany(
                         "INSERT INTO node_queue_history VALUES (?, ?, ?, ?, ?)", rows
                     )
                     store._connection.executemany(
-                        "INSERT INTO node_traffic_history VALUES (?, ?, ?, ?, ?)", traffic
+                        "INSERT INTO node_traffic_history VALUES (?, ?, ?, ?)", traffic
                     )
+                # An inactive series' latest sample must also survive trimming,
+                # even though it is older than the active series' latest point.
+                for timestamp in (5.25, 6.25):
+                    store.append_queue("offline-node", timestamp, 7, 8, 9)
+                    store.append_traffic("offline-node", timestamp, [("ssh", 10, 11)])
                 before = store._database_footprint()
                 store._max_bytes = before * 3 // 4
                 store._last_size_check = 0.0
@@ -194,6 +233,8 @@ class HistoryStoreTest(unittest.TestCase):
                 self.assertEqual(load_range[1], 6000.0)
                 self.assertGreater(traffic_range[0], 0.0)
                 self.assertEqual(traffic_range[1], 5999.0)
+                self.assertEqual(store.queue_history("offline-node", None), [(6.25, 7, 8, 9)])
+                self.assertEqual(store.traffic_history("offline-node", None, []), {"ssh": [(6.25, 10, 11)]})
             finally:
                 store.close()
 

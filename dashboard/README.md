@@ -32,6 +32,18 @@ expire after seven days in SQLite and in browser history; the database size
 cap can remove older samples sooner. Expired rows are cleaned at startup and
 during collection and queries, including while collection is idle.
 
+History samples use integer Node/service identifiers; names are stored once in
+small catalog tables. Both sample tables use `WITHOUT ROWID` with a primary key
+ordered by series and timestamp, with no secondary sample indexes. Chart queries
+and expiration both seek each series' primary-key timestamp range. Size-based
+trimming removes the oldest samples per series, retaining each series' latest
+point until it expires. Location cache tables also use `WITHOUT ROWID`.
+Raw sampling frequency, timestamp precision and chart aggregation are unchanged.
+When upgrading from the old schema, stop the old dashboard and remove its
+database and WAL/SHM files before deploying the new dashboard. Startup opens the
+database and creates any missing tables using this schema; it contains no old
+schema detection or migration. New history survives normal restarts.
+
 ## Protocol summary (from the C++ source)
 
 - **Transport**: TCP → mutual TLS. The server runs
@@ -88,10 +100,10 @@ complete versioned snapshot after membership or report changes; raw ICMP
 samples are not centralized.
 
 The page starts with cluster status and the cluster-wide Current Flows metro
-map, followed by the selected Node's five compact health metrics and responsive
-queue/bandwidth charts, then registered services. The Node picker belongs to
-the health section; the header identifies the collection entry. The map shows established TCP/TLS/UDP
-businesses, independently of the selected health Node. Agent route calculations,
+map, followed by responsive queue/bandwidth charts, then registered services.
+The Node picker belongs to the queue chart; the header identifies the collection
+entry. The map shows established TCP/TLS/UDP businesses, independently of the
+Node selected for queue history. Agent route calculations,
 per-ingress candidate costs, and connection establishment are recorded in Agent logs. Topology collection still supplies
 current membership and queue values; the API retains link quality data. The score
 in that data is derived from cost as `100 * exp(-cost / 100)` and is not transmitted by Nodes.
@@ -232,10 +244,9 @@ without resizing the workspace. Route legends scroll horizontally in a fixed
 footer row. Diagnostic fields and business identifiers expand in the inspector;
 the default page has concise labels and no persistent instruction paragraphs.
 
-An optional **ICMP links** layer shows all directed Node measurements as dashed
-curves. It does not add business connections. Anomalous measurements along
-observed routes have directional RTT/loss labels even with the layer off. Display
-warnings use RTT at least 200 ms, jitter at least 50 ms or loss at least 1%; loss
+ICMP measurements are available through Node and route details in the inspector.
+The map draws business routes without ICMP curves, measurement labels or a layer
+toggle. Display warnings use RTT at least 200 ms, jitter at least 50 ms or loss at least 1%; loss
 at least 10% or an unusable measured link is critical. These are display thresholds,
 independent of route selection. Missing/expired measurements show unknown, and
 details mark retained diagnostic values as last known. Neither per-route throughput
@@ -386,9 +397,9 @@ sudo systemctl restart relayweave-dashboard
 relayweave-dashboard /etc/relayweave/dashboard.json --database /var/lib/relayweave-dashboard/history.sqlite3
 ```
 
-服务接收 SIGTERM 后停止 HTTP 服务，等待已接纳的 Flask 页面/API 处理结束，再结束采集和位置查询线程并关闭 SQLite。页面/API 均一次性生成响应，不使用流式数据库响应；重启时底层 HTTP 连接可能关闭，浏览器后续请求会重新连接。数据库位于 systemd `StateDirectory`，重启、升级和卸载软件包均不主动删除历史记录。修改监听端口、采样间隔或历史容量时使用 `sudo systemctl edit relayweave-dashboard` 覆盖 `ExecStart`，再重启；端口变化时同步修改发布端 Agent 的目标端口。
+服务接收 SIGTERM 后停止 HTTP 服务，等待已接纳的 Flask 页面/API 处理结束，再结束采集和位置查询线程并关闭 SQLite。页面/API 均一次性生成响应，不使用流式数据库响应；重启时底层 HTTP 连接可能关闭，浏览器后续请求会重新连接。数据库位于 systemd `StateDirectory`，当前结构版本的数据库会在重启后保留，卸载软件包也不主动删除该目录。修改监听端口、采样间隔或历史容量时使用 `sudo systemctl edit relayweave-dashboard` 覆盖 `ExecStart`，再重启；端口变化时同步修改发布端 Agent 的目标端口。
 
-迁移旧的本地历史库时，先正常退出旧看板并停止新服务；将数据库及存在的 `-wal` / `-shm` 文件作为同一组复制，设置所有者为 `relayweave-dashboard:relayweave-dashboard`，再启动服务。不要在旧进程仍写入时只复制主数据库文件。
+本次从旧结构升级时，先停止旧看板，直接删除 `/var/lib/relayweave-dashboard/history.sqlite3` 及同名 `-wal` / `-shm` 文件，再部署并启动新版；使用自定义 `--database` 时按实际路径删除。程序按新结构初始化缺失的表，不包含旧库识别、兼容迁移或自动重建逻辑。之后正常保存新采样，重启保留新历史。
 
 ### 从源码运行
 
@@ -431,15 +442,16 @@ python test/tools/dashboard_service_smoke.py --build-dir build --two-nodes
 
 ## Dashboard design
 
-The Node health selector chooses the node shown by the metric tiles and queue chart.
+The Node selector inside the queue chart chooses its history.
 The registered-services table combines services from all discovered nodes.
-The cluster Flow map comes first, with five compact health metrics below it;
-queue-delay and per-service bandwidth
+The cluster Flow map comes first; queue-delay and per-service bandwidth
 charts share a row on wide screens and stack on narrow screens.
-Metric tiles form one equal-height strip. Both chart cards use the same header,
-toolbar and plotting dimensions. The service table scrolls inside a fixed-height
-area. Neutral surfaces, subtle borders and consistent spacing carry across the
-map, metrics, charts and table; light and dark themes share the same structure.
+Both chart cards use the same header, compact selector toolbar and plotting
+dimensions. Services paginate in groups of at most ten, retaining the page across
+refreshes and clamping it when records disappear. The table has no internal
+scrollbars; on narrow screens each service uses a responsive field layout.
+Neutral surfaces, subtle borders and consistent spacing carry across the map,
+charts and table; light and dark themes share the same structure.
 Queue history is sampled from the Master's immutable
 topology snapshots rather than duplicated `server.cluster` fields.
 The backend returns every topology member with its queue history even before a
